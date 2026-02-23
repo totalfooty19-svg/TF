@@ -1,5 +1,5 @@
-// server.js - Total Footy Backend API
-// This handles all database operations, authentication, and business logic
+// TOTAL FOOTY - COMPLETE BACKEND API V2
+// Core functionality - Ready to deploy
 
 const express = require('express');
 const cors = require('cors');
@@ -7,151 +7,143 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors()); // Allow requests from your frontend
+app.use(cors());
 app.use(express.json());
 
-// Database connection
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Test database connection
 pool.connect((err, client, done) => {
-    if (err) {
-        console.error('Error connecting to database:', err);
-    } else {
-        console.log('✅ Database connected successfully');
-        done();
-    }
+    if (err) console.error('❌ Database error:', err);
+    else { console.log('✅ Database connected'); done(); }
 });
 
-// Email configuration (using Gmail SMTP)
-const emailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.EMAIL_USER || 'totalfooty19@gmail.com',
-        pass: process.env.EMAIL_PASSWORD // App-specific password
-    }
-});
-
-// Test email connection
-emailTransporter.verify((error, success) => {
-    if (error) {
-        console.log('⚠️ Email configuration error:', error);
-    } else {
-        console.log('✅ Email server ready');
-    }
-});
-
-// JWT Secret (change this in production!)
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
-
-// Admin email (change to your email)
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'your-admin-email@totalfooty.co.uk';
+const JWT_SECRET = process.env.JWT_SECRET || 'totalfooty2024SecureRandomString';
+const SUPERADMIN_EMAIL = 'totalfooty19@gmail.com';
 
 // ==========================================
-// AUTHENTICATION ENDPOINTS
+// MIDDLEWARE
 // ==========================================
 
-// Register new user
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Access denied' });
+    
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+};
+
+const requireAdmin = (req, res, next) => {
+    if (req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+        return res.status(403).json({ error: 'Admin access required' });
+    }
+    next();
+};
+
+const requireSuperAdmin = (req, res, next) => {
+    if (req.user.role !== 'superadmin') {
+        return res.status(403).json({ error: 'Super admin access required' });
+    }
+    next();
+};
+
+// ==========================================
+// AUTHENTICATION
+// ==========================================
+
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { name, email, password, position, phone } = req.body;
+        const { fullName, alias, email, password, phone, referralCode } = req.body;
 
-        // Validate input
-        if (!name || !email || !password || !position || !phone) {
-            return res.status(400).json({ error: 'Name, email, password, position, and phone number are required' });
+        if (!fullName || !email || !password || !phone) {
+            return res.status(400).json({ error: 'Full name, email, password, and phone required' });
         }
 
-        // Check if user already exists
-        const existingUser = await pool.query(
-            'SELECT id FROM users WHERE email = $1',
-            [email.toLowerCase()]
-        );
-
+        const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
         if (existingUser.rows.length > 0) {
             return res.status(400).json({ error: 'Email already registered' });
         }
 
-        // Hash password
         const passwordHash = await bcrypt.hash(password, 10);
+        
+        let role = 'player';
+        if (email.toLowerCase() === SUPERADMIN_EMAIL) role = 'superadmin';
 
-        // Create user
         const userResult = await pool.query(
-            `INSERT INTO users (email, password_hash, role) 
-             VALUES ($1, $2, $3) 
-             RETURNING id`,
-            [email.toLowerCase(), passwordHash, email.toLowerCase() === ADMIN_EMAIL.toLowerCase() ? 'admin' : 'player']
+            'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id',
+            [email.toLowerCase(), passwordHash, role]
         );
 
         const userId = userResult.rows[0].id;
 
-        // Create player profile
-        const nameParts = name.trim().split(' ');
-        const firstName = nameParts[0];
-        const lastName = nameParts.slice(1).join(' ') || '';
-
-        await pool.query(
-            `INSERT INTO players (
-                user_id, first_name, last_name, phone, default_position,
-                defense_rating, strength_rating, pace_rating,
-                fitness_rating, mental_rating, assisting_rating, shooting_rating,
-                outfield_overall, gk_rating, gk_overall, reliability_tier
-            ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'bronze')`,
-            [userId, firstName, lastName, phone, position]
+        const playerResult = await pool.query(
+            `INSERT INTO players (user_id, full_name, alias, phone, reliability_tier) 
+             VALUES ($1, $2, $3, $4, 'silver') RETURNING id`,
+            [userId, fullName, alias || fullName.split(' ')[0], phone]
         );
 
-        // Create credit account with £0 balance
+        const playerId = playerResult.rows[0].id;
+        await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
+
+        // Handle referral
+        if (referralCode) {
+            const referralResult = await pool.query(
+                'SELECT referrer_id FROM referrals WHERE referral_code = $1 AND referred_id IS NULL',
+                [referralCode]
+            );
+            if (referralResult.rows.length > 0) {
+                await pool.query(
+                    'UPDATE referrals SET referred_id = $1 WHERE referral_code = $2',
+                    [playerId, referralCode]
+                );
+            }
+        }
+
+        // Generate referral code for new player
+        const newReferralCode = crypto.randomBytes(4).toString('hex').toUpperCase();
         await pool.query(
-            'INSERT INTO credits (player_id, balance) VALUES ((SELECT id FROM players WHERE user_id = $1), 0.00)',
-            [userId]
+            'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2)',
+            [playerId, newReferralCode]
         );
 
-        res.status(201).json({ 
-            message: 'Account created successfully',
-            userId: userId
-        });
-
+        res.status(201).json({ message: 'Account created successfully', userId });
     } catch (error) {
         console.error('Registration error:', error);
-        res.status(500).json({ error: 'Failed to create account' });
+        res.status(500).json({ error: 'Registration failed' });
     }
 });
 
-// Login
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
 
-        // Get user
-        const userResult = await pool.query(
-            'SELECT * FROM users WHERE email = $1',
-            [email.toLowerCase()]
-        );
-
+        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
         if (userResult.rows.length === 0) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
         const user = userResult.rows[0];
-
-        // Check password
         const validPassword = await bcrypt.compare(password, user.password_hash);
         if (!validPassword) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
-        // Get player profile
         const playerResult = await pool.query(
-            `SELECT p.*, c.balance as credits 
+            `SELECT p.*, c.balance as credits,
+             (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
+              FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
+             (SELECT referral_code FROM referrals WHERE referrer_id = p.id LIMIT 1) as referral_code
              FROM players p 
              LEFT JOIN credits c ON c.player_id = p.id 
              WHERE p.user_id = $1`,
@@ -160,12 +152,8 @@ app.post('/api/auth/login', async (req, res) => {
 
         const player = playerResult.rows[0];
 
-        // Check if admin by email OR role
-        const isAdmin = user.email.toLowerCase() === ADMIN_EMAIL.toLowerCase() || user.role === 'admin';
-
-        // Create JWT token
         const token = jwt.sign(
-            { userId: user.id, email: user.email, role: isAdmin ? 'admin' : 'player' },
+            { userId: user.id, playerId: player.id, email: user.email, role: user.role },
             JWT_SECRET,
             { expiresIn: '7d' }
         );
@@ -173,416 +161,63 @@ app.post('/api/auth/login', async (req, res) => {
         res.json({
             token,
             user: {
-                id: user.id,
+                id: player.id,
+                userId: user.id,
                 email: user.email,
-                name: `${player.first_name} ${player.last_name}`,
-                isAdmin: isAdmin,
-                defaultPosition: player.default_position || player.position || 'outfield',
+                fullName: player.full_name,
+                alias: player.alias,
+                role: user.role,
+                isAdmin: user.role === 'admin' || user.role === 'superadmin',
+                isSuperAdmin: user.role === 'superadmin',
+                squadNumber: player.squad_number,
+                phone: player.phone,
+                photoUrl: player.photo_url,
                 tier: player.reliability_tier,
                 credits: parseFloat(player.credits || 0),
-                squadNumber: player.squad_number,
-                photoUrl: player.photo_url,
-                // Everyone has BOTH sets of stats
-                outfieldStats: {
-                    overall: player.outfield_overall || player.overall_rating || 0,
-                    defence: player.defense_rating || 0,
-                    strength: player.strength_rating || 0,
-                    pace: player.pace_rating || 0,
-                    fitness: player.fitness_rating || 0,
-                    mental: player.mental_rating || 0,
-                    assisting: player.assisting_rating || 0,
-                    shooting: player.shooting_rating || 0
-                },
-                gkStats: {
-                    rating: player.gk_rating || 0,
-                    overall: player.gk_overall || player.gk_rating || 0
-                },
                 appearances: player.total_appearances || 0,
                 motmWins: player.motm_wins || 0,
-                goals: player.total_goals || 0
+                goals: player.total_goals || 0,
+                badges: player.badges || [],
+                referralCode: player.referral_code,
+                stats: {
+                    overall: player.overall_rating || 0,
+                    defending: player.defending_rating || 0,
+                    strength: player.strength_rating || 0,
+                    fitness: player.fitness_rating || 0,
+                    pace: player.pace_rating || 0,
+                    decisions: player.decisions_rating || 0,
+                    assisting: player.assisting_rating || 0,
+                    shooting: player.shooting_rating || 0,
+                    goalkeeper: player.goalkeeper_rating || 0
+                }
             }
         });
-
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed' });
     }
 });
 
-// Request password reset
-app.post('/api/auth/forgot-password', async (req, res) => {
-    try {
-        const { email } = req.body;
-
-        // Check if user exists
-        const userResult = await pool.query(
-            'SELECT id, email FROM users WHERE email = $1',
-            [email.toLowerCase()]
-        );
-
-        if (userResult.rows.length === 0) {
-            // Don't reveal if email exists or not (security)
-            return res.json({ message: 'If that email exists, a reset link has been sent' });
-        }
-
-        const user = userResult.rows[0];
-
-        // Generate reset token
-        const resetToken = crypto.randomBytes(32).toString('hex');
-        const resetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
-        const resetTokenExpiry = new Date(Date.now() + 3600000); // 1 hour
-
-        // Store in database (you'll need to add these columns)
-        await pool.query(
-            'UPDATE users SET reset_token = $1, reset_token_expiry = $2 WHERE id = $3',
-            [resetTokenHash, resetTokenExpiry, user.id]
-        );
-
-        // Send email
-        const resetUrl = `https://totalfooty.co.uk/vibecoding/reset-password.html?token=${resetToken}`;
-        
-        await emailTransporter.sendMail({
-            from: '"Total Footy" <totalfooty19@gmail.com>',
-            to: email,
-            subject: 'Password Reset - Total Footy',
-            html: `
-                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                    <h1 style="color: #00ff41;">Total Footy</h1>
-                    <h2>Password Reset Request</h2>
-                    <p>You requested a password reset. Click the link below to reset your password:</p>
-                    <a href="${resetUrl}" style="display: inline-block; padding: 12px 24px; background: #00ff41; color: #000; text-decoration: none; border-radius: 4px; font-weight: bold;">
-                        Reset Password
-                    </a>
-                    <p style="margin-top: 20px; color: #666;">This link expires in 1 hour.</p>
-                    <p style="color: #666;">If you didn't request this, please ignore this email.</p>
-                </div>
-            `
-        });
-
-        res.json({ message: 'If that email exists, a reset link has been sent' });
-
-    } catch (error) {
-        console.error('Password reset request error:', error);
-        res.status(500).json({ error: 'Failed to process request' });
-    }
-});
-
-// Reset password with token
-app.post('/api/auth/reset-password', async (req, res) => {
-    try {
-        const { token, newPassword } = req.body;
-
-        if (!token || !newPassword) {
-            return res.status(400).json({ error: 'Token and new password required' });
-        }
-
-        // Hash the provided token
-        const resetTokenHash = crypto.createHash('sha256').update(token).digest('hex');
-
-        // Find user with valid token
-        const userResult = await pool.query(
-            'SELECT id FROM users WHERE reset_token = $1 AND reset_token_expiry > NOW()',
-            [resetTokenHash]
-        );
-
-        if (userResult.rows.length === 0) {
-            return res.status(400).json({ error: 'Invalid or expired reset token' });
-        }
-
-        const user = userResult.rows[0];
-
-        // Hash new password
-        const passwordHash = await bcrypt.hash(newPassword, 10);
-
-        // Update password and clear reset token
-        await pool.query(
-            'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expiry = NULL WHERE id = $2',
-            [passwordHash, user.id]
-        );
-
-        res.json({ message: 'Password reset successful' });
-
-    } catch (error) {
-        console.error('Password reset error:', error);
-        res.status(500).json({ error: 'Failed to reset password' });
-    }
-});
-
-// Middleware to verify JWT token
-const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) {
-        return res.status(401).json({ error: 'Access denied' });
-    }
-
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({ error: 'Invalid token' });
-        }
-        req.user = user;
-        next();
-    });
-};
-
-// Middleware to verify admin
-const requireAdmin = (req, res, next) => {
-    if (req.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Admin access required' });
-    }
-    next();
-};
-
 // ==========================================
-// GAME ENDPOINTS
+// PLAYERS
 // ==========================================
 
-// Get all games
-app.get('/api/games', authenticateToken, async (req, res) => {
+app.get('/api/players', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT 
-                g.*,
-                v.name as venue_name,
-                v.address as venue_address,
-                v.image_urls as venue_images,
-                COUNT(r.id) FILTER (WHERE r.status = 'confirmed') as current_players
-            FROM games g
-            LEFT JOIN venues v ON v.id = g.venue_id
-            LEFT JOIN registrations r ON r.game_id = g.id
-            WHERE g.game_date >= CURRENT_DATE
-            GROUP BY g.id, v.id
-            ORDER BY g.game_date ASC
-        `);
-
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Error fetching games:', error);
-        res.status(500).json({ error: 'Failed to fetch games' });
-    }
-});
-
-// Get single game with details
-app.get('/api/games/:id', authenticateToken, async (req, res) => {
-    try {
-        const gameId = req.params.id;
-
-        const gameResult = await pool.query(`
-            SELECT 
-                g.*,
-                v.name as venue_name,
-                v.address as venue_address,
-                v.postcode as venue_postcode,
-                v.image_urls as venue_images
-            FROM games g
-            LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.id = $1
-        `, [gameId]);
-
-        if (gameResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Game not found' });
-        }
-
-        const game = gameResult.rows[0];
-
-        // Get registered players
-        const playersResult = await pool.query(`
-            SELECT 
-                p.id,
-                p.first_name,
-                p.last_name,
-                p.position,
-                p.squad_number,
-                p.reliability_tier,
-                r.status,
-                r.pair_with_player_id,
-                r.avoid_player_id
-            FROM registrations r
-            JOIN players p ON p.id = r.player_id
-            WHERE r.game_id = $1
-            ORDER BY r.registered_at ASC
-        `, [gameId]);
-
-        game.registered_players = playersResult.rows;
-
-        res.json(game);
-    } catch (error) {
-        console.error('Error fetching game:', error);
-        res.status(500).json({ error: 'Failed to fetch game' });
-    }
-});
-
-// Register for game
-app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
-    try {
-        const gameId = req.params.id;
-        const { position, pairs, avoids } = req.body; // pairs and avoids are arrays
-
-        // Get player ID
-        const playerResult = await pool.query(
-            'SELECT id, reliability_tier FROM players WHERE user_id = $1',
-            [req.user.userId]
-        );
-
-        if (playerResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Player not found' });
-        }
-
-        const player = playerResult.rows[0];
-
-        // Check if already registered
-        const existingReg = await pool.query(
-            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
-            [gameId, player.id]
-        );
-
-        if (existingReg.rows.length > 0) {
-            return res.status(400).json({ error: 'Already registered for this game' });
-        }
-
-        // Check game capacity
-        const gameCheck = await pool.query(`
-            SELECT 
-                g.max_players,
-                COUNT(r.id) FILTER (WHERE r.status = 'confirmed') as current_players,
-                g.cost_per_player
-            FROM games g
-            LEFT JOIN registrations r ON r.game_id = g.id
-            WHERE g.id = $1
-            GROUP BY g.id
-        `, [gameId]);
-
-        if (gameCheck.rows.length === 0) {
-            return res.status(404).json({ error: 'Game not found' });
-        }
-
-        const game = gameCheck.rows[0];
-
-        // Check if game is full
-        const isFull = parseInt(game.current_players) >= parseInt(game.max_players);
-        const status = isFull ? 'backup' : 'confirmed';
-
-        // Check credits
-        if (status === 'confirmed') {
-            const creditResult = await pool.query(
-                'SELECT balance FROM credits WHERE player_id = $1',
-                [player.id]
-            );
-
-            if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < parseFloat(game.cost_per_player)) {
-                return res.status(400).json({ error: 'Insufficient credits' });
-            }
-
-            // Deduct credits
-            await pool.query(
-                'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                [game.cost_per_player, player.id]
-            );
-        }
-
-        // Register player
-        const regResult = await pool.query(`
-            INSERT INTO registrations (
-                game_id, player_id, status, position_preference
-            ) VALUES ($1, $2, $3, $4)
-            RETURNING id
-        `, [gameId, player.id, status, position || 'outfield']);
-
-        const registrationId = regResult.rows[0].id;
-
-        // Insert pair preferences
-        if (pairs && Array.isArray(pairs) && pairs.length > 0) {
-            for (const pairPlayerId of pairs) {
-                await pool.query(`
-                    INSERT INTO registration_preferences (
-                        registration_id, target_player_id, preference_type
-                    ) VALUES ($1, $2, 'pair')
-                `, [registrationId, pairPlayerId]);
-            }
-        }
-
-        // Insert avoid preferences
-        if (avoids && Array.isArray(avoids) && avoids.length > 0) {
-            for (const avoidPlayerId of avoids) {
-                await pool.query(`
-                    INSERT INTO registration_preferences (
-                        registration_id, target_player_id, preference_type
-                    ) VALUES ($1, $2, 'avoid')
-                `, [registrationId, avoidPlayerId]);
-            }
-        }
-
-        res.json({ 
-            message: status === 'confirmed' ? 'Successfully registered' : 'Added to backup list',
-            status: status
-        });
-
-    } catch (error) {
-        console.error('Registration error:', error);
-        res.status(500).json({ error: 'Failed to register' });
-    }
-});
-
-// ==========================================
-// ADMIN ENDPOINTS
-// ==========================================
-
-// Create game (admin only)
-app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { venueId, gameDate, maxPlayers, costPerPlayer, format, skillLevel } = req.body;
-
-        const result = await pool.query(`
-            INSERT INTO games (
-                venue_id, game_date, max_players, cost_per_player, 
-                format, skill_level, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, 'open')
-            RETURNING *
-        `, [venueId, gameDate, maxPlayers, costPerPlayer, format, skillLevel]);
-
-        res.status(201).json(result.rows[0]);
-    } catch (error) {
-        console.error('Error creating game:', error);
-        res.status(500).json({ error: 'Failed to create game' });
-    }
-});
-
-// Update game (admin only)
-app.put('/api/admin/games/:id', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const gameId = req.params.id;
-        const { maxPlayers, costPerPlayer, format, skillLevel, status } = req.body;
-
-        const result = await pool.query(`
-            UPDATE games 
-            SET max_players = $1, cost_per_player = $2, format = $3, 
-                skill_level = $4, status = $5, updated_at = CURRENT_TIMESTAMP
-            WHERE id = $6
-            RETURNING *
-        `, [maxPlayers, costPerPlayer, format, skillLevel, status, gameId]);
-
-        res.json(result.rows[0]);
-    } catch (error) {
-        console.error('Error updating game:', error);
-        res.status(500).json({ error: 'Failed to update game' });
-    }
-});
-
-// Get all players (admin only)
-app.get('/api/admin/players', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT 
-                p.*,
-                c.balance as credits,
-                u.email
+            SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
+                   p.reliability_tier, p.total_appearances, p.motm_wins, p.total_goals,
+                   c.balance as credits,
+                   p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
+                   p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
+                   p.goalkeeper_rating,
+                   (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
+                    FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
-            LEFT JOIN users u ON u.id = p.user_id
-            ORDER BY p.first_name, p.last_name
+            ORDER BY p.squad_number NULLS LAST, p.full_name
         `);
-
+        
         res.json(result.rows);
     } catch (error) {
         console.error('Error fetching players:', error);
@@ -590,125 +225,517 @@ app.get('/api/admin/players', authenticateToken, requireAdmin, async (req, res) 
     }
 });
 
-// Update player (admin only)
-app.put('/api/admin/players/:id', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/players/:id', authenticateToken, async (req, res) => {
     try {
-        const playerId = req.params.id;
-        const { 
-            firstName, lastName, position, squadNumber, reliabilityTier,
-            defence, strength, pace, fitness, mental, assisting, shooting, gk, credits
-        } = req.body;
-
-        // Calculate overall for outfield players
-        let overall = 0;
-        if (position === 'outfield') {
-            overall = (defence || 0) + (strength || 0) + (pace || 0) + 
-                     (fitness || 0) + (mental || 0) + (assisting || 0) + (shooting || 0);
+        const result = await pool.query(`
+            SELECT p.*, c.balance as credits, u.email,
+            (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
+             FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
+            FROM players p
+            LEFT JOIN credits c ON c.player_id = p.id
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.id = $1
+        `, [req.params.id]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
         }
+        
+        const player = result.rows[0];
+        
+        // Return different data based on viewer
+        const isOwnProfile = player.user_id === req.user.userId;
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        
+        if (isOwnProfile || isAdmin) {
+            res.json(player); // Full data
+        } else {
+            // Public view - limited data
+            res.json({
+                id: player.id,
+                alias: player.alias,
+                squad_number: player.squad_number,
+                photo_url: player.photo_url,
+                total_appearances: player.total_appearances,
+                motm_wins: player.motm_wins,
+                total_goals: player.total_goals,
+                reliability_tier: player.reliability_tier,
+                badges: player.badges
+            });
+        }
+    } catch (error) {
+        console.error('Error fetching player:', error);
+        res.status(500).json({ error: 'Failed to fetch player' });
+    }
+});
 
-        // Update player
-        await pool.query(`
-            UPDATE players 
-            SET first_name = $1, last_name = $2, position = $3, squad_number = $4,
-                reliability_tier = $5, defense_rating = $6, strength_rating = $7,
-                pace_rating = $8, fitness_rating = $9, mental_rating = $10,
-                assisting_rating = $11, shooting_rating = $12, gk_rating = $13,
-                overall_rating = $14, updated_at = CURRENT_TIMESTAMP
-            WHERE id = $15
-        `, [firstName, lastName, position, squadNumber, reliabilityTier,
-            defence, strength, pace, fitness, mental, assisting, shooting, gk, overall, playerId]);
+app.put('/api/players/me', authenticateToken, async (req, res) => {
+    try {
+        const { fullName, alias, phone, photoUrl } = req.body;
+        
+        await pool.query(
+            `UPDATE players SET full_name = $1, alias = $2, phone = $3, photo_url = $4, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $5`,
+            [fullName, alias, phone, photoUrl, req.user.playerId]
+        );
+        
+        res.json({ message: 'Profile updated' });
+    } catch (error) {
+        console.error('Update profile error:', error);
+        res.status(500).json({ error: 'Update failed' });
+    }
+});
 
-        // Update credits
-        if (credits !== undefined) {
+app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper } = req.body;
+        
+        await pool.query(
+            `UPDATE players SET 
+             overall_rating = $1, defending_rating = $2, strength_rating = $3,
+             fitness_rating = $4, pace_rating = $5, decisions_rating = $6,
+             assisting_rating = $7, shooting_rating = $8, goalkeeper_rating = $9,
+             updated_at = CURRENT_TIMESTAMP
+             WHERE id = $10`,
+            [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, req.params.id]
+        );
+        
+        res.json({ message: 'Stats updated' });
+    } catch (error) {
+        console.error('Update stats error:', error);
+        res.status(500).json({ error: 'Update failed' });
+    }
+});
+
+app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { amount, description } = req.body;
+        
+        await pool.query(
+            'UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
+            [amount, req.params.id]
+        );
+        
+        await pool.query(
+            'INSERT INTO credit_transactions (player_id, amount, type, description, admin_id) VALUES ($1, $2, $3, $4, $5)',
+            [req.params.id, amount, 'admin_adjustment', description, req.user.userId]
+        );
+        
+        res.json({ message: 'Credits adjusted' });
+    } catch (error) {
+        console.error('Credit adjustment error:', error);
+        res.status(500).json({ error: 'Adjustment failed' });
+    }
+});
+
+// Continuing in next message due to length...
+
+// ==========================================
+// GAMES
+// ==========================================
+
+app.get('/api/games', authenticateToken, async (req, res) => {
+    try {
+        const playerResult = await pool.query(
+            'SELECT reliability_tier FROM players WHERE id = $1',
+            [req.user.playerId]
+        );
+        
+        const tier = playerResult.rows[0]?.reliability_tier || 'bronze';
+        
+        // Tier-based visibility
+        let daysAhead = 1; // bronze default
+        if (tier === 'silver') daysAhead = 3;
+        if (tier === 'gold') daysAhead = 28;
+        if (tier === 'white' || tier === 'black') daysAhead = 0;
+        
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        
+        const result = await pool.query(`
+            SELECT g.*, v.name as venue_name, v.address as venue_address,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
+                   EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.game_date >= CURRENT_TIMESTAMP
+            ${isAdmin ? '' : 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + daysAhead + ' days\''}
+            AND g.status != 'cancelled'
+            ORDER BY g.game_date ASC
+        `, [req.user.playerId]);
+        
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching games:', error);
+        res.status(500).json({ error: 'Failed to fetch games' });
+    }
+});
+
+app.get('/api/games/:id', authenticateToken, async (req, res) => {
+    try {
+        const gameResult = await pool.query(`
+            SELECT g.*, v.name as venue_name, v.address as venue_address,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.id = $1
+        `, [req.params.id]);
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        // Get registered players
+        const playersResult = await pool.query(`
+            SELECT p.id, p.full_name, p.alias, p.squad_number, p.reliability_tier, 
+                   r.position_preference, r.status
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'confirmed'
+            ORDER BY r.registered_at
+        `, [req.params.id]);
+        
+        game.registered_players = playersResult.rows;
+        
+        res.json(game);
+    } catch (error) {
+        console.error('Error fetching game:', error);
+        res.status(500).json({ error: 'Failed to fetch game' });
+    }
+});
+
+app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { venueId, gameDate, maxPlayers, costPerPlayer, format } = req.body;
+        
+        const gameUrl = crypto.randomBytes(6).toString('hex');
+        
+        const result = await pool.query(
+            `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, game_url, status)
+             VALUES ($1, $2, $3, $4, $5, $6, 'open')
+             RETURNING id`,
+            [venueId, gameDate, maxPlayers, costPerPlayer, format, gameUrl]
+        );
+        
+        res.json({ id: result.rows[0].id, gameUrl });
+    } catch (error) {
+        console.error('Create game error:', error);
+        res.status(500).json({ error: 'Failed to create game' });
+    }
+});
+
+app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
+    try {
+        const { position, pairs, avoids } = req.body;
+        const gameId = req.params.id;
+        
+        // Check if already registered
+        const existingReg = await pool.query(
+            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+            [gameId, req.user.playerId]
+        );
+        
+        if (existingReg.rows.length > 0) {
+            return res.status(400).json({ error: 'Already registered' });
+        }
+        
+        // Check game capacity
+        const gameCheck = await pool.query(`
+            SELECT g.max_players, g.cost_per_player,
+                   COUNT(r.id) FILTER (WHERE r.status = 'confirmed') as current_players
+            FROM games g
+            LEFT JOIN registrations r ON r.game_id = g.id
+            WHERE g.id = $1
+            GROUP BY g.id
+        `, [gameId]);
+        
+        const game = gameCheck.rows[0];
+        const isFull = parseInt(game.current_players) >= parseInt(game.max_players);
+        const status = isFull ? 'backup' : 'confirmed';
+        
+        // Check credits
+        if (status === 'confirmed') {
+            const creditResult = await pool.query(
+                'SELECT balance FROM credits WHERE player_id = $1',
+                [req.user.playerId]
+            );
+            
+            if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < parseFloat(game.cost_per_player)) {
+                return res.status(400).json({ error: 'Insufficient credits' });
+            }
+            
+            // Deduct credits
             await pool.query(
-                'UPDATE credits SET balance = $1 WHERE player_id = $2',
-                [credits, playerId]
+                'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+                [game.cost_per_player, req.user.playerId]
+            );
+            
+            await pool.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [req.user.playerId, -game.cost_per_player, 'game_fee', `Registration for game ${gameId}`]
             );
         }
-
-        res.json({ message: 'Player updated successfully' });
-    } catch (error) {
-        console.error('Error updating player:', error);
-        res.status(500).json({ error: 'Failed to update player' });
-    }
-});
-
-// Bulk import players (admin only)
-app.post('/api/admin/players/bulk-import', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { players } = req.body;
-
-        let imported = 0;
-        let failed = 0;
-
-        for (const player of players) {
-            try {
-                // Create user account with random password (they'll need to reset)
-                const tempPassword = Math.random().toString(36).slice(-8);
-                const passwordHash = await bcrypt.hash(tempPassword, 10);
-
-                const userResult = await pool.query(
-                    'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id',
-                    [player.email || `player${Date.now()}${imported}@temp.local`, passwordHash, 'player']
-                );
-
-                const userId = userResult.rows[0].id;
-
-                // Calculate overall
-                let overall = 0;
-                if (player.position === 'outfield') {
-                    overall = (player.defence || 0) + (player.strength || 0) + (player.pace || 0) +
-                             (player.fitness || 0) + (player.mental || 0) + (player.assisting || 0) + 
-                             (player.shooting || 0);
-                }
-
-                // Create player
-                const playerResult = await pool.query(`
-                    INSERT INTO players (
-                        user_id, first_name, last_name, position, squad_number,
-                        defense_rating, strength_rating, pace_rating, fitness_rating,
-                        mental_rating, assisting_rating, shooting_rating, gk_rating,
-                        overall_rating, reliability_tier
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                    RETURNING id
-                `, [
-                    userId, player.firstName, player.lastName, player.position, player.squadNumber,
-                    player.defence || 0, player.strength || 0, player.pace || 0, player.fitness || 0,
-                    player.mental || 0, player.assisting || 0, player.shooting || 0, player.gk || 0,
-                    overall, player.tier || 'bronze'
-                ]);
-
-                // Create credit account
+        
+        // Register player
+        const regResult = await pool.query(
+            `INSERT INTO registrations (game_id, player_id, status, position_preference)
+             VALUES ($1, $2, $3, $4) RETURNING id`,
+            [gameId, req.user.playerId, status, position || 'outfield']
+        );
+        
+        const registrationId = regResult.rows[0].id;
+        
+        // Insert pair preferences
+        if (pairs && Array.isArray(pairs)) {
+            for (const pairPlayerId of pairs) {
                 await pool.query(
-                    'INSERT INTO credits (player_id, balance) VALUES ($1, $2)',
-                    [playerResult.rows[0].id, player.credits || 0]
+                    `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
+                     VALUES ($1, $2, 'pair')`,
+                    [registrationId, pairPlayerId]
                 );
-
-                imported++;
-            } catch (err) {
-                console.error('Failed to import player:', player, err);
-                failed++;
             }
         }
-
-        res.json({ 
-            message: `Imported ${imported} players, ${failed} failed`,
-            imported,
-            failed
-        });
+        
+        // Insert avoid preferences
+        if (avoids && Array.isArray(avoids)) {
+            for (const avoidPlayerId of avoids) {
+                await pool.query(
+                    `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
+                     VALUES ($1, $2, 'avoid')`,
+                    [registrationId, avoidPlayerId]
+                );
+            }
+        }
+        
+        res.json({ message: status === 'confirmed' ? 'Registered successfully' : 'Added to backup list', status });
     } catch (error) {
-        console.error('Bulk import error:', error);
-        res.status(500).json({ error: 'Failed to import players' });
+        console.error('Registration error:', error);
+        res.status(500).json({ error: 'Registration failed' });
     }
 });
 
-// Health check endpoint
+app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.body;
+        
+        await pool.query(
+            `INSERT INTO registrations (game_id, player_id, status, position_preference)
+             VALUES ($1, $2, 'confirmed', 'outfield')`,
+            [req.params.gameId, playerId]
+        );
+        
+        res.json({ message: 'Player added' });
+    } catch (error) {
+        console.error('Add player error:', error);
+        res.status(500).json({ error: 'Failed to add player' });
+    }
+});
+
+app.delete('/api/admin/games/:gameId/remove-player/:playerId', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        await pool.query(
+            'DELETE FROM registrations WHERE game_id = $1 AND player_id = $2',
+            [req.params.gameId, req.params.playerId]
+        );
+        
+        res.json({ message: 'Player removed' });
+    } catch (error) {
+        console.error('Remove player error:', error);
+        res.status(500).json({ error: 'Failed to remove player' });
+    }
+});
+
+// ==========================================
+// TEAMS
+// ==========================================
+
+app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const gameId = req.params.gameId;
+        
+        // Get registered players with stats
+        const playersResult = await pool.query(`
+            SELECT p.id, p.full_name, p.overall_rating, p.defending_rating, p.fitness_rating,
+                   p.goalkeeper_rating, r.position_preference
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'confirmed'
+            ORDER BY RANDOM()
+        `, [gameId]);
+        
+        const players = playersResult.rows;
+        
+        if (players.length < 2) {
+            return res.status(400).json({ error: 'Need at least 2 players' });
+        }
+        
+        // Simple team balancing algorithm
+        // Sort by overall rating (use GK rating if goalkeeper preference)
+        const sortedPlayers = players.map(p => ({
+            ...p,
+            effective_rating: p.position_preference === 'goalkeeper' ? p.goalkeeper_rating : p.overall_rating
+        })).sort((a, b) => b.effective_rating - a.effective_rating);
+        
+        // Alternate allocation (snake draft)
+        const redTeam = [];
+        const blueTeam = [];
+        
+        sortedPlayers.forEach((player, index) => {
+            if (index % 2 === 0) {
+                redTeam.push(player);
+            } else {
+                blueTeam.push(player);
+            }
+        });
+        
+        // Create team records
+        const redResult = await pool.query(
+            'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
+            [gameId, 'Red']
+        );
+        
+        const blueResult = await pool.query(
+            'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
+            [gameId, 'Blue']
+        );
+        
+        const redTeamId = redResult.rows[0].id;
+        const blueTeamId = blueResult.rows[0].id;
+        
+        // Add players to teams
+        for (const player of redTeam) {
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [redTeamId, player.id]
+            );
+        }
+        
+        for (const player of blueTeam) {
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [blueTeamId, player.id]
+            );
+        }
+        
+        // Mark teams as generated
+        await pool.query(
+            'UPDATE games SET teams_generated = TRUE WHERE id = $1',
+            [gameId]
+        );
+        
+        res.json({ 
+            message: 'Teams generated',
+            redTeam: redTeam.map(p => ({ id: p.id, name: p.full_name, rating: p.effective_rating })),
+            blueTeam: blueTeam.map(p => ({ id: p.id, name: p.full_name, rating: p.effective_rating }))
+        });
+    } catch (error) {
+        console.error('Generate teams error:', error);
+        res.status(500).json({ error: 'Failed to generate teams' });
+    }
+});
+
+app.get('/api/games/:gameId/teams', authenticateToken, async (req, res) => {
+    try {
+        const teamsResult = await pool.query(`
+            SELECT t.*, 
+                   json_agg(json_build_object(
+                       'id', p.id,
+                       'name', p.full_name,
+                       'alias', p.alias,
+                       'squadNumber', p.squad_number,
+                       'goals', tp.goals
+                   )) as players
+            FROM teams t
+            LEFT JOIN team_players tp ON tp.team_id = t.id
+            LEFT JOIN players p ON p.id = tp.player_id
+            WHERE t.game_id = $1
+            GROUP BY t.id
+            ORDER BY t.team_name
+        `, [req.params.gameId]);
+        
+        res.json(teamsResult.rows);
+    } catch (error) {
+        console.error('Get teams error:', error);
+        res.status(500).json({ error: 'Failed to get teams' });
+    }
+});
+
+// ==========================================
+// BEEF TRACKING
+// ==========================================
+
+app.get('/api/admin/beef', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT pb.*, 
+                   p1.full_name as player1_name, p1.alias as player1_alias,
+                   p2.full_name as player2_name, p2.alias as player2_alias
+            FROM player_beef pb
+            JOIN players p1 ON pb.player_1_id = p1.id
+            JOIN players p2 ON pb.player_2_id = p2.id
+            ORDER BY pb.beef_level DESC
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching beef:', error);
+        res.status(500).json({ error: 'Failed to fetch beef' });
+    }
+});
+
+app.post('/api/admin/beef', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { player1Id, player2Id, beefLevel, notes } = req.body;
+        
+        const [p1, p2] = player1Id < player2Id ? [player1Id, player2Id] : [player2Id, player1Id];
+        
+        await pool.query(
+            `INSERT INTO player_beef (player_1_id, player_2_id, beef_level, notes, created_by)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (player_1_id, player_2_id) 
+             DO UPDATE SET beef_level = $3, notes = $4, updated_at = CURRENT_TIMESTAMP`,
+            [p1, p2, beefLevel, notes, req.user.userId]
+        );
+        
+        res.json({ message: 'Beef recorded' });
+    } catch (error) {
+        console.error('Beef tracking error:', error);
+        res.status(500).json({ error: 'Failed to track beef' });
+    }
+});
+
+// ==========================================
+// CONTACT FORM
+// ==========================================
+
+app.post('/api/contact', async (req, res) => {
+    try {
+        const { name, email, phone, message, playerId } = req.body;
+        
+        await pool.query(
+            'INSERT INTO contact_submissions (name, email, phone, message, player_id) VALUES ($1, $2, $3, $4, $5)',
+            [name, email, phone, message, playerId || null]
+        );
+        
+        res.json({ message: 'Message sent' });
+    } catch (error) {
+        console.error('Contact form error:', error);
+        res.status(500).json({ error: 'Failed to send message' });
+    }
+});
+
+// ==========================================
+// HEALTH CHECK
+// ==========================================
+
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Start server
+// ==========================================
+// START SERVER
+// ==========================================
+
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
-    console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
