@@ -17,11 +17,12 @@ CREATE TABLE players (
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     first_name VARCHAR(100) NOT NULL,
     last_name VARCHAR(100) NOT NULL,
-    phone VARCHAR(20),
-    position VARCHAR(20) NOT NULL, -- 'outfield' or 'goalkeeper'
+    phone VARCHAR(20) NOT NULL,
+    photo_url TEXT,
+    default_position VARCHAR(20) DEFAULT 'outfield', -- Their preferred position
     squad_number INTEGER,
     
-    -- Stats (out of 20 for outfield)
+    -- Outfield Stats (out of 20 each)
     defense_rating INTEGER DEFAULT 0,
     strength_rating INTEGER DEFAULT 0,
     pace_rating INTEGER DEFAULT 0,
@@ -29,10 +30,14 @@ CREATE TABLE players (
     mental_rating INTEGER DEFAULT 0,
     assisting_rating INTEGER DEFAULT 0,
     shooting_rating INTEGER DEFAULT 0,
-    overall_rating INTEGER DEFAULT 0, -- Sum of above for outfield
+    outfield_overall INTEGER DEFAULT 0, -- Sum of above 7 stats (max 140)
     
-    -- GK stat (out of 100)
+    -- Goalkeeper Stats (out of 100)
     gk_rating INTEGER DEFAULT 0,
+    gk_overall INTEGER DEFAULT 0, -- Overall rating when playing as GK (out of 100)
+    
+    -- Performance Stats
+    total_goals INTEGER DEFAULT 0,
     
     -- Reliability tracking
     reliability_tier VARCHAR(20) DEFAULT 'bronze',
@@ -102,8 +107,7 @@ CREATE TABLE registrations (
     game_id UUID REFERENCES games(id) ON DELETE CASCADE,
     player_id UUID REFERENCES players(id) ON DELETE CASCADE,
     status VARCHAR(50) DEFAULT 'confirmed',
-    pair_with_player_id UUID REFERENCES players(id),
-    avoid_player_id UUID REFERENCES players(id),
+    position_preference VARCHAR(20), -- 'outfield' or 'goalkeeper' for THIS game
     
     -- Attendance tracking
     checked_in BOOLEAN DEFAULT FALSE,
@@ -114,6 +118,17 @@ CREATE TABLE registrations (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     
     UNIQUE(game_id, player_id)
+);
+
+-- Player preferences table (for pair/avoid)
+CREATE TABLE registration_preferences (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    registration_id UUID REFERENCES registrations(id) ON DELETE CASCADE,
+    target_player_id UUID REFERENCES players(id) ON DELETE CASCADE,
+    preference_type VARCHAR(10) NOT NULL, -- 'pair' or 'avoid'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    UNIQUE(registration_id, target_player_id)
 );
 
 -- Teams table

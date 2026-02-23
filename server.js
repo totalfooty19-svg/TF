@@ -67,8 +67,8 @@ app.post('/api/auth/register', async (req, res) => {
         const { name, email, password, position, phone } = req.body;
 
         // Validate input
-        if (!name || !email || !password || !position) {
-            return res.status(400).json({ error: 'Name, email, password, and position are required' });
+        if (!name || !email || !password || !position || !phone) {
+            return res.status(400).json({ error: 'Name, email, password, position, and phone number are required' });
         }
 
         // Check if user already exists
@@ -101,15 +101,15 @@ app.post('/api/auth/register', async (req, res) => {
 
         await pool.query(
             `INSERT INTO players (
-                user_id, first_name, last_name, phone, position,
-                overall_rating, defense_rating, strength_rating, pace_rating,
+                user_id, first_name, last_name, phone, default_position,
+                defense_rating, strength_rating, pace_rating,
                 fitness_rating, mental_rating, assisting_rating, shooting_rating,
-                gk_rating, reliability_tier
-            ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'bronze')`,
-            [userId, firstName, lastName, phone || null, position]
+                outfield_overall, gk_rating, gk_overall, reliability_tier
+            ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'bronze')`,
+            [userId, firstName, lastName, phone, position]
         );
 
-        // Create credit account
+        // Create credit account with £0 balance
         await pool.query(
             'INSERT INTO credits (player_id, balance) VALUES ((SELECT id FROM players WHERE user_id = $1), 0.00)',
             [userId]
@@ -181,6 +181,7 @@ app.post('/api/auth/login', async (req, res) => {
                 tier: player.reliability_tier,
                 credits: parseFloat(player.credits || 0),
                 squadNumber: player.squad_number,
+                photoUrl: player.photo_url,
                 // Everyone has BOTH sets of stats
                 outfieldStats: {
                     overall: player.outfield_overall || player.overall_rating || 0,
@@ -197,7 +198,8 @@ app.post('/api/auth/login', async (req, res) => {
                     overall: player.gk_overall || player.gk_rating || 0
                 },
                 appearances: player.total_appearances || 0,
-                motmWins: player.motm_wins || 0
+                motmWins: player.motm_wins || 0,
+                goals: player.total_goals || 0
             }
         });
 
@@ -415,7 +417,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
 app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
     try {
         const gameId = req.params.id;
-        const { pairWith, avoid } = req.body;
+        const { position, pairs, avoids } = req.body; // pairs and avoids are arrays
 
         // Get player ID
         const playerResult = await pool.query(
@@ -480,11 +482,36 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         }
 
         // Register player
-        await pool.query(`
+        const regResult = await pool.query(`
             INSERT INTO registrations (
-                game_id, player_id, status, pair_with_player_id, avoid_player_id
-            ) VALUES ($1, $2, $3, $4, $5)
-        `, [gameId, player.id, status, pairWith || null, avoid || null]);
+                game_id, player_id, status, position_preference
+            ) VALUES ($1, $2, $3, $4)
+            RETURNING id
+        `, [gameId, player.id, status, position || 'outfield']);
+
+        const registrationId = regResult.rows[0].id;
+
+        // Insert pair preferences
+        if (pairs && Array.isArray(pairs) && pairs.length > 0) {
+            for (const pairPlayerId of pairs) {
+                await pool.query(`
+                    INSERT INTO registration_preferences (
+                        registration_id, target_player_id, preference_type
+                    ) VALUES ($1, $2, 'pair')
+                `, [registrationId, pairPlayerId]);
+            }
+        }
+
+        // Insert avoid preferences
+        if (avoids && Array.isArray(avoids) && avoids.length > 0) {
+            for (const avoidPlayerId of avoids) {
+                await pool.query(`
+                    INSERT INTO registration_preferences (
+                        registration_id, target_player_id, preference_type
+                    ) VALUES ($1, $2, 'avoid')
+                `, [registrationId, avoidPlayerId]);
+            }
+        }
 
         res.json({ 
             message: status === 'confirmed' ? 'Successfully registered' : 'Added to backup list',
