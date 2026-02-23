@@ -140,9 +140,12 @@ app.post('/api/auth/login', async (req, res) => {
 
         const player = playerResult.rows[0];
 
+        // Check if admin by email OR role
+        const isAdmin = user.email.toLowerCase() === ADMIN_EMAIL.toLowerCase() || user.role === 'admin';
+
         // Create JWT token
         const token = jwt.sign(
-            { userId: user.id, email: user.email, role: user.role },
+            { userId: user.id, email: user.email, role: isAdmin ? 'admin' : 'player' },
             JWT_SECRET,
             { expiresIn: '7d' }
         );
@@ -153,23 +156,28 @@ app.post('/api/auth/login', async (req, res) => {
                 id: user.id,
                 email: user.email,
                 name: `${player.first_name} ${player.last_name}`,
-                isAdmin: user.role === 'admin',
-                position: player.position,
+                isAdmin: isAdmin,
+                defaultPosition: player.default_position || player.position || 'outfield',
                 tier: player.reliability_tier,
                 credits: parseFloat(player.credits || 0),
-                stats: {
-                    overall: player.overall_rating,
-                    defence: player.defense_rating,
-                    strength: player.strength_rating,
-                    pace: player.pace_rating,
-                    fitness: player.fitness_rating,
-                    mental: player.mental_rating,
-                    assisting: player.assisting_rating,
-                    shooting: player.shooting_rating
+                squadNumber: player.squad_number,
+                // Everyone has BOTH sets of stats
+                outfieldStats: {
+                    overall: player.outfield_overall || player.overall_rating || 0,
+                    defence: player.defense_rating || 0,
+                    strength: player.strength_rating || 0,
+                    pace: player.pace_rating || 0,
+                    fitness: player.fitness_rating || 0,
+                    mental: player.mental_rating || 0,
+                    assisting: player.assisting_rating || 0,
+                    shooting: player.shooting_rating || 0
                 },
-                gk: player.gk_rating,
-                appearances: player.total_appearances,
-                motmWins: player.motm_wins
+                gkStats: {
+                    rating: player.gk_rating || 0,
+                    overall: player.gk_overall || player.gk_rating || 0
+                },
+                appearances: player.total_appearances || 0,
+                motmWins: player.motm_wins || 0
             }
         });
 
