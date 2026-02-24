@@ -360,6 +360,52 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
     }
 });
 
+// Update player (admin)
+app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const {
+            goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+            pace_rating, decisions_rating, assisting_rating, shooting_rating,
+            total_goals, squad_number, phone, balance
+        } = req.body;
+        
+        // Calculate overall rating
+        const overall_rating = (defending_rating || 0) + (strength_rating || 0) + (fitness_rating || 0) + 
+                              (pace_rating || 0) + (decisions_rating || 0) + (assisting_rating || 0) + (shooting_rating || 0);
+        
+        // Update player ratings and stats
+        await pool.query(`
+            UPDATE players SET
+                goalkeeper_rating = $1,
+                defending_rating = $2,
+                strength_rating = $3,
+                fitness_rating = $4,
+                pace_rating = $5,
+                decisions_rating = $6,
+                assisting_rating = $7,
+                shooting_rating = $8,
+                overall_rating = $9,
+                total_goals = $10,
+                squad_number = $11,
+                phone = $12
+            WHERE id = $13
+        `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+            pace_rating, decisions_rating, assisting_rating, shooting_rating,
+            overall_rating, total_goals, squad_number, phone, playerId]);
+        
+        // Update balance if changed
+        if (balance !== undefined) {
+            await pool.query('UPDATE credits SET balance = $1 WHERE player_id = $2', [balance, playerId]);
+        }
+        
+        res.json({ message: 'Player updated successfully' });
+    } catch (error) {
+        console.error('Update player error:', error);
+        res.status(500).json({ error: 'Failed to update player' });
+    }
+});
+
 // Continuing in next message due to length...
 
 // ==========================================
