@@ -362,6 +362,20 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
 // Continuing in next message due to length...
 
 // ==========================================
+// ==========================================
+// VENUES
+// ==========================================
+
+app.get('/api/venues', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT id, name, address, postcode FROM venues ORDER BY name');
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching venues:', error);
+        res.status(500).json({ error: 'Failed to fetch venues' });
+    }
+});
+
 // GAMES
 // ==========================================
 
