@@ -772,6 +772,261 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
     }
 });
 
+// Generate teams with algorithm
+app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        // Get all confirmed registrations with player stats
+        const playersResult = await pool.query(`
+            SELECT 
+                r.id as reg_id,
+                p.id as player_id,
+                p.full_name,
+                p.alias,
+                p.squad_number,
+                p.overall_rating,
+                p.goalkeeper_rating,
+                p.defending_rating,
+                p.fitness_rating,
+                r.position_preference,
+                array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
+                array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
+            LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
+            WHERE r.game_id = $1 AND r.status = 'confirmed'
+            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.fitness_rating, r.position_preference
+            ORDER BY p.overall_rating DESC
+        `, [gameId]);
+        
+        const players = playersResult.rows;
+        
+        if (players.length < 2) {
+            return res.status(400).json({ error: 'Need at least 2 players to generate teams' });
+        }
+        
+        // Get beef relationships (rating 3+)
+        const beefsResult = await pool.query(`
+            SELECT player_id, target_player_id, rating
+            FROM beef
+            WHERE rating >= 3
+        `);
+        
+        const highBeefs = new Map();
+        const lowBeefs = new Map();
+        
+        beefsResult.rows.forEach(beef => {
+            if (beef.rating >= 3) {
+                if (!highBeefs.has(beef.player_id)) highBeefs.set(beef.player_id, []);
+                highBeefs.get(beef.player_id).push(beef.target_player_id);
+            } else if (beef.rating >= 2) {
+                if (!lowBeefs.has(beef.player_id)) lowBeefs.set(beef.player_id, []);
+                lowBeefs.get(beef.player_id).push(beef.target_player_id);
+            }
+        });
+        
+        // ALGORITHM
+        const redTeam = [];
+        const blueTeam = [];
+        
+        // PRIORITY 1: Assign 1 GK to each team
+        const goalkeepers = players.filter(p => p.position_preference?.toLowerCase().includes('gk'));
+        const outfield = players.filter(p => !p.position_preference?.toLowerCase().includes('gk'));
+        
+        if (goalkeepers.length >= 1) redTeam.push(goalkeepers[0]);
+        if (goalkeepers.length >= 2) blueTeam.push(goalkeepers[1]);
+        if (goalkeepers.length >= 3) outfield.push(...goalkeepers.slice(2)); // Extra GKs as outfield
+        
+        // Helper: Check if player has high beef with team
+        const hasHighBeef = (player, team) => {
+            const beefs = highBeefs.get(player.player_id) || [];
+            return team.some(tp => beefs.includes(tp.player_id));
+        };
+        
+        // Helper: Check if player has low beef with team
+        const hasLowBeef = (player, team) => {
+            const beefs = lowBeefs.get(player.player_id) || [];
+            return team.some(tp => beefs.includes(tp.player_id));
+        };
+        
+        // Helper: Check pair preferences
+        const wantsToPairWith = (player, team) => {
+            return (player.pairs || []).some(pid => team.find(tp => tp.player_id === pid));
+        };
+        
+        // Helper: Check avoid preferences
+        const wantsToAvoid = (player, team) => {
+            return (player.avoids || []).some(pid => team.find(tp => tp.player_id === pid));
+        };
+        
+        // Snake draft with constraints
+        let assignToRed = true;
+        for (const player of outfield) {
+            // PRIORITY 2: Avoid high beefs (3+)
+            const redBeef = hasHighBeef(player, redTeam);
+            const blueBeef = hasHighBeef(player, blueTeam);
+            
+            if (redBeef && !blueBeef) {
+                blueTeam.push(player);
+                continue;
+            }
+            if (blueBeef && !redBeef) {
+                redTeam.push(player);
+                continue;
+            }
+            
+            // PRIORITY 3: Balance overall stats
+            const redTotal = redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
+            const blueTotal = blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
+            
+            // Add to weaker team
+            if (Math.abs(redTotal - blueTotal) > 10) {
+                if (redTotal < blueTotal) {
+                    redTeam.push(player);
+                } else {
+                    blueTeam.push(player);
+                }
+                continue;
+            }
+            
+            // PRIORITY 4: Pair preferences
+            const redPair = wantsToPairWith(player, redTeam);
+            const bluePair = wantsToPairWith(player, blueTeam);
+            
+            if (redPair && !bluePair && !wantsToAvoid(player, redTeam)) {
+                redTeam.push(player);
+                continue;
+            }
+            if (bluePair && !redPair && !wantsToAvoid(player, blueTeam)) {
+                blueTeam.push(player);
+                continue;
+            }
+            
+            // PRIORITY 5: Avoid preferences
+            const redAvoid = wantsToAvoid(player, redTeam);
+            const blueAvoid = wantsToAvoid(player, blueTeam);
+            
+            if (redAvoid && !blueAvoid) {
+                blueTeam.push(player);
+                continue;
+            }
+            if (blueAvoid && !redAvoid) {
+                redTeam.push(player);
+                continue;
+            }
+            
+            // PRIORITY 6: Balance defense & fitness within 5%
+            const redDef = redTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0);
+            const blueDef = blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0);
+            const redFit = redTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0);
+            const blueFit = blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0);
+            
+            if (redDef < blueDef || redFit < blueFit) {
+                redTeam.push(player);
+                continue;
+            }
+            if (blueDef < redDef || blueFit < redFit) {
+                blueTeam.push(player);
+                continue;
+            }
+            
+            // PRIORITY 7: Avoid low beefs (2)
+            const redLowBeef = hasLowBeef(player, redTeam);
+            const blueLowBeef = hasLowBeef(player, blueTeam);
+            
+            if (redLowBeef && !blueLowBeef) {
+                blueTeam.push(player);
+                continue;
+            }
+            if (blueLowBeef && !redLowBeef) {
+                redTeam.push(player);
+                continue;
+            }
+            
+            // Default: Snake draft
+            if (assignToRed) {
+                redTeam.push(player);
+            } else {
+                blueTeam.push(player);
+            }
+            assignToRed = !assignToRed;
+        }
+        
+        // Delete existing teams if any
+        await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+        
+        // Create team records
+        const redResult = await pool.query(
+            'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
+            [gameId, 'Red']
+        );
+        
+        const blueResult = await pool.query(
+            'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
+            [gameId, 'Blue']
+        );
+        
+        const redTeamId = redResult.rows[0].id;
+        const blueTeamId = blueResult.rows[0].id;
+        
+        // Add players to teams
+        for (const player of redTeam) {
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [redTeamId, player.player_id]
+            );
+        }
+        
+        for (const player of blueTeam) {
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [blueTeamId, player.player_id]
+            );
+        }
+        
+        // Mark teams as generated
+        await pool.query('UPDATE games SET teams_generated = TRUE WHERE id = $1', [gameId]);
+        
+        // Calculate stats
+        const redStats = {
+            overall: redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0),
+            defense: redTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
+            fitness: redTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
+        };
+        
+        const blueStats = {
+            overall: blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0),
+            defense: blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
+            fitness: blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
+        };
+        
+        res.json({
+            message: 'Teams generated successfully',
+            redTeam: redTeam.map(p => ({
+                id: p.player_id,
+                name: p.alias || p.full_name,
+                squadNumber: p.squad_number,
+                overall: p.overall_rating,
+                isGK: p.position_preference?.toLowerCase().includes('gk')
+            })),
+            blueTeam: blueTeam.map(p => ({
+                id: p.player_id,
+                name: p.alias || p.full_name,
+                squadNumber: p.squad_number,
+                overall: p.overall_rating,
+                isGK: p.position_preference?.toLowerCase().includes('gk')
+            })),
+            redStats,
+            blueStats
+        });
+    } catch (error) {
+        console.error('Generate teams error:', error);
+        res.status(500).json({ error: 'Failed to generate teams', details: error.message });
+    }
+});
+
 // Delete single game with refunds
 app.delete('/api/admin/games/:gameId', authenticateToken, requireAdmin, async (req, res) => {
     try {
