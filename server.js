@@ -506,6 +506,34 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
     }
 });
 
+// Get players registered for a specific game
+app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT 
+                p.id as player_id,
+                p.full_name,
+                p.alias,
+                p.squad_number,
+                r.position_preference as positions,
+                array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
+                array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
+            LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
+            WHERE r.game_id = $1 AND r.status = 'confirmed'
+            GROUP BY p.id, p.full_name, p.alias, p.squad_number, r.position_preference
+            ORDER BY p.squad_number NULLS LAST, p.alias
+        `, [req.params.id]);
+        
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get game players error:', error);
+        res.status(500).json({ error: 'Failed to fetch players' });
+    }
+});
+
 app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
     try {
         const { position, pairs, avoids } = req.body;
@@ -593,6 +621,108 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Registration error:', error);
         res.status(500).json({ error: 'Registration failed' });
+    }
+});
+
+// Drop out of game with refund
+app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        
+        // Check if teams already generated
+        const gameCheck = await pool.query('SELECT teams_generated FROM games WHERE id = $1', [gameId]);
+        if (gameCheck.rows[0]?.teams_generated) {
+            return res.status(400).json({ error: 'Cannot drop out - teams already generated' });
+        }
+        
+        // Get registration
+        const regResult = await pool.query(
+            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+            [gameId, req.user.playerId]
+        );
+        
+        if (regResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Not registered for this game' });
+        }
+        
+        // Get game cost
+        const costResult = await pool.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
+        const cost = parseFloat(costResult.rows[0].cost_per_player);
+        
+        // Refund player
+        await pool.query(
+            'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+            [cost, req.user.playerId]
+        );
+        
+        await pool.query(
+            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+            [req.user.playerId, cost, 'refund', `Dropped out of game - refund`]
+        );
+        
+        // Delete registration (cascade deletes preferences)
+        await pool.query('DELETE FROM registrations WHERE id = $1', [regResult.rows[0].id]);
+        
+        res.json({ message: `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.` });
+    } catch (error) {
+        console.error('Drop out error:', error);
+        res.status(500).json({ error: 'Failed to drop out' });
+    }
+});
+
+// Update registration preferences
+app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        const { positions, pairs, avoids } = req.body;
+        
+        // Get registration
+        const regResult = await pool.query(
+            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+            [gameId, req.user.playerId]
+        );
+        
+        if (regResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Not registered for this game' });
+        }
+        
+        const registrationId = regResult.rows[0].id;
+        
+        // Update positions
+        await pool.query(
+            'UPDATE registrations SET position_preference = $1 WHERE id = $2',
+            [positions, registrationId]
+        );
+        
+        // Delete old preferences
+        await pool.query('DELETE FROM registration_preferences WHERE registration_id = $1', [registrationId]);
+        
+        // Add new pairs
+        if (pairs && pairs.length > 0) {
+            for (const pairPlayerId of pairs) {
+                await pool.query(
+                    `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
+                     VALUES ($1, $2, 'pair')`,
+                    [registrationId, pairPlayerId]
+                );
+            }
+        }
+        
+        // Add new avoids
+        if (avoids && avoids.length > 0) {
+            for (const avoidPlayerId of avoids) {
+                await pool.query(
+                    `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
+                     VALUES ($1, $2, 'avoid')`,
+                    [registrationId, avoidPlayerId]
+                );
+            }
+        }
+        
+        res.json({ message: 'Preferences updated successfully' });
+    } catch (error) {
+        console.error('Update preferences error:', error);
+        res.status(500).json({ error: 'Failed to update preferences' });
     }
 });
 
