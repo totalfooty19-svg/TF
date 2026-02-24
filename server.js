@@ -453,7 +453,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
 
 app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) => {
     try {
-        const { venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, exclusivity } = req.body;
+        const { venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, exclusivity, positionType } = req.body;
         
         const createdGames = [];
         
@@ -473,10 +473,10 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                 const fullSeriesId = `${seriesId}-${gameNumber}`; // e.g., "TF0001-01"
                 
                 const result = await pool.query(
-                    `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, game_url, status, series_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9)
+                    `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, position_type, game_url, status, series_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10)
                      RETURNING id`,
-                    [venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', exclusivity || 'everyone', gameUrl, fullSeriesId]
+                    [venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl, fullSeriesId]
                 );
                 
                 createdGames.push({ id: result.rows[0].id, gameUrl, date: weekDate, seriesId: fullSeriesId });
@@ -492,10 +492,10 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
             const gameUrl = crypto.randomBytes(6).toString('hex');
             
             const result = await pool.query(
-                `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, game_url, status)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open')
+                `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, position_type, game_url, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open')
                  RETURNING id`,
-                [venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', exclusivity || 'everyone', gameUrl]
+                [venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl]
             );
             
             res.json({ id: result.rows[0].id, gameUrl });
