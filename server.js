@@ -406,6 +406,112 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
     }
 });
 
+// ==========================================
+// DISCIPLINE SYSTEM
+// ==========================================
+
+// Add discipline points
+app.post('/api/admin/discipline', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId, gameId, points, reason } = req.body;
+        
+        // Add discipline record
+        await pool.query(
+            `INSERT INTO discipline_records (player_id, game_id, points, reason, recorded_by)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [playerId, gameId, points, reason, req.user.userId]
+        );
+        
+        // Tier is auto-updated by database trigger
+        
+        res.json({ message: 'Discipline points added. Tier updated automatically.' });
+    } catch (error) {
+        console.error('Add discipline error:', error);
+        res.status(500).json({ error: 'Failed to add discipline points' });
+    }
+});
+
+// Get player discipline history
+app.get('/api/players/:playerId/discipline', authenticateToken, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        
+        // Get last 10 games worth of discipline
+        const result = await pool.query(`
+            SELECT 
+                dr.id,
+                dr.points,
+                dr.reason,
+                dr.recorded_at,
+                g.game_date,
+                g.format,
+                v.name as venue_name,
+                admin.email as recorded_by_email
+            FROM discipline_records dr
+            JOIN games g ON g.id = dr.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN users admin ON admin.id = dr.recorded_by
+            WHERE dr.player_id = $1
+            ORDER BY g.game_date DESC
+            LIMIT 10
+        `, [playerId]);
+        
+        // Calculate current points
+        const pointsSum = result.rows.reduce((sum, r) => sum + (r.points || 0), 0);
+        
+        // Get current tier
+        const tierResult = await pool.query(
+            'SELECT reliability_tier FROM players WHERE id = $1',
+            [playerId]
+        );
+        
+        res.json({
+            records: result.rows,
+            totalPoints: pointsSum,
+            currentTier: tierResult.rows[0]?.reliability_tier || 'silver',
+            nextTierAt: getNextTierThreshold(pointsSum)
+        });
+    } catch (error) {
+        console.error('Get discipline error:', error);
+        res.status(500).json({ error: 'Failed to fetch discipline history' });
+    }
+});
+
+// Helper function
+function getNextTierThreshold(currentPoints) {
+    if (currentPoints === 0) return { points: 1, tier: 'silver', direction: 'down' };
+    if (currentPoints <= 3) return { points: 0, tier: 'gold', direction: 'up' };
+    if (currentPoints <= 6) return { points: 3, tier: 'silver', direction: 'up' };
+    if (currentPoints <= 11) return { points: 6, tier: 'bronze', direction: 'up' };
+    return { points: 11, tier: 'white', direction: 'up' };
+}
+
+// Recalculate all player tiers (admin utility)
+app.post('/api/admin/recalculate-tiers', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const playersResult = await pool.query('SELECT id FROM players');
+        
+        for (const player of playersResult.rows) {
+            const tierResult = await pool.query(
+                'SELECT calculate_player_tier($1) as new_tier',
+                [player.id]
+            );
+            
+            const newTier = tierResult.rows[0].new_tier;
+            
+            await pool.query(
+                'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                [newTier, player.id]
+            );
+        }
+        
+        res.json({ message: `Recalculated tiers for ${playersResult.rows.length} players` });
+    } catch (error) {
+        console.error('Recalculate tiers error:', error);
+        res.status(500).json({ error: 'Failed to recalculate tiers' });
+    }
+});
+
 // Continuing in next message due to length...
 
 // ==========================================
@@ -433,13 +539,13 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             [req.user.playerId]
         );
         
-        const tier = playerResult.rows[0]?.reliability_tier || 'bronze';
+        const tier = playerResult.rows[0]?.reliability_tier || 'silver';
         
-        // Tier-based visibility
-        let daysAhead = 1; // bronze default
-        if (tier === 'silver') daysAhead = 3;
-        if (tier === 'gold') daysAhead = 28;
-        if (tier === 'white' || tier === 'black') daysAhead = 0;
+        // Tier-based visibility (exact requirements)
+        let hoursAhead = 72; // silver default (72 hours = 3 days)
+        if (tier === 'gold') hoursAhead = 28 * 24; // 28 days
+        if (tier === 'bronze') hoursAhead = 24; // 24 hours
+        if (tier === 'white' || tier === 'black') hoursAhead = 0; // banned - no games visible
         
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
         
@@ -450,7 +556,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.game_date >= CURRENT_TIMESTAMP
-            ${isAdmin ? '' : 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + daysAhead + ' days\''}
+            ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
             AND g.status != 'cancelled'
             ORDER BY g.game_date ASC
         `, [req.user.playerId]);
@@ -1367,4 +1473,14 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
+    
+    // Keep database warm (ping every 10 minutes)
+    setInterval(async () => {
+        try {
+            await pool.query('SELECT 1');
+            console.log('Database keep-alive ping');
+        } catch (error) {
+            console.error('Keep-alive error:', error);
+        }
+    }, 10 * 60 * 1000); // 10 minutes
 });
