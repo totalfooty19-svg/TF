@@ -368,7 +368,7 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
 
 app.get('/api/venues', authenticateToken, async (req, res) => {
     try {
-        const result = await pool.query('SELECT id, name, address, postcode FROM venues ORDER BY name');
+        const result = await pool.query('SELECT DISTINCT ON (name) id, name, address, postcode FROM venues ORDER BY name, id');
         res.json(result.rows);
     } catch (error) {
         console.error('Error fetching venues:', error);
@@ -454,16 +454,43 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
     try {
         const { venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, exclusivity } = req.body;
         
-        const gameUrl = crypto.randomBytes(6).toString('hex');
+        const createdGames = [];
         
-        const result = await pool.query(
-            `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, game_url, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open')
-             RETURNING id`,
-            [venueId, gameDate, maxPlayers, costPerPlayer, format, regularity || 'one-off', exclusivity || 'everyone', gameUrl]
-        );
-        
-        res.json({ id: result.rows[0].id, gameUrl });
+        if (regularity === 'weekly') {
+            // Create 26 weeks of games (6 months)
+            for (let week = 0; week < 26; week++) {
+                const weekDate = new Date(gameDate);
+                weekDate.setDate(weekDate.getDate() + (week * 7));
+                
+                const gameUrl = crypto.randomBytes(6).toString('hex');
+                
+                const result = await pool.query(
+                    `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, game_url, status)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open')
+                     RETURNING id`,
+                    [venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', exclusivity || 'everyone', gameUrl]
+                );
+                
+                createdGames.push({ id: result.rows[0].id, gameUrl, date: weekDate });
+            }
+            
+            res.json({ 
+                message: 'Created 26 weekly games (6 months)',
+                games: createdGames 
+            });
+        } else {
+            // Create single one-off game
+            const gameUrl = crypto.randomBytes(6).toString('hex');
+            
+            const result = await pool.query(
+                `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, game_url, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open')
+                 RETURNING id`,
+                [venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', exclusivity || 'everyone', gameUrl]
+            );
+            
+            res.json({ id: result.rows[0].id, gameUrl });
+        }
     } catch (error) {
         console.error('Create game error:', error);
         res.status(500).json({ error: 'Failed to create game', details: error.message });
