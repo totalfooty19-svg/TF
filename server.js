@@ -308,18 +308,61 @@ app.get('/api/players/:id', authenticateToken, async (req, res) => {
 
 app.put('/api/players/me', authenticateToken, async (req, res) => {
     try {
-        const { fullName, alias, phone, photoUrl } = req.body;
+        const { fullName, alias, email, phone } = req.body;
         
+        // Split name into first and last
+        const nameParts = fullName.trim().split(/\s+/);
+        const firstName = nameParts[0];
+        const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : firstName;
+        
+        // Update player
         await pool.query(
-            `UPDATE players SET full_name = $1, alias = $2, phone = $3, photo_url = $4, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $5`,
-            [fullName, alias, phone, photoUrl, req.user.playerId]
+            `UPDATE players SET 
+             full_name = $1, 
+             first_name = $2, 
+             last_name = $3, 
+             alias = $4, 
+             phone = $5, 
+             updated_at = CURRENT_TIMESTAMP
+             WHERE id = $6`,
+            [fullName.trim(), firstName, lastName, alias?.trim(), phone?.trim(), req.user.playerId]
         );
         
-        res.json({ message: 'Profile updated' });
+        // Update email in users table
+        if (email) {
+            await pool.query(
+                'UPDATE users SET email = $1 WHERE id = $2',
+                [email.toLowerCase(), req.user.userId]
+            );
+        }
+        
+        res.json({ message: 'Profile updated successfully' });
     } catch (error) {
         console.error('Update profile error:', error);
         res.status(500).json({ error: 'Update failed' });
+    }
+});
+
+// Upload profile photo (base64)
+app.post('/api/players/me/photo', authenticateToken, async (req, res) => {
+    try {
+        const { photoData } = req.body; // Base64 string
+        
+        if (!photoData) {
+            return res.status(400).json({ error: 'No photo data provided' });
+        }
+        
+        // In production, you'd upload to S3/Cloudinary
+        // For now, just save the base64 string (not recommended for production)
+        await pool.query(
+            'UPDATE players SET photo_url = $1 WHERE id = $2',
+            [photoData, req.user.playerId]
+        );
+        
+        res.json({ message: 'Photo uploaded successfully' });
+    } catch (error) {
+        console.error('Photo upload error:', error);
+        res.status(500).json({ error: 'Upload failed' });
     }
 });
 
