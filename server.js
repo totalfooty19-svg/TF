@@ -89,21 +89,23 @@ app.post('/api/auth/register', async (req, res) => {
 
         // Try to create player with player_number if sequence exists
         let playerResult;
-        const firstName = fullName.split(' ')[0];
+        const nameParts = fullName.split(' ');
+        const firstName = nameParts[0];
+        const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0]; // Use first name as last if only one name
         const playerAlias = alias || firstName;
         
         try {
             playerResult = await pool.query(
-                `INSERT INTO players (user_id, full_name, first_name, alias, phone, reliability_tier, player_number) 
-                 VALUES ($1, $2, $3, $4, $5, $6, nextval('player_number_seq')) RETURNING id, player_number`,
-                [userId, fullName, firstName, playerAlias, phone, 'silver']
+                `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, reliability_tier, player_number) 
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, nextval('player_number_seq')) RETURNING id, player_number`,
+                [userId, fullName, firstName, lastName, playerAlias, phone, 'silver']
             );
         } catch (seqError) {
             // Sequence doesn't exist yet, create without player_number
             playerResult = await pool.query(
-                `INSERT INTO players (user_id, full_name, first_name, alias, phone, reliability_tier) 
-                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-                [userId, fullName, firstName, playerAlias, phone, 'silver']
+                `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, reliability_tier) 
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+                [userId, fullName, firstName, lastName, playerAlias, phone, 'silver']
             );
         }
 
