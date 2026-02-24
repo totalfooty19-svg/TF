@@ -91,16 +91,16 @@ app.post('/api/auth/register', async (req, res) => {
         let playerResult;
         try {
             playerResult = await pool.query(
-                `INSERT INTO players (user_id, full_name, alias, phone, reliability_tier, player_number) 
-                 VALUES ($1, $2, $3, $4, 'silver', nextval('player_number_seq')) RETURNING id, player_number`,
-                [userId, fullName, alias || fullName.split(' ')[0], phone]
+                `INSERT INTO players (user_id, full_name, first_name, alias, phone, reliability_tier, player_number) 
+                 VALUES ($1, $2, $3, $4, $5, 'silver', nextval('player_number_seq')) RETURNING id, player_number`,
+                [userId, fullName, fullName.split(' ')[0], alias || fullName.split(' ')[0], phone]
             );
         } catch (seqError) {
             // Sequence doesn't exist yet, create without player_number
             playerResult = await pool.query(
-                `INSERT INTO players (user_id, full_name, alias, phone, reliability_tier) 
-                 VALUES ($1, $2, $3, $4, 'silver') RETURNING id`,
-                [userId, fullName, alias || fullName.split(' ')[0], phone]
+                `INSERT INTO players (user_id, full_name, first_name, alias, phone, reliability_tier) 
+                 VALUES ($1, $2, $3, $4, $5, 'silver') RETURNING id`,
+                [userId, fullName, fullName.split(' ')[0], alias || fullName.split(' ')[0], phone]
             );
         }
 
@@ -132,7 +132,13 @@ app.post('/api/auth/register', async (req, res) => {
         res.status(201).json({ message: 'Account created successfully', userId });
     } catch (error) {
         console.error('Registration error:', error);
-        res.status(500).json({ error: 'Registration failed' });
+        console.error('Error details:', error.message);
+        console.error('Error stack:', error.stack);
+        res.status(500).json({ 
+            error: 'Registration failed', 
+            details: error.message,
+            hint: 'Check server logs for full error'
+        });
     }
 });
 
