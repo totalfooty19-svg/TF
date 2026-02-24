@@ -64,85 +64,68 @@ const requireSuperAdmin = (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone, referralCode } = req.body;
+        const { fullName, alias, email, password, phone } = req.body;
 
+        // Validate required fields
         if (!fullName || !email || !password || !phone) {
-            return res.status(400).json({ error: 'Full name, email, password, and phone required' });
+            return res.status(400).json({ error: 'Full name, email, password, and phone are required' });
         }
 
+        // Check if email already exists
         const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
         if (existingUser.rows.length > 0) {
             return res.status(400).json({ error: 'Email already registered' });
         }
 
+        // Hash password
         const passwordHash = await bcrypt.hash(password, 10);
         
+        // Determine role
         let role = 'player';
         if (email.toLowerCase() === SUPERADMIN_EMAIL) role = 'superadmin';
 
+        // Create user
         const userResult = await pool.query(
             'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id',
             [email.toLowerCase(), passwordHash, role]
         );
-
         const userId = userResult.rows[0].id;
 
-        // Try to create player with player_number if sequence exists
-        let playerResult;
-        const nameParts = fullName.split(' ');
+        // Extract first and last name
+        const nameParts = fullName.trim().split(/\s+/);
         const firstName = nameParts[0];
-        const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : nameParts[0]; // Use first name as last if only one name
-        const playerAlias = alias || firstName;
-        
-        try {
-            playerResult = await pool.query(
-                `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, reliability_tier, player_number) 
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, nextval('player_number_seq')) RETURNING id, player_number`,
-                [userId, fullName, firstName, lastName, playerAlias, phone, 'silver']
-            );
-        } catch (seqError) {
-            // Sequence doesn't exist yet, create without player_number
-            playerResult = await pool.query(
-                `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, reliability_tier) 
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-                [userId, fullName, firstName, lastName, playerAlias, phone, 'silver']
-            );
-        }
+        const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : firstName;
+        const playerAlias = alias?.trim() || firstName;
 
+        // Create player - simple insert with just the fields we know exist
+        const playerResult = await pool.query(
+            `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, reliability_tier) 
+             VALUES ($1, $2, $3, $4, $5, $6, 'silver') RETURNING id`,
+            [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim()]
+        );
         const playerId = playerResult.rows[0].id;
-        const playerNumber = playerResult.rows[0]?.player_number;
+
+        // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
 
-        // Handle referral
-        if (referralCode) {
-            const referralResult = await pool.query(
-                'SELECT referrer_id FROM referrals WHERE referral_code = $1 AND referred_id IS NULL',
-                [referralCode]
-            );
-            if (referralResult.rows.length > 0) {
-                await pool.query(
-                    'UPDATE referrals SET referred_id = $1 WHERE referral_code = $2',
-                    [playerId, referralCode]
-                );
-            }
-        }
-
-        // Generate referral code for new player
-        const newReferralCode = crypto.randomBytes(4).toString('hex').toUpperCase();
+        // Generate referral code
+        const referralCode = crypto.randomBytes(4).toString('hex').toUpperCase();
         await pool.query(
             'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2)',
-            [playerId, newReferralCode]
+            [playerId, referralCode]
         );
 
-        res.status(201).json({ message: 'Account created successfully', userId });
+        res.status(201).json({ 
+            message: 'Account created successfully', 
+            userId,
+            playerId 
+        });
     } catch (error) {
         console.error('Registration error:', error);
-        console.error('Error details:', error.message);
-        console.error('Error stack:', error.stack);
+        console.error('Error message:', error.message);
         res.status(500).json({ 
             error: 'Registration failed', 
-            details: error.message,
-            hint: 'Check server logs for full error'
+            details: error.message 
         });
     }
 });
