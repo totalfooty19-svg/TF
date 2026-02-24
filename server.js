@@ -89,12 +89,23 @@ app.post('/api/auth/register', async (req, res) => {
 
         const playerResult = await pool.query(
             `INSERT INTO players (user_id, full_name, alias, phone, reliability_tier, player_number) 
-             VALUES ($1, $2, $3, $4, 'silver', nextval('player_number_seq')) RETURNING id, player_number`,
+             VALUES ($1, $2, $3, $4, 'silver', COALESCE((SELECT nextval('player_number_seq')), (SELECT COUNT(*) + 1 FROM players)::integer)) 
+             RETURNING id, player_number`,
             [userId, fullName, alias || fullName.split(' ')[0], phone]
-        );
+        ).catch(async (err) => {
+            // If sequence doesn't exist, insert without it
+            if (err.message.includes('player_number_seq')) {
+                return await pool.query(
+                    `INSERT INTO players (user_id, full_name, alias, phone, reliability_tier) 
+                     VALUES ($1, $2, $3, $4, 'silver') RETURNING id`,
+                    [userId, fullName, alias || fullName.split(' ')[0], phone]
+                );
+            }
+            throw err;
+        });
 
         const playerId = playerResult.rows[0].id;
-        const playerNumber = playerResult.rows[0].player_number;
+        const playerNumber = playerResult.rows[0]?.player_number;
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
 
         // Handle referral
