@@ -99,9 +99,9 @@ app.post('/api/auth/register', async (req, res) => {
 
         // Create player - simple insert with just the fields we know exist
         const playerResult = await pool.query(
-            `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, reliability_tier) 
-             VALUES ($1, $2, $3, $4, $5, $6, 'silver') RETURNING id`,
-            [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim()]
+            `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver') RETURNING id`,
+            [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield']
         );
         const playerId = playerResult.rows[0].id;
 
