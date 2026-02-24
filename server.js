@@ -1460,11 +1460,39 @@ app.post('/api/contact', async (req, res) => {
 });
 
 // ==========================================
-// HEALTH CHECK
+// HEALTH CHECK (Public - no auth needed)
 // ==========================================
 
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/health', async (req, res) => {
+    try {
+        // Test database connection
+        const dbStart = Date.now();
+        await pool.query('SELECT 1');
+        const dbTime = Date.now() - dbStart;
+        
+        res.json({ 
+            status: 'ok', 
+            timestamp: new Date().toISOString(),
+            database: 'connected',
+            dbResponseTime: `${dbTime}ms`,
+            uptime: process.uptime()
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            status: 'error', 
+            database: 'disconnected',
+            error: error.message 
+        });
+    }
+});
+
+app.get('/', (req, res) => {
+    res.json({ 
+        service: 'Total Footy API',
+        status: 'running',
+        version: '4.0',
+        health: `${req.protocol}://${req.get('host')}/health`
+    });
 });
 
 // ==========================================
@@ -1474,13 +1502,13 @@ app.get('/health', (req, res) => {
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
     
-    // Keep database warm (ping every 10 minutes)
+    // Keep database AND backend warm (ping every 5 minutes)
     setInterval(async () => {
         try {
             await pool.query('SELECT 1');
-            console.log('Database keep-alive ping');
+            console.log('✓ Keep-alive ping:', new Date().toLocaleTimeString());
         } catch (error) {
-            console.error('Keep-alive error:', error);
+            console.error('✗ Keep-alive error:', error.message);
         }
-    }, 10 * 60 * 1000); // 10 minutes
+    }, 5 * 60 * 1000); // 5 minutes (more aggressive)
 });
