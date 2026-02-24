@@ -202,6 +202,37 @@ app.post('/api/auth/login', async (req, res) => {
 // PLAYERS
 // ==========================================
 
+// ==========================================
+// PLAYERS - Get current user's player data
+// ==========================================
+
+app.get('/api/players/me', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT p.id, p.full_name, p.alias, p.squad_number, p.phone, p.photo_url, 
+                   p.reliability_tier, p.total_appearances, p.motm_wins, p.total_goals,
+                   c.balance as credits,
+                   u.email,
+                   p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
+                   p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
+                   p.goalkeeper_rating
+            FROM players p
+            LEFT JOIN credits c ON c.player_id = p.id
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.id = $1
+        `, [req.user.playerId]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Error fetching player data:', error);
+        res.status(500).json({ error: 'Failed to fetch player data' });
+    }
+});
+
 app.get('/api/players', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(`
