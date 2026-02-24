@@ -89,18 +89,21 @@ app.post('/api/auth/register', async (req, res) => {
 
         // Try to create player with player_number if sequence exists
         let playerResult;
+        const firstName = fullName.split(' ')[0];
+        const playerAlias = alias || firstName;
+        
         try {
             playerResult = await pool.query(
                 `INSERT INTO players (user_id, full_name, first_name, alias, phone, reliability_tier, player_number) 
-                 VALUES ($1, $2, $3, $4, $5, 'silver', nextval('player_number_seq')) RETURNING id, player_number`,
-                [userId, fullName, fullName.split(' ')[0], alias || fullName.split(' ')[0], phone]
+                 VALUES ($1, $2, $3, $4, $5, $6, nextval('player_number_seq')) RETURNING id, player_number`,
+                [userId, fullName, firstName, playerAlias, phone, 'silver']
             );
         } catch (seqError) {
             // Sequence doesn't exist yet, create without player_number
             playerResult = await pool.query(
                 `INSERT INTO players (user_id, full_name, first_name, alias, phone, reliability_tier) 
-                 VALUES ($1, $2, $3, $4, $5, 'silver') RETURNING id`,
-                [userId, fullName, fullName.split(' ')[0], alias || fullName.split(' ')[0], phone]
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+                [userId, fullName, firstName, playerAlias, phone, 'silver']
             );
         }
 
