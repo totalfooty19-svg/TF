@@ -88,12 +88,13 @@ app.post('/api/auth/register', async (req, res) => {
         const userId = userResult.rows[0].id;
 
         const playerResult = await pool.query(
-            `INSERT INTO players (user_id, full_name, alias, phone, reliability_tier) 
-             VALUES ($1, $2, $3, $4, 'silver') RETURNING id`,
+            `INSERT INTO players (user_id, full_name, alias, phone, reliability_tier, player_number) 
+             VALUES ($1, $2, $3, $4, 'silver', nextval('player_number_seq')) RETURNING id, player_number`,
             [userId, fullName, alias || fullName.split(' ')[0], phone]
         );
 
         const playerId = playerResult.rows[0].id;
+        const playerNumber = playerResult.rows[0].player_number;
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
 
         // Handle referral
@@ -457,29 +458,37 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
         const createdGames = [];
         
         if (regularity === 'weekly') {
+            // Generate series ID (e.g., "TF0001")
+            const countResult = await pool.query('SELECT COUNT(*) FROM games WHERE series_id IS NOT NULL');
+            const seriesCount = parseInt(countResult.rows[0].count) + 1;
+            const seriesId = `TF${String(seriesCount).padStart(4, '0')}`;
+            
             // Create 26 weeks of games (6 months)
             for (let week = 0; week < 26; week++) {
                 const weekDate = new Date(gameDate);
                 weekDate.setDate(weekDate.getDate() + (week * 7));
                 
                 const gameUrl = crypto.randomBytes(6).toString('hex');
+                const gameNumber = String(week + 1).padStart(2, '0');
+                const fullSeriesId = `${seriesId}-${gameNumber}`; // e.g., "TF0001-01"
                 
                 const result = await pool.query(
-                    `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, game_url, status)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open')
+                    `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, game_url, status, series_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9)
                      RETURNING id`,
-                    [venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', exclusivity || 'everyone', gameUrl]
+                    [venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', exclusivity || 'everyone', gameUrl, fullSeriesId]
                 );
                 
-                createdGames.push({ id: result.rows[0].id, gameUrl, date: weekDate });
+                createdGames.push({ id: result.rows[0].id, gameUrl, date: weekDate, seriesId: fullSeriesId });
             }
             
             res.json({ 
-                message: 'Created 26 weekly games (6 months)',
+                message: `Created 26 weekly games (series ${seriesId})`,
+                seriesId: seriesId,
                 games: createdGames 
             });
         } else {
-            // Create single one-off game
+            // Create single one-off game (no series_id)
             const gameUrl = crypto.randomBytes(6).toString('hex');
             
             const result = await pool.query(
@@ -584,6 +593,123 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Registration error:', error);
         res.status(500).json({ error: 'Registration failed' });
+    }
+});
+
+// Delete single game with refunds
+app.delete('/api/admin/games/:gameId', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        // Get all registrations for this game
+        const registrations = await pool.query(
+            'SELECT player_id, status FROM registrations WHERE game_id = $1 AND status = $2',
+            [gameId, 'confirmed']
+        );
+        
+        // Get game cost
+        const gameResult = await pool.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
+        const cost = parseFloat(gameResult.rows[0]?.cost_per_player || 0);
+        
+        // Refund all registered players
+        for (const reg of registrations.rows) {
+            await pool.query(
+                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                [cost, reg.player_id]
+            );
+            
+            await pool.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [reg.player_id, cost, 'refund', `Game cancelled - refund for ${cost}`]
+            );
+        }
+        
+        // Delete the game (cascade will delete registrations)
+        await pool.query('DELETE FROM games WHERE id = $1', [gameId]);
+        
+        res.json({ 
+            message: `Game deleted. Refunded ${registrations.rows.length} players £${cost.toFixed(2)} each.` 
+        });
+    } catch (error) {
+        console.error('Delete game error:', error);
+        res.status(500).json({ error: 'Failed to delete game' });
+    }
+});
+
+// Delete entire weekly series with refunds (FUTURE games only)
+app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        // Get the game's series_id
+        const gameResult = await pool.query(
+            'SELECT series_id, cost_per_player FROM games WHERE id = $1',
+            [gameId]
+        );
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        if (!game.series_id) {
+            return res.status(400).json({ error: 'This is not part of a weekly series' });
+        }
+        
+        // Extract base series ID (e.g., "TF0001" from "TF0001-05")
+        const baseSeriesId = game.series_id.split('-')[0];
+        
+        // Find all FUTURE games in this series
+        const seriesGames = await pool.query(`
+            SELECT id FROM games 
+            WHERE series_id LIKE $1
+            AND game_date > CURRENT_TIMESTAMP
+        `, [`${baseSeriesId}%`]);
+        
+        const gameIds = seriesGames.rows.map(g => g.id);
+        
+        if (gameIds.length === 0) {
+            return res.json({ message: 'No future games to delete in this series' });
+        }
+        
+        let totalRefunded = 0;
+        const cost = parseFloat(game.cost_per_player);
+        
+        // Refund all registrations for FUTURE games only
+        for (const gid of gameIds) {
+            const registrations = await pool.query(
+                'SELECT player_id FROM registrations WHERE game_id = $1 AND status = $2',
+                [gid, 'confirmed']
+            );
+            
+            for (const reg of registrations.rows) {
+                await pool.query(
+                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                    [cost, reg.player_id]
+                );
+                
+                await pool.query(
+                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                    [reg.player_id, cost, 'refund', `Series ${baseSeriesId} cancelled - refund`]
+                );
+                
+                totalRefunded++;
+            }
+        }
+        
+        // Delete only FUTURE games in series
+        await pool.query(
+            'DELETE FROM games WHERE id = ANY($1::uuid[])',
+            [gameIds]
+        );
+        
+        res.json({ 
+            message: `Deleted ${gameIds.length} future games from series ${baseSeriesId}. Refunded ${totalRefunded} registrations. Past games preserved.` 
+        });
+    } catch (error) {
+        console.error('Delete series error:', error);
+        res.status(500).json({ error: 'Failed to delete series' });
     }
 });
 
