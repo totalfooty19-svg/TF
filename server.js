@@ -1993,6 +1993,70 @@ app.get('/api/games/:gameId/motm', authenticateToken, async (req, res) => {
     }
 });
 
+// PUBLIC endpoint - Get team sheet by game URL (no auth required)
+app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        
+        // Get game by URL
+        const gameResult = await pool.query(`
+            SELECT g.*, v.name as venue_name
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.game_url = $1 AND g.game_status IN ('confirmed', 'completed')
+        `, [gameUrl]);
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found or not confirmed yet' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        // Get teams
+        const teamsResult = await pool.query(`
+            SELECT t.id, t.team_name
+            FROM teams t
+            WHERE t.game_id = $1
+            ORDER BY t.team_name
+        `, [game.id]);
+        
+        if (teamsResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Teams not generated yet' });
+        }
+        
+        const redTeamId = teamsResult.rows.find(t => t.team_name === 'Red')?.id;
+        const blueTeamId = teamsResult.rows.find(t => t.team_name === 'Blue')?.id;
+        
+        // Get players for each team
+        const [redTeamResult, blueTeamResult] = await Promise.all([
+            pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.squad_number, tp.position
+                FROM team_players tp
+                JOIN players p ON p.id = tp.player_id
+                WHERE tp.team_id = $1
+                ORDER BY tp.position, p.full_name
+            `, [redTeamId]),
+            pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.squad_number, tp.position
+                FROM team_players tp
+                JOIN players p ON p.id = tp.player_id
+                WHERE tp.team_id = $1
+                ORDER BY tp.position, p.full_name
+            `, [blueTeamId])
+        ]);
+        
+        res.json({
+            game: game,
+            redTeam: redTeamResult.rows,
+            blueTeam: blueTeamResult.rows
+        });
+        
+    } catch (error) {
+        console.error('Get public team sheet error:', error);
+        res.status(500).json({ error: 'Failed to get team sheet' });
+    }
+});
+
 // Vote for MOTM
 app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => {
     try {
