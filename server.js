@@ -961,25 +961,30 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
             return res.status(400).json({ error: 'Need at least 2 players to generate teams' });
         }
         
-        // Get beef relationships (rating 3+)
-        const beefsResult = await pool.query(`
-            SELECT player_id, target_player_id, rating
-            FROM beef
-            WHERE rating >= 3
-        `);
+        // Get beef relationships (rating 3+) - optional, may not exist yet
+        let highBeefs = new Map();
+        let lowBeefs = new Map();
         
-        const highBeefs = new Map();
-        const lowBeefs = new Map();
-        
-        beefsResult.rows.forEach(beef => {
-            if (beef.rating >= 3) {
-                if (!highBeefs.has(beef.player_id)) highBeefs.set(beef.player_id, []);
-                highBeefs.get(beef.player_id).push(beef.target_player_id);
-            } else if (beef.rating >= 2) {
-                if (!lowBeefs.has(beef.player_id)) lowBeefs.set(beef.player_id, []);
-                lowBeefs.get(beef.player_id).push(beef.target_player_id);
-            }
-        });
+        try {
+            const beefsResult = await pool.query(`
+                SELECT player_id, target_player_id, rating
+                FROM beef
+                WHERE rating >= 2
+            `);
+            
+            beefsResult.rows.forEach(beef => {
+                if (beef.rating >= 3) {
+                    if (!highBeefs.has(beef.player_id)) highBeefs.set(beef.player_id, []);
+                    highBeefs.get(beef.player_id).push(beef.target_player_id);
+                } else if (beef.rating >= 2) {
+                    if (!lowBeefs.has(beef.player_id)) lowBeefs.set(beef.player_id, []);
+                    lowBeefs.get(beef.player_id).push(beef.target_player_id);
+                }
+            });
+        } catch (beefError) {
+            // Beef table doesn't exist yet - that's fine, continue without it
+            console.log('Beef table not found, skipping beef checks');
+        }
         
         // ALGORITHM
         const redTeam = [];
@@ -1333,223 +1338,6 @@ app.delete('/api/admin/games/:gameId/remove-player/:playerId', authenticateToken
 // TEAMS
 // ==========================================
 
-app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const gameId = req.params.gameId;
-        
-        // Get registered players with stats
-        const playersResult = await pool.query(`
-            SELECT p.id, p.full_name, p.overall_rating, p.defending_rating, p.fitness_rating,
-                   p.goalkeeper_rating, r.position_preference
-            FROM registrations r
-            JOIN players p ON p.id = r.player_id
-            WHERE r.game_id = $1 AND r.status = 'confirmed'
-            ORDER BY RANDOM()
-        `, [gameId]);
-        
-        const players = playersResult.rows;
-        
-        if (players.length < 2) {
-            return res.status(400).json({ error: 'Need at least 2 players' });
-        }
-        
-        // Simple team balancing algorithm
-        // Sort by overall rating (use GK rating if goalkeeper preference)
-        const sortedPlayers = players.map(p => ({
-            ...p,
-            effective_rating: p.position_preference === 'goalkeeper' ? p.goalkeeper_rating : p.overall_rating
-        })).sort((a, b) => b.effective_rating - a.effective_rating);
-        
-        // Alternate allocation (snake draft)
-        const redTeam = [];
-        const blueTeam = [];
-        
-        sortedPlayers.forEach((player, index) => {
-            if (index % 2 === 0) {
-                redTeam.push(player);
-            } else {
-                blueTeam.push(player);
-            }
-        });
-        
-        // Create team records
-        const redResult = await pool.query(
-            'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
-            [gameId, 'Red']
-        );
-        
-        const blueResult = await pool.query(
-            'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
-            [gameId, 'Blue']
-        );
-        
-        const redTeamId = redResult.rows[0].id;
-        const blueTeamId = blueResult.rows[0].id;
-        
-        // Add players to teams
-        for (const player of redTeam) {
-            await pool.query(
-                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                [redTeamId, player.id]
-            );
-        }
-        
-        for (const player of blueTeam) {
-            await pool.query(
-                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                [blueTeamId, player.id]
-            );
-        }
-        
-        // Mark teams as generated
-        await pool.query(
-            'UPDATE games SET teams_generated = TRUE WHERE id = $1',
-            [gameId]
-        );
-        
-        res.json({ 
-            message: 'Teams generated',
-            redTeam: redTeam.map(p => ({ id: p.id, name: p.full_name, rating: p.effective_rating })),
-            blueTeam: blueTeam.map(p => ({ id: p.id, name: p.full_name, rating: p.effective_rating }))
-        });
-    } catch (error) {
-        console.error('Generate teams error:', error);
-        res.status(500).json({ error: 'Failed to generate teams' });
-    }
-});
-
-app.get('/api/games/:gameId/teams', authenticateToken, async (req, res) => {
-    try {
-        const teamsResult = await pool.query(`
-            SELECT t.*, 
-                   json_agg(json_build_object(
-                       'id', p.id,
-                       'name', p.full_name,
-                       'alias', p.alias,
-                       'squadNumber', p.squad_number,
-                       'goals', tp.goals
-                   )) as players
-            FROM teams t
-            LEFT JOIN team_players tp ON tp.team_id = t.id
-            LEFT JOIN players p ON p.id = tp.player_id
-            WHERE t.game_id = $1
-            GROUP BY t.id
-            ORDER BY t.team_name
-        `, [req.params.gameId]);
-        
-        res.json(teamsResult.rows);
-    } catch (error) {
-        console.error('Get teams error:', error);
-        res.status(500).json({ error: 'Failed to get teams' });
-    }
-});
-
-// ==========================================
-// BEEF TRACKING
-// ==========================================
-
-app.get('/api/admin/beef', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT pb.*, 
-                   p1.full_name as player1_name, p1.alias as player1_alias,
-                   p2.full_name as player2_name, p2.alias as player2_alias
-            FROM player_beef pb
-            JOIN players p1 ON pb.player_1_id = p1.id
-            JOIN players p2 ON pb.player_2_id = p2.id
-            ORDER BY pb.beef_level DESC
-        `);
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Error fetching beef:', error);
-        res.status(500).json({ error: 'Failed to fetch beef' });
-    }
-});
-
-app.post('/api/admin/beef', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { player1Id, player2Id, beefLevel, notes } = req.body;
-        
-        const [p1, p2] = player1Id < player2Id ? [player1Id, player2Id] : [player2Id, player1Id];
-        
-        await pool.query(
-            `INSERT INTO player_beef (player_1_id, player_2_id, beef_level, notes, created_by)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (player_1_id, player_2_id) 
-             DO UPDATE SET beef_level = $3, notes = $4, updated_at = CURRENT_TIMESTAMP`,
-            [p1, p2, beefLevel, notes, req.user.userId]
-        );
-        
-        res.json({ message: 'Beef recorded' });
-    } catch (error) {
-        console.error('Beef tracking error:', error);
-        res.status(500).json({ error: 'Failed to track beef' });
-    }
-});
-
-// ==========================================
-// CONTACT FORM
-// ==========================================
-
-app.post('/api/contact', async (req, res) => {
-    try {
-        const { name, email, phone, message, playerId } = req.body;
-        
-        await pool.query(
-            'INSERT INTO contact_submissions (name, email, phone, message, player_id) VALUES ($1, $2, $3, $4, $5)',
-            [name, email, phone, message, playerId || null]
-        );
-        
-        res.json({ message: 'Message sent' });
-    } catch (error) {
-        console.error('Contact form error:', error);
-        res.status(500).json({ error: 'Failed to send message' });
-    }
-});
-
-// ==========================================
-// HEALTH CHECK (Public - no auth needed)
-// ==========================================
-
-app.get('/health', async (req, res) => {
-    try {
-        // Test database connection
-        const dbStart = Date.now();
-        await pool.query('SELECT 1');
-        const dbTime = Date.now() - dbStart;
-        
-        res.json({ 
-            status: 'ok', 
-            timestamp: new Date().toISOString(),
-            database: 'connected',
-            dbResponseTime: `${dbTime}ms`,
-            uptime: process.uptime()
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'error', 
-            database: 'disconnected',
-            error: error.message 
-        });
-    }
-});
-
-app.get('/', (req, res) => {
-    res.json({ 
-        service: 'Total Footy API',
-        status: 'running',
-        version: '4.0',
-        health: `${req.protocol}://${req.get('host')}/health`
-    });
-});
-
-// ==========================================
-// START SERVER
-// ==========================================
-
-app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT}`);
-    
     // Keep database AND backend warm (ping every 5 minutes)
     setInterval(async () => {
         try {
