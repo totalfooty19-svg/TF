@@ -634,7 +634,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
         
         const result = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
+            SELECT g.*, v.name as venue_name, v.address as venue_address,
                    g.teams_generated,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered
@@ -649,17 +649,35 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             ORDER BY g.game_date ASC
         `, [req.user.playerId]);
         
+        // Try to add venue photos if column exists
+        const gamesWithPhotos = await Promise.all(result.rows.map(async (game) => {
+            if (game.venue_id) {
+                try {
+                    const venueResult = await pool.query(
+                        'SELECT photo_url FROM venues WHERE id = $1',
+                        [game.venue_id]
+                    );
+                    if (venueResult.rows[0]?.photo_url) {
+                        game.venue_photo = venueResult.rows[0].photo_url;
+                    }
+                } catch (e) {
+                    // Column doesn't exist yet, skip silently
+                }
+            }
+            return game;
+        }));
+        
         // Log first game to check teams_generated field
-        if (result.rows.length > 0) {
+        if (gamesWithPhotos.length > 0) {
             console.log('Sample game data:', {
-                id: result.rows[0].id,
-                current_players: result.rows[0].current_players,
-                max_players: result.rows[0].max_players,
-                teams_generated: result.rows[0].teams_generated
+                id: gamesWithPhotos[0].id,
+                current_players: gamesWithPhotos[0].current_players,
+                max_players: gamesWithPhotos[0].max_players,
+                teams_generated: gamesWithPhotos[0].teams_generated
             });
         }
         
-        res.json(result.rows);
+        res.json(gamesWithPhotos);
     } catch (error) {
         console.error('Error fetching games:', error);
         res.status(500).json({ error: 'Failed to fetch games' });
