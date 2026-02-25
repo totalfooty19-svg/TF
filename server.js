@@ -634,14 +634,16 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
         
         const result = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    g.teams_generated,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.game_date >= CURRENT_TIMESTAMP
-            AND g.game_status IN ('available', 'confirmed')
+            WHERE (
+                (g.game_status = 'available' AND g.game_date >= CURRENT_TIMESTAMP)
+                OR (g.game_status = 'confirmed')
+            )
             ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
             AND g.status != 'cancelled'
             ORDER BY g.game_date ASC
