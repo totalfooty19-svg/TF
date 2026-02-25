@@ -215,13 +215,15 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/players/me', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT p.id, p.full_name, p.alias, p.squad_number, p.phone, p.photo_url, 
+            SELECT p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.phone, p.photo_url, 
                    p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
                    c.balance as credits,
                    u.email,
                    p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                    p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
-                   p.goalkeeper_rating
+                   p.goalkeeper_rating,
+                   (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
+                    FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
             LEFT JOIN users u ON u.id = p.user_id
@@ -1342,6 +1344,193 @@ app.delete('/api/admin/games/:gameId/remove-player/:playerId', authenticateToken
     } catch (error) {
         console.error('Remove player error:', error);
         res.status(500).json({ error: 'Failed to remove player' });
+    }
+});
+
+// ==========================================
+// POST-GAME SYSTEM
+// ==========================================
+
+// Start MOTM voting
+app.post('/api/admin/games/:gameId/start-motm', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { winningTeam, additionalNominees } = req.body;
+        
+        // Get winning team players
+        const winnersResult = await pool.query(`
+            SELECT player_id FROM team_players tp
+            JOIN teams t ON t.id = tp.team_id
+            WHERE t.game_id = $1 AND t.team_name = $2
+        `, [gameId, winningTeam === 'red' ? 'Red' : 'Blue']);
+        
+        const nominees = winnersResult.rows.map(r => r.player_id);
+        
+        // Add additional nominees from losing team
+        if (additionalNominees && additionalNominees.length > 0) {
+            nominees.push(...additionalNominees);
+        }
+        
+        // Insert nominees
+        for (const playerId of nominees) {
+            await pool.query(
+                'INSERT INTO motm_nominees (game_id, player_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                [gameId, playerId]
+            );
+        }
+        
+        // Set voting end time (24 hours from now)
+        const votingEnds = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        
+        await pool.query(
+            `UPDATE games SET motm_voting_open = true, motm_voting_ends_at = $1 WHERE id = $2`,
+            [votingEnds, gameId]
+        );
+        
+        res.json({ message: 'MOTM voting started', votingEndsAt: votingEnds });
+    } catch (error) {
+        console.error('Start MOTM error:', error);
+        res.status(500).json({ error: 'Failed to start MOTM voting' });
+    }
+});
+
+// Complete post-game (save discipline, beefs, mark game complete)
+app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { winningTeam, disciplineRecords, beefs } = req.body;
+        
+        // Save discipline records
+        for (const record of disciplineRecords) {
+            if (record.points > 0) {
+                await pool.query(
+                    `INSERT INTO discipline_records (player_id, game_id, points, warning_level, reason, recorded_by)
+                     VALUES ($1, $2, $3, $4, $5, $6)`,
+                    [
+                        record.playerId,
+                        gameId,
+                        record.points,
+                        record.warning,
+                        getWarningText(record.warning),
+                        req.user.playerId
+                    ]
+                );
+            }
+        }
+        
+        // Save beefs
+        for (const beef of beefs) {
+            // Save both directions
+            await pool.query(
+                'INSERT INTO beef (player_id, target_player_id, rating) VALUES ($1, $2, $3) ON CONFLICT (player_id, target_player_id) DO UPDATE SET rating = $3',
+                [beef.player1Id, beef.player2Id, beef.rating]
+            );
+            await pool.query(
+                'INSERT INTO beef (player_id, target_player_id, rating) VALUES ($1, $2, $3) ON CONFLICT (player_id, target_player_id) DO UPDATE SET rating = $3',
+                [beef.player2Id, beef.player1Id, beef.rating]
+            );
+        }
+        
+        // Update winning team players' win count
+        await pool.query(`
+            UPDATE players p
+            SET total_wins = total_wins + 1
+            FROM team_players tp
+            JOIN teams t ON t.id = tp.team_id
+            WHERE tp.player_id = p.id
+              AND t.game_id = $1
+              AND t.team_name = $2
+        `, [gameId, winningTeam === 'red' ? 'Red' : 'Blue']);
+        
+        // Mark game as completed
+        await pool.query(
+            'UPDATE games SET game_completed = true, winning_team = $1 WHERE id = $2',
+            [winningTeam, gameId]
+        );
+        
+        res.json({ message: 'Post-game completed successfully' });
+    } catch (error) {
+        console.error('Complete post-game error:', error);
+        res.status(500).json({ error: 'Failed to complete post-game', details: error.message });
+    }
+});
+
+function getWarningText(warning) {
+    const map = {
+        0: 'On Time',
+        1: 'Late Drop Out',
+        2: '5-10 Minutes Late',
+        3: '10+ Minutes Late',
+        4: 'No Show'
+    };
+    return map[warning] || 'Unknown';
+}
+
+// Vote for MOTM
+app.post('/api/games/:gameId/vote-motm', authenticateToken, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { votedForId } = req.body;
+        
+        // Check if player played in this game
+        const playedResult = await pool.query(
+            'SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = $3',
+            [gameId, req.user.playerId, 'confirmed']
+        );
+        
+        if (playedResult.rows.length === 0) {
+            return res.status(403).json({ error: 'Only players who played can vote' });
+        }
+        
+        // Check if voting is open
+        const gameResult = await pool.query(
+            'SELECT motm_voting_open, motm_voting_ends_at FROM games WHERE id = $1',
+            [gameId]
+        );
+        
+        const game = gameResult.rows[0];
+        if (!game.motm_voting_open || new Date() > new Date(game.motm_voting_ends_at)) {
+            return res.status(400).json({ error: 'Voting is closed' });
+        }
+        
+        // Insert vote (ON CONFLICT will update if already voted)
+        await pool.query(
+            `INSERT INTO motm_votes (game_id, voter_id, voted_for_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (game_id, voter_id) DO UPDATE SET voted_for_id = $3`,
+            [gameId, req.user.playerId, votedForId]
+        );
+        
+        res.json({ message: 'Vote recorded' });
+    } catch (error) {
+        console.error('Vote MOTM error:', error);
+        res.status(500).json({ error: 'Failed to record vote' });
+    }
+});
+
+// Get MOTM voting results
+app.get('/api/games/:gameId/motm-results', authenticateToken, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        const result = await pool.query(`
+            SELECT 
+                p.id,
+                p.full_name,
+                p.alias,
+                COUNT(mv.id) as votes
+            FROM motm_nominees mn
+            JOIN players p ON p.id = mn.player_id
+            LEFT JOIN motm_votes mv ON mv.game_id = mn.game_id AND mv.voted_for_id = mn.player_id
+            WHERE mn.game_id = $1
+            GROUP BY p.id, p.full_name, p.alias
+            ORDER BY votes DESC
+        `, [gameId]);
+        
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get MOTM results error:', error);
+        res.status(500).json({ error: 'Failed to get results' });
     }
 });
 
