@@ -565,6 +565,53 @@ app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, asyn
 });
 
 // ==========================================
+// BADGES SYSTEM
+// ==========================================
+
+// Get all badges
+app.get('/api/badges', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM badges ORDER BY name'
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get badges error:', error);
+        res.status(500).json({ error: 'Failed to get badges' });
+    }
+});
+
+// Update player badges (admin only)
+app.put('/api/admin/players/:playerId/badges', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const { badgeIds } = req.body;
+        
+        // Start transaction
+        await pool.query('BEGIN');
+        
+        // Remove all existing badges
+        await pool.query('DELETE FROM player_badges WHERE player_id = $1', [playerId]);
+        
+        // Add new badges
+        for (const badgeId of badgeIds) {
+            await pool.query(
+                'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2)',
+                [playerId, badgeId]
+            );
+        }
+        
+        await pool.query('COMMIT');
+        
+        res.json({ message: 'Badges updated successfully' });
+    } catch (error) {
+        await pool.query('ROLLBACK');
+        console.error('Update badges error:', error);
+        res.status(500).json({ error: 'Failed to update badges' });
+    }
+});
+
+// ==========================================
 // DISCIPLINE SYSTEM
 // ==========================================
 
@@ -935,6 +982,28 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
     try {
         const { position, pairs, avoids } = req.body;
         const gameId = req.params.id;
+        
+        // Check if game is All Star only
+        const gameTypeCheck = await pool.query(
+            'SELECT all_star_only FROM games WHERE id = $1',
+            [gameId]
+        );
+        
+        if (gameTypeCheck.rows[0]?.all_star_only) {
+            // Check if player has TF All Star badge
+            const badgeCheck = await pool.query(`
+                SELECT 1 FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name = 'TF All Star'
+            `, [req.user.playerId]);
+            
+            if (badgeCheck.rows.length === 0) {
+                return res.status(403).json({ 
+                    error: 'This is an All Star game. You need the TF All Star badge to register.',
+                    requiresBadge: 'TF All Star'
+                });
+            }
+        }
         
         // Check if already registered
         const existingReg = await pool.query(
@@ -1905,10 +1974,19 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
         const { gameId } = req.params;
         const { winningTeam, disciplineRecords, beefEntries, motmNominees } = req.body;
         
+        console.log('Complete game request:', {
+            gameId,
+            winningTeam,
+            disciplineRecordsCount: disciplineRecords?.length || 0,
+            beefEntriesCount: beefEntries?.length || 0,
+            motmNomineesCount: motmNominees?.length || 0
+        });
+        
         // Start transaction
         await pool.query('BEGIN');
         
         // 1. Update game winning team and status
+        console.log('Step 1: Updating game status...');
         await pool.query(
             `UPDATE games 
              SET winning_team = $1, 
@@ -1921,6 +1999,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
         
         // 2. Update winners' total_wins
         if (winningTeam) {
+            console.log('Step 2: Updating winners total_wins...');
             const winningTeamId = await pool.query(
                 'SELECT id FROM teams WHERE game_id = $1 AND team_name = $2',
                 [gameId, winningTeam === 'red' ? 'Red' : 'Blue']
@@ -1938,24 +2017,31 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
             }
         }
         
-        // 3. Save discipline records
-        for (const record of disciplineRecords) {
-            const offenseTypes = {
-                'late_drop': 'Late Drop Out',
-                '5_10_late': '5-10 Minutes Late',
-                '10_late': '10+ Minutes Late',
-                'no_show': 'No Show'
-            };
-            
-            await pool.query(
-                `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
-                 VALUES ($1, $2, $3, $4, $5)`,
-                [record.playerId, gameId, offenseTypes[record.offense], record.points, record.warning]
-            );
+        // 3. Save discipline records (only for offenses, not on_time)
+        console.log('Step 3: Saving discipline records...');
+        for (const record of disciplineRecords || []) {
+            if (record.points > 0) {
+                const offenseTypes = {
+                    'on_time': 'On Time',
+                    'late_drop': 'Late Drop Out',
+                    '5_10_late': '5-10 Minutes Late',
+                    '10_late': '10+ Minutes Late',
+                    'no_show': 'No Show'
+                };
+                
+                console.log('Inserting discipline record:', record);
+                await pool.query(
+                    `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
+                     VALUES ($1, $2, $3, $4, $5)`,
+                    [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
+                );
+            }
         }
         
         // 4. Save beef entries (bidirectional)
-        for (const beef of beefEntries) {
+        console.log('Step 4: Saving beef entries...');
+        for (const beef of beefEntries || []) {
+            console.log('Inserting beef:', beef);
             // Player 1 -> Player 2
             await pool.query(
                 `INSERT INTO beef (player_id, target_player_id, rating)
@@ -1976,16 +2062,25 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
         }
         
         // 5. Create MOTM nominees
-        for (const playerId of motmNominees) {
-            await pool.query(
-                `INSERT INTO motm_nominees (game_id, player_id)
-                 VALUES ($1, $2)
-                 ON CONFLICT DO NOTHING`,
-                [gameId, playerId]
-            );
+        console.log('Step 5: Creating MOTM nominees...');
+        for (const playerId of motmNominees || []) {
+            console.log('Inserting MOTM nominee:', playerId);
+            try {
+                await pool.query(
+                    `INSERT INTO motm_nominees (game_id, player_id)
+                     VALUES ($1, $2)`,
+                    [gameId, playerId]
+                );
+            } catch (nomineeError) {
+                // If duplicate, skip
+                if (nomineeError.code !== '23505') { // Not a unique violation
+                    throw nomineeError;
+                }
+            }
         }
         
         await pool.query('COMMIT');
+        console.log('Complete game successful!');
         
         res.json({ 
             message: 'Game completed successfully',
@@ -1995,7 +2090,12 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
     } catch (error) {
         await pool.query('ROLLBACK');
         console.error('Complete game error:', error);
-        res.status(500).json({ error: 'Failed to complete game', details: error.message });
+        console.error('Error stack:', error.stack);
+        res.status(500).json({ 
+            error: 'Failed to complete game', 
+            details: error.message,
+            step: error.step || 'unknown'
+        });
     }
 });
 
