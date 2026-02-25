@@ -641,6 +641,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.game_date >= CURRENT_TIMESTAMP
+            AND g.game_status IN ('available', 'confirmed')
             ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
             AND g.status != 'cancelled'
             ORDER BY g.game_date ASC
@@ -660,6 +661,35 @@ app.get('/api/games', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Error fetching games:', error);
         res.status(500).json({ error: 'Failed to fetch games' });
+    }
+});
+
+// Get completed games
+app.get('/api/games/completed', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT g.*, v.name as venue_name,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
+                   p.full_name as motm_winner_name,
+                   p.alias as motm_winner_alias
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN players p ON p.id = g.motm_winner_id
+            WHERE g.game_status = 'completed'
+            ORDER BY g.game_date DESC
+            LIMIT 50
+        `);
+        
+        // Format the response to include winner name
+        const games = result.rows.map(game => ({
+            ...game,
+            motm_winner_name: game.motm_winner_name || game.motm_winner_alias
+        }));
+        
+        res.json(games);
+    } catch (error) {
+        console.error('Get completed games error:', error);
+        res.status(500).json({ error: 'Failed to get completed games' });
     }
 });
 
