@@ -221,9 +221,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                    u.email,
                    p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                    p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
-                   p.goalkeeper_rating,
-                   (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
-                    FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
+                   p.goalkeeper_rating
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
             LEFT JOIN users u ON u.id = p.user_id
@@ -234,10 +232,29 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Player not found' });
         }
         
-        res.json(result.rows[0]);
+        const player = result.rows[0];
+        
+        // Try to get badges (optional - table might not exist yet)
+        try {
+            const badgesResult = await pool.query(`
+                SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon)) as badges
+                FROM player_badges pb 
+                JOIN badges b ON pb.badge_id = b.id 
+                WHERE pb.player_id = $1
+            `, [req.user.playerId]);
+            
+            player.badges = badgesResult.rows[0]?.badges || [];
+        } catch (badgeError) {
+            // Badges table doesn't exist yet - that's fine
+            console.log('Badges table not found, skipping badges');
+            player.badges = [];
+        }
+        
+        res.json(player);
     } catch (error) {
         console.error('Error fetching player data:', error);
-        res.status(500).json({ error: 'Failed to fetch player data' });
+        console.error('Error details:', error.message);
+        res.status(500).json({ error: 'Failed to fetch player data', details: error.message });
     }
 });
 
