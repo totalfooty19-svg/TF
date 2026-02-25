@@ -342,6 +342,51 @@ app.get('/api/players/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// Get player's games (upcoming and completed)
+app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        
+        // Get upcoming games (registered and not completed)
+        const upcomingResult = await pool.query(`
+            SELECT g.id, g.game_date, g.cost_per_player, g.max_players, g.format, g.game_url,
+                   v.name as venue_name,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players
+            FROM registrations r
+            JOIN games g ON g.id = r.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE r.player_id = $1 
+            AND r.status = 'confirmed'
+            AND g.game_status IN ('available', 'confirmed')
+            AND g.game_date >= CURRENT_TIMESTAMP
+            ORDER BY g.game_date ASC
+        `, [playerId]);
+        
+        // Get completed games
+        const completedResult = await pool.query(`
+            SELECT g.id, g.game_date, g.game_url, g.winning_team,
+                   v.name as venue_name
+            FROM registrations r
+            JOIN games g ON g.id = r.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE r.player_id = $1
+            AND r.status = 'confirmed'
+            AND g.game_status = 'completed'
+            ORDER BY g.game_date DESC
+            LIMIT 20
+        `, [playerId]);
+        
+        res.json({
+            upcomingGames: upcomingResult.rows,
+            completedGames: completedResult.rows
+        });
+        
+    } catch (error) {
+        console.error('Get player games error:', error);
+        res.status(500).json({ error: 'Failed to get player games' });
+    }
+});
+
 app.put('/api/players/me', authenticateToken, async (req, res) => {
     try {
         const { fullName, alias, email, phone } = req.body;
@@ -487,6 +532,35 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
     } catch (error) {
         console.error('Update player error:', error);
         res.status(500).json({ error: 'Failed to update player' });
+    }
+});
+
+// Delete player (admin only)
+app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        
+        // Start transaction
+        await pool.query('BEGIN');
+        
+        // Delete player (cascade will handle related records)
+        const result = await pool.query('DELETE FROM players WHERE id = $1 RETURNING full_name, alias', [playerId]);
+        
+        if (result.rows.length === 0) {
+            await pool.query('ROLLBACK');
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        
+        await pool.query('COMMIT');
+        
+        res.json({ 
+            message: 'Player deleted successfully',
+            player: result.rows[0]
+        });
+    } catch (error) {
+        await pool.query('ROLLBACK');
+        console.error('Delete player error:', error);
+        res.status(500).json({ error: 'Failed to delete player' });
     }
 });
 
@@ -1656,6 +1730,53 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireAdm
     } catch (error) {
         console.error('Confirm teams error:', error);
         res.status(500).json({ error: 'Failed to confirm teams' });
+    }
+});
+
+// Get teams for a game (for Complete Game modal)
+app.get('/api/admin/games/:gameId/teams', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        // Get team IDs
+        const teamsResult = await pool.query(
+            'SELECT id, team_name FROM teams WHERE game_id = $1 ORDER BY team_name',
+            [gameId]
+        );
+        
+        if (teamsResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Teams not found' });
+        }
+        
+        const redTeamId = teamsResult.rows.find(t => t.team_name === 'Red')?.id;
+        const blueTeamId = teamsResult.rows.find(t => t.team_name === 'Blue')?.id;
+        
+        // Get players for each team
+        const [redTeamResult, blueTeamResult] = await Promise.all([
+            pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.squad_number
+                FROM team_players tp
+                JOIN players p ON p.id = tp.player_id
+                WHERE tp.team_id = $1
+                ORDER BY p.full_name
+            `, [redTeamId]),
+            pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.squad_number
+                FROM team_players tp
+                JOIN players p ON p.id = tp.player_id
+                WHERE tp.team_id = $1
+                ORDER BY p.full_name
+            `, [blueTeamId])
+        ]);
+        
+        res.json({
+            redTeam: redTeamResult.rows,
+            blueTeam: blueTeamResult.rows
+        });
+        
+    } catch (error) {
+        console.error('Get teams error:', error);
+        res.status(500).json({ error: 'Failed to get teams' });
     }
 });
 
