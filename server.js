@@ -746,6 +746,15 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         const tier = playerResult.rows[0]?.reliability_tier || 'silver';
         
+        // Check if player has TF All Star badge
+        const allStarBadgeResult = await pool.query(`
+            SELECT 1 FROM player_badges pb
+            JOIN badges b ON b.id = pb.badge_id
+            WHERE pb.player_id = $1 AND b.name = 'TF All Star'
+        `, [req.user.playerId]);
+        
+        const hasAllStarBadge = allStarBadgeResult.rows.length > 0;
+        
         // Tier-based visibility (exact requirements)
         let hoursAhead = 72; // silver default (72 hours = 3 days)
         if (tier === 'gold') hoursAhead = 28 * 24; // 28 days
@@ -767,6 +776,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             )
             ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
             AND g.status != 'cancelled'
+            ${!isAdmin && !hasAllStarBadge ? 'AND (g.all_star_only IS NULL OR g.all_star_only = FALSE)' : ''}
             ORDER BY g.game_date ASC
         `, [req.user.playerId]);
         
