@@ -1346,9 +1346,12 @@ app.delete('/api/admin/games/:gameId/remove-player/:playerId', authenticateToken
 });
 
 // ==========================================
-// TEAMS
+// START SERVER
 // ==========================================
 
+app.listen(PORT, () => {
+    console.log(`🚀 Total Footy API running on port ${PORT}`);
+    
     // Keep database AND backend warm (ping every 5 minutes)
     setInterval(async () => {
         try {
