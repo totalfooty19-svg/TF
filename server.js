@@ -214,19 +214,16 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/players/me', authenticateToken, async (req, res) => {
     try {
+        console.log('Fetching player data for playerId:', req.user.playerId);
+        
+        // Start with absolute basics
         const result = await pool.query(`
-            SELECT p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.phone, p.photo_url, 
-                   p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
-                   c.balance as credits,
-                   u.email,
-                   p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
-                   p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
-                   p.goalkeeper_rating
+            SELECT p.id, p.full_name, p.alias, p.phone
             FROM players p
-            LEFT JOIN credits c ON c.player_id = p.id
-            LEFT JOIN users u ON u.id = p.user_id
             WHERE p.id = $1
         `, [req.user.playerId]);
+        
+        console.log('Query result:', result.rows);
         
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Player not found' });
@@ -234,27 +231,47 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
         
         const player = result.rows[0];
         
-        // Try to get badges (optional - table might not exist yet)
+        // Add other fields one by one
         try {
-            const badgesResult = await pool.query(`
-                SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon)) as badges
-                FROM player_badges pb 
-                JOIN badges b ON pb.badge_id = b.id 
-                WHERE pb.player_id = $1
+            const detailsResult = await pool.query(`
+                SELECT 
+                    p.squad_number, 
+                    p.player_number, 
+                    p.photo_url, 
+                    p.reliability_tier, 
+                    p.total_appearances, 
+                    p.motm_wins, 
+                    p.total_wins,
+                    c.balance as credits,
+                    u.email
+                FROM players p
+                LEFT JOIN credits c ON c.player_id = p.id
+                LEFT JOIN users u ON u.id = p.user_id
+                WHERE p.id = $1
             `, [req.user.playerId]);
             
-            player.badges = badgesResult.rows[0]?.badges || [];
-        } catch (badgeError) {
-            // Badges table doesn't exist yet - that's fine
-            console.log('Badges table not found, skipping badges');
-            player.badges = [];
+            if (detailsResult.rows.length > 0) {
+                Object.assign(player, detailsResult.rows[0]);
+            }
+        } catch (detailsError) {
+            console.error('Error fetching details:', detailsError.message);
+            // Continue with basic info
         }
         
+        // Set badges to empty array
+        player.badges = [];
+        
+        console.log('Returning player:', player);
         res.json(player);
     } catch (error) {
         console.error('Error fetching player data:', error);
-        console.error('Error details:', error.message);
-        res.status(500).json({ error: 'Failed to fetch player data', details: error.message });
+        console.error('Error message:', error.message);
+        console.error('Error stack:', error.stack);
+        res.status(500).json({ 
+            error: 'Failed to fetch player data', 
+            details: error.message,
+            playerId: req.user?.playerId
+        });
     }
 });
 
@@ -618,6 +635,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name, v.address as venue_address,
+                   g.teams_generated,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered
             FROM games g
@@ -627,6 +645,16 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             AND g.status != 'cancelled'
             ORDER BY g.game_date ASC
         `, [req.user.playerId]);
+        
+        // Log first game to check teams_generated field
+        if (result.rows.length > 0) {
+            console.log('Sample game data:', {
+                id: result.rows[0].id,
+                current_players: result.rows[0].current_players,
+                max_players: result.rows[0].max_players,
+                teams_generated: result.rows[0].teams_generated
+            });
+        }
         
         res.json(result.rows);
     } catch (error) {
