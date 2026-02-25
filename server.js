@@ -700,15 +700,28 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
 
 app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) => {
     try {
-        const { venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, exclusivity, positionType } = req.body;
+        const { 
+            venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
+            exclusivity, positionType, teamSelectionType, externalOpponent 
+        } = req.body;
         
         const createdGames = [];
         
         if (regularity === 'weekly') {
             // Generate series ID (e.g., "TF0001")
-            const countResult = await pool.query('SELECT COUNT(*) FROM games WHERE series_id IS NOT NULL');
+            const countResult = await pool.query('SELECT COUNT(*) FROM game_series');
             const seriesCount = parseInt(countResult.rows[0].count) + 1;
-            const seriesId = `TF${String(seriesCount).padStart(4, '0')}`;
+            const seriesIdValue = `TF${String(seriesCount).padStart(4, '0')}`;
+            
+            // Create series record for fixed_draft games
+            let seriesUuid = null;
+            if (teamSelectionType === 'fixed_draft') {
+                const seriesResult = await pool.query(
+                    'INSERT INTO game_series (series_name) VALUES ($1) RETURNING id',
+                    [seriesIdValue]
+                );
+                seriesUuid = seriesResult.rows[0].id;
+            }
             
             // Create 26 weeks of games (6 months)
             for (let week = 0; week < 26; week++) {
@@ -717,21 +730,28 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                 
                 const gameUrl = crypto.randomBytes(6).toString('hex');
                 const gameNumber = String(week + 1).padStart(2, '0');
-                const fullSeriesId = `${seriesId}-${gameNumber}`; // e.g., "TF0001-01"
+                const fullSeriesId = `${seriesIdValue}-${gameNumber}`; // e.g., "TF0001-01"
                 
                 const result = await pool.query(
-                    `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, position_type, game_url, status, series_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10)
-                     RETURNING id`,
-                    [venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl, fullSeriesId]
+                    `INSERT INTO games (
+                        venue_id, game_date, max_players, cost_per_player, format, regularity, 
+                        exclusivity, position_type, game_url, status, series_id, 
+                        team_selection_type, external_opponent
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12)
+                    RETURNING id`,
+                    [
+                        venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
+                        exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl, 
+                        seriesUuid, teamSelectionType || 'normal', externalOpponent
+                    ]
                 );
                 
                 createdGames.push({ id: result.rows[0].id, gameUrl, date: weekDate, seriesId: fullSeriesId });
             }
             
             res.json({ 
-                message: `Created 26 weekly games (series ${seriesId})`,
-                seriesId: seriesId,
+                message: `Created 26 weekly games (series ${seriesIdValue})`,
+                seriesId: seriesIdValue,
                 games: createdGames 
             });
         } else {
@@ -739,10 +759,16 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
             const gameUrl = crypto.randomBytes(6).toString('hex');
             
             const result = await pool.query(
-                `INSERT INTO games (venue_id, game_date, max_players, cost_per_player, format, regularity, exclusivity, position_type, game_url, status)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open')
-                 RETURNING id`,
-                [venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl]
+                `INSERT INTO games (
+                    venue_id, game_date, max_players, cost_per_player, format, regularity, 
+                    exclusivity, position_type, game_url, status, team_selection_type, external_opponent
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11)
+                RETURNING id`,
+                [
+                    venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
+                    exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl,
+                    teamSelectionType || 'normal', externalOpponent
+                ]
             );
             
             res.json({ id: result.rows[0].id, gameUrl });
@@ -1171,8 +1197,11 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         
         console.log(`FINAL: Red=${redTeam.length}, Blue=${blueTeam.length}`);
         
-        // Delete existing teams if any
+        // Delete existing teams if any (for re-generation)
         await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+        
+        // Reset confirmation flag (teams need to be re-confirmed after regeneration)
+        await pool.query('UPDATE games SET teams_confirmed = FALSE WHERE id = $1', [gameId]);
         
         // Create team records
         const redResult = await pool.query(
@@ -1389,6 +1418,175 @@ app.delete('/api/admin/games/:gameId/remove-player/:playerId', authenticateToken
     } catch (error) {
         console.error('Remove player error:', error);
         res.status(500).json({ error: 'Failed to remove player' });
+    }
+});
+
+// Get fixed team assignments for a game's series
+app.get('/api/admin/games/:gameId/fixed-teams', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        // Get game's series_id
+        const gameResult = await pool.query('SELECT series_id FROM games WHERE id = $1', [gameId]);
+        const seriesId = gameResult.rows[0]?.series_id;
+        
+        if (!seriesId) {
+            return res.json([]);
+        }
+        
+        // Get fixed teams for this series
+        const result = await pool.query(`
+            SELECT player_id, fixed_team
+            FROM player_fixed_teams
+            WHERE series_id = $1
+        `, [seriesId]);
+        
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get fixed teams error:', error);
+        res.status(500).json({ error: 'Failed to get fixed teams' });
+    }
+});
+
+// Save manual team assignments (for fixed_draft games)
+app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { redTeam, blueTeam } = req.body;
+        
+        // Get game info
+        const gameResult = await pool.query('SELECT series_id, team_selection_type FROM games WHERE id = $1', [gameId]);
+        const game = gameResult.rows[0];
+        
+        if (game.team_selection_type === 'fixed_draft' && game.series_id) {
+            // Save fixed team assignments for the series
+            for (const playerId of redTeam) {
+                await pool.query(`
+                    INSERT INTO player_fixed_teams (player_id, series_id, fixed_team)
+                    VALUES ($1, $2, 'red')
+                    ON CONFLICT (player_id, series_id) DO UPDATE SET fixed_team = 'red'
+                `, [playerId, game.series_id]);
+            }
+            
+            for (const playerId of blueTeam) {
+                await pool.query(`
+                    INSERT INTO player_fixed_teams (player_id, series_id, fixed_team)
+                    VALUES ($1, $2, 'blue')
+                    ON CONFLICT (player_id, series_id) DO UPDATE SET fixed_team = 'blue'
+                `, [playerId, game.series_id]);
+            }
+        }
+        
+        // Create/update teams for this specific game
+        await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+        
+        const redResult = await pool.query(
+            'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
+            [gameId, 'Red']
+        );
+        
+        const blueResult = await pool.query(
+            'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
+            [gameId, 'Blue']
+        );
+        
+        const redTeamId = redResult.rows[0].id;
+        const blueTeamId = blueResult.rows[0].id;
+        
+        // Add players to teams
+        for (const playerId of redTeam) {
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [redTeamId, playerId]
+            );
+        }
+        
+        for (const playerId of blueTeam) {
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [blueTeamId, playerId]
+            );
+        }
+        
+        // Mark teams as generated and confirmed
+        await pool.query(
+            'UPDATE games SET teams_generated = true, teams_confirmed = true WHERE id = $1',
+            [gameId]
+        );
+        
+        res.json({ message: 'Teams saved successfully' });
+    } catch (error) {
+        console.error('Save manual teams error:', error);
+        res.status(500).json({ error: 'Failed to save manual teams' });
+    }
+});
+
+// Confirm teams (saves to database, sets teams_generated = true)
+app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { redTeam, blueTeam } = req.body;
+        
+        // Get game details for response
+        const gameResult = await pool.query('SELECT * FROM games WHERE id = $1', [gameId]);
+        const game = gameResult.rows[0];
+        
+        // Update existing teams (they were created by generate-teams)
+        await pool.query(`
+            UPDATE teams SET team_name = 'Red'
+            WHERE game_id = $1 AND team_name = 'Red'
+        `, [gameId]);
+        
+        await pool.query(`
+            UPDATE teams SET team_name = 'Blue'
+            WHERE game_id = $1 AND team_name = 'Blue'
+        `, [gameId]);
+        
+        // Clear existing team_players
+        await pool.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)', [gameId]);
+        
+        // Get team IDs
+        const redTeamResult = await pool.query(
+            'SELECT id FROM teams WHERE game_id = $1 AND team_name = $2',
+            [gameId, 'Red']
+        );
+        const blueTeamResult = await pool.query(
+            'SELECT id FROM teams WHERE game_id = $1 AND team_name = $2',
+            [gameId, 'Blue']
+        );
+        
+        const redTeamId = redTeamResult.rows[0].id;
+        const blueTeamId = blueTeamResult.rows[0].id;
+        
+        // Insert red team players
+        for (const playerId of redTeam) {
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [redTeamId, playerId]
+            );
+        }
+        
+        // Insert blue team players
+        for (const playerId of blueTeam) {
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [blueTeamId, playerId]
+            );
+        }
+        
+        // Mark teams as confirmed
+        await pool.query(
+            'UPDATE games SET teams_generated = true, teams_confirmed = true WHERE id = $1',
+            [gameId]
+        );
+        
+        res.json({ 
+            message: 'Teams confirmed',
+            game: game
+        });
+    } catch (error) {
+        console.error('Confirm teams error:', error);
+        res.status(500).json({ error: 'Failed to confirm teams' });
     }
 });
 
