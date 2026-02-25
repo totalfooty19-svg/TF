@@ -1018,16 +1018,22 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         };
         
         // Allocate outfield players
+        console.log(`Starting allocation for ${outfield.length} outfield players`);
+        console.log(`Red starts with ${redTeam.length}, Blue starts with ${blueTeam.length}`);
+        
         for (const player of outfield) {
             let assignToRed = null; // null = undecided
             
             // CRITICAL: Always maintain equal team sizes (ABSOLUTE PRIORITY)
             // If one team is bigger, MUST add to smaller team
             if (redTeam.length > blueTeam.length) {
+                console.log(`Red (${redTeam.length}) > Blue (${blueTeam.length}) - Forcing ${player.full_name} to BLUE`);
                 assignToRed = false; // Force to blue
             } else if (blueTeam.length > redTeam.length) {
+                console.log(`Blue (${blueTeam.length}) > Red (${redTeam.length}) - Forcing ${player.full_name} to RED`);
                 assignToRed = true; // Force to red
             } else {
+                console.log(`Teams equal (${redTeam.length}/${blueTeam.length}) - Applying rules for ${player.full_name}`);
                 // Teams are equal, apply other rules
                 
                 // PRIORITY 2: Avoid high beefs (3+)
@@ -1109,10 +1115,14 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
             // Assign player
             if (assignToRed) {
                 redTeam.push(player);
+                console.log(`✓ Assigned ${player.full_name} to RED (now ${redTeam.length} vs ${blueTeam.length})`);
             } else {
                 blueTeam.push(player);
+                console.log(`✓ Assigned ${player.full_name} to BLUE (now ${redTeam.length} vs ${blueTeam.length})`);
             }
         }
+        
+        console.log(`FINAL: Red=${redTeam.length}, Blue=${blueTeam.length}`);
         
         // Delete existing teams if any
         await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
