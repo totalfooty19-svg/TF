@@ -986,7 +986,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
             console.log('Beef table not found, skipping beef checks');
         }
         
-        // ALGORITHM
+        // ALGORITHM - PRIORITY ORDER
         const redTeam = [];
         const blueTeam = [];
         
@@ -998,119 +998,120 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         if (goalkeepers.length >= 2) blueTeam.push(goalkeepers[1]);
         if (goalkeepers.length >= 3) outfield.push(...goalkeepers.slice(2)); // Extra GKs as outfield
         
-        // Helper: Check if player has high beef with team
+        // Helper functions
         const hasHighBeef = (player, team) => {
             const beefs = highBeefs.get(player.player_id) || [];
             return team.some(tp => beefs.includes(tp.player_id));
         };
         
-        // Helper: Check if player has low beef with team
         const hasLowBeef = (player, team) => {
             const beefs = lowBeefs.get(player.player_id) || [];
             return team.some(tp => beefs.includes(tp.player_id));
         };
         
-        // Helper: Check pair preferences
         const wantsToPairWith = (player, team) => {
             return (player.pairs || []).some(pid => team.find(tp => tp.player_id === pid));
         };
         
-        // Helper: Check avoid preferences
         const wantsToAvoid = (player, team) => {
             return (player.avoids || []).some(pid => team.find(tp => tp.player_id === pid));
         };
         
-        // Snake draft with constraints
-        let assignToRed = true;
+        // Allocate outfield players
         for (const player of outfield) {
-            // PRIORITY 2: Avoid high beefs (3+)
-            const redBeef = hasHighBeef(player, redTeam);
-            const blueBeef = hasHighBeef(player, blueTeam);
+            let assignToRed = null; // null = undecided
             
-            if (redBeef && !blueBeef) {
-                blueTeam.push(player);
-                continue;
-            }
-            if (blueBeef && !redBeef) {
-                redTeam.push(player);
-                continue;
-            }
-            
-            // PRIORITY 3: Balance overall stats
-            const redTotal = redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
-            const blueTotal = blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
-            
-            // Add to weaker team
-            if (Math.abs(redTotal - blueTotal) > 10) {
-                if (redTotal < blueTotal) {
-                    redTeam.push(player);
-                } else {
-                    blueTeam.push(player);
+            // CRITICAL: Always maintain equal team sizes (ABSOLUTE PRIORITY)
+            // If one team is bigger, MUST add to smaller team
+            if (redTeam.length > blueTeam.length) {
+                assignToRed = false; // Force to blue
+            } else if (blueTeam.length > redTeam.length) {
+                assignToRed = true; // Force to red
+            } else {
+                // Teams are equal, apply other rules
+                
+                // PRIORITY 2: Avoid high beefs (3+)
+                const redBeef = hasHighBeef(player, redTeam);
+                const blueBeef = hasHighBeef(player, blueTeam);
+                
+                if (redBeef && !blueBeef) {
+                    assignToRed = false;
+                } else if (blueBeef && !redBeef) {
+                    assignToRed = true;
                 }
-                continue;
+                
+                // PRIORITY 3: Balance overall stats (only if teams equal size and no beef)
+                if (assignToRed === null) {
+                    const redTotal = redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
+                    const blueTotal = blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
+                    
+                    if (Math.abs(redTotal - blueTotal) > 10) {
+                        assignToRed = redTotal < blueTotal;
+                    }
+                }
+                
+                // PRIORITY 4: Pair preferences
+                if (assignToRed === null) {
+                    const redPair = wantsToPairWith(player, redTeam);
+                    const bluePair = wantsToPairWith(player, blueTeam);
+                    
+                    if (redPair && !bluePair && !wantsToAvoid(player, redTeam)) {
+                        assignToRed = true;
+                    } else if (bluePair && !redPair && !wantsToAvoid(player, blueTeam)) {
+                        assignToRed = false;
+                    }
+                }
+                
+                // PRIORITY 5: Avoid preferences
+                if (assignToRed === null) {
+                    const redAvoid = wantsToAvoid(player, redTeam);
+                    const blueAvoid = wantsToAvoid(player, blueTeam);
+                    
+                    if (redAvoid && !blueAvoid) {
+                        assignToRed = false;
+                    } else if (blueAvoid && !redAvoid) {
+                        assignToRed = true;
+                    }
+                }
+                
+                // PRIORITY 6: Balance defense & fitness
+                if (assignToRed === null) {
+                    const redDef = redTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0);
+                    const blueDef = blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0);
+                    const redFit = redTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0);
+                    const blueFit = blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0);
+                    
+                    if (redDef < blueDef || redFit < blueFit) {
+                        assignToRed = true;
+                    } else if (blueDef < redDef || blueFit < redFit) {
+                        assignToRed = false;
+                    }
+                }
+                
+                // PRIORITY 7: Avoid low beefs (2)
+                if (assignToRed === null) {
+                    const redLowBeef = hasLowBeef(player, redTeam);
+                    const blueLowBeef = hasLowBeef(player, blueTeam);
+                    
+                    if (redLowBeef && !blueLowBeef) {
+                        assignToRed = false;
+                    } else if (blueLowBeef && !redLowBeef) {
+                        assignToRed = true;
+                    }
+                }
+                
+                // DEFAULT: Alternate (snake draft)
+                if (assignToRed === null) {
+                    assignToRed = redTeam.length <= blueTeam.length;
+                }
             }
             
-            // PRIORITY 4: Pair preferences
-            const redPair = wantsToPairWith(player, redTeam);
-            const bluePair = wantsToPairWith(player, blueTeam);
-            
-            if (redPair && !bluePair && !wantsToAvoid(player, redTeam)) {
-                redTeam.push(player);
-                continue;
-            }
-            if (bluePair && !redPair && !wantsToAvoid(player, blueTeam)) {
-                blueTeam.push(player);
-                continue;
-            }
-            
-            // PRIORITY 5: Avoid preferences
-            const redAvoid = wantsToAvoid(player, redTeam);
-            const blueAvoid = wantsToAvoid(player, blueTeam);
-            
-            if (redAvoid && !blueAvoid) {
-                blueTeam.push(player);
-                continue;
-            }
-            if (blueAvoid && !redAvoid) {
-                redTeam.push(player);
-                continue;
-            }
-            
-            // PRIORITY 6: Balance defense & fitness within 5%
-            const redDef = redTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0);
-            const blueDef = blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0);
-            const redFit = redTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0);
-            const blueFit = blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0);
-            
-            if (redDef < blueDef || redFit < blueFit) {
-                redTeam.push(player);
-                continue;
-            }
-            if (blueDef < redDef || blueFit < redFit) {
-                blueTeam.push(player);
-                continue;
-            }
-            
-            // PRIORITY 7: Avoid low beefs (2)
-            const redLowBeef = hasLowBeef(player, redTeam);
-            const blueLowBeef = hasLowBeef(player, blueTeam);
-            
-            if (redLowBeef && !blueLowBeef) {
-                blueTeam.push(player);
-                continue;
-            }
-            if (blueLowBeef && !redLowBeef) {
-                redTeam.push(player);
-                continue;
-            }
-            
-            // Default: Snake draft
+            // Assign player
             if (assignToRed) {
                 redTeam.push(player);
             } else {
                 blueTeam.push(player);
             }
-            assignToRed = !assignToRed;
         }
         
         // Delete existing teams if any
