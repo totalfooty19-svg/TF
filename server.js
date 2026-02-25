@@ -182,7 +182,7 @@ app.post('/api/auth/login', async (req, res) => {
                 credits: parseFloat(player.credits || 0),
                 appearances: player.total_appearances || 0,
                 motmWins: player.motm_wins || 0,
-                goals: player.total_goals || 0,
+                wins: player.total_wins || 0,
                 badges: player.badges || [],
                 referralCode: player.referral_code,
                 stats: {
@@ -216,7 +216,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT p.id, p.full_name, p.alias, p.squad_number, p.phone, p.photo_url, 
-                   p.reliability_tier, p.total_appearances, p.motm_wins, p.total_goals,
+                   p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
                    c.balance as credits,
                    u.email,
                    p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
@@ -243,7 +243,7 @@ app.get('/api/players', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
-                   p.reliability_tier, p.total_appearances, p.motm_wins, p.total_goals,
+                   p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
                    c.balance as credits,
                    p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                    p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
@@ -295,7 +295,7 @@ app.get('/api/players/:id', authenticateToken, async (req, res) => {
                 photo_url: player.photo_url,
                 total_appearances: player.total_appearances,
                 motm_wins: player.motm_wins,
-                total_goals: player.total_goals,
+                total_wins: player.total_wins,
                 reliability_tier: player.reliability_tier,
                 badges: player.badges
             });
@@ -415,7 +415,7 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         const {
             goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            total_goals, squad_number, phone, balance
+            total_wins, squad_number, phone, balance
         } = req.body;
         
         // Calculate overall rating
@@ -434,13 +434,13 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 assisting_rating = $7,
                 shooting_rating = $8,
                 overall_rating = $9,
-                total_goals = $10,
+                total_wins = $10,
                 squad_number = $11,
                 phone = $12
             WHERE id = $13
         `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            overall_rating, total_goals, squad_number, phone, playerId]);
+            overall_rating, total_wins, squad_number, phone, playerId]);
         
         // Update balance if changed
         if (balance !== undefined) {
