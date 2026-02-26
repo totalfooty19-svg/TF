@@ -2007,24 +2007,43 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
             [winningTeam, gameId]
         );
         
-        // 2. Update winners' total_wins
-        if (winningTeam) {
-            console.log('Step 2: Updating winners total_wins...');
-            const winningTeamId = await pool.query(
-                'SELECT id FROM teams WHERE game_id = $1 AND team_name = $2',
-                [gameId, winningTeam === 'red' ? 'Red' : 'Blue']
+        // 2. Get all players in the game
+        console.log('Step 2: Getting players and updating stats...');
+        const playersResult = await pool.query(
+            `SELECT DISTINCT player_id FROM registrations 
+             WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        const allPlayerIds = playersResult.rows.map(r => r.player_id);
+        
+        // Get players with no-show discipline
+        const noShowPlayerIds = (disciplineRecords || [])
+            .filter(d => d.offense === 'no_show')
+            .map(d => d.playerId);
+        
+        // Players who showed up (everyone except no-shows)
+        const showedUpPlayerIds = allPlayerIds.filter(id => !noShowPlayerIds.includes(id));
+        
+        // Update appearances for players who showed up
+        if (showedUpPlayerIds.length > 0) {
+            await pool.query(
+                `UPDATE players 
+                 SET total_appearances = total_appearances + 1
+                 WHERE id = ANY($1)`,
+                [showedUpPlayerIds]
             );
-            
-            if (winningTeamId.rows.length > 0) {
-                await pool.query(
-                    `UPDATE players 
-                     SET total_wins = total_wins + 1
-                     WHERE id IN (
-                         SELECT player_id FROM team_players WHERE team_id = $1
-                     )`,
-                    [winningTeamId.rows[0].id]
-                );
-            }
+            console.log(`Updated appearances for ${showedUpPlayerIds.length} players`);
+        }
+        
+        // Update wins for MOTM nominees (players eligible for MOTM voting)
+        if (motmNominees && motmNominees.length > 0) {
+            await pool.query(
+                `UPDATE players 
+                 SET total_wins = total_wins + 1
+                 WHERE id = ANY($1)`,
+                [motmNominees]
+            );
+            console.log(`Updated wins for ${motmNominees.length} MOTM nominees`);
         }
         
         // 3. Save discipline records (only for offenses, not on_time)
@@ -2258,6 +2277,90 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
     } catch (error) {
         console.error('MOTM vote error:', error);
         res.status(500).json({ error: 'Failed to record vote' });
+    }
+});
+
+// Finalize MOTM voting - called manually or by cron job
+app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        // Get game and check if voting has ended
+        const gameResult = await pool.query(
+            'SELECT motm_voting_ends, motm_winner_id FROM games WHERE id = $1',
+            [gameId]
+        );
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        if (game.motm_winner_id) {
+            return res.status(400).json({ error: 'MOTM already finalized' });
+        }
+        
+        // Get vote counts for all nominees
+        const votesResult = await pool.query(`
+            SELECT 
+                n.player_id,
+                p.full_name,
+                p.alias,
+                COUNT(v.id) as votes
+            FROM motm_nominees n
+            JOIN players p ON p.id = n.player_id
+            LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
+            WHERE n.game_id = $1
+            GROUP BY n.player_id, p.full_name, p.alias
+            ORDER BY votes DESC
+        `, [gameId]);
+        
+        if (votesResult.rows.length === 0) {
+            return res.status(400).json({ error: 'No MOTM nominees found' });
+        }
+        
+        // Find the highest vote count
+        const maxVotes = parseInt(votesResult.rows[0].votes);
+        
+        // Get all players with the max votes (handles ties)
+        const winners = votesResult.rows.filter(r => parseInt(r.votes) === maxVotes);
+        
+        // Calculate MOTM increment (1 divided by number of winners for ties)
+        const motmIncrement = 1.0 / winners.length;
+        
+        console.log(`MOTM finalization: ${winners.length} winner(s) with ${maxVotes} votes each`);
+        console.log(`MOTM increment: ${motmIncrement} per winner`);
+        
+        // Update MOTM wins for all winners
+        for (const winner of winners) {
+            await pool.query(
+                `UPDATE players 
+                 SET motm_wins = motm_wins + $1
+                 WHERE id = $2`,
+                [motmIncrement, winner.player_id]
+            );
+        }
+        
+        // Set the first winner as the "official" winner (for display purposes)
+        await pool.query(
+            'UPDATE games SET motm_winner_id = $1 WHERE id = $2',
+            [winners[0].player_id, gameId]
+        );
+        
+        res.json({ 
+            message: 'MOTM voting finalized',
+            winners: winners.map(w => ({
+                playerId: w.player_id,
+                name: w.full_name || w.alias,
+                votes: maxVotes,
+                motmIncrement: motmIncrement
+            }))
+        });
+        
+    } catch (error) {
+        console.error('Finalize MOTM error:', error);
+        res.status(500).json({ error: 'Failed to finalize MOTM voting' });
     }
 });
 
