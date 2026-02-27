@@ -1346,9 +1346,8 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
                     const redTotal = redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
                     const blueTotal = blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
                     
-                    if (Math.abs(redTotal - blueTotal) > 10) {
-                        assignToRed = redTotal < blueTotal;
-                    }
+                    // Always try to balance overall - assign to team with lower total
+                    assignToRed = redTotal <= blueTotal;
                 }
                 
                 // PRIORITY 4: Pair preferences
@@ -1477,6 +1476,8 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
                 name: p.alias || p.full_name,
                 squadNumber: p.squad_number,
                 overall: p.overall_rating,
+                defense: p.defending_rating || 0,
+                fitness: p.fitness_rating || 0,
                 isGK: p.position_preference?.toLowerCase().includes('gk')
             })),
             blueTeam: blueTeam.map(p => ({
@@ -1484,10 +1485,23 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
                 name: p.alias || p.full_name,
                 squadNumber: p.squad_number,
                 overall: p.overall_rating,
+                defense: p.defending_rating || 0,
+                fitness: p.fitness_rating || 0,
                 isGK: p.position_preference?.toLowerCase().includes('gk')
             })),
             redStats,
-            blueStats
+            blueStats,
+            beefs: Array.from(highBeefs.entries()).map(([playerId, targets]) => ({
+                playerId,
+                targets,
+                rating: 3
+            })).concat(
+                Array.from(lowBeefs.entries()).map(([playerId, targets]) => ({
+                    playerId,
+                    targets,
+                    rating: 2
+                }))
+            )
         });
     } catch (error) {
         console.error('Generate teams error:', error);
