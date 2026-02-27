@@ -1612,37 +1612,6 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
     }
 });
 
-app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { playerId } = req.body;
-        
-        await pool.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference)
-             VALUES ($1, $2, 'confirmed', 'outfield')`,
-            [req.params.gameId, playerId]
-        );
-        
-        res.json({ message: 'Player added' });
-    } catch (error) {
-        console.error('Add player error:', error);
-        res.status(500).json({ error: 'Failed to add player' });
-    }
-});
-
-app.delete('/api/admin/games/:gameId/remove-player/:playerId', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        await pool.query(
-            'DELETE FROM registrations WHERE game_id = $1 AND player_id = $2',
-            [req.params.gameId, req.params.playerId]
-        );
-        
-        res.json({ message: 'Player removed' });
-    } catch (error) {
-        console.error('Remove player error:', error);
-        res.status(500).json({ error: 'Failed to remove player' });
-    }
-});
-
 // Get fixed team assignments for a game's series
 app.get('/api/admin/games/:gameId/fixed-teams', authenticateToken, requireAdmin, async (req, res) => {
     try {
@@ -2568,7 +2537,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireAdmin, asy
             FROM registrations r
             JOIN players p ON p.id = r.player_id
             WHERE r.game_id = $1
-            ORDER BY r.created_at ASC
+            ORDER BY p.squad_number ASC NULLS LAST
         `, [gameId]);
         
         res.json(result.rows);
