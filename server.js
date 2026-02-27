@@ -2280,6 +2280,197 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
     }
 });
 
+// ==========================================
+// PUBLIC GAME PAGES
+// ==========================================
+
+// Get public team sheet for completed game
+app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        
+        // Get game details
+        const gameResult = await pool.query(`
+            SELECT g.*, v.name as venue_name, v.address as venue_address
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.game_url = $1
+        `, [gameUrl]);
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        // Check if voting is still open
+        const votingEnds = new Date(game.motm_voting_ends);
+        const now = new Date();
+        const votingOpen = votingEnds > now;
+        const votingFinalized = game.motm_winner_id !== null;
+        
+        // Get teams
+        const teamsResult = await pool.query(
+            'SELECT id, team_name FROM teams WHERE game_id = $1',
+            [game.id]
+        );
+        
+        const teams = {};
+        for (const team of teamsResult.rows) {
+            const playersResult = await pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.squad_number, 
+                       tp.position, p.goalkeeper_rating, p.overall_rating
+                FROM team_players tp
+                JOIN players p ON p.id = tp.player_id
+                WHERE tp.team_id = $1
+                ORDER BY 
+                    CASE WHEN tp.position = 'goalkeeper' THEN 1 ELSE 2 END,
+                    p.squad_number ASC
+            `, [team.id]);
+            
+            teams[team.team_name.toLowerCase()] = playersResult.rows;
+        }
+        
+        // Get MOTM nominees with vote counts
+        const motmResult = await pool.query(`
+            SELECT 
+                n.player_id,
+                p.full_name,
+                p.alias,
+                p.squad_number,
+                COUNT(v.id) as votes,
+                (n.player_id = g.motm_winner_id) as is_winner
+            FROM motm_nominees n
+            JOIN players p ON p.id = n.player_id
+            JOIN games g ON g.id = n.game_id
+            LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
+            WHERE n.game_id = $1
+            GROUP BY n.player_id, p.full_name, p.alias, p.squad_number, g.motm_winner_id
+            ORDER BY votes DESC, p.full_name ASC
+        `, [game.id]);
+        
+        // Get players who played (for voting eligibility check)
+        const playersResult = await pool.query(
+            `SELECT player_id FROM registrations 
+             WHERE game_id = $1 AND status = 'confirmed'`,
+            [game.id]
+        );
+        const playerIds = playersResult.rows.map(r => r.player_id);
+        
+        // Get next game in series if exists
+        let nextGame = null;
+        if (game.series_id) {
+            const nextGameResult = await pool.query(`
+                SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.format,
+                       v.name as venue_name,
+                       (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
+                       g.max_players
+                FROM games g
+                LEFT JOIN venues v ON v.id = g.venue_id
+                WHERE g.series_id = $1 
+                AND g.game_date > $2
+                AND g.game_status IN ('available', 'confirmed')
+                ORDER BY g.game_date ASC
+                LIMIT 1
+            `, [game.series_id, game.game_date]);
+            
+            if (nextGameResult.rows.length > 0) {
+                nextGame = nextGameResult.rows[0];
+            }
+        }
+        
+        res.json({
+            game: {
+                id: game.id,
+                date: game.game_date,
+                venue: game.venue_name,
+                format: game.format,
+                winning_team: game.winning_team,
+                motm_winner_id: game.motm_winner_id,
+                game_url: game.game_url,
+                motm_voting_ends: game.motm_voting_ends,
+                votingOpen,
+                votingFinalized
+            },
+            teams,
+            motm: motmResult.rows,
+            eligibleVoters: playerIds,
+            nextGame
+        });
+        
+    } catch (error) {
+        console.error('Public team sheet error:', error);
+        res.status(500).json({ error: 'Failed to load team sheet' });
+    }
+});
+
+// Get player profile (public)
+app.get('/api/public/player/:playerId', async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        
+        // Get player by ID or squad number
+        let playerResult;
+        if (isNaN(playerId)) {
+            // UUID
+            playerResult = await pool.query(
+                'SELECT * FROM players WHERE id = $1',
+                [playerId]
+            );
+        } else {
+            // Squad number
+            playerResult = await pool.query(
+                'SELECT * FROM players WHERE squad_number = $1',
+                [parseInt(playerId)]
+            );
+        }
+        
+        if (playerResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        
+        const player = playerResult.rows[0];
+        
+        // Get badges
+        const badgesResult = await pool.query(`
+            SELECT b.name, b.icon, b.color, b.description
+            FROM player_badges pb
+            JOIN badges b ON b.id = pb.badge_id
+            WHERE pb.player_id = $1
+            ORDER BY b.name
+        `, [player.id]);
+        
+        // Calculate win ratio
+        const appearances = player.total_appearances || 0;
+        const wins = player.total_wins || 0;
+        const winRatio = appearances > 0 ? ((wins / appearances) * 100).toFixed(1) : '0.0';
+        
+        // Calculate MOTM ratio
+        const motmWins = parseFloat(player.motm_wins || 0);
+        const motmRatio = appearances > 0 ? ((motmWins / appearances) * 100).toFixed(1) : '0.0';
+        
+        res.json({
+            player: {
+                id: player.id,
+                alias: player.alias,
+                full_name: player.full_name,
+                squad_number: player.squad_number,
+                reliability_tier: player.reliability_tier,
+                total_appearances: appearances,
+                total_wins: wins,
+                motm_wins: motmWins,
+                win_ratio: winRatio,
+                motm_ratio: motmRatio
+            },
+            badges: badgesResult.rows
+        });
+        
+    } catch (error) {
+        console.error('Player profile error:', error);
+        res.status(500).json({ error: 'Failed to load player profile' });
+    }
+});
+
 // Finalize MOTM voting - called manually or by cron job
 app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireAdmin, async (req, res) => {
     try {
