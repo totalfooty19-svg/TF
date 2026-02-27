@@ -1626,6 +1626,59 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
     }
 });
 
+// Update game settings (venue, max players, price)
+app.put('/api/admin/games/:gameId/settings', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { venue_id, max_players, cost_per_player } = req.body;
+        
+        // Validate inputs
+        if (!venue_id || !max_players || cost_per_player === undefined) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+        
+        if (max_players < 1) {
+            return res.status(400).json({ error: 'Max players must be at least 1' });
+        }
+        
+        if (cost_per_player < 0) {
+            return res.status(400).json({ error: 'Price cannot be negative' });
+        }
+        
+        // Check current registrations
+        const currentRegs = await pool.query(
+            'SELECT COUNT(*) as count FROM registrations WHERE game_id = $1 AND status = $2',
+            [gameId, 'confirmed']
+        );
+        
+        const currentCount = parseInt(currentRegs.rows[0].count);
+        
+        if (max_players < currentCount) {
+            return res.status(400).json({ 
+                error: `Cannot reduce max players to ${max_players}. Currently have ${currentCount} confirmed registrations.` 
+            });
+        }
+        
+        // Update the game
+        await pool.query(`
+            UPDATE games 
+            SET venue_id = $1, 
+                max_players = $2, 
+                cost_per_player = $3
+            WHERE id = $4
+        `, [venue_id, max_players, cost_per_player, gameId]);
+        
+        res.json({ 
+            message: 'Game settings updated successfully',
+            updated: { venue_id, max_players, cost_per_player }
+        });
+        
+    } catch (error) {
+        console.error('Update game settings error:', error);
+        res.status(500).json({ error: 'Failed to update game settings' });
+    }
+});
+
 // Get fixed team assignments for a game's series
 app.get('/api/admin/games/:gameId/fixed-teams', authenticateToken, requireAdmin, async (req, res) => {
     try {
@@ -2210,19 +2263,25 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         // Get players for each team
         const [redTeamResult, blueTeamResult] = await Promise.all([
             pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, tp.position
+                SELECT p.id, p.full_name, p.alias, p.squad_number, r.position_preference as position
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
+                JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                 WHERE tp.team_id = $1
-                ORDER BY tp.position, p.full_name
-            `, [redTeamId]),
+                ORDER BY 
+                    CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END,
+                    p.full_name
+            `, [redTeamId, game.id]),
             pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, tp.position
+                SELECT p.id, p.full_name, p.alias, p.squad_number, r.position_preference as position
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
+                JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                 WHERE tp.team_id = $1
-                ORDER BY tp.position, p.full_name
-            `, [blueTeamId])
+                ORDER BY 
+                    CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END,
+                    p.full_name
+            `, [blueTeamId, game.id])
         ]);
         
         res.json({
