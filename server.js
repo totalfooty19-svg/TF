@@ -1630,7 +1630,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { venue_id, max_players, cost_per_player } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -1659,19 +1659,35 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireAdmin, as
             });
         }
         
-        // Update the game
-        await pool.query(`
-            UPDATE games 
-            SET venue_id = $1, 
-                max_players = $2, 
-                cost_per_player = $3
-            WHERE id = $4
-        `, [venue_id, max_players, cost_per_player, gameId]);
-        
-        res.json({ 
-            message: 'Game settings updated successfully',
-            updated: { venue_id, max_players, cost_per_player }
-        });
+        // Update the game (include game_date if provided)
+        if (game_date) {
+            await pool.query(`
+                UPDATE games 
+                SET game_date = $1,
+                    venue_id = $2, 
+                    max_players = $3, 
+                    cost_per_player = $4
+                WHERE id = $5
+            `, [game_date, venue_id, max_players, cost_per_player, gameId]);
+            
+            res.json({ 
+                message: 'Game settings updated successfully',
+                updated: { game_date, venue_id, max_players, cost_per_player }
+            });
+        } else {
+            await pool.query(`
+                UPDATE games 
+                SET venue_id = $1, 
+                    max_players = $2, 
+                    cost_per_player = $3
+                WHERE id = $4
+            `, [venue_id, max_players, cost_per_player, gameId]);
+            
+            res.json({ 
+                message: 'Game settings updated successfully',
+                updated: { venue_id, max_players, cost_per_player }
+            });
+        }
         
     } catch (error) {
         console.error('Update game settings error:', error);
