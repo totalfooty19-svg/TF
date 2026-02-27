@@ -2178,16 +2178,16 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
     try {
         const { gameUrl } = req.params;
         
-        // Get game by URL
+        // Get game by URL - allow confirmed games even if not completed
         const gameResult = await pool.query(`
-            SELECT g.*, v.name as venue_name
+            SELECT g.*, v.name as venue_name, v.address as venue_address
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.game_url = $1 AND g.game_status IN ('confirmed', 'completed')
+            WHERE g.game_url = $1 AND g.teams_confirmed = TRUE
         `, [gameUrl]);
         
         if (gameResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Game not found or not confirmed yet' });
+            return res.status(404).json({ error: 'Game not found or teams not confirmed yet' });
         }
         
         const game = gameResult.rows[0];
