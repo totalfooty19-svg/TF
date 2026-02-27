@@ -995,9 +995,16 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         // Check if game is All Star only
         const gameTypeCheck = await pool.query(
-            'SELECT all_star_only FROM games WHERE id = $1',
+            'SELECT all_star_only, player_editing_locked FROM games WHERE id = $1',
             [gameId]
         );
+        
+        // Check if game is locked for editing
+        if (gameTypeCheck.rows[0]?.player_editing_locked) {
+            return res.status(423).json({ 
+                error: 'Game is currently being edited by an admin. Please try again in a few minutes.'
+            });
+        }
         
         if (gameTypeCheck.rows[0]?.all_star_only) {
             // Check if player has TF All Star badge
@@ -1104,6 +1111,18 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
 app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
     try {
         const gameId = req.params.id;
+        
+        // Check if game is locked for editing
+        const lockCheck = await pool.query(
+            'SELECT player_editing_locked FROM games WHERE id = $1',
+            [gameId]
+        );
+        
+        if (lockCheck.rows[0]?.player_editing_locked) {
+            return res.status(423).json({ 
+                error: 'Game is currently being edited by an admin. Please try again in a few minutes.'
+            });
+        }
         
         // Check if teams already generated
         const gameCheck = await pool.query('SELECT teams_generated FROM games WHERE id = $1', [gameId]);
@@ -2468,6 +2487,223 @@ app.get('/api/public/player/:playerId', async (req, res) => {
     } catch (error) {
         console.error('Player profile error:', error);
         res.status(500).json({ error: 'Failed to load player profile' });
+    }
+});
+
+// ==========================================
+// GAME PLAYER EDITING (ADMIN)
+// ==========================================
+
+// Lock game for player editing
+app.post('/api/admin/games/:gameId/lock', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        // Check if already locked by someone else
+        const lockCheck = await pool.query(
+            'SELECT player_editing_locked, locked_by FROM games WHERE id = $1',
+            [gameId]
+        );
+        
+        if (lockCheck.rows[0]?.player_editing_locked && 
+            lockCheck.rows[0]?.locked_by !== req.user.playerId) {
+            return res.status(409).json({ error: 'Game is being edited by another admin' });
+        }
+        
+        // Lock the game
+        await pool.query(
+            `UPDATE games 
+             SET player_editing_locked = TRUE,
+                 locked_by = $1,
+                 locked_at = NOW()
+             WHERE id = $2`,
+            [req.user.playerId, gameId]
+        );
+        
+        res.json({ message: 'Game locked for editing' });
+        
+    } catch (error) {
+        console.error('Lock game error:', error);
+        res.status(500).json({ error: 'Failed to lock game' });
+    }
+});
+
+// Unlock game
+app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        await pool.query(
+            `UPDATE games 
+             SET player_editing_locked = FALSE,
+                 locked_by = NULL,
+                 locked_at = NULL
+             WHERE id = $1`,
+            [gameId]
+        );
+        
+        res.json({ message: 'Game unlocked' });
+        
+    } catch (error) {
+        console.error('Unlock game error:', error);
+        res.status(500).json({ error: 'Failed to unlock game' });
+    }
+});
+
+// Get registered players for a game
+app.get('/api/admin/games/:gameId/players', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        const result = await pool.query(`
+            SELECT 
+                r.id as registration_id,
+                p.id as player_id,
+                p.full_name,
+                p.alias,
+                p.squad_number,
+                p.overall_rating,
+                r.status,
+                r.position_preference
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1
+            ORDER BY r.created_at ASC
+        `, [gameId]);
+        
+        res.json(result.rows);
+        
+    } catch (error) {
+        console.error('Get game players error:', error);
+        res.status(500).json({ error: 'Failed to get players' });
+    }
+});
+
+// Add player to game (admin)
+app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { playerId, position } = req.body;
+        
+        // Check if game is locked by this admin
+        const lockCheck = await pool.query(
+            'SELECT locked_by FROM games WHERE id = $1 AND player_editing_locked = TRUE',
+            [gameId]
+        );
+        
+        if (lockCheck.rows.length === 0 || lockCheck.rows[0].locked_by !== req.user.playerId) {
+            return res.status(403).json({ error: 'Game must be locked by you to edit players' });
+        }
+        
+        // Check if player already registered
+        const existingReg = await pool.query(
+            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+            [gameId, playerId]
+        );
+        
+        if (existingReg.rows.length > 0) {
+            return res.status(400).json({ error: 'Player already registered' });
+        }
+        
+        // Get game cost
+        const gameResult = await pool.query(
+            'SELECT cost_per_player FROM games WHERE id = $1',
+            [gameId]
+        );
+        const cost = parseFloat(gameResult.rows[0].cost_per_player);
+        
+        // Check/deduct credits
+        const creditResult = await pool.query(
+            'SELECT balance FROM credits WHERE player_id = $1',
+            [playerId]
+        );
+        
+        if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < cost) {
+            return res.status(400).json({ error: 'Player has insufficient credits' });
+        }
+        
+        // Deduct credits
+        await pool.query(
+            'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+            [cost, playerId]
+        );
+        
+        await pool.query(
+            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+            [playerId, -cost, 'game_fee', `Admin added to game ${gameId}`]
+        );
+        
+        // Add player
+        await pool.query(
+            `INSERT INTO registrations (game_id, player_id, status, position_preference)
+             VALUES ($1, $2, 'confirmed', $3)`,
+            [gameId, playerId, position || 'outfield']
+        );
+        
+        res.json({ message: 'Player added successfully' });
+        
+    } catch (error) {
+        console.error('Add player error:', error);
+        res.status(500).json({ error: 'Failed to add player' });
+    }
+});
+
+// Remove player from game (admin)
+app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId, registrationId } = req.params;
+        
+        // Check if game is locked by this admin
+        const lockCheck = await pool.query(
+            'SELECT locked_by FROM games WHERE id = $1 AND player_editing_locked = TRUE',
+            [gameId]
+        );
+        
+        if (lockCheck.rows.length === 0 || lockCheck.rows[0].locked_by !== req.user.playerId) {
+            return res.status(403).json({ error: 'Game must be locked by you to edit players' });
+        }
+        
+        // Get registration details
+        const regResult = await pool.query(
+            'SELECT player_id FROM registrations WHERE id = $1 AND game_id = $2',
+            [registrationId, gameId]
+        );
+        
+        if (regResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Registration not found' });
+        }
+        
+        const playerId = regResult.rows[0].player_id;
+        
+        // Get game cost
+        const gameResult = await pool.query(
+            'SELECT cost_per_player FROM games WHERE id = $1',
+            [gameId]
+        );
+        const cost = parseFloat(gameResult.rows[0].cost_per_player);
+        
+        // Refund credits
+        await pool.query(
+            'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+            [cost, playerId]
+        );
+        
+        await pool.query(
+            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+            [playerId, cost, 'refund', `Admin removed from game ${gameId}`]
+        );
+        
+        // Delete registration
+        await pool.query(
+            'DELETE FROM registrations WHERE id = $1',
+            [registrationId]
+        );
+        
+        res.json({ message: 'Player removed successfully' });
+        
+    } catch (error) {
+        console.error('Remove player error:', error);
+        res.status(500).json({ error: 'Failed to remove player' });
     }
 });
 
