@@ -2395,6 +2395,49 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
     }
 });
 
+// PUBLIC endpoint - Get game details for registration/sharing (no auth required)
+app.get('/api/public/game/:gameUrl/details', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        
+        // Get game details
+        const gameResult = await pool.query(`
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.game_url = $1
+        `, [gameUrl]);
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        res.json({
+            id: game.id,
+            game_url: game.game_url,
+            game_date: game.game_date,
+            venue_name: game.venue_name,
+            venue_address: game.venue_address,
+            venue_photo: game.venue_photo,
+            format: game.format,
+            max_players: game.max_players,
+            current_players: game.current_players,
+            cost_per_player: game.cost_per_player,
+            game_status: game.game_status,
+            teams_confirmed: game.teams_confirmed,
+            team_selection_type: game.team_selection_type,
+            external_opponent: game.external_opponent
+        });
+        
+    } catch (error) {
+        console.error('Get public game details error:', error);
+        res.status(500).json({ error: 'Failed to get game details' });
+    }
+});
+
 // Vote for MOTM
 app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => {
     try {
