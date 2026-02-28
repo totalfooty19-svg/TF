@@ -2050,6 +2050,109 @@ app.get('/api/games/:gameId/motm-results', authenticateToken, async (req, res) =
 // ==========================================
 
 // Complete game (post-game process)
+// Unconfirm game / Delete teams
+app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { reason, removedPlayers } = req.body;
+        
+        // Get game details
+        const gameResult = await pool.query(
+            'SELECT cost_per_player, format FROM games WHERE id = $1',
+            [gameId]
+        );
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        const gameCost = parseFloat(game.cost_per_player);
+        
+        // Start transaction
+        await pool.query('BEGIN');
+        
+        try {
+            // Handle player removals if reason is player_dropout
+            if (reason === 'player_dropout' && removedPlayers && removedPlayers.length > 0) {
+                for (const removal of removedPlayers) {
+                    const { playerId, registrationId, refundAmount, isLateDropout } = removal;
+                    
+                    // Remove player registration
+                    await pool.query(
+                        'DELETE FROM registrations WHERE id = $1',
+                        [registrationId]
+                    );
+                    
+                    // Process refund if amount > 0
+                    if (refundAmount > 0) {
+                        await pool.query(
+                            `UPDATE credits 
+                             SET balance = balance + $1 
+                             WHERE player_id = $2`,
+                            [refundAmount, playerId]
+                        );
+                        
+                        // Log the refund
+                        await pool.query(
+                            `INSERT INTO credit_transactions (player_id, amount, transaction_type, description)
+                             VALUES ($1, $2, 'refund', $3)`,
+                            [playerId, refundAmount, `Removed from game - £${refundAmount.toFixed(2)} refund`]
+                        );
+                    }
+                    
+                    // Award discipline points if late dropout
+                    if (isLateDropout) {
+                        const disciplinePoints = game.format === '11-a-side' ? 3 : 2;
+                        
+                        await pool.query(
+                            `INSERT INTO player_discipline (player_id, game_id, infraction_type, points, notes)
+                             VALUES ($1, $2, 'late_dropout', $3, 'Late drop out after teams confirmed')`,
+                            [playerId, gameId, disciplinePoints]
+                        );
+                    }
+                }
+            }
+            
+            // Delete teams
+            const teamsResult = await pool.query(
+                'SELECT id FROM teams WHERE game_id = $1',
+                [gameId]
+            );
+            
+            for (const team of teamsResult.rows) {
+                await pool.query('DELETE FROM team_players WHERE team_id = $1', [team.id]);
+            }
+            
+            await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+            
+            // Revert game status
+            await pool.query(`
+                UPDATE games 
+                SET game_status = 'available',
+                    teams_confirmed = FALSE,
+                    teams_generated = FALSE
+                WHERE id = $1
+            `, [gameId]);
+            
+            await pool.query('COMMIT');
+            
+            res.json({ 
+                message: 'Game unconfirmed successfully',
+                playersRemoved: removedPlayers?.length || 0
+            });
+            
+        } catch (error) {
+            await pool.query('ROLLBACK');
+            throw error;
+        }
+        
+    } catch (error) {
+        console.error('Unconfirm game error:', error);
+        res.status(500).json({ error: 'Failed to unconfirm game' });
+    }
+});
+
 app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
