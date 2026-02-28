@@ -611,6 +611,180 @@ app.put('/api/admin/players/:playerId/badges', authenticateToken, requireAdmin, 
     }
 });
 
+// Auto-allocate badges based on player stats
+async function autoAllocateBadges(playerId) {
+    try {
+        // Get player stats
+        const playerResult = await pool.query(`
+            SELECT 
+                p.id,
+                p.total_appearances,
+                p.motm_wins,
+                p.reliability_tier,
+                p.created_at,
+                (SELECT json_agg(badge_id) FROM player_badges WHERE player_id = p.id) as current_badge_ids
+            FROM players p
+            WHERE p.id = $1
+        `, [playerId]);
+        
+        if (playerResult.rows.length === 0) return;
+        
+        const player = playerResult.rows[0];
+        const currentBadgeIds = player.current_badge_ids || [];
+        
+        // Get all auto-allocated badges
+        const badgesResult = await pool.query(`
+            SELECT id, name FROM badges WHERE is_auto_allocated = TRUE
+        `);
+        
+        const badgesToAward = [];
+        const badgesToRemove = [];
+        
+        for (const badge of badgesResult.rows) {
+            const shouldHave = await checkBadgeCriteria(badge.name, player);
+            const hasNow = currentBadgeIds.includes(badge.id);
+            
+            if (shouldHave && !hasNow) {
+                badgesToAward.push(badge.id);
+            } else if (!shouldHave && hasNow) {
+                badgesToRemove.push(badge.id);
+            }
+        }
+        
+        // Award new badges
+        for (const badgeId of badgesToAward) {
+            await pool.query(
+                'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                [playerId, badgeId]
+            );
+        }
+        
+        // Remove badges that no longer apply
+        for (const badgeId of badgesToRemove) {
+            await pool.query(
+                'DELETE FROM player_badges WHERE player_id = $1 AND badge_id = $2',
+                [playerId, badgeId]
+            );
+        }
+        
+        return { awarded: badgesToAward.length, removed: badgesToRemove.length };
+        
+    } catch (error) {
+        console.error('Auto allocate badges error:', error);
+        return null;
+    }
+}
+
+async function checkBadgeCriteria(badgeName, player) {
+    switch (badgeName) {
+        case '100 Apps':
+            return player.total_appearances >= 100;
+            
+        case '250 Apps':
+            return player.total_appearances >= 250;
+            
+        case '15 MOTM':
+            return player.motm_wins >= 15;
+            
+        case 'Reliable':
+            // Check if gold tier for 3+ months
+            if (player.reliability_tier !== 'gold') return false;
+            
+            const tierHistoryResult = await pool.query(`
+                SELECT MIN(created_at) as first_gold
+                FROM (
+                    SELECT created_at 
+                    FROM discipline_records 
+                    WHERE player_id = $1 
+                    AND created_at > NOW() - INTERVAL '3 months'
+                    ORDER BY created_at DESC
+                ) recent
+            `, [player.id]);
+            
+            // Simplified: if they're gold tier, they get it
+            // (Full implementation would track tier changes over time)
+            return true;
+            
+        case 'New':
+            // Less than 1 month since account creation
+            const accountAge = (Date.now() - new Date(player.created_at)) / (1000 * 60 * 60 * 24);
+            return accountAge < 30;
+            
+        case 'MOTM Streak':
+            // Won MOTM in last 3 consecutive games
+            const recentGamesResult = await pool.query(`
+                SELECT g.id, g.motm_winner_id
+                FROM games g
+                JOIN registrations r ON r.game_id = g.id
+                WHERE r.player_id = $1
+                AND g.game_status = 'completed'
+                AND g.motm_winner_id IS NOT NULL
+                ORDER BY g.game_date DESC
+                LIMIT 3
+            `, [player.id]);
+            
+            if (recentGamesResult.rows.length < 3) return false;
+            
+            // Check if player won all 3
+            const wonAll = recentGamesResult.rows.every(game => 
+                game.motm_winner_id === player.id
+            );
+            
+            return wonAll;
+            
+        default:
+            return false;
+    }
+}
+
+// Endpoint to trigger badge auto-allocation
+app.post('/api/admin/players/:playerId/auto-badges', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const result = await autoAllocateBadges(playerId);
+        
+        if (result) {
+            res.json({ 
+                message: 'Badges updated',
+                awarded: result.awarded,
+                removed: result.removed
+            });
+        } else {
+            res.status(500).json({ error: 'Failed to allocate badges' });
+        }
+    } catch (error) {
+        console.error('Auto badge allocation error:', error);
+        res.status(500).json({ error: 'Failed to allocate badges' });
+    }
+});
+
+// Auto-allocate badges for all players
+app.post('/api/admin/badges/auto-allocate-all', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const playersResult = await pool.query('SELECT id FROM players');
+        let totalAwarded = 0;
+        let totalRemoved = 0;
+        
+        for (const player of playersResult.rows) {
+            const result = await autoAllocateBadges(player.id);
+            if (result) {
+                totalAwarded += result.awarded;
+                totalRemoved += result.removed;
+            }
+        }
+        
+        res.json({ 
+            message: 'All players processed',
+            totalAwarded,
+            totalRemoved,
+            playersProcessed: playersResult.rows.length
+        });
+    } catch (error) {
+        console.error('Auto allocate all error:', error);
+        res.status(500).json({ error: 'Failed to allocate badges' });
+    }
+});
+
 // ==========================================
 // DISCIPLINE SYSTEM
 // ==========================================
@@ -2282,6 +2456,17 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
             }
         }
         
+        // 6. Auto-allocate badges for all players in the game
+        console.log('Step 6: Auto-allocating badges...');
+        for (const playerId of allPlayerIds) {
+            try {
+                await autoAllocateBadges(playerId);
+            } catch (badgeError) {
+                console.error(`Failed to auto-allocate badges for player ${playerId}:`, badgeError);
+                // Don't fail the whole transaction if badge allocation fails
+            }
+        }
+        
         await pool.query('COMMIT');
         console.log('Complete game successful!');
         
@@ -2538,6 +2723,60 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
     } catch (error) {
         console.error('Get public game details error:', error);
         res.status(500).json({ error: 'Failed to get game details' });
+    }
+});
+
+// Get registered players for public game view
+app.get('/api/public/game/:gameUrl/players', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        
+        // Get game ID first
+        const gameResult = await pool.query(
+            'SELECT id FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const gameId = gameResult.rows[0].id;
+        
+        // Get registered players with pair/avoid info
+        const playersResult = await pool.query(`
+            SELECT 
+                p.id,
+                p.full_name,
+                p.alias,
+                p.squad_number,
+                p.photo_url,
+                p.total_appearances,
+                p.motm_wins,
+                p.total_wins,
+                p.reliability_tier,
+                r.position_preference,
+                r.registered_at,
+                (SELECT json_agg(json_build_object('name', b.name, 'icon', b.icon))
+                 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
+                array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pair_with,
+                array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoid_with
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
+            LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
+            WHERE r.game_id = $1 AND r.status = 'confirmed'
+            GROUP BY p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
+                     p.total_appearances, p.motm_wins, p.total_wins, p.reliability_tier,
+                     r.position_preference, r.registered_at
+            ORDER BY r.registered_at ASC
+        `, [gameId]);
+        
+        res.json(playersResult.rows);
+        
+    } catch (error) {
+        console.error('Get public game players error:', error);
+        res.status(500).json({ error: 'Failed to get players' });
     }
 });
 
