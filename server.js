@@ -620,7 +620,6 @@ async function autoAllocateBadges(playerId) {
                 p.id,
                 p.total_appearances,
                 p.motm_wins,
-                p.reliability_tier,
                 p.created_at,
                 (SELECT json_agg(badge_id) FROM player_badges WHERE player_id = p.id) as current_badge_ids
             FROM players p
@@ -644,9 +643,13 @@ async function autoAllocateBadges(playerId) {
             const shouldHave = await checkBadgeCriteria(badge.name, player);
             const hasNow = currentBadgeIds.includes(badge.id);
             
+            // Award badges if criteria met
             if (shouldHave && !hasNow) {
                 badgesToAward.push(badge.id);
-            } else if (!shouldHave && hasNow) {
+            }
+            
+            // ONLY remove "New" badge - preserve all other badges
+            if (!shouldHave && hasNow && badge.name === 'New') {
                 badgesToRemove.push(badge.id);
             }
         }
@@ -659,7 +662,7 @@ async function autoAllocateBadges(playerId) {
             );
         }
         
-        // Remove badges that no longer apply
+        // Remove "New" badge if no longer applicable
         for (const badgeId of badgesToRemove) {
             await pool.query(
                 'DELETE FROM player_badges WHERE player_id = $1 AND badge_id = $2',
@@ -686,49 +689,34 @@ async function checkBadgeCriteria(badgeName, player) {
         case '15 MOTM':
             return player.motm_wins >= 15;
             
-        case 'Reliable':
-            // Check if gold tier for 3+ months
-            if (player.reliability_tier !== 'gold') return false;
-            
-            const tierHistoryResult = await pool.query(`
-                SELECT MIN(created_at) as first_gold
-                FROM (
-                    SELECT created_at 
-                    FROM discipline_records 
-                    WHERE player_id = $1 
-                    AND created_at > NOW() - INTERVAL '3 months'
-                    ORDER BY created_at DESC
-                ) recent
-            `, [player.id]);
-            
-            // Simplified: if they're gold tier, they get it
-            // (Full implementation would track tier changes over time)
-            return true;
-            
         case 'New':
-            // Less than 1 month since account creation
+            // Less than 30 days since account creation
+            if (!player.created_at) return false;
             const accountAge = (Date.now() - new Date(player.created_at)) / (1000 * 60 * 60 * 24);
             return accountAge < 30;
             
         case 'MOTM Streak':
-            // Won MOTM in last 3 consecutive games
+            // Won or split MOTM in last 3 consecutive games
             const recentGamesResult = await pool.query(`
-                SELECT g.id, g.motm_winner_id
+                SELECT 
+                    g.id,
+                    EXISTS(
+                        SELECT 1 FROM motm_winners mw 
+                        WHERE mw.game_id = g.id AND mw.player_id = $1
+                    ) as won_motm
                 FROM games g
                 JOIN registrations r ON r.game_id = g.id
                 WHERE r.player_id = $1
                 AND g.game_status = 'completed'
-                AND g.motm_winner_id IS NOT NULL
+                AND EXISTS(SELECT 1 FROM motm_winners WHERE game_id = g.id)
                 ORDER BY g.game_date DESC
                 LIMIT 3
             `, [player.id]);
             
             if (recentGamesResult.rows.length < 3) return false;
             
-            // Check if player won all 3
-            const wonAll = recentGamesResult.rows.every(game => 
-                game.motm_winner_id === player.id
-            );
+            // Check if player won or split MOTM in all 3 games
+            const wonAll = recentGamesResult.rows.every(game => game.won_motm);
             
             return wonAll;
             
