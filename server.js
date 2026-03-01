@@ -9,6 +9,14 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 require('dotenv').config();
 
+// Twilio WhatsApp Integration
+const twilio = require('twilio');
+const twilioClient = twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+);
+const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER;
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -3196,6 +3204,279 @@ app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireAdm
 // ==========================================
 // START SERVER
 // ==========================================
+
+// ==========================================
+// WHATSAPP NOTIFICATIONS
+// ==========================================
+
+// Get all message templates
+app.get('/api/admin/whatsapp/templates', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT * FROM whatsapp_templates 
+            ORDER BY notification_type, created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get templates error:', error);
+        res.status(500).json({ error: 'Failed to get templates' });
+    }
+});
+
+// Create or update message template
+app.post('/api/admin/whatsapp/templates', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { notification_type, name, message_template, variables } = req.body;
+        
+        // Check if template exists
+        const existing = await pool.query(
+            'SELECT id FROM whatsapp_templates WHERE notification_type = $1',
+            [notification_type]
+        );
+        
+        if (existing.rows.length > 0) {
+            // Update existing
+            await pool.query(`
+                UPDATE whatsapp_templates 
+                SET name = $1, message_template = $2, variables = $3, updated_at = NOW()
+                WHERE notification_type = $4
+            `, [name, message_template, variables, notification_type]);
+        } else {
+            // Create new
+            await pool.query(`
+                INSERT INTO whatsapp_templates (notification_type, name, message_template, variables)
+                VALUES ($1, $2, $3, $4)
+            `, [notification_type, name, message_template, variables]);
+        }
+        
+        res.json({ message: 'Template saved successfully' });
+    } catch (error) {
+        console.error('Save template error:', error);
+        res.status(500).json({ error: 'Failed to save template' });
+    }
+});
+
+// Delete message template
+app.delete('/api/admin/whatsapp/templates/:type', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        await pool.query('DELETE FROM whatsapp_templates WHERE notification_type = $1', [req.params.type]);
+        res.json({ message: 'Template deleted' });
+    } catch (error) {
+        console.error('Delete template error:', error);
+        res.status(500).json({ error: 'Failed to delete template' });
+    }
+});
+
+// Send WhatsApp message
+async function sendWhatsAppMessage(phoneNumber, message) {
+    try {
+        // Ensure phone number has country code
+        let formattedNumber = phoneNumber.replace(/\s+/g, '');
+        if (!formattedNumber.startsWith('+')) {
+            formattedNumber = '+44' + formattedNumber.replace(/^0/, '');
+        }
+        
+        const result = await twilioClient.messages.create({
+            from: TWILIO_WHATSAPP_NUMBER,
+            to: `whatsapp:${formattedNumber}`,
+            body: message
+        });
+        
+        console.log('WhatsApp sent:', result.sid);
+        return { success: true, sid: result.sid };
+    } catch (error) {
+        console.error('WhatsApp send error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// Send notification using template
+app.post('/api/admin/whatsapp/send', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { notification_type, player_ids, custom_data } = req.body;
+        
+        // Get template
+        const templateResult = await pool.query(
+            'SELECT message_template, variables FROM whatsapp_templates WHERE notification_type = $1',
+            [notification_type]
+        );
+        
+        if (templateResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Template not found' });
+        }
+        
+        const template = templateResult.rows[0];
+        let message = template.message_template;
+        
+        // Get players
+        const playersResult = await pool.query(
+            'SELECT id, phone, full_name, alias FROM players WHERE id = ANY($1)',
+            [player_ids]
+        );
+        
+        const results = [];
+        
+        for (const player of playersResult.rows) {
+            // Replace variables in template
+            let personalizedMessage = message
+                .replace(/\{name\}/g, player.alias || player.full_name)
+                .replace(/\{full_name\}/g, player.full_name);
+            
+            // Replace custom data variables
+            if (custom_data) {
+                Object.keys(custom_data).forEach(key => {
+                    personalizedMessage = personalizedMessage.replace(
+                        new RegExp(`\\{${key}\\}`, 'g'),
+                        custom_data[key]
+                    );
+                });
+            }
+            
+            // Send message
+            const result = await sendWhatsAppMessage(player.phone, personalizedMessage);
+            
+            results.push({
+                player_id: player.id,
+                player_name: player.alias || player.full_name,
+                phone: player.phone,
+                ...result
+            });
+            
+            // Log notification
+            if (result.success) {
+                await pool.query(`
+                    INSERT INTO notification_log (player_id, notification_type, channel, message, status)
+                    VALUES ($1, $2, 'whatsapp', $3, 'sent')
+                `, [player.id, notification_type, personalizedMessage]);
+            }
+        }
+        
+        res.json({ 
+            message: 'Notifications sent',
+            results,
+            sent: results.filter(r => r.success).length,
+            failed: results.filter(r => !r.success).length
+        });
+        
+    } catch (error) {
+        console.error('Send notifications error:', error);
+        res.status(500).json({ error: 'Failed to send notifications' });
+    }
+});
+
+// Send test WhatsApp message
+app.post('/api/admin/whatsapp/test', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { phone, message } = req.body;
+        
+        const result = await sendWhatsAppMessage(phone, message);
+        
+        if (result.success) {
+            res.json({ message: 'Test message sent successfully', sid: result.sid });
+        } else {
+            res.status(500).json({ error: result.error });
+        }
+    } catch (error) {
+        console.error('Test message error:', error);
+        res.status(500).json({ error: 'Failed to send test message' });
+    }
+});
+
+// Send game reminder notifications
+app.post('/api/admin/whatsapp/game-reminder/:gameId', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        // Get game details
+        const gameResult = await pool.query(`
+            SELECT g.*, v.name as venue_name, v.address as venue_address
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.id = $1
+        `, [gameId]);
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        // Get registered players
+        const playersResult = await pool.query(`
+            SELECT p.id, p.phone, p.full_name, p.alias
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'confirmed'
+        `, [gameId]);
+        
+        // Get template
+        const templateResult = await pool.query(
+            "SELECT message_template FROM whatsapp_templates WHERE notification_type = 'game_reminder'"
+        );
+        
+        let messageTemplate = templateResult.rows.length > 0 
+            ? templateResult.rows[0].message_template
+            : `Hi {name}! Reminder: Football on {day} {date} at {time}. Location: {venue}. See you there! ⚽`;
+        
+        const gameDate = new Date(game.game_date);
+        const day = gameDate.toLocaleDateString('en-US', { weekday: 'long' });
+        const date = gameDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+        const time = gameDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+        
+        const results = [];
+        
+        for (const player of playersResult.rows) {
+            const message = messageTemplate
+                .replace(/\{name\}/g, player.alias || player.full_name)
+                .replace(/\{day\}/g, day)
+                .replace(/\{date\}/g, date)
+                .replace(/\{time\}/g, time)
+                .replace(/\{venue\}/g, game.venue_name)
+                .replace(/\{address\}/g, game.venue_address);
+            
+            const result = await sendWhatsAppMessage(player.phone, message);
+            
+            results.push({
+                player_id: player.id,
+                player_name: player.alias || player.full_name,
+                ...result
+            });
+        }
+        
+        res.json({
+            message: 'Reminders sent',
+            results,
+            sent: results.filter(r => r.success).length,
+            failed: results.filter(r => !r.success).length
+        });
+        
+    } catch (error) {
+        console.error('Game reminder error:', error);
+        res.status(500).json({ error: 'Failed to send reminders' });
+    }
+});
+
+// Get notification log
+app.get('/api/admin/whatsapp/logs', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT 
+                nl.*,
+                p.full_name,
+                p.alias,
+                p.phone
+            FROM notification_log nl
+            LEFT JOIN players p ON p.id = nl.player_id
+            WHERE nl.channel = 'whatsapp'
+            ORDER BY nl.sent_at DESC
+            LIMIT 100
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get logs error:', error);
+        res.status(500).json({ error: 'Failed to get logs' });
+    }
+});
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
