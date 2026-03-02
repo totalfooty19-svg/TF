@@ -764,19 +764,16 @@ async function checkBadgeCriteria(badgeName, player) {
             return accountAge < 30;
             
         case 'MOTM Streak':
-            // Won or split MOTM in last 3 consecutive games
+            // Won MOTM in last 3 consecutive games
             const recentGamesResult = await pool.query(`
                 SELECT 
                     g.id,
-                    EXISTS(
-                        SELECT 1 FROM motm_winners mw 
-                        WHERE mw.game_id = g.id AND mw.player_id = $1
-                    ) as won_motm
+                    (g.motm_winner_id = $1) as won_motm
                 FROM games g
                 JOIN registrations r ON r.game_id = g.id
                 WHERE r.player_id = $1
                 AND g.game_status = 'completed'
-                AND EXISTS(SELECT 1 FROM motm_winners WHERE game_id = g.id)
+                AND g.motm_winner_id IS NOT NULL
                 ORDER BY g.game_date DESC
                 LIMIT 3
             `, [player.id]);
