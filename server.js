@@ -316,9 +316,8 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                  AND g.game_date >= NOW() - INTERVAL '3 months') as apps_3m,
                 
                 (SELECT COUNT(*)
-                 FROM motm_winners mw
-                 JOIN games g ON g.id = mw.game_id
-                 WHERE mw.player_id = p.id
+                 FROM games g
+                 WHERE g.motm_winner_id = p.id
                  AND g.game_date >= NOW() - INTERVAL '3 months') as motm_3m,
                 
                 (SELECT COUNT(DISTINCT r.game_id)
@@ -341,9 +340,8 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                  AND g.game_date >= DATE_TRUNC('year', NOW())) as apps_year,
                 
                 (SELECT COUNT(*)
-                 FROM motm_winners mw
-                 JOIN games g ON g.id = mw.game_id
-                 WHERE mw.player_id = p.id
+                 FROM games g
+                 WHERE g.motm_winner_id = p.id
                  AND g.game_date >= DATE_TRUNC('year', NOW())) as motm_year,
                 
                 (SELECT COUNT(DISTINCT r.game_id)
@@ -1162,23 +1160,27 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             ORDER BY g.game_date DESC
         `, [req.user.playerId]);
         
-        // Try to add venue photos if column exists
-        const gamesWithPhotos = await Promise.all(result.rows.map(async (game) => {
-            if (game.venue_id) {
-                try {
-                    const venueResult = await pool.query(
-                        'SELECT photo_url FROM venues WHERE id = $1',
-                        [game.venue_id]
-                    );
-                    if (venueResult.rows[0]?.photo_url) {
-                        game.venue_photo = venueResult.rows[0].photo_url;
-                    }
-                } catch (e) {
-                    // Column doesn't exist yet, skip silently
-                }
+        // Map venue names to their photo URLs
+        const venuePhotoMap = {
+            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
+            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
+        };
+        
+        // Add venue photos based on venue name
+        const gamesWithPhotos = result.rows.map(game => {
+            if (game.venue_name && venuePhotoMap[game.venue_name]) {
+                game.venue_photo = venuePhotoMap[game.venue_name];
             }
             return game;
-        }));
+        });
         
         // Log first game to check teams_generated field
         if (gamesWithPhotos.length > 0) {
@@ -1213,10 +1215,25 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             LIMIT 50
         `);
         
-        // Format the response to include winner name
+        // Map venue names to their photo URLs
+        const venuePhotoMap = {
+            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
+            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
+        };
+        
+        // Format the response to include winner name and venue photo
         const games = result.rows.map(game => ({
             ...game,
-            motm_winner_name: game.motm_winner_name || game.motm_winner_alias
+            motm_winner_name: game.motm_winner_name || game.motm_winner_alias,
+            venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null
         }));
         
         res.json(games);
@@ -1253,6 +1270,24 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         `, [req.params.id]);
         
         game.registered_players = playersResult.rows;
+        
+        // Map venue names to their photo URLs
+        const venuePhotoMap = {
+            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
+            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
+        };
+        
+        if (game.venue_name && venuePhotoMap[game.venue_name]) {
+            game.venue_photo = venuePhotoMap[game.venue_name];
+        }
         
         res.json(game);
     } catch (error) {
@@ -2911,13 +2946,31 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
         
         const game = gameResult.rows[0];
         
+        // Map venue names to their photo URLs (override database)
+        const venuePhotoMap = {
+            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
+            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
+        };
+        
+        const venue_photo = game.venue_name && venuePhotoMap[game.venue_name] 
+            ? venuePhotoMap[game.venue_name] 
+            : game.venue_photo;
+        
         res.json({
             id: game.id,
             game_url: game.game_url,
             game_date: game.game_date,
             venue_name: game.venue_name,
             venue_address: game.venue_address,
-            venue_photo: game.venue_photo,
+            venue_photo: venue_photo,
             format: game.format,
             max_players: game.max_players,
             current_players: game.current_players,
