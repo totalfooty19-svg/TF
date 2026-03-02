@@ -2965,7 +2965,7 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
                 COUNT(v.id) as vote_count
             FROM motm_nominees mn
             JOIN players p ON p.id = mn.player_id
-            LEFT JOIN motm_votes v ON v.motm_nominee_id = mn.id
+            LEFT JOIN motm_votes v ON v.voted_for_id = mn.player_id AND v.game_id = mn.game_id
             WHERE mn.game_id = $1
             GROUP BY p.id, p.full_name, p.alias, p.squad_number
             ORDER BY vote_count DESC
