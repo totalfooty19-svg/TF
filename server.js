@@ -212,6 +212,35 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// Get current user info (for game.html auth check)
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+    try {
+        const playerResult = await pool.query(
+            `SELECT p.id, p.full_name, p.alias, p.squad_number, u.role
+             FROM players p
+             JOIN users u ON u.id = p.user_id
+             WHERE p.id = $1`,
+            [req.user.playerId]
+        );
+        
+        if (playerResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        
+        const player = playerResult.rows[0];
+        res.json({
+            playerId: player.id,
+            fullName: player.full_name,
+            alias: player.alias,
+            squadNumber: player.squad_number,
+            role: player.role
+        });
+    } catch (error) {
+        console.error('Auth me error:', error);
+        res.status(500).json({ error: 'Failed to get user info' });
+    }
+});
+
 // ==========================================
 // PLAYERS
 // ==========================================
@@ -285,16 +314,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
 
 app.get('/api/players', authenticateToken, async (req, res) => {
     try {
-        const { timeRange } = req.query;
-        
-        // Calculate date ranges based on timeRange
-        let dateFilter = '';
-        if (timeRange === 'last3months') {
-            dateFilter = `AND g.game_date >= NOW() - INTERVAL '3 months'`;
-        } else if (timeRange === 'calendaryear') {
-            dateFilter = `AND g.game_date >= DATE_TRUNC('year', NOW())`;
-        }
-        
         const result = await pool.query(`
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
@@ -323,11 +342,12 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                 (SELECT COUNT(DISTINCT r.game_id)
                  FROM registrations r
                  JOIN games g ON g.id = r.game_id
-                 JOIN team_assignments ta ON ta.registration_id = r.id
+                 JOIN team_players tp ON tp.player_id = r.player_id
+                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                  WHERE r.player_id = p.id
                  AND r.status = 'confirmed'
                  AND g.game_completed = TRUE
-                 AND g.winning_team = ta.team_color
+                 AND LOWER(g.winning_team) = LOWER(t.team_name)
                  AND g.game_date >= NOW() - INTERVAL '3 months') as wins_3m,
                 
                 -- Calendar year stats
@@ -347,11 +367,12 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                 (SELECT COUNT(DISTINCT r.game_id)
                  FROM registrations r
                  JOIN games g ON g.id = r.game_id
-                 JOIN team_assignments ta ON ta.registration_id = r.id
+                 JOIN team_players tp ON tp.player_id = r.player_id
+                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                  WHERE r.player_id = p.id
                  AND r.status = 'confirmed'
                  AND g.game_completed = TRUE
-                 AND g.winning_team = ta.team_color
+                 AND LOWER(g.winning_team) = LOWER(t.team_name)
                  AND g.game_date >= DATE_TRUNC('year', NOW())) as wins_year
                 
             FROM players p
@@ -2509,7 +2530,7 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireAdmin, 
                         
                         // Log the refund
                         await pool.query(
-                            `INSERT INTO credit_transactions (player_id, amount, transaction_type, description)
+                            `INSERT INTO credit_transactions (player_id, amount, type, description)
                              VALUES ($1, $2, 'refund', $3)`,
                             [playerId, refundAmount, `Removed from game - £${refundAmount.toFixed(2)} refund`]
                         );
@@ -2520,8 +2541,8 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireAdmin, 
                         const disciplinePoints = game.format === '11-a-side' ? 3 : 2;
                         
                         await pool.query(
-                            `INSERT INTO player_discipline (player_id, game_id, infraction_type, points, notes)
-                             VALUES ($1, $2, 'late_dropout', $3, 'Late drop out after teams confirmed')`,
+                            `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
+                             VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
                             [playerId, gameId, disciplinePoints]
                         );
                     }
@@ -2568,6 +2589,7 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireAdmin, 
 });
 
 app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
         const { gameId } = req.params;
         const { winningTeam, disciplineRecords, beefEntries, motmNominees } = req.body;
@@ -2577,15 +2599,15 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
             winningTeam,
             disciplineRecordsCount: disciplineRecords?.length || 0,
             beefEntriesCount: beefEntries?.length || 0,
-            motmNomineesCount: motmNominees?.length || 0
+            motmNomineesCount: motmNominees?.length || 0,
+            motmNomineeIds: motmNominees
         });
         
-        // Start transaction
-        await pool.query('BEGIN');
+        await client.query('BEGIN');
         
         // 1. Update game winning team and status
         console.log('Step 1: Updating game status...');
-        await pool.query(
+        await client.query(
             `UPDATE games 
              SET winning_team = $1, 
                  game_completed = TRUE, 
@@ -2597,7 +2619,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
         
         // 2. Get all players in the game
         console.log('Step 2: Getting players and updating stats...');
-        const playersResult = await pool.query(
+        const playersResult = await client.query(
             `SELECT DISTINCT player_id FROM registrations 
              WHERE game_id = $1 AND status = 'confirmed'`,
             [gameId]
@@ -2614,7 +2636,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
         
         // Update appearances for players who showed up
         if (showedUpPlayerIds.length > 0) {
-            await pool.query(
+            await client.query(
                 `UPDATE players 
                  SET total_appearances = total_appearances + 1
                  WHERE id = ANY($1)`,
@@ -2623,15 +2645,15 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
             console.log(`Updated appearances for ${showedUpPlayerIds.length} players`);
         }
         
-        // Update wins for MOTM nominees (players eligible for MOTM voting)
+        // Update wins for winning team players
         if (motmNominees && motmNominees.length > 0) {
-            await pool.query(
+            await client.query(
                 `UPDATE players 
                  SET total_wins = total_wins + 1
                  WHERE id = ANY($1)`,
                 [motmNominees]
             );
-            console.log(`Updated wins for ${motmNominees.length} MOTM nominees`);
+            console.log(`Updated wins for ${motmNominees.length} winning team players`);
         }
         
         // 3. Save discipline records (only for offenses, not on_time)
@@ -2646,8 +2668,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
                     'no_show': 'No Show'
                 };
                 
-                console.log('Inserting discipline record:', record);
-                await pool.query(
+                await client.query(
                     `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
                      VALUES ($1, $2, $3, $4, $5)`,
                     [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
@@ -2658,9 +2679,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
         // 4. Save beef entries (bidirectional)
         console.log('Step 4: Saving beef entries...');
         for (const beef of beefEntries || []) {
-            console.log('Inserting beef:', beef);
-            // Player 1 -> Player 2
-            await pool.query(
+            await client.query(
                 `INSERT INTO beef (player_id, target_player_id, rating)
                  VALUES ($1, $2, $3)
                  ON CONFLICT (player_id, target_player_id) 
@@ -2668,8 +2687,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
                 [beef.player1, beef.player2, beef.level]
             );
             
-            // Player 2 -> Player 1 (bidirectional)
-            await pool.query(
+            await client.query(
                 `INSERT INTO beef (player_id, target_player_id, rating)
                  VALUES ($1, $2, $3)
                  ON CONFLICT (player_id, target_player_id) 
@@ -2680,50 +2698,53 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
         
         // 5. Create MOTM nominees
         console.log('Step 5: Creating MOTM nominees...');
+        let nomineesInserted = 0;
         for (const playerId of motmNominees || []) {
-            console.log('Inserting MOTM nominee:', playerId);
-            try {
-                await pool.query(
-                    `INSERT INTO motm_nominees (game_id, player_id)
-                     VALUES ($1, $2)`,
-                    [gameId, playerId]
-                );
-            } catch (nomineeError) {
-                // If duplicate, skip
-                if (nomineeError.code !== '23505') { // Not a unique violation
-                    throw nomineeError;
-                }
-            }
+            await client.query(
+                `INSERT INTO motm_nominees (game_id, player_id)
+                 VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING`,
+                [gameId, playerId]
+            );
+            nomineesInserted++;
         }
+        console.log(`Inserted ${nomineesInserted} MOTM nominees`);
         
-        // 6. Auto-allocate badges for all players in the game
-        console.log('Step 6: Auto-allocating badges...');
+        // Verify nominees were saved
+        const nomineeCheck = await client.query(
+            'SELECT COUNT(*) as count FROM motm_nominees WHERE game_id = $1',
+            [gameId]
+        );
+        console.log(`Verified ${nomineeCheck.rows[0].count} nominees in database for game ${gameId}`);
+        
+        await client.query('COMMIT');
+        console.log('Complete game transaction committed successfully!');
+        
+        // 6. Auto-allocate badges OUTSIDE transaction (non-critical)
         for (const playerId of allPlayerIds) {
             try {
                 await autoAllocateBadges(playerId);
             } catch (badgeError) {
-                console.error(`Failed to auto-allocate badges for player ${playerId}:`, badgeError);
-                // Don't fail the whole transaction if badge allocation fails
+                console.error(`Failed to auto-allocate badges for player ${playerId}:`, badgeError.message);
             }
         }
         
-        await pool.query('COMMIT');
-        console.log('Complete game successful!');
-        
         res.json({ 
             message: 'Game completed successfully',
+            motmNominees: nomineesInserted,
             motmVotingEnds: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
         });
         
     } catch (error) {
-        await pool.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Complete game error:', error);
         console.error('Error stack:', error.stack);
         res.status(500).json({ 
             error: 'Failed to complete game', 
-            details: error.message,
-            step: error.step || 'unknown'
+            details: error.message
         });
+    } finally {
+        client.release();
     }
 });
 
@@ -2965,6 +2986,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             id: game.id,
             game_url: game.game_url,
             game_date: game.game_date,
+            venue_id: game.venue_id,
             venue_name: game.venue_name,
             venue_address: game.venue_address,
             venue_photo: venue_photo,
@@ -2975,7 +2997,10 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             game_status: game.game_status,
             teams_confirmed: game.teams_confirmed,
             team_selection_type: game.team_selection_type,
-            external_opponent: game.external_opponent
+            external_opponent: game.external_opponent,
+            winning_team: game.winning_team,
+            motm_voting_ends: game.motm_voting_ends,
+            motm_winner_id: game.motm_winner_id
         });
         
     } catch (error) {
@@ -2989,6 +3014,8 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
     try {
         const { gameUrl } = req.params;
         
+        console.log('Public MOTM request for game URL:', gameUrl);
+        
         // Get game ID and status from URL
         const gameResult = await pool.query(
             'SELECT id, game_status, motm_voting_ends FROM games WHERE game_url = $1',
@@ -2996,12 +3023,15 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
         );
         
         if (gameResult.rows.length === 0) {
+            console.log('MOTM: Game not found for URL:', gameUrl);
             return res.status(404).json({ error: 'Game not found' });
         }
         
         const game = gameResult.rows[0];
+        console.log('MOTM: Game found:', { id: game.id, status: game.game_status, votingEnds: game.motm_voting_ends });
         
         if (game.game_status !== 'completed') {
+            console.log('MOTM: Game not completed, status:', game.game_status);
             return res.status(400).json({ error: 'Game not completed yet' });
         }
         
@@ -3021,8 +3051,10 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
             ORDER BY vote_count DESC
         `, [game.id]);
         
+        console.log('MOTM: Found', nomineesResult.rows.length, 'nominees for game', game.id);
+        
         // Check if voting is still open
-        const votingEnds = new Date(game.motm_voting_ends);
+        const votingEnds = game.motm_voting_ends ? new Date(game.motm_voting_ends) : new Date(0);
         const now = new Date();
         const votingOpen = votingEnds > now;
         
@@ -3030,12 +3062,13 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
             nominees: nomineesResult.rows,
             votingEnds: game.motm_voting_ends,
             votingOpen,
-            userHasVoted: false // Public users can't vote without login
+            userHasVoted: false
         });
         
     } catch (error) {
         console.error('Get public MOTM error:', error);
-        res.status(500).json({ error: 'Failed to get MOTM data' });
+        console.error('MOTM error details:', error.message);
+        res.status(500).json({ error: 'Failed to get MOTM data', details: error.message });
     }
 });
 
@@ -3580,27 +3613,6 @@ app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireAdm
 // ==========================================
 // START SERVER
 // ==========================================
-
-// ==========================================
-// WHATSAPP NOTIFICATIONS - TEMPORARILY DISABLED
-// ==========================================
-// To enable: Add "twilio": "^4.20.0" to package.json and redeploy
-/*
-// OLD WhatsApp code (disabled)
-// Get all message templates
-app.get('/api/admin/whatsapp/templates', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT * FROM whatsapp_templates 
-            ORDER BY notification_type, created_at DESC
-        `);
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Get templates error:', error);
-        res.status(500).json({ error: 'Failed to get templates' });
-    }
-});
-*/
 
 // ==========================================
 // WHATSAPP ADMIN ENDPOINTS
