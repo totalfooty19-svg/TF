@@ -9,6 +9,14 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 require('dotenv').config();
 
+// Twilio WhatsApp setup
+const twilio = require('twilio');
+const twilioClient = twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+);
+const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+447864872538';
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -834,6 +842,155 @@ app.post('/api/admin/badges/auto-allocate-all', authenticateToken, requireAdmin,
         res.status(500).json({ error: 'Failed to allocate badges' });
     }
 });
+
+// ==========================================
+// WHATSAPP SERVICE
+// ==========================================
+
+// Helper function to replace placeholders in message templates
+function replacePlaceholders(template, data) {
+    let message = template;
+    
+    // Replace all placeholders with actual data
+    message = message.replace(/\[Name\]/g, data.name || '');
+    message = message.replace(/\[Day\]/g, data.day || '');
+    message = message.replace(/\[Time\]/g, data.time || '');
+    message = message.replace(/\[Venue\]/g, data.venue || '');
+    message = message.replace(/\[gameurl\]/g, data.gameurl || '');
+    message = message.replace(/\[Balance\]/g, data.balance || '0.00');
+    message = message.replace(/\[generic_game_url\]/g, data.generic_game_url || 'https://totalfooty.co.uk/vibecoding/');
+    message = message.replace(/\[profile_url\]/g, data.profile_url || 'https://totalfooty.co.uk/vibecoding/');
+    
+    return message;
+}
+
+// Helper function to format game data for WhatsApp messages
+async function getGameDataForMessage(gameId) {
+    const gameResult = await pool.query(`
+        SELECT g.*, v.name as venue_name, g.game_url
+        FROM games g
+        LEFT JOIN venues v ON v.id = g.venue_id
+        WHERE g.id = $1
+    `, [gameId]);
+    
+    if (gameResult.rows.length === 0) return null;
+    
+    const game = gameResult.rows[0];
+    const gameDate = new Date(game.game_date);
+    
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const day = days[gameDate.getDay()];
+    
+    const hours = gameDate.getHours().toString().padStart(2, '0');
+    const minutes = gameDate.getMinutes().toString().padStart(2, '0');
+    const time = `${hours}:${minutes}`;
+    
+    const gameurl = `https://totalfooty.co.uk/vibecoding/game.html?url=${game.game_url}`;
+    
+    return {
+        day,
+        time,
+        venue: game.venue_name,
+        gameurl
+    };
+}
+
+// Send WhatsApp message via Twilio
+async function sendWhatsAppMessage(playerPhone, message, notificationType, playerId = null) {
+    try {
+        // Format phone number to E.164 format
+        let formattedPhone = playerPhone.replace(/\s+/g, '');
+        if (!formattedPhone.startsWith('+')) {
+            if (formattedPhone.startsWith('0')) {
+                formattedPhone = '+44' + formattedPhone.substring(1);
+            } else if (formattedPhone.startsWith('44')) {
+                formattedPhone = '+' + formattedPhone;
+            } else {
+                formattedPhone = '+44' + formattedPhone;
+            }
+        }
+        
+        const twilioMessage = await twilioClient.messages.create({
+            body: message,
+            from: TWILIO_WHATSAPP_NUMBER,
+            to: `whatsapp:${formattedPhone}`
+        });
+        
+        // Log successful send
+        await pool.query(`
+            INSERT INTO whatsapp_logs (player_id, notification_type, phone_number, message_content, status, twilio_sid)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        `, [playerId, notificationType, formattedPhone, message, 'sent', twilioMessage.sid]);
+        
+        return { success: true, sid: twilioMessage.sid };
+        
+    } catch (error) {
+        console.error('WhatsApp send error:', error);
+        
+        // Log failed send
+        await pool.query(`
+            INSERT INTO whatsapp_logs (player_id, notification_type, phone_number, message_content, status, error_message)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        `, [playerId, notificationType, playerPhone, message, 'failed', error.message]);
+        
+        return { success: false, error: error.message };
+    }
+}
+
+// Send notification based on type
+async function sendNotification(notificationType, playerId, additionalData = {}) {
+    try {
+        // Get player data
+        const playerResult = await pool.query(`
+            SELECT p.id, p.full_name, p.alias, p.phone, c.balance as credits
+            FROM players p
+            LEFT JOIN credits c ON c.player_id = p.id
+            WHERE p.id = $1
+        `, [playerId]);
+        
+        if (playerResult.rows.length === 0) {
+            return { success: false, error: 'Player not found' };
+        }
+        
+        const player = playerResult.rows[0];
+        
+        if (!player.phone) {
+            return { success: false, error: 'Player has no phone number' };
+        }
+        
+        // Get message template
+        const templateResult = await pool.query(`
+            SELECT message_template 
+            FROM whatsapp_templates 
+            WHERE notification_type = $1 AND is_active = TRUE
+        `, [notificationType]);
+        
+        if (templateResult.rows.length === 0) {
+            return { success: false, error: 'Message template not found' };
+        }
+        
+        const template = templateResult.rows[0].message_template;
+        
+        // Prepare data for placeholder replacement
+        const messageData = {
+            name: player.alias || player.full_name,
+            balance: player.credits ? parseFloat(player.credits).toFixed(2) : '0.00',
+            generic_game_url: 'https://totalfooty.co.uk/vibecoding/',
+            profile_url: 'https://totalfooty.co.uk/vibecoding/',
+            ...additionalData
+        };
+        
+        // Replace placeholders
+        const message = replacePlaceholders(template, messageData);
+        
+        // Send message
+        return await sendWhatsAppMessage(player.phone, message, notificationType, playerId);
+        
+    } catch (error) {
+        console.error('Send notification error:', error);
+        return { success: false, error: error.message };
+    }
+}
 
 // ==========================================
 // DISCIPLINE SYSTEM
@@ -3390,6 +3547,105 @@ app.get('/api/admin/whatsapp/templates', authenticateToken, requireAdmin, async 
     } catch (error) {
         console.error('Get templates error:', error);
         res.status(500).json({ error: 'Failed to get templates' });
+    }
+});
+
+// ==========================================
+// WHATSAPP ADMIN ENDPOINTS
+// ==========================================
+
+// Get all message templates
+app.get('/api/admin/whatsapp/templates', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT * FROM whatsapp_templates 
+            ORDER BY notification_type
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get templates error:', error);
+        res.status(500).json({ error: 'Failed to get templates' });
+    }
+});
+
+// Update message template
+app.put('/api/admin/whatsapp/templates/:notificationType', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { notificationType } = req.params;
+        const { message_template, trigger_description, is_active } = req.body;
+        
+        await pool.query(`
+            UPDATE whatsapp_templates 
+            SET message_template = $1, 
+                trigger_description = $2,
+                is_active = $3,
+                updated_at = NOW()
+            WHERE notification_type = $4
+        `, [message_template, trigger_description, is_active, notificationType]);
+        
+        res.json({ message: 'Template updated successfully' });
+    } catch (error) {
+        console.error('Update template error:', error);
+        res.status(500).json({ error: 'Failed to update template' });
+    }
+});
+
+// Send test message
+app.post('/api/admin/whatsapp/test', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { phoneNumber, message } = req.body;
+        
+        const result = await sendWhatsAppMessage(phoneNumber, message, 'test', null);
+        
+        if (result.success) {
+            res.json({ message: 'Test message sent successfully', sid: result.sid });
+        } else {
+            res.status(500).json({ error: result.error });
+        }
+    } catch (error) {
+        console.error('Send test message error:', error);
+        res.status(500).json({ error: 'Failed to send test message' });
+    }
+});
+
+// Send notification to player
+app.post('/api/admin/whatsapp/send', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId, notificationType, additionalData } = req.body;
+        
+        const result = await sendNotification(notificationType, playerId, additionalData);
+        
+        if (result.success) {
+            res.json({ message: 'Notification sent successfully' });
+        } else {
+            res.status(500).json({ error: result.error });
+        }
+    } catch (error) {
+        console.error('Send notification error:', error);
+        res.status(500).json({ error: 'Failed to send notification' });
+    }
+});
+
+// Get WhatsApp logs
+app.get('/api/admin/whatsapp/logs', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { limit = 50, offset = 0 } = req.query;
+        
+        const result = await pool.query(`
+            SELECT 
+                wl.*,
+                p.full_name,
+                p.alias
+            FROM whatsapp_logs wl
+            LEFT JOIN players p ON p.id = wl.player_id
+            ORDER BY wl.created_at DESC
+            LIMIT $1 OFFSET $2
+        `, [limit, offset]);
+        
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get WhatsApp logs error:', error);
+        res.status(500).json({ error: 'Failed to get logs' });
     }
 });
 
