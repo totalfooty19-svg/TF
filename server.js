@@ -3536,6 +3536,7 @@ app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireAdm
 // ==========================================
 // To enable: Add "twilio": "^4.20.0" to package.json and redeploy
 /*
+// OLD WhatsApp code (disabled)
 // Get all message templates
 app.get('/api/admin/whatsapp/templates', authenticateToken, requireAdmin, async (req, res) => {
     try {
@@ -3549,6 +3550,7 @@ app.get('/api/admin/whatsapp/templates', authenticateToken, requireAdmin, async 
         res.status(500).json({ error: 'Failed to get templates' });
     }
 });
+*/
 
 // ==========================================
 // WHATSAPP ADMIN ENDPOINTS
@@ -3648,10 +3650,6 @@ app.get('/api/admin/whatsapp/logs', authenticateToken, requireAdmin, async (req,
         res.status(500).json({ error: 'Failed to get logs' });
     }
 });
-
-// (WhatsApp endpoints commented out - see full server.js for complete code)
-// ... 
-*/
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
