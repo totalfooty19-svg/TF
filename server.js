@@ -1164,7 +1164,10 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             SELECT g.*, v.name as venue_name, v.address as venue_address,
                    g.teams_generated,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
-                   EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
+                   EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
+                   (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1) as my_status,
+                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $1) as my_backup_type
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE (
@@ -1265,7 +1268,8 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         const gameResult = await pool.query(`
             SELECT g.*, v.name as venue_name, v.address as venue_address,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.id = $1
@@ -1276,8 +1280,10 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         }
         
         const game = gameResult.rows[0];
+        game.max_gk_slots = game.team_selection_type === 'vs_external' ? 1 : 2;
+        game.gk_count = parseInt(game.gk_count) || 0;
         
-        // Get registered players
+        // Get registered players (confirmed)
         const playersResult = await pool.query(`
             SELECT p.id, p.full_name, p.alias, p.squad_number, p.reliability_tier, 
                    r.position_preference, r.status
@@ -1288,6 +1294,24 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         `, [req.params.id]);
         
         game.registered_players = playersResult.rows;
+        
+        // Get backup players
+        const backupsResult = await pool.query(`
+            SELECT p.id, p.full_name, p.alias, p.squad_number,
+                   r.backup_type, r.position_preference, r.registered_at
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'backup'
+            ORDER BY 
+                CASE r.backup_type 
+                    WHEN 'confirmed_backup' THEN 1 
+                    WHEN 'gk_backup' THEN 2 
+                    ELSE 3 
+                END,
+                r.registered_at ASC
+        `, [req.params.id]);
+        
+        game.backup_players = backupsResult.rows;
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -1424,32 +1448,51 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
     try {
-        const { position, pairs, avoids } = req.body;
+        const { position, positions, pairs, avoids, backupType } = req.body;
         const gameId = req.params.id;
+        const positionValue = positions || position || 'outfield';
         
-        // Check if game is All Star only
-        const gameTypeCheck = await pool.query(
-            'SELECT all_star_only, player_editing_locked FROM games WHERE id = $1',
-            [gameId]
-        );
+        await client.query('BEGIN');
+        
+        // Lock the game row to prevent race conditions
+        const gameCheck = await client.query(`
+            SELECT g.max_players, g.cost_per_player, g.all_star_only, 
+                   g.player_editing_locked, g.team_selection_type, g.position_type,
+                   COUNT(r.id) FILTER (WHERE r.status = 'confirmed') as current_players
+            FROM games g
+            LEFT JOIN registrations r ON r.game_id = g.id
+            WHERE g.id = $1
+            GROUP BY g.id
+            FOR UPDATE OF g
+        `, [gameId]);
+        
+        if (gameCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameCheck.rows[0];
         
         // Check if game is locked for editing
-        if (gameTypeCheck.rows[0]?.player_editing_locked) {
+        if (game.player_editing_locked) {
+            await client.query('ROLLBACK');
             return res.status(423).json({ 
                 error: 'Game is currently being edited by an admin. Please try again in a few minutes.'
             });
         }
         
-        if (gameTypeCheck.rows[0]?.all_star_only) {
-            // Check if player has TF All Star badge
-            const badgeCheck = await pool.query(`
+        // Check All Star restriction
+        if (game.all_star_only) {
+            const badgeCheck = await client.query(`
                 SELECT 1 FROM player_badges pb
                 JOIN badges b ON b.id = pb.badge_id
                 WHERE pb.player_id = $1 AND b.name = 'TF All Star'
             `, [req.user.playerId]);
             
             if (badgeCheck.rows.length === 0) {
+                await client.query('ROLLBACK');
                 return res.status(403).json({ 
                     error: 'This is an All Star game. You need the TF All Star badge to register.',
                     requiresBadge: 'TF All Star'
@@ -1458,65 +1501,125 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         }
         
         // Check if already registered
-        const existingReg = await pool.query(
-            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+        const existingReg = await client.query(
+            'SELECT id, status, backup_type FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
         
         if (existingReg.rows.length > 0) {
+            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Already registered' });
         }
         
-        // Check game capacity
-        const gameCheck = await pool.query(`
-            SELECT g.max_players, g.cost_per_player,
-                   COUNT(r.id) FILTER (WHERE r.status = 'confirmed') as current_players
-            FROM games g
-            LEFT JOIN registrations r ON r.game_id = g.id
-            WHERE g.id = $1
-            GROUP BY g.id
-        `, [gameId]);
-        
-        const game = gameCheck.rows[0];
         const isFull = parseInt(game.current_players) >= parseInt(game.max_players);
-        const status = isFull ? 'backup' : 'confirmed';
         
-        // Check credits
-        if (status === 'confirmed') {
-            const creditResult = await pool.query(
+        // GK slot check for confirmed registrations
+        const isGKOnly = positionValue.trim().toUpperCase() === 'GK';
+        if (!isFull && isGKOnly) {
+            const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : 2;
+            const gkCount = await client.query(`
+                SELECT COUNT(*) as gk_count FROM registrations 
+                WHERE game_id = $1 AND status = 'confirmed' 
+                AND UPPER(TRIM(position_preference)) = 'GK'
+            `, [gameId]);
+            
+            if (parseInt(gkCount.rows[0].gk_count) >= maxGKSlots) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ 
+                    error: 'gk_full',
+                    message: 'Please note, this game already has the maximum number of goalkeepers. To register, please adjust your position or choose another game.',
+                    maxGKSlots
+                });
+            }
+        }
+        
+        // Determine registration status
+        let status, regBackupType = null;
+        
+        if (isFull) {
+            // Game is full - must be a backup registration
+            if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ 
+                    error: 'game_full',
+                    message: 'Game is full. Please choose a backup option.',
+                    currentPlayers: parseInt(game.current_players),
+                    maxPlayers: parseInt(game.max_players)
+                });
+            }
+            
+            // Validate GK backup - must have GK as only position
+            if (backupType === 'gk_backup' && !isGKOnly) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ 
+                    error: 'GK Backup is only available if GK is your only selected position.'
+                });
+            }
+            
+            status = 'backup';
+            regBackupType = backupType;
+            
+            // For confirmed backup, deduct credits immediately
+            if (backupType === 'confirmed_backup') {
+                const creditResult = await client.query(
+                    'SELECT balance FROM credits WHERE player_id = $1',
+                    [req.user.playerId]
+                );
+                
+                if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < parseFloat(game.cost_per_player)) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
+                }
+                
+                await client.query(
+                    'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+                    [game.cost_per_player, req.user.playerId]
+                );
+                
+                await client.query(
+                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                    [req.user.playerId, -game.cost_per_player, 'game_fee', `Confirmed backup for game ${gameId}`]
+                );
+            }
+        } else {
+            // Game has space - confirm registration
+            status = 'confirmed';
+            
+            // Deduct credits
+            const creditResult = await client.query(
                 'SELECT balance FROM credits WHERE player_id = $1',
                 [req.user.playerId]
             );
             
             if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < parseFloat(game.cost_per_player)) {
+                await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
             
-            // Deduct credits
-            await pool.query(
+            await client.query(
                 'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
                 [game.cost_per_player, req.user.playerId]
             );
             
-            await pool.query(
+            await client.query(
                 'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
                 [req.user.playerId, -game.cost_per_player, 'game_fee', `Registration for game ${gameId}`]
             );
         }
         
         // Register player
-        const regResult = await pool.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference)
-             VALUES ($1, $2, $3, $4) RETURNING id`,
-            [gameId, req.user.playerId, status, position || 'outfield']
+        const regResult = await client.query(
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+            [gameId, req.user.playerId, status, positionValue, regBackupType]
         );
         
         const registrationId = regResult.rows[0].id;
         
-        // Insert pair preferences
-        if (pairs && Array.isArray(pairs)) {
+        // Insert pair preferences (only for confirmed players)
+        if (status === 'confirmed' && pairs && Array.isArray(pairs)) {
             for (const pairPlayerId of pairs) {
-                await pool.query(
+                await client.query(
                     `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
                      VALUES ($1, $2, 'pair')`,
                     [registrationId, pairPlayerId]
@@ -1524,10 +1627,10 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             }
         }
         
-        // Insert avoid preferences
-        if (avoids && Array.isArray(avoids)) {
+        // Insert avoid preferences (only for confirmed players)
+        if (status === 'confirmed' && avoids && Array.isArray(avoids)) {
             for (const avoidPlayerId of avoids) {
-                await pool.query(
+                await client.query(
                     `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
                      VALUES ($1, $2, 'avoid')`,
                     [registrationId, avoidPlayerId]
@@ -1535,68 +1638,233 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             }
         }
         
-        res.json({ message: status === 'confirmed' ? 'Registered successfully' : 'Added to backup list', status });
+        await client.query('COMMIT');
+        
+        // Build response
+        let message;
+        if (status === 'confirmed') {
+            message = 'Registered successfully';
+        } else if (regBackupType === 'confirmed_backup') {
+            message = `You're on the confirmed backup list. £${parseFloat(game.cost_per_player).toFixed(2)} has been deducted and you'll be first in line if a spot opens. If you don't get on, you'll be refunded after the game.`;
+        } else if (regBackupType === 'gk_backup') {
+            message = "You're on the GK backup list. You'll be notified if a GK spot becomes available.";
+        } else {
+            message = "You're on the backup list. You'll be notified if a space becomes available.";
+        }
+        
+        res.json({ message, status, backupType: regBackupType });
+        
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Registration error:', error);
         res.status(500).json({ error: 'Registration failed' });
+    } finally {
+        client.release();
     }
 });
 
-// Drop out of game with refund
-app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
+// Check GK slot availability for a game
+app.get('/api/games/:id/gk-slots', authenticateToken, async (req, res) => {
     try {
         const gameId = req.params.id;
         
-        // Check if game is locked for editing
-        const lockCheck = await pool.query(
-            'SELECT player_editing_locked FROM games WHERE id = $1',
+        const result = await pool.query(`
+            SELECT g.team_selection_type,
+                   COUNT(r.id) FILTER (WHERE r.status = 'confirmed' AND UPPER(TRIM(r.position_preference)) = 'GK') as gk_count
+            FROM games g
+            LEFT JOIN registrations r ON r.game_id = g.id
+            WHERE g.id = $1
+            GROUP BY g.id
+        `, [gameId]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const maxGKSlots = result.rows[0].team_selection_type === 'vs_external' ? 1 : 2;
+        const currentGKs = parseInt(result.rows[0].gk_count) || 0;
+        
+        res.json({ 
+            maxGKSlots, 
+            currentGKs, 
+            slotsAvailable: maxGKSlots - currentGKs 
+        });
+    } catch (error) {
+        console.error('GK slots check error:', error);
+        res.status(500).json({ error: 'Failed to check GK slots' });
+    }
+});
+
+// Get backup queue for a game
+app.get('/api/games/:id/backups', authenticateToken, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        
+        const result = await pool.query(`
+            SELECT r.id, r.player_id, r.backup_type, r.position_preference, r.registered_at,
+                   p.full_name, p.alias, p.squad_number
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'backup'
+            ORDER BY 
+                CASE r.backup_type 
+                    WHEN 'confirmed_backup' THEN 1 
+                    WHEN 'gk_backup' THEN 2 
+                    ELSE 3 
+                END,
+                r.registered_at ASC
+        `, [gameId]);
+        
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get backups error:', error);
+        res.status(500).json({ error: 'Failed to get backup queue' });
+    }
+});
+
+// Drop out of game with refund + backup promotion
+app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        
+        await client.query('BEGIN');
+        
+        // Lock the game row
+        const gameCheck = await client.query(
+            'SELECT player_editing_locked, teams_generated, cost_per_player, team_selection_type FROM games WHERE id = $1 FOR UPDATE',
             [gameId]
         );
         
-        if (lockCheck.rows[0]?.player_editing_locked) {
+        if (gameCheck.rows[0]?.player_editing_locked) {
+            await client.query('ROLLBACK');
             return res.status(423).json({ 
                 error: 'Game is currently being edited by an admin. Please try again in a few minutes.'
             });
         }
         
-        // Check if teams already generated
-        const gameCheck = await pool.query('SELECT teams_generated FROM games WHERE id = $1', [gameId]);
         if (gameCheck.rows[0]?.teams_generated) {
+            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Cannot drop out - teams already generated' });
         }
         
-        // Get registration
-        const regResult = await pool.query(
-            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+        const cost = parseFloat(gameCheck.rows[0].cost_per_player);
+        
+        // Get the dropping player's registration
+        const regResult = await client.query(
+            'SELECT id, status, backup_type, position_preference FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
         
         if (regResult.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Not registered for this game' });
         }
         
-        // Get game cost
-        const costResult = await pool.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
-        const cost = parseFloat(costResult.rows[0].cost_per_player);
+        const droppingReg = regResult.rows[0];
+        const wasConfirmed = droppingReg.status === 'confirmed';
+        const wasConfirmedBackup = droppingReg.backup_type === 'confirmed_backup';
+        const wasGKOnly = droppingReg.position_preference?.trim().toUpperCase() === 'GK';
         
-        // Refund player
-        await pool.query(
-            'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-            [cost, req.user.playerId]
-        );
-        
-        await pool.query(
-            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-            [req.user.playerId, cost, 'refund', `Dropped out of game - refund`]
-        );
+        // Refund if they paid (confirmed players or confirmed backups)
+        if (wasConfirmed || wasConfirmedBackup) {
+            await client.query(
+                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                [cost, req.user.playerId]
+            );
+            
+            await client.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [req.user.playerId, cost, 'refund', `Dropped out of game - refund`]
+            );
+        }
         
         // Delete registration (cascade deletes preferences)
-        await pool.query('DELETE FROM registrations WHERE id = $1', [regResult.rows[0].id]);
+        await client.query('DELETE FROM registrations WHERE id = $1', [droppingReg.id]);
         
-        res.json({ message: `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.` });
+        // If a confirmed player dropped out, try to promote a backup
+        let promotedPlayer = null;
+        if (wasConfirmed) {
+            // If a GK dropped out, first check for GK backups
+            if (wasGKOnly) {
+                const gkBackup = await client.query(`
+                    SELECT r.id, r.player_id, r.backup_type, p.full_name, p.alias
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'gk_backup'
+                    ORDER BY r.registered_at ASC
+                    LIMIT 1
+                `, [gameId]);
+                
+                if (gkBackup.rows.length > 0) {
+                    promotedPlayer = gkBackup.rows[0];
+                }
+            }
+            
+            // If no GK backup was promoted, check confirmed backups (first come first served)
+            if (!promotedPlayer) {
+                const confirmedBackup = await client.query(`
+                    SELECT r.id, r.player_id, r.backup_type, p.full_name, p.alias
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'confirmed_backup'
+                    ORDER BY r.registered_at ASC
+                    LIMIT 1
+                `, [gameId]);
+                
+                if (confirmedBackup.rows.length > 0) {
+                    promotedPlayer = confirmedBackup.rows[0];
+                }
+            }
+            
+            // Promote the backup player
+            if (promotedPlayer) {
+                await client.query(
+                    `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
+                    [promotedPlayer.id]
+                );
+                
+                // If they weren't a confirmed_backup, charge them now
+                if (promotedPlayer.backup_type !== 'confirmed_backup') {
+                    await client.query(
+                        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+                        [cost, promotedPlayer.player_id]
+                    );
+                    
+                    await client.query(
+                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                        [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
+                    );
+                }
+                
+                // Create notification for promoted player
+                await client.query(
+                    `INSERT INTO notifications (player_id, type, message, game_id)
+                     VALUES ($1, 'backup_promoted', $2, $3)`,
+                    [promotedPlayer.player_id, 
+                     `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
+                     gameId]
+                );
+            }
+        }
+        
+        await client.query('COMMIT');
+        
+        let message = wasConfirmed || wasConfirmedBackup 
+            ? `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.`
+            : 'Successfully removed from backup list.';
+            
+        if (promotedPlayer) {
+            message += ` ${promotedPlayer.alias || promotedPlayer.full_name} has been promoted from the backup list.`;
+        }
+        
+        res.json({ message, promotedPlayer: promotedPlayer ? { name: promotedPlayer.alias || promotedPlayer.full_name } : null });
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Drop out error:', error);
         res.status(500).json({ error: 'Failed to drop out' });
+    } finally {
+        client.release();
     }
 });
 
