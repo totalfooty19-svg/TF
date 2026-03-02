@@ -935,11 +935,12 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             WHERE (
                 (g.game_status = 'available' AND g.game_date >= CURRENT_TIMESTAMP)
                 OR (g.game_status = 'confirmed')
+                ${isAdmin ? "OR (g.game_status = 'completed')" : ''}
             )
             ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
             AND g.status != 'cancelled'
             ${!isAdmin && !hasAllStarBadge ? 'AND (g.all_star_only IS NULL OR g.all_star_only = FALSE)' : ''}
-            ORDER BY g.game_date ASC
+            ORDER BY g.game_date DESC
         `, [req.user.playerId]);
         
         // Try to add venue photos if column exists
@@ -2711,6 +2712,61 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
     } catch (error) {
         console.error('Get public game details error:', error);
         res.status(500).json({ error: 'Failed to get game details' });
+    }
+});
+
+// Get MOTM data for public game view (no auth required)
+app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        
+        // Get game ID and status from URL
+        const gameResult = await pool.query(
+            'SELECT id, game_status, motm_voting_ends FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        if (game.game_status !== 'completed') {
+            return res.status(400).json({ error: 'Game not completed yet' });
+        }
+        
+        // Get MOTM nominees with vote counts
+        const nomineesResult = await pool.query(`
+            SELECT 
+                p.id as player_id,
+                p.full_name,
+                p.alias,
+                p.squad_number,
+                COUNT(v.id) as vote_count
+            FROM motm_nominees mn
+            JOIN players p ON p.id = mn.player_id
+            LEFT JOIN motm_votes v ON v.nominee_id = mn.id
+            WHERE mn.game_id = $1
+            GROUP BY p.id, p.full_name, p.alias, p.squad_number
+            ORDER BY vote_count DESC
+        `, [game.id]);
+        
+        // Check if voting is still open
+        const votingEnds = new Date(game.motm_voting_ends);
+        const now = new Date();
+        const votingOpen = votingEnds > now;
+        
+        res.json({
+            nominees: nomineesResult.rows,
+            votingEnds: game.motm_voting_ends,
+            votingOpen,
+            userHasVoted: false // Public users can't vote without login
+        });
+        
+    } catch (error) {
+        console.error('Get public MOTM error:', error);
+        res.status(500).json({ error: 'Failed to get MOTM data' });
     }
 });
 
