@@ -1233,7 +1233,6 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             LEFT JOIN players p ON p.id = g.motm_winner_id
             WHERE g.game_status = 'completed'
             ORDER BY g.game_date DESC
-            LIMIT 50
         `);
         
         // Map venue names to their photo URLs
@@ -1250,11 +1249,13 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
         
-        // Format the response to include winner name and venue photo
+        // Format the response
         const games = result.rows.map(game => ({
             ...game,
-            motm_winner_name: game.motm_winner_name || game.motm_winner_alias,
-            venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null
+            motm_winner_name: game.motm_winner_alias || game.motm_winner_name,
+            venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null,
+            game_time: new Date(game.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+            game_day: new Date(game.game_date).toLocaleDateString('en-US', { weekday: 'long' })
         }));
         
         res.json(games);
@@ -1342,7 +1343,7 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
     try {
         const { 
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
-            exclusivity, positionType, teamSelectionType, externalOpponent 
+            exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor 
         } = req.body;
         
         const createdGames = [];
@@ -1353,12 +1354,13 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
             const seriesCount = parseInt(countResult.rows[0].count) + 1;
             const seriesIdValue = `TF${String(seriesCount).padStart(4, '0')}`;
             
-            // Create series record for fixed_draft games
+            // Create series record for draft_memory and vs_external games
             let seriesUuid = null;
-            if (teamSelectionType === 'fixed_draft') {
+            const selType = teamSelectionType || 'normal';
+            if (selType === 'draft_memory' || selType === 'vs_external') {
                 const seriesResult = await pool.query(
-                    'INSERT INTO game_series (series_name) VALUES ($1) RETURNING id',
-                    [seriesIdValue]
+                    'INSERT INTO game_series (series_name, series_type) VALUES ($1, $2) RETURNING id',
+                    [seriesIdValue, selType]
                 );
                 seriesUuid = seriesResult.rows[0].id;
             }
@@ -1376,13 +1378,13 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                     `INSERT INTO games (
                         venue_id, game_date, max_players, cost_per_player, format, regularity, 
                         exclusivity, position_type, game_url, status, series_id, 
-                        team_selection_type, external_opponent
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12)
+                        team_selection_type, external_opponent, tf_kit_color
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12, $13)
                     RETURNING id`,
                     [
                         venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
                         exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl, 
-                        seriesUuid, teamSelectionType || 'normal', externalOpponent
+                        seriesUuid, selType, externalOpponent || null, tfKitColor || null
                     ]
                 );
                 
@@ -1395,19 +1397,34 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                 games: createdGames 
             });
         } else {
-            // Create single one-off game (no series_id)
+            // Create single one-off game
             const gameUrl = crypto.randomBytes(6).toString('hex');
+            const selType = teamSelectionType || 'normal';
+            
+            // Create series record for one-off draft_memory or vs_external (for scoreline tracking)
+            let seriesUuid = null;
+            if (selType === 'draft_memory' || selType === 'vs_external') {
+                const countResult = await pool.query('SELECT COUNT(*) FROM game_series');
+                const seriesCount = parseInt(countResult.rows[0].count) + 1;
+                const seriesIdValue = `TF${String(seriesCount).padStart(4, '0')}`;
+                const seriesResult = await pool.query(
+                    'INSERT INTO game_series (series_name, series_type) VALUES ($1, $2) RETURNING id',
+                    [seriesIdValue, selType]
+                );
+                seriesUuid = seriesResult.rows[0].id;
+            }
             
             const result = await pool.query(
                 `INSERT INTO games (
                     venue_id, game_date, max_players, cost_per_player, format, regularity, 
-                    exclusivity, position_type, game_url, status, team_selection_type, external_opponent
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11)
+                    exclusivity, position_type, game_url, status, series_id,
+                    team_selection_type, external_opponent, tf_kit_color
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12, $13)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
                     exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl,
-                    teamSelectionType || 'normal', externalOpponent
+                    seriesUuid, selType, externalOpponent || null, tfKitColor || null
                 ]
             );
             
@@ -2425,7 +2442,7 @@ app.get('/api/admin/games/:gameId/fixed-teams', authenticateToken, requireAdmin,
     }
 });
 
-// Save manual team assignments (for fixed_draft games)
+// Save manual team assignments (for fixed_draft/draft_memory games)
 app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
@@ -2435,7 +2452,7 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
         const gameResult = await pool.query('SELECT series_id, team_selection_type FROM games WHERE id = $1', [gameId]);
         const game = gameResult.rows[0];
         
-        if (game.team_selection_type === 'fixed_draft' && game.series_id) {
+        if ((game.team_selection_type === 'fixed_draft' || game.team_selection_type === 'draft_memory') && game.series_id) {
             // Save fixed team assignments for the series
             for (const playerId of redTeam) {
                 await pool.query(`
@@ -2997,6 +3014,29 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
             }
         }
         
+        // 7. Update series scoreline (non-critical, outside transaction)
+        try {
+            const seriesCheck = await pool.query(
+                'SELECT series_id, team_selection_type FROM games WHERE id = $1',
+                [gameId]
+            );
+            const seriesUuid = seriesCheck.rows[0]?.series_id;
+            const selType = seriesCheck.rows[0]?.team_selection_type;
+            
+            if (seriesUuid && (selType === 'draft_memory' || selType === 'vs_external')) {
+                if (winningTeam === 'red') {
+                    await pool.query('UPDATE game_series SET red_wins = red_wins + 1 WHERE id = $1', [seriesUuid]);
+                } else if (winningTeam === 'blue') {
+                    await pool.query('UPDATE game_series SET blue_wins = blue_wins + 1 WHERE id = $1', [seriesUuid]);
+                } else if (winningTeam === 'draw') {
+                    await pool.query('UPDATE game_series SET draws = draws + 1 WHERE id = $1', [seriesUuid]);
+                }
+                console.log(`Updated series ${seriesUuid} scoreline: ${winningTeam}`);
+            }
+        } catch (seriesErr) {
+            console.error('Series scoreline update failed (non-critical):', seriesErr.message);
+        }
+        
         res.json({ 
             message: 'Game completed successfully',
             motmNominees: nomineesInserted,
@@ -3166,6 +3206,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         
         // Get next game in series if exists
         let nextGame = null;
+        let seriesScoreline = null;
         if (game.series_id) {
             const nextGameResult = await pool.query(`
                 SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.format,
@@ -3184,6 +3225,17 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             if (nextGameResult.rows.length > 0) {
                 nextGame = nextGameResult.rows[0];
             }
+            
+            // Get series scoreline for draft_memory / vs_external
+            try {
+                const scoreResult = await pool.query(
+                    'SELECT series_name, series_type, red_wins, blue_wins, draws FROM game_series WHERE id = $1',
+                    [game.series_id]
+                );
+                if (scoreResult.rows.length > 0) {
+                    seriesScoreline = scoreResult.rows[0];
+                }
+            } catch (e) { /* non-critical */ }
         }
         
         res.json({
@@ -3196,6 +3248,9 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                 format: game.format,
                 winning_team: game.winning_team,
                 game_status: game.game_status,
+                team_selection_type: game.team_selection_type,
+                external_opponent: game.external_opponent,
+                tf_kit_color: game.tf_kit_color,
                 votingOpen,
                 votingFinalized,
                 votingEnds: game.motm_voting_ends
@@ -3203,7 +3258,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             redTeam,
             blueTeam,
             motmNominees,
-            nextGame
+            nextGame,
+            seriesScoreline
         });
         
     } catch (error) {
@@ -3250,6 +3306,20 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             ? venuePhotoMap[game.venue_name] 
             : game.venue_photo;
         
+        // Get series scoreline if applicable
+        let seriesScoreline = null;
+        if (game.series_id) {
+            try {
+                const scoreResult = await pool.query(
+                    'SELECT series_name, series_type, red_wins, blue_wins, draws FROM game_series WHERE id = $1',
+                    [game.series_id]
+                );
+                if (scoreResult.rows.length > 0) {
+                    seriesScoreline = scoreResult.rows[0];
+                }
+            } catch (e) { /* non-critical */ }
+        }
+        
         res.json({
             id: game.id,
             game_url: game.game_url,
@@ -3266,9 +3336,11 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             teams_confirmed: game.teams_confirmed,
             team_selection_type: game.team_selection_type,
             external_opponent: game.external_opponent,
+            tf_kit_color: game.tf_kit_color,
             winning_team: game.winning_team,
             motm_voting_ends: game.motm_voting_ends,
-            motm_winner_id: game.motm_winner_id
+            motm_winner_id: game.motm_winner_id,
+            seriesScoreline
         });
         
     } catch (error) {
