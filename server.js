@@ -277,15 +277,77 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
 
 app.get('/api/players', authenticateToken, async (req, res) => {
     try {
+        const { timeRange } = req.query;
+        
+        // Calculate date ranges based on timeRange
+        let dateFilter = '';
+        if (timeRange === 'last3months') {
+            dateFilter = `AND g.game_date >= NOW() - INTERVAL '3 months'`;
+        } else if (timeRange === 'calendaryear') {
+            dateFilter = `AND g.game_date >= DATE_TRUNC('year', NOW())`;
+        }
+        
         const result = await pool.query(`
-            SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
-                   p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
-                   c.balance as credits,
-                   p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
-                   p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
-                   p.goalkeeper_rating,
-                   (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
-                    FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
+            SELECT 
+                p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
+                p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
+                c.balance as credits,
+                p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
+                p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
+                p.goalkeeper_rating,
+                (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
+                 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
+                
+                -- Last 3 months stats
+                (SELECT COUNT(DISTINCT r.game_id)
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = p.id 
+                 AND r.status = 'confirmed'
+                 AND g.game_completed = TRUE
+                 AND g.game_date >= NOW() - INTERVAL '3 months') as apps_3m,
+                
+                (SELECT COUNT(*)
+                 FROM motm_winners mw
+                 JOIN games g ON g.id = mw.game_id
+                 WHERE mw.player_id = p.id
+                 AND g.game_date >= NOW() - INTERVAL '3 months') as motm_3m,
+                
+                (SELECT COUNT(DISTINCT r.game_id)
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 JOIN team_assignments ta ON ta.registration_id = r.id
+                 WHERE r.player_id = p.id
+                 AND r.status = 'confirmed'
+                 AND g.game_completed = TRUE
+                 AND g.winning_team = ta.team_color
+                 AND g.game_date >= NOW() - INTERVAL '3 months') as wins_3m,
+                
+                -- Calendar year stats
+                (SELECT COUNT(DISTINCT r.game_id)
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = p.id 
+                 AND r.status = 'confirmed'
+                 AND g.game_completed = TRUE
+                 AND g.game_date >= DATE_TRUNC('year', NOW())) as apps_year,
+                
+                (SELECT COUNT(*)
+                 FROM motm_winners mw
+                 JOIN games g ON g.id = mw.game_id
+                 WHERE mw.player_id = p.id
+                 AND g.game_date >= DATE_TRUNC('year', NOW())) as motm_year,
+                
+                (SELECT COUNT(DISTINCT r.game_id)
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 JOIN team_assignments ta ON ta.registration_id = r.id
+                 WHERE r.player_id = p.id
+                 AND r.status = 'confirmed'
+                 AND g.game_completed = TRUE
+                 AND g.winning_team = ta.team_color
+                 AND g.game_date >= DATE_TRUNC('year', NOW())) as wins_year
+                
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
             ORDER BY p.squad_number NULLS LAST, p.full_name
@@ -2746,7 +2808,7 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
                 COUNT(v.id) as vote_count
             FROM motm_nominees mn
             JOIN players p ON p.id = mn.player_id
-            LEFT JOIN motm_votes v ON v.nominee_id = mn.id
+            LEFT JOIN motm_votes v ON v.motm_nominee_id = mn.id
             WHERE mn.game_id = $1
             GROUP BY p.id, p.full_name, p.alias, p.squad_number
             ORDER BY vote_count DESC
@@ -3091,6 +3153,77 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin,
     } catch (error) {
         console.error('Add player error:', error);
         res.status(500).json({ error: 'Failed to add player' });
+    }
+});
+
+// Add player with custom discount (admin)
+app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { playerId, customAmount, position } = req.body;
+        
+        // Check if game is locked by this admin
+        const lockCheck = await pool.query(
+            'SELECT locked_by FROM games WHERE id = $1 AND player_editing_locked = TRUE',
+            [gameId]
+        );
+        
+        if (lockCheck.rows.length === 0 || lockCheck.rows[0].locked_by !== req.user.playerId) {
+            return res.status(403).json({ error: 'Game must be locked by you to edit players' });
+        }
+        
+        // Check if player already registered
+        const existingReg = await pool.query(
+            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+            [gameId, playerId]
+        );
+        
+        if (existingReg.rows.length > 0) {
+            return res.status(400).json({ error: 'Player already registered' });
+        }
+        
+        // Get player credits
+        const creditResult = await pool.query(
+            'SELECT balance FROM credits WHERE player_id = $1',
+            [playerId]
+        );
+        
+        if (creditResult.rows.length === 0) {
+            return res.status(400).json({ error: 'Player has no credits account' });
+        }
+        
+        const currentBalance = parseFloat(creditResult.rows[0].balance);
+        const customCharge = parseFloat(customAmount);
+        
+        if (currentBalance < customCharge) {
+            return res.status(400).json({ error: `Player only has £${currentBalance.toFixed(2)} but custom charge is £${customCharge.toFixed(2)}` });
+        }
+        
+        // Deduct custom amount from player credits
+        await pool.query(
+            'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+            [customCharge, playerId]
+        );
+        
+        // Record transaction
+        await pool.query(
+            `INSERT INTO credit_transactions (player_id, amount, type, description)
+             VALUES ($1, $2, $3, $4)`,
+            [playerId, -customCharge, 'game_fee', `Game registration (custom charge: £${customCharge.toFixed(2)})`]
+        );
+        
+        // Add player
+        await pool.query(
+            `INSERT INTO registrations (game_id, player_id, status, position_preference)
+             VALUES ($1, $2, 'confirmed', $3)`,
+            [gameId, playerId, position || 'outfield']
+        );
+        
+        res.json({ message: 'Player added with custom charge' });
+        
+    } catch (error) {
+        console.error('Add player with discount error:', error);
+        res.status(500).json({ error: 'Failed to add player with discount' });
     }
 });
 
