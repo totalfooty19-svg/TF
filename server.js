@@ -532,7 +532,18 @@ app.get('/api/players', authenticateToken, async (req, res) => {
             ORDER BY p.squad_number NULLS LAST, p.full_name
         `);
         
-        res.json(result.rows);
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        
+        if (isAdmin) {
+            res.json(result.rows);
+        } else {
+            // Strip sensitive fields for non-admin users
+            const safeRows = result.rows.map(p => {
+                const { phone, email, credits, is_clm_admin, is_organiser, ...safe } = p;
+                return safe;
+            });
+            res.json(safeRows);
+        }
     } catch (error) {
         console.error('Error fetching players:', error);
         res.status(500).json({ error: 'Failed to fetch players' });
@@ -3616,15 +3627,28 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             console.log(`Updated appearances for ${showedUpPlayerIds.length} players`);
         }
         
-        // Update wins for winning team players
-        if (motmNominees && motmNominees.length > 0) {
-            await client.query(
-                `UPDATE players 
-                 SET total_wins = total_wins + 1
-                 WHERE id = ANY($1)`,
-                [motmNominees]
-            );
-            console.log(`Updated wins for ${motmNominees.length} winning team players`);
+        // Update wins for winning team players (from actual team assignment, NOT motm nominees)
+        if (winningTeam && winningTeam !== 'draw') {
+            const winningTeamName = winningTeam === 'red' ? 'Red' : 'Blue';
+            const winningPlayersResult = await client.query(`
+                SELECT tp.player_id FROM team_players tp
+                JOIN teams t ON t.id = tp.team_id
+                WHERE t.game_id = $1 AND t.team_name = $2
+            `, [gameId, winningTeamName]);
+            
+            const winningPlayerIds = winningPlayersResult.rows.map(r => r.player_id);
+            
+            if (winningPlayerIds.length > 0) {
+                await client.query(
+                    `UPDATE players 
+                     SET total_wins = total_wins + 1
+                     WHERE id = ANY($1)`,
+                    [winningPlayerIds]
+                );
+                console.log(`Updated wins for ${winningPlayerIds.length} winning team players (${winningTeamName})`);
+            }
+        } else if (winningTeam === 'draw') {
+            console.log('Game was a draw - no wins awarded');
         }
         
         // 3. Save discipline records (only for offenses, not on_time)
@@ -4807,31 +4831,31 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 ORDER BY g.game_date DESC LIMIT 50`;
             params = [];
-        } else if (player.is_clm_admin) {
-            query = `SELECT g.*, v.name as venue_name,
-                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
-                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players, motm_p.alias as motm_winner_alias
-                FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
-                WHERE g.exclusivity = 'clm'
-                ORDER BY g.game_date DESC LIMIT 50`;
-            params = [];
-        } else if (player.is_organiser) {
-            query = `SELECT g.*, v.name as venue_name,
-                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
-                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players, motm_p.alias as motm_winner_alias
-                FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
-                WHERE EXISTS (
+        } else {
+            // Build OR conditions for each role the player has
+            const conditions = [];
+            if (player.is_clm_admin) {
+                conditions.push(`g.exclusivity = 'clm'`);
+            }
+            if (player.is_organiser) {
+                conditions.push(`EXISTS (
                     SELECT 1 FROM registrations r 
                     WHERE r.game_id = g.id AND r.player_id = $1 AND r.status = 'confirmed'
-                )
+                )`);
+            }
+            query = `SELECT g.*, v.name as venue_name,
+                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
+                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players, motm_p.alias as motm_winner_alias
+                FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+                WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
-            params = [playerId];
+            params = player.is_organiser ? [playerId] : [];
         }
         
         const result = await pool.query(query, params);
         res.json({
             games: result.rows,
-            managerRole: isFullAdmin ? 'admin' : player.is_clm_admin ? 'clm_admin' : 'organiser',
+            managerRole: isFullAdmin ? 'admin' : (player.is_clm_admin && player.is_organiser) ? 'clm_organiser' : player.is_clm_admin ? 'clm_admin' : 'organiser',
             permissions: {
                 canCreate: isFullAdmin || player.is_clm_admin,
                 canDelete: isFullAdmin || player.is_clm_admin,
