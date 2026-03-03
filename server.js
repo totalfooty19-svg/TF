@@ -1479,6 +1479,19 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             game.venue_photo = venuePhotoMap[game.venue_name];
         }
         
+        // Check if current user has a +1 guest on this game
+        if (req.user && req.user.playerId) {
+            try {
+                const guestCheck = await pool.query(
+                    'SELECT id, guest_name FROM game_guests WHERE game_id = $1 AND invited_by = $2',
+                    [req.params.id, req.user.playerId]
+                );
+                game.my_guest = guestCheck.rows.length > 0 ? guestCheck.rows[0] : null;
+            } catch (guestErr) {
+                game.my_guest = null; // Table may not exist yet
+            }
+        }
+        
         res.json(game);
     } catch (error) {
         console.error('Error fetching game:', error);
@@ -3631,39 +3644,41 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         // Get players for each team
         const [redTeamResult, blueTeamResult] = await Promise.all([
             pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, r.position_preference as position
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
                 JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                 WHERE tp.team_id = $1
                 ORDER BY 
                     CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END,
-                    p.full_name
+                    COALESCE(p.alias, p.full_name)
             `, [redTeamId, game.id]),
             pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, r.position_preference as position
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
                 JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                 WHERE tp.team_id = $1
                 ORDER BY 
                     CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END,
-                    p.full_name
+                    COALESCE(p.alias, p.full_name)
             `, [blueTeamId, game.id])
         ]);
         
         // Map to format expected by frontend
         const redTeam = redTeamResult.rows.map(p => ({
             id: p.id,
-            name: p.full_name || p.alias,
+            name: p.alias || p.full_name,
             squadNumber: p.squad_number,
+            photo_url: p.photo_url,
             isGK: p.position === 'goalkeeper'
         }));
         
         const blueTeam = blueTeamResult.rows.map(p => ({
             id: p.id,
-            name: p.full_name || p.alias,
+            name: p.alias || p.full_name,
             squadNumber: p.squad_number,
+            photo_url: p.photo_url,
             isGK: p.position === 'goalkeeper'
         }));
         
@@ -4061,9 +4076,9 @@ app.get('/api/public/player/:playerId', async (req, res) => {
         res.json({
             player: {
                 id: player.id,
-                alias: player.alias,
-                full_name: player.full_name,
+                alias: player.alias || player.full_name,
                 squad_number: player.squad_number,
+                photo_url: player.photo_url,
                 reliability_tier: player.reliability_tier,
                 total_appearances: appearances,
                 total_wins: wins,
