@@ -354,7 +354,7 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                  JOIN games g ON g.id = r.game_id
                  WHERE r.player_id = p.id 
                  AND r.status = 'confirmed'
-                 AND g.game_completed = TRUE
+                 AND g.game_status = 'completed'
                  AND g.game_date >= NOW() - INTERVAL '3 months') as apps_3m,
                 
                 (SELECT COUNT(*)
@@ -369,7 +369,7 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                  JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                  WHERE r.player_id = p.id
                  AND r.status = 'confirmed'
-                 AND g.game_completed = TRUE
+                 AND g.game_status = 'completed'
                  AND LOWER(g.winning_team) = LOWER(t.team_name)
                  AND g.game_date >= NOW() - INTERVAL '3 months') as wins_3m,
                 
@@ -379,7 +379,7 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                  JOIN games g ON g.id = r.game_id
                  WHERE r.player_id = p.id 
                  AND r.status = 'confirmed'
-                 AND g.game_completed = TRUE
+                 AND g.game_status = 'completed'
                  AND g.game_date >= DATE_TRUNC('year', NOW())) as apps_year,
                 
                 (SELECT COUNT(*)
@@ -394,7 +394,7 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                  JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                  WHERE r.player_id = p.id
                  AND r.status = 'confirmed'
-                 AND g.game_completed = TRUE
+                 AND g.game_status = 'completed'
                  AND LOWER(g.winning_team) = LOWER(t.team_name)
                  AND g.game_date >= DATE_TRUNC('year', NOW())) as wins_year
                 
@@ -2493,7 +2493,7 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
         const gameResult = await pool.query('SELECT series_id, team_selection_type FROM games WHERE id = $1', [gameId]);
         const game = gameResult.rows[0];
         
-        if ((game.team_selection_type === 'fixed_draft' || game.team_selection_type === 'draft_memory') && game.series_id) {
+        if ((game.team_selection_type === 'fixed_draft' || game.team_selection_type === 'draft_memory' || game.team_selection_type === 'vs_external') && game.series_id) {
             // Save fixed team assignments for the series
             for (const playerId of redTeam) {
                 await pool.query(`
@@ -2564,6 +2564,23 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
     } catch (error) {
         console.error('Save manual teams error:', error);
         res.status(500).json({ error: 'Failed to save manual teams' });
+    }
+});
+
+// Confirm game (mark as confirmed without needing team generation)
+app.post('/api/admin/games/:gameId/confirm-game', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        await pool.query(
+            "UPDATE games SET game_status = 'confirmed', teams_confirmed = true WHERE id = $1",
+            [gameId]
+        );
+        
+        res.json({ message: 'Game confirmed' });
+    } catch (error) {
+        console.error('Confirm game error:', error);
+        res.status(500).json({ error: 'Failed to confirm game' });
     }
 });
 
@@ -2727,7 +2744,7 @@ app.post('/api/admin/games/:gameId/start-motm', authenticateToken, requireAdmin,
         const votingEnds = new Date(Date.now() + 24 * 60 * 60 * 1000);
         
         await pool.query(
-            `UPDATE games SET motm_voting_open = true, motm_voting_ends_at = $1 WHERE id = $2`,
+            `UPDATE games SET motm_voting_ends = $1 WHERE id = $2`,
             [votingEnds, gameId]
         );
         
@@ -2761,12 +2778,12 @@ app.post('/api/games/:gameId/vote-motm', authenticateToken, async (req, res) => 
         
         // Check if voting is open
         const gameResult = await pool.query(
-            'SELECT motm_voting_open, motm_voting_ends_at FROM games WHERE id = $1',
+            'SELECT motm_voting_ends FROM games WHERE id = $1',
             [gameId]
         );
         
         const game = gameResult.rows[0];
-        if (!game.motm_voting_open || new Date() > new Date(game.motm_voting_ends_at)) {
+        if (!game.motm_voting_ends || new Date() > new Date(game.motm_voting_ends)) {
             return res.status(400).json({ error: 'Voting is closed' });
         }
         
@@ -2941,7 +2958,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, a
         await client.query(
             `UPDATE games 
              SET winning_team = $1, 
-                 game_completed = TRUE, 
                  game_status = 'completed',
                  motm_voting_ends = NOW() + INTERVAL '24 hours'
              WHERE id = $2`,
