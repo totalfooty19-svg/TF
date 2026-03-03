@@ -550,6 +550,198 @@ app.get('/api/players', authenticateToken, async (req, res) => {
     }
 });
 
+// ==========================================
+// ADMIN PLAYERS GRID — all data for manage-players.html
+// ==========================================
+app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT 
+                p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
+                p.reliability_tier,
+                p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
+                p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
+                p.goalkeeper_rating,
+                p.is_clm_admin, p.is_organiser,
+                c.balance as credits,
+
+                -- Badges with IDs
+                (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
+                 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
+
+                -- GAME STATS: all time
+                p.total_appearances, p.total_wins, p.motm_wins,
+
+                -- GAME STATS: last 3 months
+                (SELECT COUNT(DISTINCT r.game_id)
+                 FROM registrations r JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = p.id AND r.status = 'confirmed'
+                 AND g.game_status = 'completed'
+                 AND g.game_date >= NOW() - INTERVAL '3 months') as apps_3m,
+
+                (SELECT COUNT(*) FROM games g WHERE g.motm_winner_id = p.id
+                 AND g.game_status = 'completed'
+                 AND g.game_date >= NOW() - INTERVAL '3 months') as motm_3m,
+
+                (SELECT COUNT(DISTINCT r.game_id)
+                 FROM registrations r JOIN games g ON g.id = r.game_id
+                 JOIN team_players tp ON tp.player_id = r.player_id
+                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                 WHERE r.player_id = p.id AND r.status = 'confirmed'
+                 AND g.game_status = 'completed'
+                 AND LOWER(g.winning_team) = LOWER(t.team_name)
+                 AND g.game_date >= NOW() - INTERVAL '3 months') as wins_3m,
+
+                -- GAME STATS: calendar year
+                (SELECT COUNT(DISTINCT r.game_id)
+                 FROM registrations r JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = p.id AND r.status = 'confirmed'
+                 AND g.game_status = 'completed'
+                 AND g.game_date >= DATE_TRUNC('year', NOW())) as apps_year,
+
+                (SELECT COUNT(*) FROM games g WHERE g.motm_winner_id = p.id
+                 AND g.game_status = 'completed'
+                 AND g.game_date >= DATE_TRUNC('year', NOW())) as motm_year,
+
+                (SELECT COUNT(DISTINCT r.game_id)
+                 FROM registrations r JOIN games g ON g.id = r.game_id
+                 JOIN team_players tp ON tp.player_id = r.player_id
+                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                 WHERE r.player_id = p.id AND r.status = 'confirmed'
+                 AND g.game_status = 'completed'
+                 AND LOWER(g.winning_team) = LOWER(t.team_name)
+                 AND g.game_date >= DATE_TRUNC('year', NOW())) as wins_year,
+
+                -- FINANCIAL: all time
+                COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'admin_adjustment' AND ct.amount > 0), 0) as topped_up,
+
+                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'game_fee'), 0) as spent,
+
+                (SELECT COUNT(*) FROM game_guests gg WHERE gg.invited_by = p.id) as guests_invited,
+
+                (SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id) as players_referred,
+
+                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
+                 JOIN players ref ON ct.player_id = ref.id
+                 WHERE ref.referred_by = p.id AND ct.type = 'game_fee'), 0) as referred_spend,
+
+                -- CLM REVENUE per player: their fees at CLM games + their guests' fees at CLM games
+                COALESCE((SELECT SUM(g.cost_per_player) FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = p.id AND r.status = 'confirmed'
+                 AND g.exclusivity = 'clm' AND g.game_status = 'completed'), 0)
+                +
+                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg
+                 JOIN games g ON g.id = gg.game_id
+                 WHERE gg.invited_by = p.id AND g.exclusivity = 'clm'), 0) as clm_revenue,
+
+                -- FINANCIAL: last 3 months
+                COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'admin_adjustment' AND ct.amount > 0
+                 AND ct.created_at >= NOW() - INTERVAL '3 months'), 0) as topped_up_3m,
+
+                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'game_fee'
+                 AND ct.created_at >= NOW() - INTERVAL '3 months'), 0) as spent_3m,
+
+                (SELECT COUNT(*) FROM game_guests gg
+                 JOIN games g ON g.id = gg.game_id
+                 WHERE gg.invited_by = p.id
+                 AND g.game_date >= NOW() - INTERVAL '3 months') as guests_invited_3m,
+
+                (SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id
+                 AND ref.created_at >= NOW() - INTERVAL '3 months') as players_referred_3m,
+
+                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
+                 JOIN players ref ON ct.player_id = ref.id
+                 WHERE ref.referred_by = p.id AND ct.type = 'game_fee'
+                 AND ct.created_at >= NOW() - INTERVAL '3 months'), 0) as referred_spend_3m,
+
+                COALESCE((SELECT SUM(g.cost_per_player) FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = p.id AND r.status = 'confirmed'
+                 AND g.exclusivity = 'clm' AND g.game_status = 'completed'
+                 AND g.game_date >= NOW() - INTERVAL '3 months'), 0)
+                +
+                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg
+                 JOIN games g ON g.id = gg.game_id
+                 WHERE gg.invited_by = p.id AND g.exclusivity = 'clm'
+                 AND g.game_date >= NOW() - INTERVAL '3 months'), 0) as clm_revenue_3m,
+
+                -- FINANCIAL: calendar year
+                COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'admin_adjustment' AND ct.amount > 0
+                 AND ct.created_at >= DATE_TRUNC('year', NOW())), 0) as topped_up_year,
+
+                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'game_fee'
+                 AND ct.created_at >= DATE_TRUNC('year', NOW())), 0) as spent_year,
+
+                (SELECT COUNT(*) FROM game_guests gg
+                 JOIN games g ON g.id = gg.game_id
+                 WHERE gg.invited_by = p.id
+                 AND g.game_date >= DATE_TRUNC('year', NOW())) as guests_invited_year,
+
+                (SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id
+                 AND ref.created_at >= DATE_TRUNC('year', NOW())) as players_referred_year,
+
+                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
+                 JOIN players ref ON ct.player_id = ref.id
+                 WHERE ref.referred_by = p.id AND ct.type = 'game_fee'
+                 AND ct.created_at >= DATE_TRUNC('year', NOW())), 0) as referred_spend_year,
+
+                COALESCE((SELECT SUM(g.cost_per_player) FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = p.id AND r.status = 'confirmed'
+                 AND g.exclusivity = 'clm' AND g.game_status = 'completed'
+                 AND g.game_date >= DATE_TRUNC('year', NOW())), 0)
+                +
+                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg
+                 JOIN games g ON g.id = gg.game_id
+                 WHERE gg.invited_by = p.id AND g.exclusivity = 'clm'
+                 AND g.game_date >= DATE_TRUNC('year', NOW())), 0) as clm_revenue_year
+
+            FROM players p
+            LEFT JOIN credits c ON c.player_id = p.id
+            ORDER BY p.squad_number NULLS LAST, p.full_name
+        `);
+
+        // All badges for the badge matrix headers
+        const badgesResult = await pool.query('SELECT id, name, color, icon FROM badges ORDER BY name');
+
+        // CLM totals (platform-wide) — all time, last 3 months, calendar year
+        const clmTotals = await pool.query(`
+            SELECT
+                COALESCE(SUM(g.cost_per_player * sub.player_count + COALESCE(sub.guest_revenue, 0)), 0) as clm_total,
+                COALESCE(SUM(CASE WHEN g.game_date >= NOW() - INTERVAL '3 months'
+                    THEN g.cost_per_player * sub.player_count + COALESCE(sub.guest_revenue, 0) ELSE 0 END), 0) as clm_total_3m,
+                COALESCE(SUM(CASE WHEN g.game_date >= DATE_TRUNC('year', NOW())
+                    THEN g.cost_per_player * sub.player_count + COALESCE(sub.guest_revenue, 0) ELSE 0 END), 0) as clm_total_year
+            FROM games g
+            JOIN (
+                SELECT r.game_id,
+                    COUNT(*) as player_count,
+                    (SELECT COALESCE(SUM(gg.amount_paid), 0) FROM game_guests gg WHERE gg.game_id = r.game_id) as guest_revenue
+                FROM registrations r
+                WHERE r.status = 'confirmed'
+                GROUP BY r.game_id
+            ) sub ON sub.game_id = g.id
+            WHERE g.exclusivity = 'clm' AND g.game_status = 'completed'
+        `);
+
+        res.json({
+            players: result.rows,
+            allBadges: badgesResult.rows,
+            clmTotals: clmTotals.rows[0] || { clm_total: 0, clm_total_3m: 0, clm_total_year: 0 }
+        });
+    } catch (error) {
+        console.error('Error fetching admin players grid:', error);
+        res.status(500).json({ error: 'Failed to fetch players grid data' });
+    }
+});
+
 app.get('/api/players/:id', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(`
