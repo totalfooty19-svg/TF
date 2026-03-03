@@ -2294,31 +2294,12 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         
         const players = playersResult.rows;
         
-        // Also fetch +1 guests for this game
-        const guestsResult = await pool.query(`
+        // Fetch +1 guests (assigned to teams separately, NOT in algorithm pool)
+        const gameGuests = await pool.query(`
             SELECT g.id as guest_id, g.guest_name, g.overall_rating, g.invited_by
             FROM game_guests g
             WHERE g.game_id = $1
         `, [gameId]);
-        
-        // Merge guests into player pool (as outfield, no preferences)
-        for (const guest of guestsResult.rows) {
-            players.push({
-                reg_id: null,
-                player_id: `guest_${guest.guest_id}`,
-                full_name: guest.guest_name,
-                alias: `${guest.guest_name} (+1)`,
-                squad_number: null,
-                overall_rating: guest.overall_rating || 0,
-                goalkeeper_rating: 0,
-                defending_rating: 0,
-                fitness_rating: 0,
-                position_preference: 'outfield',
-                pairs: [guest.invited_by],  // pair guest with their inviter
-                avoids: [],
-                is_guest: true
-            });
-        }
         
         if (players.length < 2) {
             return res.status(400).json({ error: 'Need at least 2 players to generate teams' });
@@ -2360,6 +2341,80 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         if (goalkeepers.length >= 1) redTeam.push(goalkeepers[0]);
         if (goalkeepers.length >= 2) blueTeam.push(goalkeepers[1]);
         if (goalkeepers.length >= 3) outfield.push(...goalkeepers.slice(2)); // Extra GKs as outfield
+        
+        // PRE-ASSIGN: Parent+Guest pairs before main algorithm
+        // For each guest: assign parent to a team, find closest-rated counterpart
+        // for the other team, add guest to parent's team, find another counterpart.
+        // This keeps teams equal AND guarantees guests play with their inviter.
+        const guestAssignments = [];
+        
+        for (const guest of gameGuests.rows) {
+            const parentIdx = outfield.findIndex(p => p.player_id === guest.invited_by);
+            if (parentIdx === -1) {
+                // Parent might be a GK already assigned - check which team
+                const parentOnRed = redTeam.some(p => p.player_id === guest.invited_by);
+                const parentOnBlue = blueTeam.some(p => p.player_id === guest.invited_by);
+                if (parentOnRed || parentOnBlue) {
+                    const teamName = parentOnRed ? 'Red' : 'Blue';
+                    guestAssignments.push({ guestId: guest.guest_id, teamName });
+                    // Find one counterpart for the guest on the other team
+                    const guestRating = guest.overall_rating || 0;
+                    let bestIdx = -1, bestDiff = Infinity;
+                    for (let i = 0; i < outfield.length; i++) {
+                        const diff = Math.abs((outfield[i].overall_rating || 0) - guestRating);
+                        if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+                    }
+                    if (bestIdx !== -1) {
+                        const cp = outfield.splice(bestIdx, 1)[0];
+                        if (parentOnRed) blueTeam.push(cp); else redTeam.push(cp);
+                    }
+                }
+                continue;
+            }
+            
+            const parent = outfield.splice(parentIdx, 1)[0];
+            
+            // Assign parent to team with lower overall rating
+            const redTotal = redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
+            const blueTotal = blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
+            const parentGoesRed = redTeam.length < blueTeam.length ? true
+                                : blueTeam.length < redTeam.length ? false
+                                : redTotal <= blueTotal;
+            
+            if (parentGoesRed) redTeam.push(parent); else blueTeam.push(parent);
+            
+            // Find closest-rated counterpart for the OTHER team (balances parent)
+            const parentRating = parent.overall_rating || 0;
+            let bestIdx = -1, bestDiff = Infinity;
+            for (let i = 0; i < outfield.length; i++) {
+                const diff = Math.abs((outfield[i].overall_rating || 0) - parentRating);
+                if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+            }
+            if (bestIdx !== -1) {
+                const cp = outfield.splice(bestIdx, 1)[0];
+                if (parentGoesRed) blueTeam.push(cp); else redTeam.push(cp);
+            }
+            
+            // Guest goes on parent's team (tracked for DB update later)
+            guestAssignments.push({
+                guestId: guest.guest_id,
+                teamName: parentGoesRed ? 'Red' : 'Blue'
+            });
+            
+            // Find closest-rated counterpart for OTHER team (balances guest)
+            const guestRating = guest.overall_rating || 0;
+            bestIdx = -1; bestDiff = Infinity;
+            for (let i = 0; i < outfield.length; i++) {
+                const diff = Math.abs((outfield[i].overall_rating || 0) - guestRating);
+                if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+            }
+            if (bestIdx !== -1) {
+                const cp = outfield.splice(bestIdx, 1)[0];
+                if (parentGoesRed) blueTeam.push(cp); else redTeam.push(cp);
+            }
+            
+            console.log(`Guest pair: ${parent.full_name} + ${guest.guest_name} -> ${parentGoesRed ? 'Red' : 'Blue'}`);
+        }
         
         // Helper functions
         const hasHighBeef = (player, team) => {
@@ -2507,33 +2562,27 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         const redTeamId = redResult.rows[0].id;
         const blueTeamId = blueResult.rows[0].id;
         
-        // Add players to teams (skip guests - they go in game_guests.team_name)
+        // Add real players to teams
         for (const player of redTeam) {
-            if (player.is_guest) {
-                await pool.query(
-                    "UPDATE game_guests SET team_name = 'Red' WHERE id = $1",
-                    [player.player_id.replace('guest_', '')]
-                );
-            } else {
-                await pool.query(
-                    'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                    [redTeamId, player.player_id]
-                );
-            }
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [redTeamId, player.player_id]
+            );
         }
         
         for (const player of blueTeam) {
-            if (player.is_guest) {
-                await pool.query(
-                    "UPDATE game_guests SET team_name = 'Blue' WHERE id = $1",
-                    [player.player_id.replace('guest_', '')]
-                );
-            } else {
-                await pool.query(
-                    'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                    [blueTeamId, player.player_id]
-                );
-            }
+            await pool.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [blueTeamId, player.player_id]
+            );
+        }
+        
+        // Assign guests to their pre-determined teams
+        for (const ga of guestAssignments) {
+            await pool.query(
+                'UPDATE game_guests SET team_name = $1 WHERE id = $2',
+                [ga.teamName, ga.guestId]
+            );
         }
         
         // Mark teams as generated
@@ -2551,6 +2600,17 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
             defense: blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
             fitness: blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
         };
+        
+        // Add guest ratings to team stats
+        for (const ga of guestAssignments) {
+            const guest = gameGuests.rows.find(g => g.guest_id === ga.guestId);
+            if (guest) {
+                const rating = guest.overall_rating || 0;
+                if (ga.teamName === 'Red') redStats.overall += rating;
+                else blueStats.overall += rating;
+            }
+        }
+        
         
         res.json({
             message: 'Teams generated successfully',
@@ -2574,6 +2634,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
             })),
             redStats,
             blueStats,
+            guests: guestAssignments.map(ga => { const g = gameGuests.rows.find(r => r.guest_id === ga.guestId); return { id: ga.guestId, name: g ? g.guest_name + " (+1)" : "Guest", team: ga.teamName, overall: g ? g.overall_rating : 0 }; }),
             beefs: Array.from(highBeefs.entries()).map(([playerId, targets]) => ({
                 playerId,
                 targets,
@@ -2900,6 +2961,21 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             await pool.query(
                 'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
                 [blueTeamId, playerId]
+            );
+        }
+        
+        // Auto-assign guests to same team as their inviter
+        const manualGuests = await pool.query(
+            'SELECT id, invited_by FROM game_guests WHERE game_id = $1',
+            [gameId]
+        );
+        for (const guest of manualGuests.rows) {
+            // Check which team the inviter is on
+            const onRed = redTeam.includes(guest.invited_by);
+            const teamName = onRed ? 'Red' : 'Blue';
+            await pool.query(
+                'UPDATE game_guests SET team_name = $1 WHERE id = $2',
+                [teamName, guest.id]
             );
         }
         
