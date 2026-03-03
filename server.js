@@ -563,6 +563,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
                 p.goalkeeper_rating,
                 p.is_clm_admin, p.is_organiser,
+                u.role as user_role,
                 c.balance as credits,
 
                 -- Badges with IDs
@@ -705,6 +706,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
 
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
+            LEFT JOIN users u ON u.id = p.user_id
             ORDER BY p.squad_number NULLS LAST, p.full_name
         `);
 
@@ -5069,7 +5071,23 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
 app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const { playerId } = req.params;
-        const { is_clm_admin, is_organiser } = req.body;
+        const { is_clm_admin, is_organiser, role } = req.body;
+        
+        // Safety: never allow promoting to superadmin via API
+        if (role === 'superadmin') {
+            return res.status(403).json({ error: 'Cannot assign superadmin role via UI' });
+        }
+        // Safety: only allow valid role values
+        if (role !== undefined && role !== 'admin' && role !== 'player') {
+            return res.status(400).json({ error: 'Invalid role. Must be admin or player' });
+        }
+        // Safety: cannot demote yourself
+        if (role !== undefined) {
+            const selfCheck = await pool.query('SELECT user_id FROM players WHERE id = $1', [playerId]);
+            if (selfCheck.rows[0]?.user_id === req.user.userId) {
+                return res.status(403).json({ error: 'Cannot change your own role' });
+            }
+        }
         
         const updates = [];
         const values = [];
@@ -5086,15 +5104,26 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
             idx++;
         }
         
-        if (updates.length === 0) {
-            return res.status(400).json({ error: 'No flags to update' });
+        // Update players table flags
+        if (updates.length > 0) {
+            values.push(playerId);
+            await pool.query(
+                'UPDATE players SET ' + updates.join(', ') + ' WHERE id = $' + idx,
+                values
+            );
         }
         
-        values.push(playerId);
-        await pool.query(
-            'UPDATE players SET ' + updates.join(', ') + ' WHERE id = $' + idx,
-            values
-        );
+        // Update users.role if provided
+        if (role !== undefined) {
+            const userResult = await pool.query('SELECT user_id FROM players WHERE id = $1', [playerId]);
+            if (userResult.rows.length > 0) {
+                await pool.query('UPDATE users SET role = $1 WHERE id = $2', [role, userResult.rows[0].user_id]);
+            }
+        }
+        
+        if (updates.length === 0 && role === undefined) {
+            return res.status(400).json({ error: 'No flags to update' });
+        }
         
         // Auto-grant CLM badge if setting CLM admin
         if (is_clm_admin) {
@@ -5119,7 +5148,8 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
         }
         
         const updated = await pool.query(
-            'SELECT id, alias, full_name, is_clm_admin, is_organiser FROM players WHERE id = $1',
+            `SELECT p.id, p.alias, p.full_name, p.is_clm_admin, p.is_organiser, u.role as user_role 
+             FROM players p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
             [playerId]
         );
         res.json({ message: 'Role flags updated', player: updated.rows[0] });
