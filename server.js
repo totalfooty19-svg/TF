@@ -1195,7 +1195,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                 ${isAdmin ? "OR (g.game_status = 'completed')" : ''}
             )
             ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
-            AND g.status != 'cancelled'
+            AND g.game_status != 'cancelled'
             ${!isAdmin && !hasAllStarBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'allstars')" : ''}
             ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
             ${!isAdmin && !hasMisfitsBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'misfits')" : ''}
@@ -1398,9 +1398,9 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                 const result = await pool.query(
                     `INSERT INTO games (
                         venue_id, game_date, max_players, cost_per_player, format, regularity, 
-                        exclusivity, position_type, game_url, status, series_id, 
+                        exclusivity, position_type, game_url, series_id, 
                         team_selection_type, external_opponent, tf_kit_color, opp_kit_color
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12, $13, $14)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                     RETURNING id`,
                     [
                         venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -1438,9 +1438,9 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
             const result = await pool.query(
                 `INSERT INTO games (
                     venue_id, game_date, max_players, cost_per_player, format, regularity, 
-                    exclusivity, position_type, game_url, status, series_id,
+                    exclusivity, position_type, game_url, series_id,
                     team_selection_type, external_opponent, tf_kit_color, opp_kit_color
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12, $13, $14)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
