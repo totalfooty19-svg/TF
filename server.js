@@ -66,6 +66,87 @@ const requireSuperAdmin = (req, res, next) => {
     next();
 };
 
+// CLM Admin: is_clm_admin flag, only operates on CLM-exclusive games
+const requireCLMAdmin = async (req, res, next) => {
+    try {
+        if (req.user.role === 'admin' || req.user.role === 'superadmin') return next();
+        const result = await pool.query('SELECT is_clm_admin FROM players WHERE id = $1', [req.user.playerId]);
+        if (!result.rows[0]?.is_clm_admin) return res.status(403).json({ error: 'CLM admin access required' });
+        const gameId = req.params.gameId || req.params.id;
+        if (gameId) {
+            const gc = await pool.query('SELECT exclusivity FROM games WHERE id = $1', [gameId]);
+            if (gc.rows.length > 0 && gc.rows[0].exclusivity !== 'clm') {
+                return res.status(403).json({ error: 'CLM admins can only manage CLM games' });
+            }
+        }
+        next();
+    } catch (error) {
+        console.error('CLM admin check error:', error);
+        res.status(500).json({ error: 'Authorization check failed' });
+    }
+};
+
+// Organiser: is_organiser flag, must be registered for the game
+const requireOrganiser = async (req, res, next) => {
+    try {
+        if (req.user.role === 'admin' || req.user.role === 'superadmin') return next();
+        const result = await pool.query('SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]);
+        if (!result.rows[0]?.is_organiser) return res.status(403).json({ error: 'Organiser access required' });
+        const gameId = req.params.gameId || req.params.id;
+        if (gameId) {
+            const rc = await pool.query(
+                "SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'",
+                [gameId, req.user.playerId]
+            );
+            if (rc.rows.length === 0) {
+                return res.status(403).json({ error: 'Organisers can only manage games they are registered for' });
+            }
+        }
+        next();
+    } catch (error) {
+        console.error('Organiser check error:', error);
+        res.status(500).json({ error: 'Authorization check failed' });
+    }
+};
+
+// Either admin, CLM admin (CLM games), or organiser (registered games)
+const requireGameManager = async (req, res, next) => {
+    try {
+        if (req.user.role === 'admin' || req.user.role === 'superadmin') {
+            req.managerRole = 'admin';
+            return next();
+        }
+        const pr = await pool.query('SELECT is_clm_admin, is_organiser FROM players WHERE id = $1', [req.user.playerId]);
+        const player = pr.rows[0];
+        if (!player) return res.status(403).json({ error: 'Access denied' });
+        const gameId = req.params.gameId || req.params.id;
+        if (gameId) {
+            const gc = await pool.query('SELECT exclusivity FROM games WHERE id = $1', [gameId]);
+            const game = gc.rows[0];
+            if (!game) return res.status(404).json({ error: 'Game not found' });
+            if (player.is_clm_admin && game.exclusivity === 'clm') {
+                req.managerRole = 'clm_admin';
+                return next();
+            }
+            if (player.is_organiser) {
+                const rc = await pool.query(
+                    "SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'",
+                    [gameId, req.user.playerId]
+                );
+                if (rc.rows.length > 0) {
+                    req.managerRole = 'organiser';
+                    return next();
+                }
+            }
+        }
+        return res.status(403).json({ error: 'You do not have permission to manage this game' });
+    } catch (error) {
+        console.error('Game manager check error:', error);
+        res.status(500).json({ error: 'Authorization check failed' });
+    }
+};
+
+
 // ==========================================
 // AUTHENTICATION
 // ==========================================
@@ -238,7 +319,9 @@ app.post('/api/auth/login', async (req, res) => {
             `SELECT p.*, c.balance as credits,
              (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
               FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
-             p.referral_code
+             p.referral_code,
+             COALESCE(p.is_clm_admin, false) as is_clm_admin,
+             COALESCE(p.is_organiser, false) as is_organiser
              FROM players p 
              LEFT JOIN credits c ON c.player_id = p.id 
              WHERE p.user_id = $1`,
@@ -248,7 +331,7 @@ app.post('/api/auth/login', async (req, res) => {
         const player = playerResult.rows[0];
 
         const token = jwt.sign(
-            { userId: user.id, playerId: player.id, email: user.email, role: user.role },
+            { userId: user.id, playerId: player.id, email: user.email, role: user.role, isCLMAdmin: player.is_clm_admin || false, isOrganiser: player.is_organiser || false },
             JWT_SECRET,
             { expiresIn: '7d' }
         );
@@ -264,6 +347,8 @@ app.post('/api/auth/login', async (req, res) => {
                 role: user.role,
                 isAdmin: user.role === 'admin' || user.role === 'superadmin',
                 isSuperAdmin: user.role === 'superadmin',
+                isCLMAdmin: player.is_clm_admin || false,
+                isOrganiser: player.is_organiser || false,
                 squadNumber: player.squad_number,
                 phone: player.phone,
                 photoUrl: player.photo_url,
@@ -1418,12 +1503,16 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
     }
 });
 
-app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { 
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
             exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor 
         } = req.body;
+        // CLM admins can only create CLM-exclusive games
+        const isCLMAdminOnly = req.user.role !== 'admin' && req.user.role !== 'superadmin';
+        const gameExclusivity = isCLMAdminOnly ? 'clm' : (exclusivity || 'everyone');
+
         
         const createdGames = [];
         
@@ -1462,7 +1551,7 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                     RETURNING id`,
                     [
                         venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
-                        exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl, 
+                        gameExclusivity, positionType || 'outfield_gk', gameUrl, 
                         seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null
                     ]
                 );
@@ -1502,7 +1591,7 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
-                    exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl,
+                    gameExclusivity, positionType || 'outfield_gk', gameUrl,
                     seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null
                 ]
             );
@@ -2264,7 +2353,7 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
 });
 
 // Generate teams with algorithm
-app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         
@@ -2654,7 +2743,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
 });
 
 // Delete single game with refunds (transaction-protected)
-app.delete('/api/admin/games/:gameId', authenticateToken, requireAdmin, async (req, res) => {
+app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
@@ -2695,7 +2784,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireAdmin, async (r
 });
 
 // Delete entire weekly series with refunds (FUTURE games only, transaction-protected)
-app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireAdmin, async (req, res) => {
+app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireCLMAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
@@ -2808,7 +2897,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
 });
 
 // Update game settings (venue, max players, price)
-app.put('/api/admin/games/:gameId/settings', authenticateToken, requireAdmin, async (req, res) => {
+app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { game_date, venue_id, max_players, cost_per_player } = req.body;
@@ -2877,7 +2966,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireAdmin, as
 });
 
 // Get fixed team assignments for a game's series
-app.get('/api/admin/games/:gameId/fixed-teams', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/games/:gameId/fixed-teams', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         
@@ -2904,7 +2993,7 @@ app.get('/api/admin/games/:gameId/fixed-teams', authenticateToken, requireAdmin,
 });
 
 // Save manual team assignments (for fixed_draft/draft_memory games)
-app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { redTeam, blueTeam } = req.body;
@@ -3004,7 +3093,7 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
 });
 
 // Confirm game (mark as confirmed without needing team generation)
-app.post('/api/admin/games/:gameId/confirm-game', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/confirm-game', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         
@@ -3021,7 +3110,7 @@ app.post('/api/admin/games/:gameId/confirm-game', authenticateToken, requireAdmi
 });
 
 // Confirm teams (saves to database, sets teams_generated = true)
-app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { redTeam, blueTeam } = req.body;
@@ -3098,7 +3187,7 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireAdm
 });
 
 // Get teams for a game (for Complete Game modal)
-app.get('/api/admin/games/:gameId/teams', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         
@@ -3149,7 +3238,7 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireAdmin, async
 // ==========================================
 
 // Start MOTM voting
-app.post('/api/admin/games/:gameId/start-motm', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/start-motm', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { winningTeam, additionalNominees } = req.body;
@@ -3270,7 +3359,7 @@ app.get('/api/games/:gameId/motm-results', authenticateToken, async (req, res) =
 
 // Complete game (post-game process)
 // Unconfirm game / Delete teams
-app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { reason, removedPlayers } = req.body;
@@ -3373,7 +3462,7 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireAdmin, 
     }
 });
 
-app.post('/api/admin/games/:gameId/complete', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameManager, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
@@ -4115,7 +4204,7 @@ app.get('/api/public/player/:playerId', async (req, res) => {
 // ==========================================
 
 // Lock game for player editing
-app.post('/api/admin/games/:gameId/lock', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/lock', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         
@@ -4149,7 +4238,7 @@ app.post('/api/admin/games/:gameId/lock', authenticateToken, requireAdmin, async
 });
 
 // Unlock game
-app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         
@@ -4171,7 +4260,7 @@ app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireAdmin, asy
 });
 
 // Get registered players for a game
-app.get('/api/admin/games/:gameId/players', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         
@@ -4200,7 +4289,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireAdmin, asy
 });
 
 // Add player to game (admin)
-app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { playerId, position } = req.body;
@@ -4269,7 +4358,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin,
 });
 
 // Add player with custom discount (admin)
-app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { playerId, customAmount, position } = req.body;
@@ -4340,7 +4429,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
 });
 
 // Remove player from game (admin)
-app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticateToken, requireAdmin, async (req, res) => {
+app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId, registrationId } = req.params;
         
@@ -4399,7 +4488,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
 });
 
 // Finalize MOTM voting - called manually or by cron job
-app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
         
@@ -4645,6 +4734,95 @@ app.get('/api/admin/referrals', authenticateToken, requireAdmin, async (req, res
 });
 
 // ==========================================
+// ==========================================
+// MANAGE GAMES (scoped for CLM admin / Organiser)
+// ==========================================
+
+app.get('/api/manage/games', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+        const isFullAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        const playerResult = await pool.query('SELECT is_clm_admin, is_organiser FROM players WHERE id = $1', [playerId]);
+        const player = playerResult.rows[0];
+        if (!player) return res.status(403).json({ error: 'Player not found' });
+        if (!isFullAdmin && !player.is_clm_admin && !player.is_organiser) {
+            return res.status(403).json({ error: 'No management access' });
+        }
+        let query, params;
+        if (isFullAdmin) {
+            query = `SELECT g.*, v.name as venue_name,
+                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
+                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+                FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+                ORDER BY g.game_date DESC LIMIT 50`;
+            params = [];
+        } else if (player.is_clm_admin) {
+            query = `SELECT g.*, v.name as venue_name,
+                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
+                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+                FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+                WHERE g.exclusivity = 'clm'
+                ORDER BY g.game_date DESC LIMIT 50`;
+            params = [];
+        } else if (player.is_organiser) {
+            query = `SELECT g.*, v.name as venue_name,
+                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
+                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+                FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+                WHERE EXISTS (SELECT 1 FROM registrations r WHERE r.game_id = g.id AND r.player_id = $1 AND r.status = 'confirmed')
+                ORDER BY g.game_date DESC LIMIT 50`;
+            params = [playerId];
+        }
+        const result = await pool.query(query, params);
+        res.json({
+            games: result.rows,
+            managerRole: isFullAdmin ? 'admin' : player.is_clm_admin ? 'clm_admin' : 'organiser',
+            permissions: {
+                canCreate: isFullAdmin || player.is_clm_admin,
+                canDelete: isFullAdmin || player.is_clm_admin,
+                canChangeSettings: isFullAdmin || player.is_clm_admin,
+                canAddRemovePlayers: isFullAdmin || player.is_clm_admin,
+                canGenerateTeams: true,
+                canComplete: true,
+                canAccessCredits: isFullAdmin,
+                canSendWhatsApp: isFullAdmin
+            }
+        });
+    } catch (error) {
+        console.error('Get manage games error:', error);
+        res.status(500).json({ error: 'Failed to get manageable games' });
+    }
+});
+
+// Superadmin: Toggle CLM admin or Organiser flag
+app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const { is_clm_admin, is_organiser } = req.body;
+        const updates = [];
+        const values = [];
+        let idx = 1;
+        if (is_clm_admin !== undefined) { updates.push('is_clm_admin = $' + idx); values.push(!!is_clm_admin); idx++; }
+        if (is_organiser !== undefined) { updates.push('is_organiser = $' + idx); values.push(!!is_organiser); idx++; }
+        if (updates.length === 0) return res.status(400).json({ error: 'No flags to update' });
+        values.push(playerId);
+        await pool.query('UPDATE players SET ' + updates.join(', ') + ' WHERE id = $' + idx, values);
+        if (is_clm_admin) {
+            const cb = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
+            if (cb.rows.length > 0) await pool.query('INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [playerId, cb.rows[0].id]);
+        }
+        if (is_organiser) {
+            const ob = await pool.query("SELECT id FROM badges WHERE name = 'Organiser'");
+            if (ob.rows.length > 0) await pool.query('INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [playerId, ob.rows[0].id]);
+        }
+        const updated = await pool.query('SELECT id, alias, full_name, is_clm_admin, is_organiser FROM players WHERE id = $1', [playerId]);
+        res.json({ message: 'Role flags updated', player: updated.rows[0] });
+    } catch (error) {
+        console.error('Update role flags error:', error);
+        res.status(500).json({ error: 'Failed to update role flags' });
+    }
+});
+
 // START SERVER
 // ==========================================
 
