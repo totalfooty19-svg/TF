@@ -1665,11 +1665,12 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             );
         }
         
-        // Register player
+        // Register player - store amount_paid for accurate refunds
+        const amountPaid = (status === 'confirmed' || regBackupType === 'confirmed_backup') ? parseFloat(game.cost_per_player) : 0;
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-            [gameId, req.user.playerId, status, positionValue, regBackupType]
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [gameId, req.user.playerId, status, positionValue, regBackupType, amountPaid]
         );
         
         const registrationId = regResult.rows[0].id;
@@ -1810,7 +1811,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         
         // Get the dropping player's registration
         const regResult = await client.query(
-            'SELECT id, status, backup_type, position_preference FROM registrations WHERE game_id = $1 AND player_id = $2',
+            'SELECT id, status, backup_type, position_preference, amount_paid FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
         
@@ -1824,16 +1825,17 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         const wasConfirmedBackup = droppingReg.backup_type === 'confirmed_backup';
         const wasGKOnly = droppingReg.position_preference?.trim().toUpperCase() === 'GK';
         
-        // Refund if they paid (confirmed players or confirmed backups)
-        if (wasConfirmed || wasConfirmedBackup) {
+        // Refund what they actually paid (not current game price)
+        const refundAmount = parseFloat(droppingReg.amount_paid || cost);
+        if ((wasConfirmed || wasConfirmedBackup) && refundAmount > 0) {
             await client.query(
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                [cost, req.user.playerId]
+                [refundAmount, req.user.playerId]
             );
             
             await client.query(
                 'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [req.user.playerId, cost, 'refund', `Dropped out of game - refund`]
+                [req.user.playerId, refundAmount, 'refund', `Dropped out of game - \u00a3${refundAmount.toFixed(2)} refund`]
             );
         }
         
@@ -1875,41 +1877,72 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
                 }
             }
             
-            // Promote the backup player
+            // Promote the backup player (with credit check)
             if (promotedPlayer) {
-                await client.query(
-                    `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
-                    [promotedPlayer.id]
-                );
+                let canPromote = true;
                 
-                // If they weren't a confirmed_backup, charge them now
+                // If not a confirmed_backup, check they can afford it first
                 if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                    await client.query(
-                        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                        [cost, promotedPlayer.player_id]
+                    const promoCredit = await client.query(
+                        'SELECT balance FROM credits WHERE player_id = $1',
+                        [promotedPlayer.player_id]
                     );
-                    
-                    await client.query(
-                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                        [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
-                    );
+                    if (promoCredit.rows.length === 0 || parseFloat(promoCredit.rows[0].balance) < cost) {
+                        canPromote = false;
+                    }
                 }
                 
-                // Create notification for promoted player
-                await client.query(
-                    `INSERT INTO notifications (player_id, type, message, game_id)
-                     VALUES ($1, 'backup_promoted', $2, $3)`,
-                    [promotedPlayer.player_id, 
-                     `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
-                     gameId]
-                );
+                if (canPromote) {
+                    await client.query(
+                        `UPDATE registrations SET status = 'confirmed', backup_type = NULL, amount_paid = $2 WHERE id = $1`,
+                        [promotedPlayer.id, cost]
+                    );
+                    
+                    // If they weren't a confirmed_backup, charge them now
+                    if (promotedPlayer.backup_type !== 'confirmed_backup') {
+                        await client.query(
+                            'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+                            [cost, promotedPlayer.player_id]
+                        );
+                        
+                        await client.query(
+                            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                            [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
+                        );
+                    } else {
+                        // Confirmed backup already paid - record their amount_paid
+                        await client.query(
+                            'UPDATE registrations SET amount_paid = $2 WHERE id = $1',
+                            [promotedPlayer.id, cost]
+                        );
+                    }
+                    
+                    // Notify promoted player
+                    await client.query(
+                        `INSERT INTO notifications (player_id, type, message, game_id)
+                         VALUES ($1, 'backup_promoted', $2, $3)`,
+                        [promotedPlayer.player_id, 
+                         `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
+                         gameId]
+                    );
+                } else {
+                    // Can't afford promotion - notify them
+                    await client.query(
+                        `INSERT INTO notifications (player_id, type, message, game_id)
+                         VALUES ($1, 'backup_spot_available', $2, $3)`,
+                        [promotedPlayer.player_id,
+                         `A spot opened up but you don't have enough credits (£${cost.toFixed(2)} required). Top up to register.`,
+                         gameId]
+                    );
+                    promotedPlayer = null;
+                }
             }
         }
         
         await client.query('COMMIT');
         
         let message = wasConfirmed || wasConfirmedBackup 
-            ? `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.`
+            ? `Successfully dropped out. £${refundAmount.toFixed(2)} refunded to your balance.`
             : 'Successfully removed from backup list.';
             
         if (promotedPlayer) {
@@ -2270,120 +2303,154 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
     }
 });
 
-// Delete single game with refunds
+// Delete single game with refunds (transactional, includes confirmed_backups)
 app.delete('/api/admin/games/:gameId', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
         const { gameId } = req.params;
         
-        // Get all registrations for this game
-        const registrations = await pool.query(
-            'SELECT player_id, status FROM registrations WHERE game_id = $1 AND status = $2',
-            [gameId, 'confirmed']
+        await client.query('BEGIN');
+        
+        // Get ALL registrations that paid (confirmed + confirmed_backup)
+        const registrations = await client.query(
+            `SELECT player_id, status, backup_type, amount_paid 
+             FROM registrations WHERE game_id = $1 
+             AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
+            [gameId]
         );
         
-        // Get game cost
-        const gameResult = await pool.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
-        const cost = parseFloat(gameResult.rows[0]?.cost_per_player || 0);
+        // Get game cost as fallback for old registrations without amount_paid
+        const gameResult = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
+        const fallbackCost = parseFloat(gameResult.rows[0]?.cost_per_player || 0);
         
-        // Refund all registered players
+        // Refund all players who paid
+        let totalRefunded = 0;
         for (const reg of registrations.rows) {
-            await pool.query(
-                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                [cost, reg.player_id]
-            );
-            
-            await pool.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [reg.player_id, cost, 'refund', `Game cancelled - refund for ${cost}`]
-            );
+            const refundAmt = parseFloat(reg.amount_paid || fallbackCost);
+            if (refundAmt > 0) {
+                await client.query(
+                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                    [refundAmt, reg.player_id]
+                );
+                
+                await client.query(
+                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                    [reg.player_id, refundAmt, 'refund', `Game cancelled - £${refundAmt.toFixed(2)} refund`]
+                );
+                totalRefunded++;
+            }
         }
         
         // Delete the game (cascade will delete registrations)
-        await pool.query('DELETE FROM games WHERE id = $1', [gameId]);
+        await client.query('DELETE FROM games WHERE id = $1', [gameId]);
+        
+        await client.query('COMMIT');
         
         res.json({ 
-            message: `Game deleted. Refunded ${registrations.rows.length} players £${cost.toFixed(2)} each.` 
+            message: `Game deleted. Refunded ${totalRefunded} players.` 
         });
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Delete game error:', error);
         res.status(500).json({ error: 'Failed to delete game' });
+    } finally {
+        client.release();
     }
 });
 
 // Delete entire weekly series with refunds (FUTURE games only)
 app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
         const { gameId } = req.params;
         
         // Get the game's series_id
-        const gameResult = await pool.query(
+        const gameResult = await client.query(
             'SELECT series_id, cost_per_player FROM games WHERE id = $1',
             [gameId]
         );
         
         if (gameResult.rows.length === 0) {
+            client.release();
             return res.status(404).json({ error: 'Game not found' });
         }
         
         const game = gameResult.rows[0];
         
         if (!game.series_id) {
+            client.release();
             return res.status(400).json({ error: 'This is not part of a weekly series' });
         }
         
-        // Extract base series ID (e.g., "TF0001" from "TF0001-05")
-        const baseSeriesId = game.series_id.split('-')[0];
+        // Get series name for response message
+        const seriesNameResult = await client.query(
+            'SELECT series_name FROM game_series WHERE id = $1',
+            [game.series_id]
+        );
+        const seriesName = seriesNameResult.rows[0]?.series_name || 'Unknown';
         
-        // Find all FUTURE games in this series
-        const seriesGames = await pool.query(`
+        // Find all FUTURE games in this series (same series UUID)
+        const seriesGames = await client.query(`
             SELECT id FROM games 
-            WHERE series_id LIKE $1
+            WHERE series_id = $1
             AND game_date > CURRENT_TIMESTAMP
-        `, [`${baseSeriesId}%`]);
+        `, [game.series_id]);
         
         const gameIds = seriesGames.rows.map(g => g.id);
         
         if (gameIds.length === 0) {
+            client.release();
             return res.json({ message: 'No future games to delete in this series' });
         }
+        
+        await client.query('BEGIN');
         
         let totalRefunded = 0;
         const cost = parseFloat(game.cost_per_player);
         
         // Refund all registrations for FUTURE games only
         for (const gid of gameIds) {
-            const registrations = await pool.query(
-                'SELECT player_id FROM registrations WHERE game_id = $1 AND status = $2',
-                [gid, 'confirmed']
+            const registrations = await client.query(
+                `SELECT player_id, amount_paid FROM registrations WHERE game_id = $1 
+                 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
+                [gid]
             );
             
             for (const reg of registrations.rows) {
-                await pool.query(
-                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                    [cost, reg.player_id]
-                );
-                
-                await pool.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [reg.player_id, cost, 'refund', `Series ${baseSeriesId} cancelled - refund`]
-                );
-                
-                totalRefunded++;
+                const refundAmt = parseFloat(reg.amount_paid || cost);
+                if (refundAmt > 0) {
+                    await client.query(
+                        'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                        [refundAmt, reg.player_id]
+                    );
+                    
+                    await client.query(
+                        `INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)`,
+                        [reg.player_id, refundAmt, 'refund', `Series ${seriesName} cancelled - refund`]
+                    );
+                    
+                    totalRefunded++;
+                }
             }
         }
         
         // Delete only FUTURE games in series
-        await pool.query(
+        await client.query(
             'DELETE FROM games WHERE id = ANY($1::uuid[])',
             [gameIds]
         );
         
+        await client.query('COMMIT');
+        
         res.json({ 
-            message: `Deleted ${gameIds.length} future games from series ${baseSeriesId}. Refunded ${totalRefunded} registrations. Past games preserved.` 
+            message: `Deleted ${gameIds.length} future games from series ${seriesName}. Refunded ${totalRefunded} registrations. Past games preserved.` 
         });
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Delete series error:', error);
         res.status(500).json({ error: 'Failed to delete series' });
+    } finally {
+        client.release();
     }
 });
 
@@ -3790,11 +3857,11 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin,
             [playerId, -cost, 'game_fee', `Admin added to game ${gameId}`]
         );
         
-        // Add player
+        // Add player with amount_paid
         await pool.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference)
-             VALUES ($1, $2, 'confirmed', $3)`,
-            [gameId, playerId, position || 'outfield']
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
+             VALUES ($1, $2, 'confirmed', $3, $4)`,
+            [gameId, playerId, position || 'outfield', cost]
         );
         
         res.json({ message: 'Player added successfully' });
@@ -3861,11 +3928,11 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             [playerId, -customCharge, 'game_fee', `Game registration (custom charge: £${customCharge.toFixed(2)})`]
         );
         
-        // Add player
+        // Add player with custom amount_paid
         await pool.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference)
-             VALUES ($1, $2, 'confirmed', $3)`,
-            [gameId, playerId, position || 'outfield']
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
+             VALUES ($1, $2, 'confirmed', $3, $4)`,
+            [gameId, playerId, position || 'outfield', customCharge]
         );
         
         res.json({ message: 'Player added with custom charge' });
@@ -3893,7 +3960,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         
         // Get registration details
         const regResult = await pool.query(
-            'SELECT player_id FROM registrations WHERE id = $1 AND game_id = $2',
+            'SELECT player_id, amount_paid FROM registrations WHERE id = $1 AND game_id = $2',
             [registrationId, gameId]
         );
         
@@ -3902,24 +3969,20 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         }
         
         const playerId = regResult.rows[0].player_id;
+        const refundAmt = parseFloat(regResult.rows[0].amount_paid || 0);
         
-        // Get game cost
-        const gameResult = await pool.query(
-            'SELECT cost_per_player FROM games WHERE id = $1',
-            [gameId]
-        );
-        const cost = parseFloat(gameResult.rows[0].cost_per_player);
-        
-        // Refund credits
-        await pool.query(
-            'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-            [cost, playerId]
-        );
-        
-        await pool.query(
-            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-            [playerId, cost, 'refund', `Admin removed from game ${gameId}`]
-        );
+        // Refund what they actually paid
+        if (refundAmt > 0) {
+            await pool.query(
+                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                [refundAmt, playerId]
+            );
+            
+            await pool.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [playerId, refundAmt, 'refund', `Admin removed from game - \u00a3${refundAmt.toFixed(2)} refund`]
+            );
+        }
         
         // Delete registration
         await pool.query(
