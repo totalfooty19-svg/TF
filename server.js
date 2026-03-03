@@ -116,15 +116,73 @@ app.post('/api/auth/register', async (req, res) => {
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
 
-        // Generate referral code
-        const referralCode = crypto.randomBytes(4).toString('hex').toUpperCase();
+        // Generate referral code and store on player + referrals table
+        const referralCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
+        await pool.query(
+            'UPDATE players SET referral_code = $1 WHERE id = $2',
+            [referralCode, playerId]
+        );
         await pool.query(
             'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2)',
             [playerId, referralCode]
         );
         
-        // Auto-assign CLM badge if registered via CLM link
-        if (ref && ref.toLowerCase() === 'clm') {
+        // Process referral: look up ref code to find who referred this player
+        let referrerId = null;
+        let referrerHasCLM = false;
+        if (ref) {
+            try {
+                // Check if ref is a player's referral code
+                const referrerResult = await pool.query(
+                    `SELECT p.id, EXISTS(
+                        SELECT 1 FROM player_badges pb 
+                        JOIN badges b ON b.id = pb.badge_id 
+                        WHERE pb.player_id = p.id AND b.name = 'CLM'
+                    ) as has_clm
+                    FROM players p
+                    WHERE p.referral_code = $1`,
+                    [ref.toUpperCase()]
+                );
+                
+                if (referrerResult.rows.length > 0) {
+                    referrerId = referrerResult.rows[0].id;
+                    referrerHasCLM = referrerResult.rows[0].has_clm;
+                    
+                    await pool.query(
+                        'UPDATE players SET referred_by = $1 WHERE id = $2',
+                        [referrerId, playerId]
+                    );
+                    console.log(`Player ${playerId} referred by ${referrerId}`);
+                } else {
+                    // Also check the referrals table (backward compat)
+                    const legacyRef = await pool.query(
+                        'SELECT referrer_id FROM referrals WHERE referral_code = $1',
+                        [ref.toUpperCase()]
+                    );
+                    if (legacyRef.rows.length > 0) {
+                        referrerId = legacyRef.rows[0].referrer_id;
+                        const clmCheck = await pool.query(
+                            `SELECT 1 FROM player_badges pb 
+                             JOIN badges b ON b.id = pb.badge_id 
+                             WHERE pb.player_id = $1 AND b.name = 'CLM'`,
+                            [referrerId]
+                        );
+                        referrerHasCLM = clmCheck.rows.length > 0;
+                        
+                        await pool.query(
+                            'UPDATE players SET referred_by = $1 WHERE id = $2',
+                            [referrerId, playerId]
+                        );
+                        console.log(`Player ${playerId} referred by ${referrerId} (legacy code)`);
+                    }
+                }
+            } catch (refErr) {
+                console.error('Referral lookup error (non-critical):', refErr.message);
+            }
+        }
+        
+        // Auto-assign CLM badge if referrer has CLM badge, or if ref is literal 'clm'
+        if (referrerHasCLM || (ref && ref.toLowerCase() === 'clm')) {
             try {
                 const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
                 if (clmBadge.rows.length > 0) {
@@ -132,7 +190,7 @@ app.post('/api/auth/register', async (req, res) => {
                         'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
                         [playerId, clmBadge.rows[0].id]
                     );
-                    console.log(`CLM badge assigned to new player ${playerId}`);
+                    console.log('CLM badge assigned to new player ' + playerId);
                 }
             } catch (badgeErr) {
                 console.error('Failed to assign CLM badge:', badgeErr.message);
@@ -180,7 +238,7 @@ app.post('/api/auth/login', async (req, res) => {
             `SELECT p.*, c.balance as credits,
              (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
               FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
-             (SELECT referral_code FROM referrals WHERE referrer_id = p.id LIMIT 1) as referral_code
+             p.referral_code
              FROM players p 
              LEFT JOIN credits c ON c.player_id = p.id 
              WHERE p.user_id = $1`,
@@ -463,7 +521,7 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
         const upcomingResult = await pool.query(`
             SELECT g.id, g.game_date, g.cost_per_player, g.max_players, g.format, g.game_url,
                    v.name as venue_name,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
             FROM registrations r
             JOIN games g ON g.id = r.game_id
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -1182,7 +1240,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name, v.address as venue_address,
                    g.teams_generated,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1) as my_status,
@@ -1246,7 +1304,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    p.full_name as motm_winner_name,
                    p.alias as motm_winner_alias
             FROM games g
@@ -1290,7 +1348,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         const gameResult = await pool.query(`
             SELECT g.*, v.name as venue_name, v.address as venue_address,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -1512,7 +1570,7 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         // Get current player count separately
         const countResult = await client.query(
-            "SELECT COUNT(*) as current_players FROM registrations WHERE game_id = $1 AND status = 'confirmed'",
+            "SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS current_players",
             [gameId]
         );
         game.current_players = parseInt(countResult.rows[0].current_players);
@@ -1665,12 +1723,11 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             );
         }
         
-        // Register player - store amount_paid for accurate refunds
-        const amountPaid = (status === 'confirmed' || regBackupType === 'confirmed_backup') ? parseFloat(game.cost_per_player) : 0;
+        // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-            [gameId, req.user.playerId, status, positionValue, regBackupType, amountPaid]
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+            [gameId, req.user.playerId, status, positionValue, regBackupType]
         );
         
         const registrationId = regResult.rows[0].id;
@@ -1717,6 +1774,208 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Registration error:', error);
         res.status(500).json({ error: 'Registration failed' });
+    } finally {
+        client.release();
+    }
+});
+
+
+// ==========================================
+// GUEST +1 SYSTEM
+// ==========================================
+
+// Add a +1 guest to a game
+app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        const { guestName } = req.body;
+        const playerId = req.user.playerId;
+
+        if (!guestName || guestName.trim().length < 2) {
+            client.release();
+            return res.status(400).json({ error: "Please provide the guest's name (at least 2 characters)" });
+        }
+
+        await client.query('BEGIN');
+
+        // Check player is registered and confirmed for this game
+        const regCheck = await client.query(
+            "SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'",
+            [gameId, playerId]
+        );
+        if (regCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: 'You must be registered for this game to add a +1' });
+        }
+
+        // Check player hasn't already added a guest to this game
+        const existingGuest = await client.query(
+            'SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2',
+            [gameId, playerId]
+        );
+        if (existingGuest.rows.length > 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: 'You have already added a +1 to this game' });
+        }
+
+        // Lock game row and check capacity
+        const gameLock = await client.query(
+            'SELECT max_players, cost_per_player, player_editing_locked FROM games WHERE id = $1 FOR UPDATE',
+            [gameId]
+        );
+        if (gameLock.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(404).json({ error: 'Game not found' });
+        }
+
+        const game = gameLock.rows[0];
+
+        if (game.player_editing_locked) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(423).json({ error: 'Game is currently being edited by an admin. Please try again shortly.' });
+        }
+
+        // Count current players (confirmed registrations + guests)
+        const countResult = await client.query(
+            `SELECT 
+                (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed') +
+                (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS total_players`,
+            [gameId]
+        );
+        const totalPlayers = parseInt(countResult.rows[0].total_players);
+
+        if (totalPlayers >= parseInt(game.max_players)) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: 'Game is full - no space for a +1' });
+        }
+
+        // Check player has enough credits to pay for guest
+        const cost = parseFloat(game.cost_per_player);
+        const creditResult = await client.query(
+            'SELECT balance FROM credits WHERE player_id = $1',
+            [playerId]
+        );
+        if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < cost) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: `Insufficient credits. You need ${cost.toFixed(2)} to add a +1.` });
+        }
+
+        // Deduct credits from the inviting player
+        await client.query(
+            'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+            [cost, playerId]
+        );
+        await client.query(
+            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+            [playerId, -cost, 'game_fee', `+1 guest (${guestName.trim()}) for game`]
+        );
+
+        // Get player's overall rating, guest gets -1
+        const playerRating = await client.query(
+            'SELECT overall_rating FROM players WHERE id = $1',
+            [playerId]
+        );
+        const guestRating = Math.max(0, (playerRating.rows[0]?.overall_rating || 0) - 1);
+
+        // Insert guest record
+        await client.query(
+            `INSERT INTO game_guests (game_id, invited_by, guest_name, overall_rating, amount_paid)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [gameId, playerId, guestName.trim(), guestRating, cost]
+        );
+
+        // Get player's referral code for the refer-a-friend prompt
+        const refResult = await client.query(
+            'SELECT referral_code FROM players WHERE id = $1',
+            [playerId]
+        );
+        const referralCode = refResult.rows[0]?.referral_code;
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: `${guestName.trim()} has been added as your +1!`,
+            guestRating,
+            amountCharged: cost,
+            referralLink: referralCode ? `https://totalfooty.co.uk/vibecoding/register.html?ref=${referralCode}` : null,
+            referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
+        });
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Add guest error:', error);
+        res.status(500).json({ error: 'Failed to add guest' });
+    } finally {
+        client.release();
+    }
+});
+
+// Remove +1 guest from a game (with refund)
+app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        const playerId = req.user.playerId;
+
+        await client.query('BEGIN');
+
+        // Check game isn't locked or teams generated
+        const gameCheck = await client.query(
+            'SELECT player_editing_locked, teams_generated FROM games WHERE id = $1 FOR UPDATE',
+            [gameId]
+        );
+        if (gameCheck.rows[0]?.player_editing_locked) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(423).json({ error: 'Game is currently being edited by an admin.' });
+        }
+        if (gameCheck.rows[0]?.teams_generated) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: 'Cannot remove guest - teams already generated.' });
+        }
+
+        // Find and delete guest
+        const guestResult = await client.query(
+            'DELETE FROM game_guests WHERE game_id = $1 AND invited_by = $2 RETURNING guest_name, amount_paid',
+            [gameId, playerId]
+        );
+        if (guestResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(404).json({ error: 'No +1 guest found for this game' });
+        }
+
+        const guest = guestResult.rows[0];
+        const refundAmt = parseFloat(guest.amount_paid || 0);
+
+        // Refund the inviting player
+        if (refundAmt > 0) {
+            await client.query(
+                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                [refundAmt, playerId]
+            );
+            await client.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [playerId, refundAmt, 'refund', `+1 guest (${guest.guest_name}) removed - refund`]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: `${guest.guest_name} removed. ${refundAmt.toFixed(2)} refunded to your balance.`
+        });
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Remove guest error:', error);
+        res.status(500).json({ error: 'Failed to remove guest' });
     } finally {
         client.release();
     }
@@ -1811,7 +2070,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         
         // Get the dropping player's registration
         const regResult = await client.query(
-            'SELECT id, status, backup_type, position_preference, amount_paid FROM registrations WHERE game_id = $1 AND player_id = $2',
+            'SELECT id, status, backup_type, position_preference FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
         
@@ -1825,18 +2084,38 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         const wasConfirmedBackup = droppingReg.backup_type === 'confirmed_backup';
         const wasGKOnly = droppingReg.position_preference?.trim().toUpperCase() === 'GK';
         
-        // Refund what they actually paid (not current game price)
-        const refundAmount = parseFloat(droppingReg.amount_paid || cost);
-        if ((wasConfirmed || wasConfirmedBackup) && refundAmount > 0) {
+        // Refund if they paid (confirmed players or confirmed backups)
+        if (wasConfirmed || wasConfirmedBackup) {
             await client.query(
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                [refundAmount, req.user.playerId]
+                [cost, req.user.playerId]
             );
             
             await client.query(
                 'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [req.user.playerId, refundAmount, 'refund', `Dropped out of game - \u00a3${refundAmount.toFixed(2)} refund`]
+                [req.user.playerId, cost, 'refund', `Dropped out of game - refund`]
             );
+        }
+        
+        // Remove guest if this player had a +1, and refund the guest fee
+        const guestCheck = await client.query(
+            'DELETE FROM game_guests WHERE game_id = $1 AND invited_by = $2 RETURNING guest_name, amount_paid',
+            [gameId, req.user.playerId]
+        );
+        let guestRefunded = null;
+        if (guestCheck.rows.length > 0) {
+            const guestRefundAmt = parseFloat(guestCheck.rows[0].amount_paid || 0);
+            if (guestRefundAmt > 0) {
+                await client.query(
+                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                    [guestRefundAmt, req.user.playerId]
+                );
+                await client.query(
+                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                    [req.user.playerId, guestRefundAmt, 'refund', '+1 guest removed - dropout refund']
+                );
+            }
+            guestRefunded = { name: guestCheck.rows[0].guest_name, amount: guestRefundAmt };
         }
         
         // Delete registration (cascade deletes preferences)
@@ -1877,72 +2156,41 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
                 }
             }
             
-            // Promote the backup player (with credit check)
+            // Promote the backup player
             if (promotedPlayer) {
-                let canPromote = true;
+                await client.query(
+                    `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
+                    [promotedPlayer.id]
+                );
                 
-                // If not a confirmed_backup, check they can afford it first
+                // If they weren't a confirmed_backup, charge them now
                 if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                    const promoCredit = await client.query(
-                        'SELECT balance FROM credits WHERE player_id = $1',
-                        [promotedPlayer.player_id]
+                    await client.query(
+                        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+                        [cost, promotedPlayer.player_id]
                     );
-                    if (promoCredit.rows.length === 0 || parseFloat(promoCredit.rows[0].balance) < cost) {
-                        canPromote = false;
-                    }
+                    
+                    await client.query(
+                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                        [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
+                    );
                 }
                 
-                if (canPromote) {
-                    await client.query(
-                        `UPDATE registrations SET status = 'confirmed', backup_type = NULL, amount_paid = $2 WHERE id = $1`,
-                        [promotedPlayer.id, cost]
-                    );
-                    
-                    // If they weren't a confirmed_backup, charge them now
-                    if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                        await client.query(
-                            'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                            [cost, promotedPlayer.player_id]
-                        );
-                        
-                        await client.query(
-                            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                            [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
-                        );
-                    } else {
-                        // Confirmed backup already paid - record their amount_paid
-                        await client.query(
-                            'UPDATE registrations SET amount_paid = $2 WHERE id = $1',
-                            [promotedPlayer.id, cost]
-                        );
-                    }
-                    
-                    // Notify promoted player
-                    await client.query(
-                        `INSERT INTO notifications (player_id, type, message, game_id)
-                         VALUES ($1, 'backup_promoted', $2, $3)`,
-                        [promotedPlayer.player_id, 
-                         `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
-                         gameId]
-                    );
-                } else {
-                    // Can't afford promotion - notify them
-                    await client.query(
-                        `INSERT INTO notifications (player_id, type, message, game_id)
-                         VALUES ($1, 'backup_spot_available', $2, $3)`,
-                        [promotedPlayer.player_id,
-                         `A spot opened up but you don't have enough credits (£${cost.toFixed(2)} required). Top up to register.`,
-                         gameId]
-                    );
-                    promotedPlayer = null;
-                }
+                // Create notification for promoted player
+                await client.query(
+                    `INSERT INTO notifications (player_id, type, message, game_id)
+                     VALUES ($1, 'backup_promoted', $2, $3)`,
+                    [promotedPlayer.player_id, 
+                     `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
+                     gameId]
+                );
             }
         }
         
         await client.query('COMMIT');
         
         let message = wasConfirmed || wasConfirmedBackup 
-            ? `Successfully dropped out. £${refundAmount.toFixed(2)} refunded to your balance.`
+            ? `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.`
             : 'Successfully removed from backup list.';
             
         if (promotedPlayer) {
@@ -2045,6 +2293,32 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         `, [gameId]);
         
         const players = playersResult.rows;
+        
+        // Also fetch +1 guests for this game
+        const guestsResult = await pool.query(`
+            SELECT g.id as guest_id, g.guest_name, g.overall_rating, g.invited_by
+            FROM game_guests g
+            WHERE g.game_id = $1
+        `, [gameId]);
+        
+        // Merge guests into player pool (as outfield, no preferences)
+        for (const guest of guestsResult.rows) {
+            players.push({
+                reg_id: null,
+                player_id: `guest_${guest.guest_id}`,
+                full_name: guest.guest_name,
+                alias: `${guest.guest_name} (+1)`,
+                squad_number: null,
+                overall_rating: guest.overall_rating || 0,
+                goalkeeper_rating: 0,
+                defending_rating: 0,
+                fitness_rating: 0,
+                position_preference: 'outfield',
+                pairs: [guest.invited_by],  // pair guest with their inviter
+                avoids: [],
+                is_guest: true
+            });
+        }
         
         if (players.length < 2) {
             return res.status(400).json({ error: 'Need at least 2 players to generate teams' });
@@ -2214,6 +2488,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         
         // Delete existing teams if any (for re-generation)
         await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+        await pool.query("UPDATE game_guests SET team_name = NULL WHERE game_id = $1", [gameId]);
         
         // Reset confirmation flag (teams need to be re-confirmed after regeneration)
         await pool.query('UPDATE games SET teams_confirmed = FALSE WHERE id = $1', [gameId]);
@@ -2232,19 +2507,33 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
         const redTeamId = redResult.rows[0].id;
         const blueTeamId = blueResult.rows[0].id;
         
-        // Add players to teams
+        // Add players to teams (skip guests - they go in game_guests.team_name)
         for (const player of redTeam) {
-            await pool.query(
-                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                [redTeamId, player.player_id]
-            );
+            if (player.is_guest) {
+                await pool.query(
+                    "UPDATE game_guests SET team_name = 'Red' WHERE id = $1",
+                    [player.player_id.replace('guest_', '')]
+                );
+            } else {
+                await pool.query(
+                    'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                    [redTeamId, player.player_id]
+                );
+            }
         }
         
         for (const player of blueTeam) {
-            await pool.query(
-                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                [blueTeamId, player.player_id]
-            );
+            if (player.is_guest) {
+                await pool.query(
+                    "UPDATE game_guests SET team_name = 'Blue' WHERE id = $1",
+                    [player.player_id.replace('guest_', '')]
+                );
+            } else {
+                await pool.query(
+                    'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                    [blueTeamId, player.player_id]
+                );
+            }
         }
         
         // Mark teams as generated
@@ -2303,52 +2592,38 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireAd
     }
 });
 
-// Delete single game with refunds (transactional, includes confirmed_backups)
+// Delete single game with refunds (transaction-protected)
 app.delete('/api/admin/games/:gameId', authenticateToken, requireAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        
         await client.query('BEGIN');
-        
-        // Get ALL registrations that paid (confirmed + confirmed_backup)
         const registrations = await client.query(
-            `SELECT player_id, status, backup_type, amount_paid 
-             FROM registrations WHERE game_id = $1 
-             AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
+            `SELECT player_id, status, backup_type, amount_paid FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
             [gameId]
         );
-        
-        // Get game cost as fallback for old registrations without amount_paid
         const gameResult = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
         const fallbackCost = parseFloat(gameResult.rows[0]?.cost_per_player || 0);
-        
-        // Refund all players who paid
         let totalRefunded = 0;
         for (const reg of registrations.rows) {
             const refundAmt = parseFloat(reg.amount_paid || fallbackCost);
             if (refundAmt > 0) {
-                await client.query(
-                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                    [refundAmt, reg.player_id]
-                );
-                
-                await client.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [reg.player_id, refundAmt, 'refund', `Game cancelled - £${refundAmt.toFixed(2)} refund`]
-                );
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundAmt, reg.player_id]);
+                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [reg.player_id, refundAmt, 'refund', 'Game cancelled - refund']);
                 totalRefunded++;
             }
         }
-        
-        // Delete the game (cascade will delete registrations)
+        const guests = await client.query('SELECT invited_by, guest_name, amount_paid FROM game_guests WHERE game_id = $1', [gameId]);
+        for (const guest of guests.rows) {
+            const guestRefund = parseFloat(guest.amount_paid || 0);
+            if (guestRefund > 0) {
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [guestRefund, guest.invited_by]);
+                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']);
+            }
+        }
         await client.query('DELETE FROM games WHERE id = $1', [gameId]);
-        
         await client.query('COMMIT');
-        
-        res.json({ 
-            message: `Game deleted. Refunded ${totalRefunded} players.` 
-        });
+        res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Delete game error:', error);
@@ -2358,13 +2633,12 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireAdmin, async (r
     }
 });
 
-// Delete entire weekly series with refunds (FUTURE games only)
+// Delete entire weekly series with refunds (FUTURE games only, transaction-protected)
 app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
         
-        // Get the game's series_id
         const gameResult = await client.query(
             'SELECT series_id, cost_per_player FROM games WHERE id = $1',
             [gameId]
@@ -2382,14 +2656,14 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
             return res.status(400).json({ error: 'This is not part of a weekly series' });
         }
         
-        // Get series name for response message
+        // Get series name for response
         const seriesNameResult = await client.query(
             'SELECT series_name FROM game_series WHERE id = $1',
             [game.series_id]
         );
         const seriesName = seriesNameResult.rows[0]?.series_name || 'Unknown';
         
-        // Find all FUTURE games in this series (same series UUID)
+        // Find all FUTURE games in this series (same UUID, not LIKE)
         const seriesGames = await client.query(`
             SELECT id FROM games 
             WHERE series_id = $1
@@ -2406,16 +2680,16 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
         await client.query('BEGIN');
         
         let totalRefunded = 0;
+        let guestRefunds = 0;
         const cost = parseFloat(game.cost_per_player);
         
-        // Refund all registrations for FUTURE games only
         for (const gid of gameIds) {
+            // Refund all players who paid (confirmed + confirmed_backup)
             const registrations = await client.query(
                 `SELECT player_id, amount_paid FROM registrations WHERE game_id = $1 
                  AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
                 [gid]
             );
-            
             for (const reg of registrations.rows) {
                 const refundAmt = parseFloat(reg.amount_paid || cost);
                 if (refundAmt > 0) {
@@ -2423,18 +2697,36 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
                         'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                         [refundAmt, reg.player_id]
                     );
-                    
                     await client.query(
-                        `INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)`,
-                        [reg.player_id, refundAmt, 'refund', `Series ${seriesName} cancelled - refund`]
+                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                        [reg.player_id, refundAmt, 'refund', 'Series ' + seriesName + ' cancelled - refund']
                     );
-                    
                     totalRefunded++;
+                }
+            }
+            
+            // Refund guest fees to the players who invited them
+            const guests = await client.query(
+                'SELECT invited_by, amount_paid FROM game_guests WHERE game_id = $1',
+                [gid]
+            );
+            for (const guest of guests.rows) {
+                const guestRefund = parseFloat(guest.amount_paid || 0);
+                if (guestRefund > 0) {
+                    await client.query(
+                        'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                        [guestRefund, guest.invited_by]
+                    );
+                    await client.query(
+                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                        [guest.invited_by, guestRefund, 'refund', 'Series ' + seriesName + ' cancelled - +1 guest refund']
+                    );
+                    guestRefunds++;
                 }
             }
         }
         
-        // Delete only FUTURE games in series
+        // Delete only FUTURE games in series (cascade handles registrations + game_guests)
         await client.query(
             'DELETE FROM games WHERE id = ANY($1::uuid[])',
             [gameIds]
@@ -2443,7 +2735,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
         await client.query('COMMIT');
         
         res.json({ 
-            message: `Deleted ${gameIds.length} future games from series ${seriesName}. Refunded ${totalRefunded} registrations. Past games preserved.` 
+            message: 'Deleted ' + gameIds.length + ' future games from series ' + seriesName + '. Refunded ' + totalRefunded + ' registrations and ' + guestRefunds + ' guest fees. Past games preserved.'
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -2581,6 +2873,7 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
         
         // Create/update teams for this specific game
         await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+        await pool.query("UPDATE game_guests SET team_name = NULL WHERE game_id = $1", [gameId]);
         
         const redResult = await pool.query(
             'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
@@ -2975,6 +3268,7 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireAdmin, 
             }
             
             await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+        await pool.query("UPDATE game_guests SET team_name = NULL WHERE game_id = $1", [gameId]);
             
             // Revert game status
             await pool.query(`
@@ -3340,7 +3634,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             const nextGameResult = await pool.query(`
                 SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.format,
                        v.name as venue_name,
-                       (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players,
+                       ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                        g.max_players
                 FROM games g
                 LEFT JOIN venues v ON v.id = g.venue_id
@@ -3406,7 +3700,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
         // Get game details
         const gameResult = await pool.query(`
             SELECT g.*, v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.game_url = $1
@@ -3857,11 +4151,11 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin,
             [playerId, -cost, 'game_fee', `Admin added to game ${gameId}`]
         );
         
-        // Add player with amount_paid
+        // Add player
         await pool.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
-             VALUES ($1, $2, 'confirmed', $3, $4)`,
-            [gameId, playerId, position || 'outfield', cost]
+            `INSERT INTO registrations (game_id, player_id, status, position_preference)
+             VALUES ($1, $2, 'confirmed', $3)`,
+            [gameId, playerId, position || 'outfield']
         );
         
         res.json({ message: 'Player added successfully' });
@@ -3928,11 +4222,11 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             [playerId, -customCharge, 'game_fee', `Game registration (custom charge: £${customCharge.toFixed(2)})`]
         );
         
-        // Add player with custom amount_paid
+        // Add player
         await pool.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
-             VALUES ($1, $2, 'confirmed', $3, $4)`,
-            [gameId, playerId, position || 'outfield', customCharge]
+            `INSERT INTO registrations (game_id, player_id, status, position_preference)
+             VALUES ($1, $2, 'confirmed', $3)`,
+            [gameId, playerId, position || 'outfield']
         );
         
         res.json({ message: 'Player added with custom charge' });
@@ -3960,7 +4254,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         
         // Get registration details
         const regResult = await pool.query(
-            'SELECT player_id, amount_paid FROM registrations WHERE id = $1 AND game_id = $2',
+            'SELECT player_id FROM registrations WHERE id = $1 AND game_id = $2',
             [registrationId, gameId]
         );
         
@@ -3969,20 +4263,24 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         }
         
         const playerId = regResult.rows[0].player_id;
-        const refundAmt = parseFloat(regResult.rows[0].amount_paid || 0);
         
-        // Refund what they actually paid
-        if (refundAmt > 0) {
-            await pool.query(
-                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                [refundAmt, playerId]
-            );
-            
-            await pool.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [playerId, refundAmt, 'refund', `Admin removed from game - \u00a3${refundAmt.toFixed(2)} refund`]
-            );
-        }
+        // Get game cost
+        const gameResult = await pool.query(
+            'SELECT cost_per_player FROM games WHERE id = $1',
+            [gameId]
+        );
+        const cost = parseFloat(gameResult.rows[0].cost_per_player);
+        
+        // Refund credits
+        await pool.query(
+            'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+            [cost, playerId]
+        );
+        
+        await pool.query(
+            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+            [playerId, cost, 'refund', `Admin removed from game ${gameId}`]
+        );
         
         // Delete registration
         await pool.query(
@@ -4079,6 +4377,168 @@ app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireAdm
     } catch (error) {
         console.error('Finalize MOTM error:', error);
         res.status(500).json({ error: 'Failed to finalize MOTM voting' });
+    }
+});
+
+// ==========================================
+// REFERRAL SYSTEM
+// ==========================================
+
+// Get my referral info (code, link, who I've referred)
+app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+        
+        // Get own referral code
+        const playerResult = await pool.query(
+            'SELECT referral_code, referred_by FROM players WHERE id = $1',
+            [playerId]
+        );
+        const referralCode = playerResult.rows[0]?.referral_code;
+        
+        // Get who referred me
+        let referredByName = null;
+        if (playerResult.rows[0]?.referred_by) {
+            const refByResult = await pool.query(
+                'SELECT alias, full_name FROM players WHERE id = $1',
+                [playerResult.rows[0].referred_by]
+            );
+            if (refByResult.rows.length > 0) {
+                referredByName = refByResult.rows[0].alias || refByResult.rows[0].full_name;
+            }
+        }
+        
+        // Get people I've referred
+        const referralsResult = await pool.query(
+            `SELECT p.id, p.alias, p.full_name, p.total_appearances, p.created_at
+             FROM players p
+             WHERE p.referred_by = $1
+             ORDER BY p.created_at DESC`,
+            [playerId]
+        );
+        
+        res.json({
+            referralCode,
+            referralLink: referralCode ? 'https://totalfooty.co.uk/vibecoding/register.html?ref=' + referralCode : null,
+            referredBy: referredByName,
+            referrals: referralsResult.rows.map(r => ({
+                id: r.id,
+                name: r.alias || r.full_name,
+                appearances: r.total_appearances || 0,
+                joinedAt: r.created_at
+            })),
+            totalReferred: referralsResult.rows.length
+        });
+    } catch (error) {
+        console.error('Get referral info error:', error);
+        res.status(500).json({ error: 'Failed to get referral info' });
+    }
+});
+
+// Public: Validate a referral code (for registration page)
+app.get('/api/public/referral/:code', async (req, res) => {
+    try {
+        const { code } = req.params;
+        
+        // Look up in players.referral_code first
+        let result = await pool.query(
+            `SELECT p.id, p.alias, p.full_name, 
+                    EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = p.id AND b.name = 'CLM') as is_clm
+             FROM players p
+             WHERE p.referral_code = $1`,
+            [code.toUpperCase()]
+        );
+        
+        // Fallback to referrals table
+        if (result.rows.length === 0) {
+            result = await pool.query(
+                `SELECT p.id, p.alias, p.full_name,
+                        EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = p.id AND b.name = 'CLM') as is_clm
+                 FROM referrals r
+                 JOIN players p ON p.id = r.referrer_id
+                 WHERE r.referral_code = $1`,
+                [code.toUpperCase()]
+            );
+        }
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ valid: false, error: 'Referral code not found' });
+        }
+        
+        const referrer = result.rows[0];
+        res.json({
+            valid: true,
+            referrerName: referrer.alias || referrer.full_name,
+            isCLM: referrer.is_clm,
+            message: referrer.is_clm 
+                ? 'You have been invited by a CLM player! You will automatically receive the CLM badge when you sign up.'
+                : 'You have been referred by ' + (referrer.alias || referrer.full_name) + '. Welcome to Total Footy!'
+        });
+    } catch (error) {
+        console.error('Validate referral error:', error);
+        res.status(500).json({ valid: false, error: 'Failed to validate referral code' });
+    }
+});
+
+// Public: Get player referral code (for profile pages and directory)
+app.get('/api/public/player/:playerId/referral', async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        
+        let result;
+        if (playerId.match(/^[0-9a-f-]{36}$/i)) {
+            // UUID
+            result = await pool.query(
+                'SELECT alias, full_name, referral_code FROM players WHERE id = $1',
+                [playerId]
+            );
+        } else {
+            // Squad number
+            result = await pool.query(
+                'SELECT alias, full_name, referral_code FROM players WHERE squad_number = $1',
+                [parseInt(playerId)]
+            );
+        }
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        
+        const player = result.rows[0];
+        const code = player.referral_code;
+        
+        res.json({
+            referralCode: code,
+            referralLink: code ? 'https://totalfooty.co.uk/vibecoding/register.html?ref=' + code : null,
+            playerName: player.alias || player.full_name
+        });
+    } catch (error) {
+        console.error('Get player referral error:', error);
+        res.status(500).json({ error: 'Failed to get referral info' });
+    }
+});
+
+// Admin: View all referral stats
+app.get('/api/admin/referrals', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT 
+                p.id,
+                p.alias,
+                p.full_name,
+                p.referral_code,
+                p.total_appearances,
+                (SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id) as total_referred,
+                (SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id AND ref.total_appearances > 0) as active_referred
+            FROM players p
+            WHERE EXISTS (SELECT 1 FROM players ref WHERE ref.referred_by = p.id)
+            ORDER BY total_referred DESC
+        `);
+        
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get referral stats error:', error);
+        res.status(500).json({ error: 'Failed to get referral stats' });
     }
 });
 
