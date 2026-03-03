@@ -3585,15 +3585,41 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             id: p.id,
             name: p.full_name || p.alias,
             squadNumber: p.squad_number,
-            isGK: p.position === 'goalkeeper'
+            isGK: p.position === 'goalkeeper',
+            isGuest: false
         }));
         
         const blueTeam = blueTeamResult.rows.map(p => ({
             id: p.id,
             name: p.full_name || p.alias,
             squadNumber: p.squad_number,
-            isGK: p.position === 'goalkeeper'
+            isGK: p.position === 'goalkeeper',
+            isGuest: false
         }));
+        
+        // Add +1 guests to their assigned teams
+        const guestsResult = await pool.query(
+            `SELECT g.id, g.guest_name, g.team_name, p.alias as invited_by_alias, p.full_name as invited_by_name
+             FROM game_guests g
+             JOIN players p ON p.id = g.invited_by
+             WHERE g.game_id = $1 AND g.team_name IS NOT NULL`,
+            [game.id]
+        );
+        for (const guest of guestsResult.rows) {
+            const guestEntry = {
+                id: 'guest_' + guest.id,
+                name: guest.guest_name + ' (+1)',
+                squadNumber: null,
+                isGK: false,
+                isGuest: true,
+                invitedBy: guest.invited_by_alias || guest.invited_by_name
+            };
+            if (guest.team_name === 'Red') {
+                redTeam.push(guestEntry);
+            } else if (guest.team_name === 'Blue') {
+                blueTeam.push(guestEntry);
+            }
+        }
         
         // Get MOTM data if game is completed
         let motmNominees = [];
