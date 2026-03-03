@@ -72,7 +72,7 @@ const requireSuperAdmin = (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone } = req.body;
+        const { fullName, alias, email, password, phone, ref } = req.body;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -122,6 +122,29 @@ app.post('/api/auth/register', async (req, res) => {
             'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2)',
             [playerId, referralCode]
         );
+        
+        // Auto-assign CLM badge if registered via CLM link
+        if (ref && ref.toLowerCase() === 'clm') {
+            try {
+                const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
+                if (clmBadge.rows.length > 0) {
+                    await pool.query(
+                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                        [playerId, clmBadge.rows[0].id]
+                    );
+                    console.log(`CLM badge assigned to new player ${playerId}`);
+                }
+            } catch (badgeErr) {
+                console.error('Failed to assign CLM badge:', badgeErr.message);
+            }
+        }
+        
+        // Auto-allocate badges immediately (assigns "New" badge)
+        try {
+            await autoAllocateBadges(playerId);
+        } catch (badgeErr) {
+            console.error('Failed to auto-allocate badges on registration:', badgeErr.message);
+        }
 
         res.status(201).json({ 
             message: 'Account created successfully', 
@@ -784,28 +807,6 @@ async function checkBadgeCriteria(badgeName, player) {
             const accountAge = (Date.now() - new Date(player.created_at)) / (1000 * 60 * 60 * 24);
             return accountAge < 30;
             
-        case 'MOTM Streak':
-            // Won MOTM in last 3 consecutive games
-            const recentGamesResult = await pool.query(`
-                SELECT 
-                    g.id,
-                    (g.motm_winner_id = $1) as won_motm
-                FROM games g
-                JOIN registrations r ON r.game_id = g.id
-                WHERE r.player_id = $1
-                AND g.game_status = 'completed'
-                AND g.motm_winner_id IS NOT NULL
-                ORDER BY g.game_date DESC
-                LIMIT 3
-            `, [player.id]);
-            
-            if (recentGamesResult.rows.length < 3) return false;
-            
-            // Check if player won or split MOTM in all 3 games
-            const wonAll = recentGamesResult.rows.every(game => game.won_motm);
-            
-            return wonAll;
-            
         default:
             return false;
     }
@@ -1152,6 +1153,24 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         const hasAllStarBadge = allStarBadgeResult.rows.length > 0;
         
+        // Check if player has CLM badge
+        const clmBadgeResult = await pool.query(`
+            SELECT 1 FROM player_badges pb
+            JOIN badges b ON b.id = pb.badge_id
+            WHERE pb.player_id = $1 AND b.name = 'CLM'
+        `, [req.user.playerId]);
+        
+        const hasCLMBadge = clmBadgeResult.rows.length > 0;
+        
+        // Check if player has Misfits badge
+        const misfitsBadgeResult = await pool.query(`
+            SELECT 1 FROM player_badges pb
+            JOIN badges b ON b.id = pb.badge_id
+            WHERE pb.player_id = $1 AND b.name = 'Misfits'
+        `, [req.user.playerId]);
+        
+        const hasMisfitsBadge = misfitsBadgeResult.rows.length > 0;
+        
         // Tier-based visibility (exact requirements)
         let hoursAhead = 72; // silver default (72 hours = 3 days)
         if (tier === 'gold') hoursAhead = 28 * 24; // 28 days
@@ -1177,7 +1196,9 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             )
             ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
             AND g.status != 'cancelled'
-            ${!isAdmin && !hasAllStarBadge ? 'AND (g.all_star_only IS NULL OR g.all_star_only = FALSE)' : ''}
+            ${!isAdmin && !hasAllStarBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'allstars')" : ''}
+            ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
+            ${!isAdmin && !hasMisfitsBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'misfits')" : ''}
             ORDER BY g.game_date DESC
         `, [req.user.playerId]);
         
@@ -1343,7 +1364,7 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
     try {
         const { 
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
-            exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor 
+            exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor 
         } = req.body;
         
         const createdGames = [];
@@ -1378,13 +1399,13 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                     `INSERT INTO games (
                         venue_id, game_date, max_players, cost_per_player, format, regularity, 
                         exclusivity, position_type, game_url, status, series_id, 
-                        team_selection_type, external_opponent, tf_kit_color
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12, $13)
+                        team_selection_type, external_opponent, tf_kit_color, opp_kit_color
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12, $13, $14)
                     RETURNING id`,
                     [
                         venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
                         exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl, 
-                        seriesUuid, selType, externalOpponent || null, tfKitColor || null
+                        seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null
                     ]
                 );
                 
@@ -1418,13 +1439,13 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                 `INSERT INTO games (
                     venue_id, game_date, max_players, cost_per_player, format, regularity, 
                     exclusivity, position_type, game_url, status, series_id,
-                    team_selection_type, external_opponent, tf_kit_color
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12, $13)
+                    team_selection_type, external_opponent, tf_kit_color, opp_kit_color
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, $11, $12, $13, $14)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
                     exclusivity || 'everyone', positionType || 'outfield_gk', gameUrl,
-                    seriesUuid, selType, externalOpponent || null, tfKitColor || null
+                    seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null
                 ]
             );
             
@@ -1474,23 +1495,27 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         await client.query('BEGIN');
         
         // Lock the game row to prevent race conditions
-        const gameCheck = await client.query(`
-            SELECT g.max_players, g.cost_per_player, g.all_star_only, 
-                   g.player_editing_locked, g.team_selection_type, g.position_type,
-                   COUNT(r.id) FILTER (WHERE r.status = 'confirmed') as current_players
-            FROM games g
-            LEFT JOIN registrations r ON r.game_id = g.id
-            WHERE g.id = $1
-            GROUP BY g.id
-            FOR UPDATE OF g
+        const gameLock = await client.query(`
+            SELECT max_players, cost_per_player, exclusivity, 
+                   player_editing_locked, team_selection_type, position_type
+            FROM games
+            WHERE id = $1
+            FOR UPDATE
         `, [gameId]);
         
-        if (gameCheck.rows.length === 0) {
+        if (gameLock.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Game not found' });
         }
         
-        const game = gameCheck.rows[0];
+        const game = gameLock.rows[0];
+        
+        // Get current player count separately
+        const countResult = await client.query(
+            "SELECT COUNT(*) as current_players FROM registrations WHERE game_id = $1 AND status = 'confirmed'",
+            [gameId]
+        );
+        game.current_players = parseInt(countResult.rows[0].current_players);
         
         // Check if game is locked for editing
         if (game.player_editing_locked) {
@@ -1500,8 +1525,8 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             });
         }
         
-        // Check All Star restriction
-        if (game.all_star_only) {
+        // Check exclusivity restrictions
+        if (game.exclusivity === 'allstars') {
             const badgeCheck = await client.query(`
                 SELECT 1 FROM player_badges pb
                 JOIN badges b ON b.id = pb.badge_id
@@ -1513,6 +1538,22 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
                 return res.status(403).json({ 
                     error: 'This is an All Star game. You need the TF All Star badge to register.',
                     requiresBadge: 'TF All Star'
+                });
+            }
+        }
+        
+        if (game.exclusivity === 'clm') {
+            const badgeCheck = await client.query(`
+                SELECT 1 FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name = 'CLM'
+            `, [req.user.playerId]);
+            
+            if (badgeCheck.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({ 
+                    error: 'This is a CLM exclusive game. You need the CLM badge to register.',
+                    requiresBadge: 'CLM'
                 });
             }
         }
@@ -2703,6 +2744,11 @@ app.post('/api/games/:gameId/vote-motm', authenticateToken, async (req, res) => 
         const { gameId } = req.params;
         const { votedForId } = req.body;
         
+        // Can't vote for yourself
+        if (votedForId === req.user.playerId) {
+            return res.status(400).json({ error: 'You cannot vote for yourself' });
+        }
+        
         // Check if player played in this game
         const playedResult = await pool.query(
             'SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = $3',
@@ -3251,6 +3297,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                 team_selection_type: game.team_selection_type,
                 external_opponent: game.external_opponent,
                 tf_kit_color: game.tf_kit_color,
+                opp_kit_color: game.opp_kit_color,
                 votingOpen,
                 votingFinalized,
                 votingEnds: game.motm_voting_ends
@@ -3337,6 +3384,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             team_selection_type: game.team_selection_type,
             external_opponent: game.external_opponent,
             tf_kit_color: game.tf_kit_color,
+            opp_kit_color: game.opp_kit_color,
             winning_team: game.winning_team,
             motm_voting_ends: game.motm_voting_ends,
             motm_winner_id: game.motm_winner_id,
@@ -3472,6 +3520,11 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
         const { gameId } = req.params;
         const { nomineeId } = req.body;
         const voterId = req.user.playerId;
+        
+        // Can't vote for yourself
+        if (nomineeId === voterId) {
+            return res.status(400).json({ error: 'You cannot vote for yourself' });
+        }
         
         // Check if player played in this game
         const playedResult = await pool.query(
