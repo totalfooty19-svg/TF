@@ -146,7 +146,6 @@ const requireGameManager = async (req, res, next) => {
     }
 };
 
-
 // ==========================================
 // AUTHENTICATION
 // ==========================================
@@ -197,84 +196,66 @@ app.post('/api/auth/register', async (req, res) => {
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
 
-        // Generate referral code and store on player + referrals table
+        // Generate referral code (TF + 8 hex chars) on players table + referrals table (backward compat)
         const referralCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
-        await pool.query(
-            'UPDATE players SET referral_code = $1 WHERE id = $2',
-            [referralCode, playerId]
-        );
-        await pool.query(
-            'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2)',
-            [playerId, referralCode]
-        );
+        await pool.query('UPDATE players SET referral_code = $1 WHERE id = $2', [referralCode, playerId]);
+        try {
+            await pool.query(
+                'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2)',
+                [playerId, referralCode]
+            );
+        } catch (refErr) {
+            console.error('Referrals table insert (non-critical):', refErr.message);
+        }
         
-        // Process referral: look up ref code to find who referred this player
-        let referrerId = null;
-        let referrerHasCLM = false;
+        // Handle referral: look up referrer by code or direct CLM link
         if (ref) {
             try {
-                // Check if ref is a player's referral code
-                const referrerResult = await pool.query(
-                    `SELECT p.id, EXISTS(
-                        SELECT 1 FROM player_badges pb 
-                        JOIN badges b ON b.id = pb.badge_id 
-                        WHERE pb.player_id = p.id AND b.name = 'CLM'
-                    ) as has_clm
-                    FROM players p
-                    WHERE p.referral_code = $1`,
-                    [ref.toUpperCase()]
-                );
-                
-                if (referrerResult.rows.length > 0) {
-                    referrerId = referrerResult.rows[0].id;
-                    referrerHasCLM = referrerResult.rows[0].has_clm;
-                    
-                    await pool.query(
-                        'UPDATE players SET referred_by = $1 WHERE id = $2',
-                        [referrerId, playerId]
-                    );
-                    console.log(`Player ${playerId} referred by ${referrerId}`);
+                if (ref.toLowerCase() === 'clm') {
+                    // Direct CLM link - just assign CLM badge
+                    const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
+                    if (clmBadge.rows.length > 0) {
+                        await pool.query(
+                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                            [playerId, clmBadge.rows[0].id]
+                        );
+                        console.log('CLM badge assigned via direct link to player ' + playerId);
+                    }
                 } else {
-                    // Also check the referrals table (backward compat)
-                    const legacyRef = await pool.query(
-                        'SELECT referrer_id FROM referrals WHERE referral_code = $1',
-                        [ref.toUpperCase()]
-                    );
-                    if (legacyRef.rows.length > 0) {
-                        referrerId = legacyRef.rows[0].referrer_id;
-                        const clmCheck = await pool.query(
-                            `SELECT 1 FROM player_badges pb 
-                             JOIN badges b ON b.id = pb.badge_id 
-                             WHERE pb.player_id = $1 AND b.name = 'CLM'`,
+                    // Look up referrer by code: try players.referral_code first, fall back to referrals table
+                    let referrerId = null;
+                    const pRef = await pool.query('SELECT id FROM players WHERE referral_code = $1', [ref.toUpperCase()]);
+                    if (pRef.rows.length > 0) {
+                        referrerId = pRef.rows[0].id;
+                    } else {
+                        const rRef = await pool.query('SELECT referrer_id FROM referrals WHERE referral_code = $1', [ref.toUpperCase()]);
+                        if (rRef.rows.length > 0) referrerId = rRef.rows[0].referrer_id;
+                    }
+                    
+                    if (referrerId) {
+                        // Set referred_by on new player
+                        await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referrerId, playerId]);
+                        console.log('Player ' + playerId + ' referred by ' + referrerId);
+                        
+                        // CLM badge inheritance: if referrer has CLM badge, new player gets it too
+                        const referrerCLM = await pool.query(
+                            "SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'CLM'",
                             [referrerId]
                         );
-                        referrerHasCLM = clmCheck.rows.length > 0;
-                        
-                        await pool.query(
-                            'UPDATE players SET referred_by = $1 WHERE id = $2',
-                            [referrerId, playerId]
-                        );
-                        console.log(`Player ${playerId} referred by ${referrerId} (legacy code)`);
+                        if (referrerCLM.rows.length > 0) {
+                            const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
+                            if (clmBadge.rows.length > 0) {
+                                await pool.query(
+                                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                                    [playerId, clmBadge.rows[0].id]
+                                );
+                                console.log('CLM badge inherited from referrer ' + referrerId + ' to ' + playerId);
+                            }
+                        }
                     }
                 }
             } catch (refErr) {
-                console.error('Referral lookup error (non-critical):', refErr.message);
-            }
-        }
-        
-        // Auto-assign CLM badge if referrer has CLM badge, or if ref is literal 'clm'
-        if (referrerHasCLM || (ref && ref.toLowerCase() === 'clm')) {
-            try {
-                const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
-                if (clmBadge.rows.length > 0) {
-                    await pool.query(
-                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                        [playerId, clmBadge.rows[0].id]
-                    );
-                    console.log('CLM badge assigned to new player ' + playerId);
-                }
-            } catch (badgeErr) {
-                console.error('Failed to assign CLM badge:', badgeErr.message);
+                console.error('Referral processing (non-critical):', refErr.message);
             }
         }
         
@@ -319,9 +300,7 @@ app.post('/api/auth/login', async (req, res) => {
             `SELECT p.*, c.balance as credits,
              (SELECT json_agg(json_build_object('name', b.name, 'color', b.color, 'icon', b.icon))
               FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
-             p.referral_code,
-             COALESCE(p.is_clm_admin, false) as is_clm_admin,
-             COALESCE(p.is_organiser, false) as is_organiser
+             p.referral_code
              FROM players p 
              LEFT JOIN credits c ON c.player_id = p.id 
              WHERE p.user_id = $1`,
@@ -382,7 +361,9 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     try {
         const playerResult = await pool.query(
-            `SELECT p.id, p.full_name, p.alias, p.squad_number, u.role
+            `SELECT p.id, p.full_name, p.alias, p.squad_number, u.role,
+             COALESCE(p.is_clm_admin, false) as is_clm_admin,
+             COALESCE(p.is_organiser, false) as is_organiser
              FROM players p
              JOIN users u ON u.id = p.user_id
              WHERE p.id = $1`,
@@ -399,7 +380,9 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
             fullName: player.full_name,
             alias: player.alias,
             squadNumber: player.squad_number,
-            role: player.role
+            role: player.role,
+            isCLMAdmin: player.is_clm_admin || false,
+            isOrganiser: player.is_organiser || false
         });
     } catch (error) {
         console.error('Auth me error:', error);
@@ -1509,10 +1492,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
             exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor 
         } = req.body;
+        
         // CLM admins can only create CLM-exclusive games
         const isCLMAdminOnly = req.user.role !== 'admin' && req.user.role !== 'superadmin';
         const gameExclusivity = isCLMAdminOnly ? 'clm' : (exclusivity || 'everyone');
-
         
         const createdGames = [];
         
@@ -2383,12 +2366,31 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         
         const players = playersResult.rows;
         
-        // Fetch +1 guests (assigned to teams separately, NOT in algorithm pool)
-        const gameGuests = await pool.query(`
+        // Also fetch +1 guests for this game
+        const guestsResult = await pool.query(`
             SELECT g.id as guest_id, g.guest_name, g.overall_rating, g.invited_by
             FROM game_guests g
             WHERE g.game_id = $1
         `, [gameId]);
+        
+        // Merge guests into player pool (as outfield, no preferences)
+        for (const guest of guestsResult.rows) {
+            players.push({
+                reg_id: null,
+                player_id: `guest_${guest.guest_id}`,
+                full_name: guest.guest_name,
+                alias: `${guest.guest_name} (+1)`,
+                squad_number: null,
+                overall_rating: guest.overall_rating || 0,
+                goalkeeper_rating: 0,
+                defending_rating: 0,
+                fitness_rating: 0,
+                position_preference: 'outfield',
+                pairs: [guest.invited_by],  // pair guest with their inviter
+                avoids: [],
+                is_guest: true
+            });
+        }
         
         if (players.length < 2) {
             return res.status(400).json({ error: 'Need at least 2 players to generate teams' });
@@ -2430,80 +2432,6 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         if (goalkeepers.length >= 1) redTeam.push(goalkeepers[0]);
         if (goalkeepers.length >= 2) blueTeam.push(goalkeepers[1]);
         if (goalkeepers.length >= 3) outfield.push(...goalkeepers.slice(2)); // Extra GKs as outfield
-        
-        // PRE-ASSIGN: Parent+Guest pairs before main algorithm
-        // For each guest: assign parent to a team, find closest-rated counterpart
-        // for the other team, add guest to parent's team, find another counterpart.
-        // This keeps teams equal AND guarantees guests play with their inviter.
-        const guestAssignments = [];
-        
-        for (const guest of gameGuests.rows) {
-            const parentIdx = outfield.findIndex(p => p.player_id === guest.invited_by);
-            if (parentIdx === -1) {
-                // Parent might be a GK already assigned - check which team
-                const parentOnRed = redTeam.some(p => p.player_id === guest.invited_by);
-                const parentOnBlue = blueTeam.some(p => p.player_id === guest.invited_by);
-                if (parentOnRed || parentOnBlue) {
-                    const teamName = parentOnRed ? 'Red' : 'Blue';
-                    guestAssignments.push({ guestId: guest.guest_id, teamName });
-                    // Find one counterpart for the guest on the other team
-                    const guestRating = guest.overall_rating || 0;
-                    let bestIdx = -1, bestDiff = Infinity;
-                    for (let i = 0; i < outfield.length; i++) {
-                        const diff = Math.abs((outfield[i].overall_rating || 0) - guestRating);
-                        if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
-                    }
-                    if (bestIdx !== -1) {
-                        const cp = outfield.splice(bestIdx, 1)[0];
-                        if (parentOnRed) blueTeam.push(cp); else redTeam.push(cp);
-                    }
-                }
-                continue;
-            }
-            
-            const parent = outfield.splice(parentIdx, 1)[0];
-            
-            // Assign parent to team with lower overall rating
-            const redTotal = redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
-            const blueTotal = blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
-            const parentGoesRed = redTeam.length < blueTeam.length ? true
-                                : blueTeam.length < redTeam.length ? false
-                                : redTotal <= blueTotal;
-            
-            if (parentGoesRed) redTeam.push(parent); else blueTeam.push(parent);
-            
-            // Find closest-rated counterpart for the OTHER team (balances parent)
-            const parentRating = parent.overall_rating || 0;
-            let bestIdx = -1, bestDiff = Infinity;
-            for (let i = 0; i < outfield.length; i++) {
-                const diff = Math.abs((outfield[i].overall_rating || 0) - parentRating);
-                if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
-            }
-            if (bestIdx !== -1) {
-                const cp = outfield.splice(bestIdx, 1)[0];
-                if (parentGoesRed) blueTeam.push(cp); else redTeam.push(cp);
-            }
-            
-            // Guest goes on parent's team (tracked for DB update later)
-            guestAssignments.push({
-                guestId: guest.guest_id,
-                teamName: parentGoesRed ? 'Red' : 'Blue'
-            });
-            
-            // Find closest-rated counterpart for OTHER team (balances guest)
-            const guestRating = guest.overall_rating || 0;
-            bestIdx = -1; bestDiff = Infinity;
-            for (let i = 0; i < outfield.length; i++) {
-                const diff = Math.abs((outfield[i].overall_rating || 0) - guestRating);
-                if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
-            }
-            if (bestIdx !== -1) {
-                const cp = outfield.splice(bestIdx, 1)[0];
-                if (parentGoesRed) blueTeam.push(cp); else redTeam.push(cp);
-            }
-            
-            console.log(`Guest pair: ${parent.full_name} + ${guest.guest_name} -> ${parentGoesRed ? 'Red' : 'Blue'}`);
-        }
         
         // Helper functions
         const hasHighBeef = (player, team) => {
@@ -2651,27 +2579,33 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         const redTeamId = redResult.rows[0].id;
         const blueTeamId = blueResult.rows[0].id;
         
-        // Add real players to teams
+        // Add players to teams (skip guests - they go in game_guests.team_name)
         for (const player of redTeam) {
-            await pool.query(
-                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                [redTeamId, player.player_id]
-            );
+            if (player.is_guest) {
+                await pool.query(
+                    "UPDATE game_guests SET team_name = 'Red' WHERE id = $1",
+                    [player.player_id.replace('guest_', '')]
+                );
+            } else {
+                await pool.query(
+                    'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                    [redTeamId, player.player_id]
+                );
+            }
         }
         
         for (const player of blueTeam) {
-            await pool.query(
-                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                [blueTeamId, player.player_id]
-            );
-        }
-        
-        // Assign guests to their pre-determined teams
-        for (const ga of guestAssignments) {
-            await pool.query(
-                'UPDATE game_guests SET team_name = $1 WHERE id = $2',
-                [ga.teamName, ga.guestId]
-            );
+            if (player.is_guest) {
+                await pool.query(
+                    "UPDATE game_guests SET team_name = 'Blue' WHERE id = $1",
+                    [player.player_id.replace('guest_', '')]
+                );
+            } else {
+                await pool.query(
+                    'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                    [blueTeamId, player.player_id]
+                );
+            }
         }
         
         // Mark teams as generated
@@ -2689,17 +2623,6 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             defense: blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
             fitness: blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
         };
-        
-        // Add guest ratings to team stats
-        for (const ga of guestAssignments) {
-            const guest = gameGuests.rows.find(g => g.guest_id === ga.guestId);
-            if (guest) {
-                const rating = guest.overall_rating || 0;
-                if (ga.teamName === 'Red') redStats.overall += rating;
-                else blueStats.overall += rating;
-            }
-        }
-        
         
         res.json({
             message: 'Teams generated successfully',
@@ -2723,7 +2646,6 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             })),
             redStats,
             blueStats,
-            guests: guestAssignments.map(ga => { const g = gameGuests.rows.find(r => r.guest_id === ga.guestId); return { id: ga.guestId, name: g ? g.guest_name + " (+1)" : "Guest", team: ga.teamName, overall: g ? g.overall_rating : 0 }; }),
             beefs: Array.from(highBeefs.entries()).map(([playerId, targets]) => ({
                 playerId,
                 targets,
@@ -3050,21 +2972,6 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             await pool.query(
                 'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
                 [blueTeamId, playerId]
-            );
-        }
-        
-        // Auto-assign guests to same team as their inviter
-        const manualGuests = await pool.query(
-            'SELECT id, invited_by FROM game_guests WHERE game_id = $1',
-            [gameId]
-        );
-        for (const guest of manualGuests.rows) {
-            // Check which team the inviter is on
-            const onRed = redTeam.includes(guest.invited_by);
-            const teamName = onRed ? 'Red' : 'Blue';
-            await pool.query(
-                'UPDATE game_guests SET team_name = $1 WHERE id = $2',
-                [teamName, guest.id]
             );
         }
         
@@ -3750,41 +3657,15 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             id: p.id,
             name: p.full_name || p.alias,
             squadNumber: p.squad_number,
-            isGK: p.position === 'goalkeeper',
-            isGuest: false
+            isGK: p.position === 'goalkeeper'
         }));
         
         const blueTeam = blueTeamResult.rows.map(p => ({
             id: p.id,
             name: p.full_name || p.alias,
             squadNumber: p.squad_number,
-            isGK: p.position === 'goalkeeper',
-            isGuest: false
+            isGK: p.position === 'goalkeeper'
         }));
-        
-        // Add +1 guests to their assigned teams
-        const guestsResult = await pool.query(
-            `SELECT g.id, g.guest_name, g.team_name, p.alias as invited_by_alias, p.full_name as invited_by_name
-             FROM game_guests g
-             JOIN players p ON p.id = g.invited_by
-             WHERE g.game_id = $1 AND g.team_name IS NOT NULL`,
-            [game.id]
-        );
-        for (const guest of guestsResult.rows) {
-            const guestEntry = {
-                id: 'guest_' + guest.id,
-                name: guest.guest_name + ' (+1)',
-                squadNumber: null,
-                isGK: false,
-                isGuest: true,
-                invitedBy: guest.invited_by_alias || guest.invited_by_name
-            };
-            if (guest.team_name === 'Red') {
-                redTeam.push(guestEntry);
-            } else if (guest.team_name === 'Blue') {
-                blueTeam.push(guestEntry);
-            }
-        }
         
         // Get MOTM data if game is completed
         let motmNominees = [];
@@ -4572,53 +4453,49 @@ app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireGam
 });
 
 // ==========================================
-// REFERRAL SYSTEM
+// ==========================================
+// REFERRAL ENDPOINTS
 // ==========================================
 
-// Get my referral info (code, link, who I've referred)
+// Get my referral info (code, link, who I referred)
 app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
     try {
         const playerId = req.user.playerId;
         
-        // Get own referral code
-        const playerResult = await pool.query(
-            'SELECT referral_code, referred_by FROM players WHERE id = $1',
+        // Get my referral code and who referred me
+        const myInfo = await pool.query(
+            `SELECT p.referral_code, p.referred_by,
+             (SELECT alias FROM players WHERE id = p.referred_by) as referred_by_alias
+             FROM players p WHERE p.id = $1`,
             [playerId]
         );
-        const referralCode = playerResult.rows[0]?.referral_code;
         
-        // Get who referred me
-        let referredByName = null;
-        if (playerResult.rows[0]?.referred_by) {
-            const refByResult = await pool.query(
-                'SELECT alias, full_name FROM players WHERE id = $1',
-                [playerResult.rows[0].referred_by]
-            );
-            if (refByResult.rows.length > 0) {
-                referredByName = refByResult.rows[0].alias || refByResult.rows[0].full_name;
-            }
-        }
+        if (myInfo.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+        const me = myInfo.rows[0];
         
-        // Get people I've referred
-        const referralsResult = await pool.query(
-            `SELECT p.id, p.alias, p.full_name, p.total_appearances, p.created_at
-             FROM players p
-             WHERE p.referred_by = $1
+        // Get list of players I referred
+        const referred = await pool.query(
+            `SELECT p.id, p.alias, p.full_name, p.created_at,
+             p.total_appearances, p.reliability_tier
+             FROM players p WHERE p.referred_by = $1
              ORDER BY p.created_at DESC`,
             [playerId]
         );
         
         res.json({
-            referralCode,
-            referralLink: referralCode ? 'https://totalfooty.co.uk/vibecoding/register.html?ref=' + referralCode : null,
-            referredBy: referredByName,
-            referrals: referralsResult.rows.map(r => ({
+            referralCode: me.referral_code,
+            referralLink: me.referral_code
+                ? 'https://totalfooty.co.uk/vibecoding/register.html?ref=' + me.referral_code
+                : null,
+            referredBy: me.referred_by ? { id: me.referred_by, alias: me.referred_by_alias } : null,
+            referrals: referred.rows.map(r => ({
                 id: r.id,
-                name: r.alias || r.full_name,
+                alias: r.alias || r.full_name,
+                joinedAt: r.created_at,
                 appearances: r.total_appearances || 0,
-                joinedAt: r.created_at
+                tier: r.reliability_tier
             })),
-            totalReferred: referralsResult.rows.length
+            totalReferred: referred.rows.length
         });
     } catch (error) {
         console.error('Get referral info error:', error);
@@ -4631,109 +4508,87 @@ app.get('/api/public/referral/:code', async (req, res) => {
     try {
         const { code } = req.params;
         
-        // Look up in players.referral_code first
-        let result = await pool.query(
-            `SELECT p.id, p.alias, p.full_name, 
-                    EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = p.id AND b.name = 'CLM') as is_clm
-             FROM players p
-             WHERE p.referral_code = $1`,
+        // Look up in players table first, then referrals
+        let referrer = null;
+        const pRef = await pool.query(
+            `SELECT p.id, p.alias, p.full_name,
+             EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm
+             FROM players p WHERE p.referral_code = $1`,
             [code.toUpperCase()]
         );
         
-        // Fallback to referrals table
-        if (result.rows.length === 0) {
-            result = await pool.query(
+        if (pRef.rows.length > 0) {
+            referrer = pRef.rows[0];
+        } else {
+            const rRef = await pool.query(
                 `SELECT p.id, p.alias, p.full_name,
-                        EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = p.id AND b.name = 'CLM') as is_clm
-                 FROM referrals r
-                 JOIN players p ON p.id = r.referrer_id
-                 WHERE r.referral_code = $1`,
+                 EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm
+                 FROM referrals r JOIN players p ON r.referrer_id = p.id WHERE r.referral_code = $1`,
                 [code.toUpperCase()]
             );
+            if (rRef.rows.length > 0) referrer = rRef.rows[0];
         }
         
-        if (result.rows.length === 0) {
+        if (!referrer) {
             return res.status(404).json({ valid: false, error: 'Referral code not found' });
         }
         
-        const referrer = result.rows[0];
         res.json({
             valid: true,
             referrerName: referrer.alias || referrer.full_name,
-            isCLM: referrer.is_clm,
-            message: referrer.is_clm 
-                ? 'You have been invited by a CLM player! You will automatically receive the CLM badge when you sign up.'
-                : 'You have been referred by ' + (referrer.alias || referrer.full_name) + '. Welcome to Total Footy!'
+            hasCLM: referrer.has_clm,
+            message: referrer.has_clm
+                ? 'You have been referred by ' + (referrer.alias || referrer.full_name) + '! You will receive CLM access upon registration.'
+                : 'You have been referred by ' + (referrer.alias || referrer.full_name) + '! Welcome to Total Footy.'
         });
     } catch (error) {
         console.error('Validate referral error:', error);
-        res.status(500).json({ valid: false, error: 'Failed to validate referral code' });
+        res.status(500).json({ error: 'Failed to validate referral code' });
     }
 });
 
-// Public: Get player referral code (for profile pages and directory)
+// Public: Get any player's referral link (for profile/directory pages)
 app.get('/api/public/player/:playerId/referral', async (req, res) => {
     try {
         const { playerId } = req.params;
-        
-        let result;
-        if (playerId.match(/^[0-9a-f-]{36}$/i)) {
-            // UUID
-            result = await pool.query(
-                'SELECT alias, full_name, referral_code FROM players WHERE id = $1',
-                [playerId]
-            );
-        } else {
-            // Squad number
-            result = await pool.query(
-                'SELECT alias, full_name, referral_code FROM players WHERE squad_number = $1',
-                [parseInt(playerId)]
-            );
-        }
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Player not found' });
-        }
-        
-        const player = result.rows[0];
-        const code = player.referral_code;
-        
+        const result = await pool.query(
+            'SELECT referral_code, alias, full_name FROM players WHERE id = $1',
+            [playerId]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+        const p = result.rows[0];
         res.json({
-            referralCode: code,
-            referralLink: code ? 'https://totalfooty.co.uk/vibecoding/register.html?ref=' + code : null,
-            playerName: player.alias || player.full_name
+            referralCode: p.referral_code,
+            referralLink: p.referral_code
+                ? 'https://totalfooty.co.uk/vibecoding/register.html?ref=' + p.referral_code
+                : null,
+            playerName: p.alias || p.full_name
         });
     } catch (error) {
         console.error('Get player referral error:', error);
-        res.status(500).json({ error: 'Failed to get referral info' });
+        res.status(500).json({ error: 'Failed to get referral link' });
     }
 });
 
-// Admin: View all referral stats
+// Admin: Referral leaderboard
 app.get('/api/admin/referrals', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT 
-                p.id,
-                p.alias,
-                p.full_name,
-                p.referral_code,
-                p.total_appearances,
-                (SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id) as total_referred,
-                (SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id AND ref.total_appearances > 0) as active_referred
+            SELECT p.id, p.alias, p.full_name, p.referral_code,
+                   (SELECT COUNT(*) FROM players WHERE referred_by = p.id) as total_referred,
+                   (SELECT COUNT(*) FROM players WHERE referred_by = p.id AND total_appearances > 0) as active_referred
             FROM players p
-            WHERE EXISTS (SELECT 1 FROM players ref WHERE ref.referred_by = p.id)
+            WHERE EXISTS (SELECT 1 FROM players WHERE referred_by = p.id)
             ORDER BY total_referred DESC
+            LIMIT 50
         `);
-        
-        res.json(result.rows);
+        res.json({ referrers: result.rows });
     } catch (error) {
-        console.error('Get referral stats error:', error);
-        res.status(500).json({ error: 'Failed to get referral stats' });
+        console.error('Admin referrals error:', error);
+        res.status(500).json({ error: 'Failed to get referral data' });
     }
 });
 
-// ==========================================
 // ==========================================
 // MANAGE GAMES (scoped for CLM admin / Organiser)
 // ==========================================
@@ -4742,12 +4597,15 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
     try {
         const playerId = req.user.playerId;
         const isFullAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
-        const playerResult = await pool.query('SELECT is_clm_admin, is_organiser FROM players WHERE id = $1', [playerId]);
+        const playerResult = await pool.query(
+            'SELECT is_clm_admin, is_organiser FROM players WHERE id = $1', [playerId]
+        );
         const player = playerResult.rows[0];
         if (!player) return res.status(403).json({ error: 'Player not found' });
         if (!isFullAdmin && !player.is_clm_admin && !player.is_organiser) {
             return res.status(403).json({ error: 'No management access' });
         }
+        
         let query, params;
         if (isFullAdmin) {
             query = `SELECT g.*, v.name as venue_name,
@@ -4769,10 +4627,14 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id
-                WHERE EXISTS (SELECT 1 FROM registrations r WHERE r.game_id = g.id AND r.player_id = $1 AND r.status = 'confirmed')
+                WHERE EXISTS (
+                    SELECT 1 FROM registrations r 
+                    WHERE r.game_id = g.id AND r.player_id = $1 AND r.status = 'confirmed'
+                )
                 ORDER BY g.game_date DESC LIMIT 50`;
             params = [playerId];
         }
+        
         const result = await pool.query(query, params);
         res.json({
             games: result.rows,
@@ -4794,28 +4656,63 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
     }
 });
 
-// Superadmin: Toggle CLM admin or Organiser flag
+// Superadmin: Toggle CLM admin or Organiser flag on a player
 app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const { playerId } = req.params;
         const { is_clm_admin, is_organiser } = req.body;
+        
         const updates = [];
         const values = [];
         let idx = 1;
-        if (is_clm_admin !== undefined) { updates.push('is_clm_admin = $' + idx); values.push(!!is_clm_admin); idx++; }
-        if (is_organiser !== undefined) { updates.push('is_organiser = $' + idx); values.push(!!is_organiser); idx++; }
-        if (updates.length === 0) return res.status(400).json({ error: 'No flags to update' });
+        
+        if (is_clm_admin !== undefined) {
+            updates.push('is_clm_admin = $' + idx);
+            values.push(!!is_clm_admin);
+            idx++;
+        }
+        if (is_organiser !== undefined) {
+            updates.push('is_organiser = $' + idx);
+            values.push(!!is_organiser);
+            idx++;
+        }
+        
+        if (updates.length === 0) {
+            return res.status(400).json({ error: 'No flags to update' });
+        }
+        
         values.push(playerId);
-        await pool.query('UPDATE players SET ' + updates.join(', ') + ' WHERE id = $' + idx, values);
+        await pool.query(
+            'UPDATE players SET ' + updates.join(', ') + ' WHERE id = $' + idx,
+            values
+        );
+        
+        // Auto-grant CLM badge if setting CLM admin
         if (is_clm_admin) {
             const cb = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
-            if (cb.rows.length > 0) await pool.query('INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [playerId, cb.rows[0].id]);
+            if (cb.rows.length > 0) {
+                await pool.query(
+                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                    [playerId, cb.rows[0].id]
+                );
+            }
         }
+        
+        // Auto-grant Organiser badge if setting organiser
         if (is_organiser) {
             const ob = await pool.query("SELECT id FROM badges WHERE name = 'Organiser'");
-            if (ob.rows.length > 0) await pool.query('INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [playerId, ob.rows[0].id]);
+            if (ob.rows.length > 0) {
+                await pool.query(
+                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                    [playerId, ob.rows[0].id]
+                );
+            }
         }
-        const updated = await pool.query('SELECT id, alias, full_name, is_clm_admin, is_organiser FROM players WHERE id = $1', [playerId]);
+        
+        const updated = await pool.query(
+            'SELECT id, alias, full_name, is_clm_admin, is_organiser FROM players WHERE id = $1',
+            [playerId]
+        );
         res.json({ message: 'Role flags updated', player: updated.rows[0] });
     } catch (error) {
         console.error('Update role flags error:', error);
@@ -4823,6 +4720,7 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
     }
 });
 
+// ==========================================
 // START SERVER
 // ==========================================
 
