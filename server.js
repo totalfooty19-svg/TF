@@ -17,6 +17,18 @@ const twilioClient = twilio(
 );
 const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+447864872538';
 
+// Fuzzy venue photo lookup — handles any capitalisation/spacing variant
+function getVenuePhoto(venueName) {
+    if (!venueName) return null;
+    const n = venueName.toLowerCase();
+    if (n.includes('daimler')) return 'https://totalfooty.co.uk/assets/daimler_green.jpg';
+    if (n.includes('corpus')) return 'https://totalfooty.co.uk/assets/corpus_Christi.jpg';
+    if (n.includes('war memorial') || n.includes('memorial park')) return 'https://totalfooty.co.uk/assets/war_memorial_park.jpg';
+    if (n.includes('powerleague') || n.includes('power league')) return 'https://totalfooty.co.uk/assets/powerleague.jpg';
+    if (n.includes('sidney') || n.includes('stringer')) return 'https://totalfooty.co.uk/assets/sidney_stringer.jpg';
+    return null;
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -454,6 +466,8 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.total_appearances, 
                     p.motm_wins, 
                     p.total_wins,
+                    p.tournament_wins,
+                    p.external_wins,
                     p.is_clm_admin,
                     p.is_organiser,
                     c.balance as credits,
@@ -507,6 +521,7 @@ app.get('/api/players', authenticateToken, async (req, res) => {
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
                 p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
+                p.tournament_wins, p.external_wins,
                 p.phone, u.email,
                 p.is_clm_admin, p.is_organiser,
                 c.balance as credits,
@@ -612,6 +627,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
 
                 -- GAME STATS: all time
                 p.total_appearances, p.total_wins, p.motm_wins,
+                p.tournament_wins, p.external_wins,
 
                 -- GAME STATS: last 3 months
                 (SELECT COUNT(DISTINCT r.game_id)
@@ -972,6 +988,41 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
     } catch (error) {
         console.error('Credit adjustment error:', error);
         res.status(500).json({ error: 'Adjustment failed' });
+    }
+});
+
+// Update player ratings only (used from teams modal inline edit — preserves squad number, wins, phone)
+app.patch('/api/admin/players/:playerId/ratings', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const {
+            goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+            pace_rating, decisions_rating, assisting_rating, shooting_rating
+        } = req.body;
+
+        const overall_rating = (defending_rating || 0) + (strength_rating || 0) + (fitness_rating || 0) +
+                               (pace_rating || 0) + (decisions_rating || 0) + (assisting_rating || 0) + (shooting_rating || 0);
+
+        await pool.query(`
+            UPDATE players SET
+                goalkeeper_rating = $1,
+                defending_rating  = $2,
+                strength_rating   = $3,
+                fitness_rating    = $4,
+                pace_rating       = $5,
+                decisions_rating  = $6,
+                assisting_rating  = $7,
+                shooting_rating   = $8,
+                overall_rating    = $9
+            WHERE id = $10
+        `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+            pace_rating, decisions_rating, assisting_rating, shooting_rating,
+            overall_rating, playerId]);
+
+        res.json({ message: 'Ratings updated', overall_rating });
+    } catch (error) {
+        console.error('Patch player ratings error:', error);
+        res.status(500).json({ error: 'Failed to update ratings' });
     }
 });
 
@@ -1809,9 +1860,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         // Add venue photos based on venue name
         const gamesWithPhotos = result.rows.map(game => {
-            if (game.venue_name && venuePhotoMap[game.venue_name]) {
-                game.venue_photo = venuePhotoMap[game.venue_name];
-            }
+            game.venue_photo = getVenuePhoto(game.venue_name);
             return game;
         });
         
@@ -1865,7 +1914,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
         const games = result.rows.map(game => ({
             ...game,
             motm_winner_name: game.motm_winner_alias || game.motm_winner_name,
-            venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null,
+            venue_photo: getVenuePhoto(game.venue_name),
             game_time: new Date(game.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
             game_day: new Date(game.game_date).toLocaleDateString('en-US', { weekday: 'long' })
         }));
@@ -1940,8 +1989,8 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
         
-        if (game.venue_name && venuePhotoMap[game.venue_name]) {
-            game.venue_photo = venuePhotoMap[game.venue_name];
+        if (!game.venue_photo) {
+            game.venue_photo = getVenuePhoto(game.venue_name);
         }
         
         // Check if current user has guest(s) on this game
@@ -3353,26 +3402,27 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             fitness: blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
         };
         
+        const mapTeamPlayer = p => ({
+            id: p.player_id,
+            name: p.alias || p.full_name,
+            squadNumber: p.squad_number,
+            overall: p.overall_rating || 0,
+            defense: p.defending_rating || 0,
+            fitness: p.fitness_rating || 0,
+            goalkeeper: p.goalkeeper_rating || 0,
+            strength: p.strength_rating || 0,
+            pace: p.pace_rating || 0,
+            decisions: p.decisions_rating || 0,
+            assisting: p.assisting_rating || 0,
+            shooting: p.shooting_rating || 0,
+            isGK: p.position_preference?.toLowerCase().includes('gk')
+        });
+
         res.json({
             message: 'Teams generated successfully',
-            redTeam: redTeam.map(p => ({
-                id: p.player_id,
-                name: p.alias || p.full_name,
-                squadNumber: p.squad_number,
-                overall: p.overall_rating,
-                defense: p.defending_rating || 0,
-                fitness: p.fitness_rating || 0,
-                isGK: p.position_preference?.toLowerCase().includes('gk')
-            })),
-            blueTeam: blueTeam.map(p => ({
-                id: p.player_id,
-                name: p.alias || p.full_name,
-                squadNumber: p.squad_number,
-                overall: p.overall_rating,
-                defense: p.defending_rating || 0,
-                fitness: p.fitness_rating || 0,
-                isGK: p.position_preference?.toLowerCase().includes('gk')
-            })),
+            team_selection_type: game.team_selection_type,
+            redTeam: redTeam.map(mapTeamPlayer),
+            blueTeam: blueTeam.map(mapTeamPlayer),
             redStats,
             blueStats,
             beefs: Array.from(highBeefs.entries()).map(([playerId, targets]) => ({
@@ -3988,19 +4038,29 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             
             const [redTeamResult, blueTeamResult] = await Promise.all([
                 pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number
+                    SELECT p.id, p.full_name, p.alias, p.squad_number,
+                           p.overall_rating, p.defending_rating, p.fitness_rating,
+                           p.goalkeeper_rating, p.strength_rating, p.pace_rating,
+                           p.decisions_rating, p.assisting_rating, p.shooting_rating,
+                           r.position_preference
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
+                    LEFT JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [redTeamId]),
+                `, [redTeamId, gameId]),
                 pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number
+                    SELECT p.id, p.full_name, p.alias, p.squad_number,
+                           p.overall_rating, p.defending_rating, p.fitness_rating,
+                           p.goalkeeper_rating, p.strength_rating, p.pace_rating,
+                           p.decisions_rating, p.assisting_rating, p.shooting_rating,
+                           r.position_preference
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
+                    LEFT JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [blueTeamId])
+                `, [blueTeamId, gameId])
             ]);
             
             const redGuests = guestsResult.rows
@@ -4009,10 +4069,43 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             const blueGuests = guestsResult.rows
                 .filter(g => g.team_name === 'Blue')
                 .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
+
+            const mapPlayer = p => ({
+                id: p.id,
+                name: p.alias || p.full_name,
+                squadNumber: p.squad_number,
+                overall: p.overall_rating || 0,
+                defense: p.defending_rating || 0,
+                fitness: p.fitness_rating || 0,
+                goalkeeper: p.goalkeeper_rating || 0,
+                strength: p.strength_rating || 0,
+                pace: p.pace_rating || 0,
+                decisions: p.decisions_rating || 0,
+                assisting: p.assisting_rating || 0,
+                shooting: p.shooting_rating || 0,
+                isGK: p.position_preference?.toLowerCase().includes('gk')
+            });
+
+            const redTeam = [...redTeamResult.rows.map(mapPlayer), ...redGuests];
+            const blueTeam = [...blueTeamResult.rows.map(mapPlayer), ...blueGuests];
+
+            const redStats = {
+                overall: redTeam.reduce((s, p) => s + (p.overall || 0), 0),
+                defense: redTeam.reduce((s, p) => s + (p.defense || 0), 0),
+                fitness: redTeam.reduce((s, p) => s + (p.fitness || 0), 0)
+            };
+            const blueStats = {
+                overall: blueTeam.reduce((s, p) => s + (p.overall || 0), 0),
+                defense: blueTeam.reduce((s, p) => s + (p.defense || 0), 0),
+                fitness: blueTeam.reduce((s, p) => s + (p.fitness || 0), 0)
+            };
             
             res.json({
-                redTeam: [...redTeamResult.rows, ...redGuests],
-                blueTeam: [...blueTeamResult.rows, ...blueGuests]
+                redTeam,
+                blueTeam,
+                redStats,
+                blueStats,
+                team_selection_type: gameCheck.rows[0].team_selection_type
             });
         }
         
@@ -4363,7 +4456,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             if (winningPlayerIds.length > 0) {
                 await client.query(
                     `UPDATE players 
-                     SET total_wins = total_wins + 1
+                     SET total_wins = total_wins + 1${isExternal && winningTeam === 'red' ? ', external_wins = external_wins + 1' : ''}
                      WHERE id = ANY($1)`,
                     [winningPlayerIds]
                 );
@@ -4861,9 +4954,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
         
-        const venue_photo = game.venue_name && venuePhotoMap[game.venue_name] 
-            ? venuePhotoMap[game.venue_name] 
-            : game.venue_photo;
+        const venue_photo = getVenuePhoto(game.venue_name) || game.venue_photo;
         
         // Get series scoreline if applicable
         let seriesScoreline = null;
@@ -5004,6 +5095,8 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                 p.total_appearances,
                 p.motm_wins,
                 p.total_wins,
+                p.tournament_wins,
+                p.external_wins,
                 p.reliability_tier,
                 r.position_preference,
                 r.registered_at,
@@ -5017,7 +5110,7 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status = 'confirmed'
             GROUP BY p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
-                     p.total_appearances, p.motm_wins, p.total_wins, p.reliability_tier,
+                     p.total_appearances, p.motm_wins, p.total_wins, p.tournament_wins, p.external_wins, p.reliability_tier,
                      r.position_preference, r.registered_at
             ORDER BY r.registered_at ASC
         `, [gameId]);
@@ -6560,7 +6653,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             const winnerIds = winningTeamPlayers.rows.map(r => r.player_id);
             if (winnerIds.length > 0) {
                 await client.query(
-                    'UPDATE players SET total_wins = total_wins + 1 WHERE id = ANY($1)',
+                    'UPDATE players SET total_wins = total_wins + 1, tournament_wins = tournament_wins + 1 WHERE id = ANY($1)',
                     [winnerIds]
                 );
             }
