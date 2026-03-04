@@ -221,8 +221,17 @@ app.post('/api/auth/register', async (req, res) => {
                         );
                         console.log('CLM badge assigned via direct link to player ' + playerId);
                     }
+                } else if (ref.toLowerCase() === 'misfits') {
+                    // Direct Misfits link - just assign Misfits badge
+                    const misfitsBadge = await pool.query("SELECT id FROM badges WHERE name = 'Misfits'");
+                    if (misfitsBadge.rows.length > 0) {
+                        await pool.query(
+                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                            [playerId, misfitsBadge.rows[0].id]
+                        );
+                        console.log('Misfits badge assigned via direct link to player ' + playerId);
+                    }
                 } else {
-                    // Look up referrer by code: try players.referral_code first, fall back to referrals table
                     let referrerId = null;
                     const pRef = await pool.query('SELECT id FROM players WHERE referral_code = $1', [ref.toUpperCase()]);
                     if (pRef.rows.length > 0) {
@@ -250,6 +259,22 @@ app.post('/api/auth/register', async (req, res) => {
                                     [playerId, clmBadge.rows[0].id]
                                 );
                                 console.log('CLM badge inherited from referrer ' + referrerId + ' to ' + playerId);
+                            }
+                        }
+                        
+                        // Misfits badge inheritance: if referrer has Misfits badge, new player gets it too
+                        const referrerMisfits = await pool.query(
+                            "SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'Misfits'",
+                            [referrerId]
+                        );
+                        if (referrerMisfits.rows.length > 0) {
+                            const misfitsBadge = await pool.query("SELECT id FROM badges WHERE name = 'Misfits'");
+                            if (misfitsBadge.rows.length > 0) {
+                                await pool.query(
+                                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                                    [playerId, misfitsBadge.rows[0].id]
+                                );
+                                console.log('Misfits badge inherited from referrer ' + referrerId + ' to ' + playerId);
                             }
                         }
                     }
@@ -361,7 +386,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     try {
         const playerResult = await pool.query(
-            `SELECT p.id, p.full_name, p.alias, p.squad_number, u.role,
+            `SELECT p.id, p.full_name, p.alias, p.squad_number, p.referral_code, u.role,
              COALESCE(p.is_clm_admin, false) as is_clm_admin,
              COALESCE(p.is_organiser, false) as is_organiser
              FROM players p
@@ -380,6 +405,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
             fullName: player.full_name,
             alias: player.alias,
             squadNumber: player.squad_number,
+            referralCode: player.referral_code,
             role: player.role,
             isCLMAdmin: player.is_clm_admin || false,
             isOrganiser: player.is_organiser || false
@@ -1240,6 +1266,50 @@ app.post('/api/admin/badges/auto-allocate-all', authenticateToken, requireAdmin,
     }
 });
 
+// Admin: manually link a player's referrer
+app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const { referredBy } = req.body;
+        
+        if (!referredBy) {
+            return res.status(400).json({ error: 'referredBy (player ID) is required' });
+        }
+        
+        // Verify both players exist
+        const playerCheck = await pool.query('SELECT id, alias, full_name, referred_by FROM players WHERE id = $1', [playerId]);
+        if (playerCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        
+        const referrerCheck = await pool.query('SELECT id, alias, full_name FROM players WHERE id = $1', [referredBy]);
+        if (referrerCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Referrer not found' });
+        }
+        
+        // Prevent self-referral
+        if (playerId === referredBy) {
+            return res.status(400).json({ error: 'A player cannot refer themselves' });
+        }
+        
+        // Update referred_by
+        await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referredBy, playerId]);
+        
+        const player = playerCheck.rows[0];
+        const referrer = referrerCheck.rows[0];
+        console.log(`Admin manually linked referral: ${player.alias || player.full_name} referred by ${referrer.alias || referrer.full_name}`);
+        
+        res.json({ 
+            message: `${player.alias || player.full_name} is now linked as referred by ${referrer.alias || referrer.full_name}`,
+            player: { id: playerId, name: player.alias || player.full_name },
+            referrer: { id: referredBy, name: referrer.alias || referrer.full_name }
+        });
+    } catch (error) {
+        console.error('Admin set referral error:', error);
+        res.status(500).json({ error: 'Failed to set referral' });
+    }
+});
+
 // Bulk upload / update players from CSV
 app.post('/api/admin/players/bulk-upload', authenticateToken, requireAdmin, async (req, res) => {
     const client = await pool.connect();
@@ -1823,7 +1893,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         }
         
         const game = gameResult.rows[0];
-        game.max_gk_slots = game.team_selection_type === 'vs_external' ? 1 : 2;
+        game.max_gk_slots = game.team_selection_type === 'vs_external' ? 1 : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4) : 2;
         game.gk_count = parseInt(game.gk_count) || 0;
         
         // Get registered players (confirmed)
@@ -1900,12 +1970,24 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
     try {
         const { 
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
-            exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor 
+            exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor,
+            tournamentTeamCount, tournamentName
         } = req.body;
         
         // CLM admins can only create CLM-exclusive games
         const isCLMAdminOnly = req.user.role !== 'admin' && req.user.role !== 'superadmin';
         const gameExclusivity = isCLMAdminOnly ? 'clm' : (exclusivity || 'everyone');
+        
+        // Tournament validation
+        const selTypeCheck = teamSelectionType || 'normal';
+        if (selTypeCheck === 'tournament') {
+            if (![4, 6].includes(parseInt(tournamentTeamCount))) {
+                return res.status(400).json({ error: 'Tournament must have 4 or 6 teams' });
+            }
+            if (regularity === 'weekly') {
+                return res.status(400).json({ error: 'Tournaments can only be created as one-off events' });
+            }
+        }
         
         const createdGames = [];
         
@@ -1979,13 +2061,16 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                 `INSERT INTO games (
                     venue_id, game_date, max_players, cost_per_player, format, regularity, 
                     exclusivity, position_type, game_url, series_id,
-                    team_selection_type, external_opponent, tf_kit_color, opp_kit_color
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
+                    tournament_team_count, tournament_name
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
                     gameExclusivity, positionType || 'outfield_gk', gameUrl,
-                    seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null
+                    seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
+                    selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
+                    selType === 'tournament' ? (tournamentName || null) : null
                 ]
             );
             
@@ -2007,6 +2092,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 p.alias,
                 p.squad_number,
                 r.position_preference as positions,
+                r.tournament_team_preference,
                 array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
             FROM registrations r
@@ -2014,7 +2100,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status = 'confirmed'
-            GROUP BY p.id, p.full_name, p.alias, p.squad_number, r.position_preference
+            GROUP BY p.id, p.full_name, p.alias, p.squad_number, r.position_preference, r.tournament_team_preference
             ORDER BY p.squad_number NULLS LAST, p.alias
         `, [req.params.id]);
         
@@ -2028,7 +2114,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
 app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
-        const { position, positions, pairs, avoids, backupType } = req.body;
+        const { position, positions, pairs, avoids, backupType, tournamentTeamPreference } = req.body;
         const gameId = req.params.id;
         const positionValue = positions || position || 'outfield';
         
@@ -2037,7 +2123,7 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         // Lock the game row to prevent race conditions
         const gameLock = await client.query(`
             SELECT max_players, cost_per_player, exclusivity, 
-                   player_editing_locked, team_selection_type, position_type
+                   player_editing_locked, team_selection_type, position_type, tournament_team_count
             FROM games
             WHERE id = $1
             FOR UPDATE
@@ -2130,7 +2216,7 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         // GK slot check for confirmed registrations
         const isGKOnly = positionValue.trim().toUpperCase() === 'GK';
         if (!isFull && isGKOnly) {
-            const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : 2;
+            const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4) : 2;
             const gkCount = await client.query(`
                 SELECT COUNT(*) as gk_count FROM registrations 
                 WHERE game_id = $1 AND status = 'confirmed' 
@@ -2223,9 +2309,10 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-            [gameId, req.user.playerId, status, positionValue, regBackupType]
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [gameId, req.user.playerId, status, positionValue, regBackupType,
+             game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null]
         );
         
         const registrationId = regResult.rows[0].id;
@@ -2401,7 +2488,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             guestNumber: nextGuestNumber,
             totalGuests: nextGuestNumber,
             amountCharged: cost,
-            referralLink: referralCode ? `https://totalfooty.co.uk/vibecoding/register.html?ref=${referralCode}` : null,
+            referralLink: referralCode ? `https://totalfooty.co.uk/vibecoding/?ref=${referralCode}` : null,
             referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
         });
     } catch (error) {
@@ -2507,7 +2594,7 @@ app.get('/api/games/:id/gk-slots', authenticateToken, async (req, res) => {
         const gameId = req.params.id;
         
         const result = await pool.query(`
-            SELECT g.team_selection_type,
+            SELECT g.team_selection_type, g.tournament_team_count,
                    COUNT(r.id) FILTER (WHERE r.status = 'confirmed' AND UPPER(TRIM(r.position_preference)) = 'GK') as gk_count
             FROM games g
             LEFT JOIN registrations r ON r.game_id = g.id
@@ -2519,7 +2606,7 @@ app.get('/api/games/:id/gk-slots', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Game not found' });
         }
         
-        const maxGKSlots = result.rows[0].team_selection_type === 'vs_external' ? 1 : 2;
+        const maxGKSlots = result.rows[0].team_selection_type === 'vs_external' ? 1 : result.rows[0].team_selection_type === 'tournament' ? (result.rows[0].tournament_team_count || 4) : 2;
         const currentGKs = parseInt(result.rows[0].gk_count) || 0;
         
         res.json({ 
@@ -2570,7 +2657,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         
         // Lock the game row
         const gameCheck = await client.query(
-            'SELECT player_editing_locked, teams_generated, cost_per_player, team_selection_type FROM games WHERE id = $1 FOR UPDATE',
+            'SELECT player_editing_locked, teams_generated, cost_per_player, team_selection_type, tournament_team_count FROM games WHERE id = $1 FOR UPDATE',
             [gameId]
         );
         
@@ -2646,7 +2733,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         let promotedPlayer = null;
         if (wasConfirmed) {
             // Get GK slot info for validation
-            const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : 2;
+            const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : gameCheck.rows[0].team_selection_type === 'tournament' ? (gameCheck.rows[0].tournament_team_count || 4) : 2;
             const gkCountResult = await client.query(
                 `SELECT COUNT(*) as gk_count FROM registrations 
                  WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'`,
@@ -2810,6 +2897,12 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
 app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
+        
+        // Block tournament games — must use manual draft
+        const tournCheck = await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId]);
+        if (tournCheck.rows[0]?.team_selection_type === 'tournament') {
+            return res.status(400).json({ error: 'Tournament games must use manual team draft, not auto-generate' });
+        }
         
         // Get all confirmed registrations with player stats
         const playersResult = await pool.query(`
@@ -3504,13 +3597,50 @@ app.get('/api/admin/games/:gameId/fixed-teams', authenticateToken, requireGameMa
 app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { redTeam, blueTeam } = req.body;
+        const { redTeam, blueTeam, teams: tournamentTeams } = req.body;
         
         // Get game info
-        const gameResult = await pool.query('SELECT series_id, team_selection_type FROM games WHERE id = $1', [gameId]);
+        const gameResult = await pool.query('SELECT series_id, team_selection_type, tournament_team_count FROM games WHERE id = $1', [gameId]);
         const game = gameResult.rows[0];
         
-        if ((game.team_selection_type === 'fixed_draft' || game.team_selection_type === 'draft_memory' || game.team_selection_type === 'vs_external') && game.series_id) {
+        const isTournament = game.team_selection_type === 'tournament';
+        
+        if (isTournament && tournamentTeams) {
+            // TOURNAMENT MODE: save N teams
+            await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+            await pool.query("UPDATE game_guests SET team_name = NULL WHERE game_id = $1", [gameId]);
+            
+            for (const [teamName, playerIds] of Object.entries(tournamentTeams)) {
+                const teamResult = await pool.query(
+                    'INSERT INTO teams (game_id, team_name) VALUES ($1, $2) RETURNING id',
+                    [gameId, teamName]
+                );
+                const teamId = teamResult.rows[0].id;
+                
+                for (const playerId of playerIds) {
+                    if (playerId.startsWith && playerId.startsWith('guest_')) {
+                        await pool.query(
+                            "UPDATE game_guests SET team_name = $1 WHERE id = $2",
+                            [teamName, playerId.replace('guest_', '')]
+                        );
+                    } else {
+                        await pool.query(
+                            'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                            [teamId, playerId]
+                        );
+                    }
+                }
+            }
+            
+            // Mark teams as generated and confirmed
+            await pool.query(
+                'UPDATE games SET teams_generated = true, teams_confirmed = true, game_status = $1 WHERE id = $2',
+                ['confirmed', gameId]
+            );
+            
+            res.json({ message: 'Tournament teams saved successfully' });
+            return;
+        } else if ((game.team_selection_type === 'fixed_draft' || game.team_selection_type === 'draft_memory' || game.team_selection_type === 'vs_external') && game.series_id) {
             // Save fixed team assignments for the series
             for (const playerId of redTeam) {
                 await pool.query(`
@@ -3703,6 +3833,10 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
     try {
         const { gameId } = req.params;
         
+        // Check if this is a tournament game
+        const gameCheck = await pool.query('SELECT team_selection_type, tournament_team_count FROM games WHERE id = $1', [gameId]);
+        const isTournament = gameCheck.rows[0]?.team_selection_type === 'tournament';
+        
         // Get team IDs
         const teamsResult = await pool.query(
             'SELECT id, team_name FROM teams WHERE game_id = $1 ORDER BY team_name',
@@ -3713,27 +3847,6 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             return res.status(404).json({ error: 'Teams not found' });
         }
         
-        const redTeamId = teamsResult.rows.find(t => t.team_name === 'Red')?.id;
-        const blueTeamId = teamsResult.rows.find(t => t.team_name === 'Blue')?.id;
-        
-        // Get players for each team
-        const [redTeamResult, blueTeamResult] = await Promise.all([
-            pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number
-                FROM team_players tp
-                JOIN players p ON p.id = tp.player_id
-                WHERE tp.team_id = $1
-                ORDER BY p.full_name
-            `, [redTeamId]),
-            pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number
-                FROM team_players tp
-                JOIN players p ON p.id = tp.player_id
-                WHERE tp.team_id = $1
-                ORDER BY p.full_name
-            `, [blueTeamId])
-        ]);
-        
         // Also fetch guests assigned to teams
         const guestsResult = await pool.query(
             `SELECT id, guest_name, overall_rating, team_name, invited_by
@@ -3741,17 +3854,59 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             [gameId]
         );
         
-        const redGuests = guestsResult.rows
-            .filter(g => g.team_name === 'Red')
-            .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
-        const blueGuests = guestsResult.rows
-            .filter(g => g.team_name === 'Blue')
-            .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
-        
-        res.json({
-            redTeam: [...redTeamResult.rows, ...redGuests],
-            blueTeam: [...blueTeamResult.rows, ...blueGuests]
-        });
+        if (isTournament) {
+            // Tournament: return all teams keyed by name
+            const teams = {};
+            for (const team of teamsResult.rows) {
+                const playersResult = await pool.query(`
+                    SELECT p.id, p.full_name, p.alias, p.squad_number, p.overall_rating
+                    FROM team_players tp
+                    JOIN players p ON p.id = tp.player_id
+                    WHERE tp.team_id = $1
+                    ORDER BY p.full_name
+                `, [team.id]);
+                
+                const teamGuests = guestsResult.rows
+                    .filter(g => g.team_name === team.team_name)
+                    .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall_rating: g.overall_rating, isGuest: true }));
+                
+                teams[team.team_name] = [...playersResult.rows, ...teamGuests];
+            }
+            res.json({ teams, isTournament: true });
+        } else {
+            // Standard 2-team: return redTeam/blueTeam (backward compatible)
+            const redTeamId = teamsResult.rows.find(t => t.team_name === 'Red')?.id;
+            const blueTeamId = teamsResult.rows.find(t => t.team_name === 'Blue')?.id;
+            
+            const [redTeamResult, blueTeamResult] = await Promise.all([
+                pool.query(`
+                    SELECT p.id, p.full_name, p.alias, p.squad_number
+                    FROM team_players tp
+                    JOIN players p ON p.id = tp.player_id
+                    WHERE tp.team_id = $1
+                    ORDER BY p.full_name
+                `, [redTeamId]),
+                pool.query(`
+                    SELECT p.id, p.full_name, p.alias, p.squad_number
+                    FROM team_players tp
+                    JOIN players p ON p.id = tp.player_id
+                    WHERE tp.team_id = $1
+                    ORDER BY p.full_name
+                `, [blueTeamId])
+            ]);
+            
+            const redGuests = guestsResult.rows
+                .filter(g => g.team_name === 'Red')
+                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
+            const blueGuests = guestsResult.rows
+                .filter(g => g.team_name === 'Blue')
+                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
+            
+            res.json({
+                redTeam: [...redTeamResult.rows, ...redGuests],
+                blueTeam: [...blueTeamResult.rows, ...blueGuests]
+            });
+        }
         
     } catch (error) {
         console.error('Get teams error:', error);
@@ -4013,6 +4168,12 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         const { gameId } = req.params;
         const { winningTeam, disciplineRecords, beefEntries, motmNominees } = req.body;
         
+        // Block tournament games — must use /finalise-tournament instead
+        const tournCheck = await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId]);
+        if (tournCheck.rows[0]?.team_selection_type === 'tournament') {
+            return res.status(400).json({ error: 'Tournament games must be completed via the Finalise Tournament flow' });
+        }
+        
         console.log('Complete game request:', {
             gameId,
             winningTeam,
@@ -4110,7 +4271,8 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             if (record.points > 0) {
                 const offenseTypes = {
                     'on_time': 'On Time',
-                    'not_ready': 'Not Ready',
+                    'not_ready': 'Not Ready (0-5 Min)',
+                    'late_drop': 'Late Drop Out',
                     '5_10_late': '5-10 Minutes Late',
                     '10_late': '10+ Minutes Late',
                     'no_show': 'No Show'
@@ -4321,6 +4483,83 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             return res.status(404).json({ error: 'Teams not generated yet' });
         }
         
+        // TOURNAMENT BRANCH: return all teams + results + league table
+        if (game.team_selection_type === 'tournament') {
+            const tournamentTeams = {};
+            for (const team of teamsResult.rows) {
+                const playersResult = await pool.query(`
+                    SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position
+                    FROM team_players tp
+                    JOIN players p ON p.id = tp.player_id
+                    JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
+                    WHERE tp.team_id = $1
+                    ORDER BY CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END, COALESCE(p.alias, p.full_name)
+                `, [team.id, game.id]);
+                
+                // Include guests on this team
+                const teamGuests = await pool.query(
+                    `SELECT id, guest_name, overall_rating FROM game_guests WHERE game_id = $1 AND team_name = $2`,
+                    [game.id, team.team_name]
+                );
+                
+                const players = playersResult.rows.map(p => ({
+                    id: p.id, name: p.alias || p.full_name, squadNumber: p.squad_number,
+                    photo_url: p.photo_url, isGK: p.position === 'goalkeeper'
+                }));
+                const guests = teamGuests.rows.map(g => ({
+                    id: `guest_${g.id}`, name: `${g.guest_name} (Guest)`, squadNumber: null,
+                    photo_url: null, isGK: false, isGuest: true
+                }));
+                
+                tournamentTeams[team.team_name] = [...players, ...guests];
+            }
+            
+            // Get results + league table
+            const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [game.id]);
+            const teamNames = teamsResult.rows.map(t => t.team_name);
+            const leagueTable = calculateLeagueTable(allResults.rows, teamNames);
+            
+            // MOTM for tournament
+            let motmNominees = [];
+            let votingOpen = false;
+            let votingFinalized = false;
+            if (game.game_status === 'completed' && game.motm_voting_ends) {
+                const votingEnds = new Date(game.motm_voting_ends);
+                votingOpen = votingEnds > new Date();
+                votingFinalized = game.motm_winner_id !== null;
+                const motmResult = await pool.query(`
+                    SELECT n.player_id, p.full_name, p.alias, p.squad_number,
+                           COUNT(v.id) as votes, (n.player_id = g.motm_winner_id) as is_winner
+                    FROM motm_nominees n
+                    JOIN players p ON p.id = n.player_id
+                    JOIN games g ON g.id = n.game_id
+                    LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
+                    WHERE n.game_id = $1
+                    GROUP BY n.player_id, p.full_name, p.alias, p.squad_number, g.motm_winner_id
+                    ORDER BY votes DESC
+                `, [game.id]);
+                motmNominees = motmResult.rows;
+            }
+            
+            return res.json({
+                isTournament: true,
+                game: {
+                    id: game.id, game_url: game.game_url, date: game.game_date,
+                    venue_name: game.venue_name, venue_address: game.venue_address, format: game.format,
+                    tournament_name: game.tournament_name, tournament_team_count: game.tournament_team_count,
+                    tournament_results_finalised: game.tournament_results_finalised,
+                    winning_team: game.winning_team, game_status: game.game_status,
+                    team_selection_type: game.team_selection_type,
+                    votingOpen, votingFinalized, votingEnds: game.motm_voting_ends
+                },
+                teams: tournamentTeams,
+                results: allResults.rows,
+                leagueTable,
+                motmNominees
+            });
+        }
+        
+        // STANDARD 2-TEAM MODE
         const redTeamId = teamsResult.rows.find(t => t.team_name === 'Red')?.id;
         const blueTeamId = teamsResult.rows.find(t => t.team_name === 'Blue')?.id;
         
@@ -4545,6 +4784,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             current_players: game.current_players,
             cost_per_player: game.cost_per_player,
             game_status: game.game_status,
+            exclusivity: game.exclusivity,
             teams_confirmed: game.teams_confirmed,
             team_selection_type: game.team_selection_type,
             external_opponent: game.external_opponent,
@@ -4553,6 +4793,9 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             winning_team: game.winning_team,
             motm_voting_ends: game.motm_voting_ends,
             motm_winner_id: game.motm_winner_id,
+            tournament_name: game.tournament_name,
+            tournament_team_count: game.tournament_team_count,
+            tournament_results_finalised: game.tournament_results_finalised,
             seriesScoreline
         });
         
@@ -4870,14 +5113,37 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
                 p.squad_number,
                 p.overall_rating,
                 r.status,
-                r.position_preference
+                r.position_preference,
+                r.tournament_team_preference
             FROM registrations r
             JOIN players p ON p.id = r.player_id
             WHERE r.game_id = $1
             ORDER BY p.squad_number ASC NULLS LAST
         `, [gameId]);
         
-        res.json(result.rows);
+        // Also fetch guests for this game
+        const guestsResult = await pool.query(
+            `SELECT id, guest_name, overall_rating, invited_by FROM game_guests WHERE game_id = $1 ORDER BY guest_number ASC`,
+            [gameId]
+        );
+        
+        // Return combined: players array + guests array
+        // Guests are appended as pseudo-players for draft compatibility
+        const guests = guestsResult.rows.map(g => ({
+            registration_id: null,
+            player_id: `guest_${g.id}`,
+            full_name: g.guest_name,
+            alias: `${g.guest_name} (+1)`,
+            squad_number: null,
+            overall_rating: g.overall_rating || 0,
+            status: 'confirmed',
+            position_preference: 'outfield',
+            tournament_team_preference: null,
+            is_guest: true,
+            invited_by: g.invited_by
+        }));
+        
+        res.json([...result.rows, ...guests]);
         
     } catch (error) {
         console.error('Get game players error:', error);
@@ -4913,7 +5179,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         
         // Get game details for capacity + GK checks
         const gameResult = await pool.query(
-            'SELECT cost_per_player, max_players, team_selection_type FROM games WHERE id = $1',
+            'SELECT cost_per_player, max_players, team_selection_type, tournament_team_count FROM games WHERE id = $1',
             [gameId]
         );
         const game = gameResult.rows[0];
@@ -4935,7 +5201,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         const posValue = position || 'outfield';
         const isGK = posValue.trim().toUpperCase() === 'GK';
         if (isGK) {
-            const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : 2;
+            const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4) : 2;
             const gkCount = await pool.query(
                 `SELECT COUNT(*) as gk_count FROM registrations
                  WHERE game_id = $1 AND status = 'confirmed'
@@ -5013,7 +5279,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         
         // Get game details for capacity + GK checks
         const gameCheck = await pool.query(
-            'SELECT max_players, team_selection_type FROM games WHERE id = $1',
+            'SELECT max_players, team_selection_type, tournament_team_count FROM games WHERE id = $1',
             [gameId]
         );
         
@@ -5033,7 +5299,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         const posValue = position || 'outfield';
         const isGK = posValue.trim().toUpperCase() === 'GK';
         if (isGK) {
-            const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : 2;
+            const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : gameCheck.rows[0].team_selection_type === 'tournament' ? (gameCheck.rows[0].tournament_team_count || 4) : 2;
             const gkCount = await pool.query(
                 `SELECT COUNT(*) as gk_count FROM registrations
                  WHERE game_id = $1 AND status = 'confirmed'
@@ -5124,7 +5390,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         
         // Get game cost and type
         const gameResult = await pool.query(
-            'SELECT cost_per_player, team_selection_type FROM games WHERE id = $1',
+            'SELECT cost_per_player, team_selection_type, tournament_team_count FROM games WHERE id = $1',
             [gameId]
         );
         const cost = parseFloat(gameResult.rows[0].cost_per_player);
@@ -5149,7 +5415,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         // Try to promote a backup if a confirmed player was removed
         let promotedPlayer = null;
         if (wasConfirmed) {
-            const maxGKSlots = gameResult.rows[0].team_selection_type === 'vs_external' ? 1 : 2;
+            const maxGKSlots = gameResult.rows[0].team_selection_type === 'vs_external' ? 1 : gameResult.rows[0].team_selection_type === 'tournament' ? (gameResult.rows[0].tournament_team_count || 4) : 2;
             const gkCountResult = await pool.query(
                 `SELECT COUNT(*) as gk_count FROM registrations 
                  WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'`,
@@ -5355,7 +5621,7 @@ app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
         res.json({
             referralCode: me.referral_code,
             referralLink: me.referral_code
-                ? 'https://totalfooty.co.uk/vibecoding/register.html?ref=' + me.referral_code
+                ? 'https://totalfooty.co.uk/vibecoding/?ref=' + me.referral_code
                 : null,
             referredBy: me.referred_by ? { id: me.referred_by, alias: me.referred_by_alias } : null,
             referrals: referred.rows.map(r => ({
@@ -5382,7 +5648,8 @@ app.get('/api/public/referral/:code', async (req, res) => {
         let referrer = null;
         const pRef = await pool.query(
             `SELECT p.id, p.alias, p.full_name,
-             EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm
+             EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm,
+             EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'Misfits') as has_misfits
              FROM players p WHERE p.referral_code = $1`,
             [code.toUpperCase()]
         );
@@ -5392,7 +5659,8 @@ app.get('/api/public/referral/:code', async (req, res) => {
         } else {
             const rRef = await pool.query(
                 `SELECT p.id, p.alias, p.full_name,
-                 EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm
+                 EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm,
+                 EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'Misfits') as has_misfits
                  FROM referrals r JOIN players p ON r.referrer_id = p.id WHERE r.referral_code = $1`,
                 [code.toUpperCase()]
             );
@@ -5407,9 +5675,17 @@ app.get('/api/public/referral/:code', async (req, res) => {
             valid: true,
             referrerName: referrer.alias || referrer.full_name,
             hasCLM: referrer.has_clm,
-            message: referrer.has_clm
-                ? 'You have been referred by ' + (referrer.alias || referrer.full_name) + '! You will receive CLM access upon registration.'
-                : 'You have been referred by ' + (referrer.alias || referrer.full_name) + '! Welcome to Total Footy.'
+            hasMisfits: referrer.has_misfits,
+            message: (() => {
+                const badges = [];
+                if (referrer.has_clm) badges.push('CLM');
+                if (referrer.has_misfits) badges.push('Misfits');
+                const name = referrer.alias || referrer.full_name;
+                if (badges.length > 0) {
+                    return `You have been referred by ${name}! You will receive ${badges.join(' + ')} access upon registration.`;
+                }
+                return `You have been referred by ${name}! Welcome to Total Footy.`;
+            })()
         });
     } catch (error) {
         console.error('Validate referral error:', error);
@@ -5430,7 +5706,7 @@ app.get('/api/public/player/:playerId/referral', async (req, res) => {
         res.json({
             referralCode: p.referral_code,
             referralLink: p.referral_code
-                ? 'https://totalfooty.co.uk/vibecoding/register.html?ref=' + p.referral_code
+                ? 'https://totalfooty.co.uk/vibecoding/?ref=' + p.referral_code
                 : null,
             playerName: p.alias || p.full_name
         });
@@ -5718,6 +5994,459 @@ app.get('/api/admin/whatsapp/logs', authenticateToken, requireAdmin, async (req,
     } catch (error) {
         console.error('Get WhatsApp logs error:', error);
         res.status(500).json({ error: 'Failed to get logs' });
+    }
+});
+
+// ==========================================
+// TOURNAMENT SYSTEM
+// ==========================================
+
+function calculateLeagueTable(results, teamNames) {
+    const table = {};
+    for (const name of teamNames) {
+        table[name] = { team: name, played: 0, won: 0, drawn: 0, lost: 0, gf: 0, ga: 0, gd: 0, points: 0 };
+    }
+    
+    for (const r of results) {
+        const a = r.team_a_name;
+        const b = r.team_b_name;
+        if (!table[a] || !table[b]) continue;
+        
+        table[a].played++;
+        table[b].played++;
+        table[a].gf += r.team_a_score;
+        table[a].ga += r.team_b_score;
+        table[b].gf += r.team_b_score;
+        table[b].ga += r.team_a_score;
+        
+        if (r.team_a_score > r.team_b_score) {
+            table[a].won++;
+            table[a].points += 3;
+            table[b].lost++;
+        } else if (r.team_b_score > r.team_a_score) {
+            table[b].won++;
+            table[b].points += 3;
+            table[a].lost++;
+        } else {
+            table[a].drawn++;
+            table[b].drawn++;
+            table[a].points += 1;
+            table[b].points += 1;
+        }
+    }
+    
+    // Calculate GD and sort
+    const sorted = Object.values(table).map(t => ({ ...t, gd: t.gf - t.ga }));
+    sorted.sort((a, b) => b.points - a.points || b.gd - a.gd || b.gf - a.gf || a.team.localeCompare(b.team));
+    return sorted;
+}
+
+// Enter a tournament match result
+app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { teamA, teamB, teamAScore, teamBScore } = req.body;
+        
+        // Validate game is a tournament and not finalised
+        const gameCheck = await pool.query(
+            'SELECT team_selection_type, tournament_results_finalised, tournament_team_count FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        if (gameCheck.rows[0].team_selection_type !== 'tournament') return res.status(400).json({ error: 'Not a tournament game' });
+        if (gameCheck.rows[0].tournament_results_finalised) return res.status(400).json({ error: 'Tournament already finalised' });
+        
+        // Validate teams exist for this game
+        const teamsCheck = await pool.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
+        const validTeams = teamsCheck.rows.map(t => t.team_name);
+        if (!validTeams.includes(teamA) || !validTeams.includes(teamB)) {
+            return res.status(400).json({ error: 'Invalid team name(s)' });
+        }
+        if (teamA === teamB) return res.status(400).json({ error: 'A team cannot play itself' });
+        
+        // Validate scores
+        const scoreA = parseInt(teamAScore);
+        const scoreB = parseInt(teamBScore);
+        if (isNaN(scoreA) || isNaN(scoreB) || scoreA < 0 || scoreB < 0) {
+            return res.status(400).json({ error: 'Scores must be non-negative integers' });
+        }
+        
+        // Check for duplicate matchup
+        const dupCheck = await pool.query(
+            `SELECT id FROM tournament_results 
+             WHERE game_id = $1 AND (
+                 (team_a_name = $2 AND team_b_name = $3) OR 
+                 (team_a_name = $3 AND team_b_name = $2)
+             )`,
+            [gameId, teamA, teamB]
+        );
+        if (dupCheck.rows.length > 0) {
+            return res.status(400).json({ error: `Result already entered for ${teamA} vs ${teamB}. Delete or edit the existing result first.` });
+        }
+        
+        // Insert result
+        const result = await pool.query(
+            `INSERT INTO tournament_results (game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [gameId, teamA, teamB, scoreA, scoreB, req.user.playerId]
+        );
+        
+        // Return updated results + league table
+        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
+        
+        res.json({
+            message: 'Result entered',
+            result: result.rows[0],
+            results: allResults.rows,
+            leagueTable
+        });
+    } catch (error) {
+        console.error('Enter tournament result error:', error);
+        res.status(500).json({ error: 'Failed to enter result' });
+    }
+});
+
+// Edit a tournament match result (update scores)
+app.put('/api/admin/games/:gameId/tournament-result/:resultId', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId, resultId } = req.params;
+        const { teamAScore, teamBScore } = req.body;
+        
+        // Validate game is tournament and not finalised
+        const gameCheck = await pool.query(
+            'SELECT team_selection_type, tournament_results_finalised FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (gameCheck.rows[0]?.team_selection_type !== 'tournament') return res.status(400).json({ error: 'Not a tournament game' });
+        if (gameCheck.rows[0]?.tournament_results_finalised) return res.status(400).json({ error: 'Tournament already finalised' });
+        
+        const scoreA = parseInt(teamAScore);
+        const scoreB = parseInt(teamBScore);
+        if (isNaN(scoreA) || isNaN(scoreB) || scoreA < 0 || scoreB < 0) {
+            return res.status(400).json({ error: 'Scores must be non-negative integers' });
+        }
+        
+        await pool.query(
+            'UPDATE tournament_results SET team_a_score = $1, team_b_score = $2 WHERE id = $3 AND game_id = $4',
+            [scoreA, scoreB, resultId, gameId]
+        );
+        
+        // Return updated results + league table
+        const teamsCheck = await pool.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
+        const validTeams = teamsCheck.rows.map(t => t.team_name);
+        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
+        
+        res.json({ message: 'Result updated', results: allResults.rows, leagueTable });
+    } catch (error) {
+        console.error('Edit tournament result error:', error);
+        res.status(500).json({ error: 'Failed to edit result' });
+    }
+});
+
+// Delete a tournament match result
+app.delete('/api/admin/games/:gameId/tournament-result/:resultId', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId, resultId } = req.params;
+        
+        const gameCheck = await pool.query(
+            'SELECT team_selection_type, tournament_results_finalised FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (gameCheck.rows[0]?.tournament_results_finalised) return res.status(400).json({ error: 'Tournament already finalised' });
+        
+        await pool.query('DELETE FROM tournament_results WHERE id = $1 AND game_id = $2', [resultId, gameId]);
+        
+        // Return updated results + league table
+        const teamsCheck = await pool.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
+        const validTeams = teamsCheck.rows.map(t => t.team_name);
+        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
+        
+        res.json({ message: 'Result deleted', results: allResults.rows, leagueTable });
+    } catch (error) {
+        console.error('Delete tournament result error:', error);
+        res.status(500).json({ error: 'Failed to delete result' });
+    }
+});
+
+// Get tournament results + league table (admin, authenticated)
+app.get('/api/admin/games/:gameId/tournament-results', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        
+        const teamsCheck = await pool.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
+        const validTeams = teamsCheck.rows.map(t => t.team_name);
+        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
+        
+        res.json({ results: allResults.rows, leagueTable });
+    } catch (error) {
+        console.error('Get tournament results error:', error);
+        res.status(500).json({ error: 'Failed to get results' });
+    }
+});
+
+// Public: Get tournament data (teams, results, league table) — no auth
+app.get('/api/public/game/:gameUrl/tournament', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        
+        const gameResult = await pool.query(`
+            SELECT g.*, v.name as venue_name, v.address as venue_address
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.game_url = $1 AND g.team_selection_type = 'tournament'
+        `, [gameUrl]);
+        
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Tournament not found' });
+        }
+        
+        const game = gameResult.rows[0];
+        
+        // Get all teams with players
+        const teamsResult = await pool.query('SELECT id, team_name FROM teams WHERE game_id = $1 ORDER BY team_name', [game.id]);
+        const teams = {};
+        for (const team of teamsResult.rows) {
+            const playersResult = await pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position
+                FROM team_players tp
+                JOIN players p ON p.id = tp.player_id
+                JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
+                WHERE tp.team_id = $1
+                ORDER BY 
+                    CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END,
+                    COALESCE(p.alias, p.full_name)
+            `, [team.id, game.id]);
+            
+            // Include guests
+            const teamGuests = await pool.query(
+                `SELECT id, guest_name, overall_rating FROM game_guests WHERE game_id = $1 AND team_name = $2`,
+                [game.id, team.team_name]
+            );
+            
+            const players = playersResult.rows.map(p => ({
+                id: p.id, name: p.alias || p.full_name, squadNumber: p.squad_number,
+                photo_url: p.photo_url, isGK: p.position === 'goalkeeper'
+            }));
+            const guests = teamGuests.rows.map(g => ({
+                id: `guest_${g.id}`, name: `${g.guest_name} (Guest)`, squadNumber: null,
+                photo_url: null, isGK: false, isGuest: true
+            }));
+            
+            teams[team.team_name] = [...players, ...guests];
+        }
+        
+        // Get results and league table
+        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [game.id]);
+        const teamNames = teamsResult.rows.map(t => t.team_name);
+        const leagueTable = calculateLeagueTable(allResults.rows, teamNames);
+        
+        // Get MOTM data if completed
+        let motmNominees = [];
+        let votingOpen = false;
+        let votingFinalized = false;
+        
+        if (game.game_status === 'completed' && game.motm_voting_ends) {
+            const votingEnds = new Date(game.motm_voting_ends);
+            votingOpen = votingEnds > new Date();
+            votingFinalized = game.motm_winner_id !== null;
+            
+            const motmResult = await pool.query(`
+                SELECT n.player_id, p.full_name, p.alias, p.squad_number,
+                       COUNT(v.id) as votes, (n.player_id = g.motm_winner_id) as is_winner
+                FROM motm_nominees n
+                JOIN players p ON p.id = n.player_id
+                JOIN games g ON g.id = n.game_id
+                LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
+                WHERE n.game_id = $1
+                GROUP BY n.player_id, p.full_name, p.alias, p.squad_number, g.motm_winner_id
+                ORDER BY votes DESC
+            `, [game.id]);
+            motmNominees = motmResult.rows;
+        }
+        
+        res.json({
+            game: {
+                id: game.id, game_url: game.game_url, date: game.game_date,
+                venue_name: game.venue_name, venue_address: game.venue_address, format: game.format,
+                tournament_name: game.tournament_name, tournament_team_count: game.tournament_team_count,
+                tournament_results_finalised: game.tournament_results_finalised,
+                winning_team: game.winning_team, game_status: game.game_status,
+                teams_confirmed: game.teams_confirmed,
+                votingOpen, votingFinalized, votingEnds: game.motm_voting_ends
+            },
+            teams,
+            results: allResults.rows,
+            leagueTable,
+            motmNominees
+        });
+    } catch (error) {
+        console.error('Get public tournament error:', error);
+        res.status(500).json({ error: 'Failed to get tournament data' });
+    }
+});
+
+// Finalise tournament — complete it based on league table
+app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requireGameManager, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { gameId } = req.params;
+        const { disciplineRecords, motmNominees } = req.body;
+        
+        await client.query('BEGIN');
+        
+        // Validate game is a tournament and not already finalised
+        const gameCheck = await client.query(
+            'SELECT team_selection_type, tournament_results_finalised, tournament_team_count FROM games WHERE id = $1 FOR UPDATE',
+            [gameId]
+        );
+        if (gameCheck.rows[0]?.team_selection_type !== 'tournament') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Not a tournament game' });
+        }
+        if (gameCheck.rows[0]?.tournament_results_finalised) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Tournament already finalised' });
+        }
+        
+        // Get results and calculate league table
+        const teamsCheck = await client.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
+        const teamNames = teamsCheck.rows.map(t => t.team_name);
+        const allResults = await client.query('SELECT * FROM tournament_results WHERE game_id = $1', [gameId]);
+        
+        if (allResults.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'No results entered. Enter at least one result before finalising.' });
+        }
+        
+        const leagueTable = calculateLeagueTable(allResults.rows, teamNames);
+        
+        // Determine winner — top of league table
+        // If top 2 are tied on points AND GD AND GF, it's a draw
+        let winningTeam;
+        if (leagueTable.length >= 2 && 
+            leagueTable[0].points === leagueTable[1].points && 
+            leagueTable[0].gd === leagueTable[1].gd && 
+            leagueTable[0].gf === leagueTable[1].gf) {
+            winningTeam = 'draw';
+        } else {
+            winningTeam = leagueTable[0].team;
+        }
+        
+        // 1. Update game status
+        await client.query(
+            `UPDATE games 
+             SET winning_team = $1, 
+                 game_status = 'completed',
+                 tournament_results_finalised = TRUE,
+                 motm_voting_ends = NOW() + INTERVAL '24 hours'
+             WHERE id = $2`,
+            [winningTeam, gameId]
+        );
+        
+        // 2. Get all confirmed players
+        const playersResult = await client.query(
+            `SELECT DISTINCT player_id FROM registrations 
+             WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        const allPlayerIds = playersResult.rows.map(r => r.player_id);
+        
+        // Get no-show players from discipline
+        const noShowPlayerIds = (disciplineRecords || [])
+            .filter(d => d.offense === 'no_show')
+            .map(d => d.playerId);
+        
+        const showedUpPlayerIds = allPlayerIds.filter(id => !noShowPlayerIds.includes(id));
+        
+        // Update appearances
+        if (showedUpPlayerIds.length > 0) {
+            await client.query(
+                'UPDATE players SET total_appearances = total_appearances + 1 WHERE id = ANY($1)',
+                [showedUpPlayerIds]
+            );
+        }
+        
+        // Update wins for winning team players (if not a draw)
+        if (winningTeam !== 'draw') {
+            const winningTeamPlayers = await client.query(
+                `SELECT tp.player_id FROM team_players tp
+                 JOIN teams t ON t.id = tp.team_id
+                 WHERE t.game_id = $1 AND t.team_name = $2`,
+                [gameId, winningTeam]
+            );
+            const winnerIds = winningTeamPlayers.rows.map(r => r.player_id);
+            if (winnerIds.length > 0) {
+                await client.query(
+                    'UPDATE players SET total_wins = total_wins + 1 WHERE id = ANY($1)',
+                    [winnerIds]
+                );
+            }
+        }
+        
+        // 3. Save discipline records
+        const offenseTypes = {
+            'on_time': 'On Time',
+            'not_ready': 'Not Ready (0-5 Min)',
+            'late_drop': 'Late Drop Out',
+            '5_10_late': '5-10 Minutes Late',
+            '10_late': '10+ Minutes Late',
+            'no_show': 'No Show'
+        };
+        for (const record of disciplineRecords || []) {
+            if (record.points > 0) {
+                await client.query(
+                    `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
+                     VALUES ($1, $2, $3, $4, $5)`,
+                    [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
+                );
+                
+                // Recalculate tier after discipline
+                const tierResult = await client.query('SELECT calculate_player_tier($1) as new_tier', [record.playerId]);
+                if (tierResult.rows.length > 0) {
+                    await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [tierResult.rows[0].new_tier, record.playerId]);
+                }
+            }
+        }
+        
+        // 4. Create MOTM nominees (from winning team only)
+        let nomineesInserted = 0;
+        for (const playerId of motmNominees || []) {
+            await client.query(
+                `INSERT INTO motm_nominees (game_id, player_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+                [gameId, playerId]
+            );
+            nomineesInserted++;
+        }
+        
+        await client.query('COMMIT');
+        
+        // Auto-allocate badges (non-critical, outside transaction)
+        for (const playerId of allPlayerIds) {
+            try {
+                await autoAllocateBadges(playerId);
+            } catch (badgeError) {
+                console.error(`Badge allocation failed for ${playerId}:`, badgeError.message);
+            }
+        }
+        
+        res.json({
+            message: 'Tournament finalised successfully',
+            winningTeam,
+            leagueTable,
+            motmNominees: nomineesInserted,
+            motmVotingEnds: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+        });
+        
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Finalise tournament error:', error);
+        res.status(500).json({ error: 'Failed to finalise tournament', details: error.message });
+    } finally {
+        client.release();
     }
 });
 
