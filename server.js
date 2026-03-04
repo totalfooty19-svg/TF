@@ -17,18 +17,6 @@ const twilioClient = twilio(
 );
 const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+447864872538';
 
-// Fuzzy venue photo lookup — handles any capitalisation/spacing variant
-function getVenuePhoto(venueName) {
-    if (!venueName) return null;
-    const n = venueName.toLowerCase();
-    if (n.includes('daimler')) return 'https://totalfooty.co.uk/assets/daimler_green.jpg';
-    if (n.includes('corpus')) return 'https://totalfooty.co.uk/assets/corpus_Christi.jpg';
-    if (n.includes('war memorial') || n.includes('memorial park')) return 'https://totalfooty.co.uk/assets/war_memorial_park.jpg';
-    if (n.includes('powerleague') || n.includes('power league')) return 'https://totalfooty.co.uk/assets/powerleague.jpg';
-    if (n.includes('sidney') || n.includes('stringer')) return 'https://totalfooty.co.uk/assets/sidney_stringer.jpg';
-    return null;
-}
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -466,8 +454,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.total_appearances, 
                     p.motm_wins, 
                     p.total_wins,
-                    p.tournament_wins,
-                    p.external_wins,
                     p.is_clm_admin,
                     p.is_organiser,
                     c.balance as credits,
@@ -521,7 +507,6 @@ app.get('/api/players', authenticateToken, async (req, res) => {
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
                 p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
-                p.tournament_wins, p.external_wins,
                 p.phone, u.email,
                 p.is_clm_admin, p.is_organiser,
                 c.balance as credits,
@@ -627,7 +612,6 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
 
                 -- GAME STATS: all time
                 p.total_appearances, p.total_wins, p.motm_wins,
-                p.tournament_wins, p.external_wins,
 
                 -- GAME STATS: last 3 months
                 (SELECT COUNT(DISTINCT r.game_id)
@@ -988,41 +972,6 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
     } catch (error) {
         console.error('Credit adjustment error:', error);
         res.status(500).json({ error: 'Adjustment failed' });
-    }
-});
-
-// Update player ratings only (used from teams modal inline edit — preserves squad number, wins, phone)
-app.patch('/api/admin/players/:playerId/ratings', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { playerId } = req.params;
-        const {
-            goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
-            pace_rating, decisions_rating, assisting_rating, shooting_rating
-        } = req.body;
-
-        const overall_rating = (defending_rating || 0) + (strength_rating || 0) + (fitness_rating || 0) +
-                               (pace_rating || 0) + (decisions_rating || 0) + (assisting_rating || 0) + (shooting_rating || 0);
-
-        await pool.query(`
-            UPDATE players SET
-                goalkeeper_rating = $1,
-                defending_rating  = $2,
-                strength_rating   = $3,
-                fitness_rating    = $4,
-                pace_rating       = $5,
-                decisions_rating  = $6,
-                assisting_rating  = $7,
-                shooting_rating   = $8,
-                overall_rating    = $9
-            WHERE id = $10
-        `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
-            pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            overall_rating, playerId]);
-
-        res.json({ message: 'Ratings updated', overall_rating });
-    } catch (error) {
-        console.error('Patch player ratings error:', error);
-        res.status(500).json({ error: 'Failed to update ratings' });
     }
 });
 
@@ -1860,7 +1809,9 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         // Add venue photos based on venue name
         const gamesWithPhotos = result.rows.map(game => {
-            game.venue_photo = getVenuePhoto(game.venue_name);
+            if (game.venue_name && venuePhotoMap[game.venue_name]) {
+                game.venue_photo = venuePhotoMap[game.venue_name];
+            }
             return game;
         });
         
@@ -1914,7 +1865,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
         const games = result.rows.map(game => ({
             ...game,
             motm_winner_name: game.motm_winner_alias || game.motm_winner_name,
-            venue_photo: getVenuePhoto(game.venue_name),
+            venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null,
             game_time: new Date(game.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
             game_day: new Date(game.game_date).toLocaleDateString('en-US', { weekday: 'long' })
         }));
@@ -1989,8 +1940,8 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
         
-        if (!game.venue_photo) {
-            game.venue_photo = getVenuePhoto(game.venue_name);
+        if (game.venue_name && venuePhotoMap[game.venue_name]) {
+            game.venue_photo = venuePhotoMap[game.venue_name];
         }
         
         // Check if current user has guest(s) on this game
@@ -2154,35 +2105,8 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             GROUP BY p.id, p.full_name, p.alias, p.squad_number, r.position_preference, r.tournament_team_preference
             ORDER BY p.squad_number NULLS LAST, p.alias
         `, [req.params.id]);
-
-        // Append guests so they appear in the registered players list and count
-        const guestsResult = await pool.query(`
-            SELECT 
-                gg.id,
-                gg.guest_name,
-                gg.guest_number,
-                p.alias as inviter_alias,
-                p.full_name as inviter_full_name
-            FROM game_guests gg
-            JOIN players p ON p.id = gg.invited_by
-            WHERE gg.game_id = $1
-            ORDER BY gg.guest_number ASC
-        `, [req.params.id]);
-
-        const guests = guestsResult.rows.map(g => ({
-            player_id: `guest_${g.id}`,
-            full_name: g.guest_name,
-            alias: g.guest_name,
-            squad_number: null,
-            positions: 'Guest',
-            tournament_team_preference: null,
-            pairs: [],
-            avoids: [],
-            is_guest: true,
-            inviter_name: g.inviter_alias || g.inviter_full_name
-        }));
-
-        res.json([...result.rows, ...guests]);
+        
+        res.json(result.rows);
     } catch (error) {
         console.error('Get game players error:', error);
         res.status(500).json({ error: 'Failed to fetch players' });
@@ -2201,7 +2125,8 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         // Lock the game row to prevent race conditions
         const gameLock = await client.query(`
             SELECT max_players, cost_per_player, exclusivity, 
-                   player_editing_locked, team_selection_type, position_type, tournament_team_count
+                   player_editing_locked, team_selection_type, position_type, tournament_team_count,
+                   series_id
             FROM games
             WHERE id = $1
             FOR UPDATE
@@ -2419,10 +2344,26 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         await client.query('COMMIT');
         
+        // For draft_memory games — look up if this player has a memorised team in this series
+        let fixedTeam = null;
+        if (status === 'confirmed' && game.team_selection_type === 'draft_memory' && game.series_id) {
+            try {
+                const ftResult = await pool.query(
+                    'SELECT fixed_team FROM player_fixed_teams WHERE player_id = $1 AND series_id = $2',
+                    [req.user.playerId, game.series_id]
+                );
+                fixedTeam = ftResult.rows[0]?.fixed_team || null;
+            } catch (e) {
+                // non-critical
+            }
+        }
+        
         // Build response
         let message;
         if (status === 'confirmed') {
-            message = 'Registered successfully';
+            message = fixedTeam
+                ? `Registered successfully! You've been placed in the ${fixedTeam.charAt(0).toUpperCase() + fixedTeam.slice(1)} team based on previous games.`
+                : 'Registered successfully';
         } else if (regBackupType === 'confirmed_backup') {
             message = `You're on the confirmed backup list. £${parseFloat(game.cost_per_player).toFixed(2)} has been deducted and you'll be first in line if a spot opens. If you don't get on, you'll be refunded after the game.`;
         } else if (regBackupType === 'gk_backup') {
@@ -2431,18 +2372,7 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             message = "You're on the backup list. You'll be notified if a space becomes available.";
         }
         
-        res.json({ message, status, backupType: regBackupType });
-
-        // Fire-and-forget WhatsApp notification (after response sent)
-        if (status === 'confirmed') {
-            getGameDataForMessage(gameId)
-                .then(gameData => sendNotification('game_registered', req.user.playerId, gameData || {}))
-                .catch(err => console.error('WhatsApp game_registered error:', err));
-        } else if (status === 'backup') {
-            getGameDataForMessage(gameId)
-                .then(gameData => sendNotification('backup_added', req.user.playerId, gameData || {}))
-                .catch(err => console.error('WhatsApp backup_added error:', err));
-        }
+        res.json({ message, status, backupType: regBackupType, fixedTeam });
         
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -2903,11 +2833,6 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
                      `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
                      gameId]
                 );
-
-                // Fire-and-forget WhatsApp for promoted player
-                getGameDataForMessage(gameId)
-                    .then(gameData => sendNotification('backup_promoted', promotedPlayer.player_id, gameData || {}))
-                    .catch(err => console.error('WhatsApp backup_promoted error:', err));
             }
         }
         
@@ -2922,13 +2847,6 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         }
         
         res.json({ message, promotedPlayer: promotedPlayer ? { name: promotedPlayer.alias || promotedPlayer.full_name } : null });
-
-        // Fire-and-forget WhatsApp for the player who dropped out (confirmed players only)
-        if (wasConfirmed || wasConfirmedBackup) {
-            getGameDataForMessage(gameId)
-                .then(gameData => sendNotification('dropout_confirmed', req.user.playerId, gameData || {}))
-                .catch(err => console.error('WhatsApp dropout_confirmed error:', err));
-        }
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Drop out error:', error);
@@ -3404,27 +3322,26 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             fitness: blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
         };
         
-        const mapTeamPlayer = p => ({
-            id: p.player_id,
-            name: p.alias || p.full_name,
-            squadNumber: p.squad_number,
-            overall: p.overall_rating || 0,
-            defense: p.defending_rating || 0,
-            fitness: p.fitness_rating || 0,
-            goalkeeper: p.goalkeeper_rating || 0,
-            strength: p.strength_rating || 0,
-            pace: p.pace_rating || 0,
-            decisions: p.decisions_rating || 0,
-            assisting: p.assisting_rating || 0,
-            shooting: p.shooting_rating || 0,
-            isGK: p.position_preference?.toLowerCase().includes('gk')
-        });
-
         res.json({
             message: 'Teams generated successfully',
-            team_selection_type: game.team_selection_type,
-            redTeam: redTeam.map(mapTeamPlayer),
-            blueTeam: blueTeam.map(mapTeamPlayer),
+            redTeam: redTeam.map(p => ({
+                id: p.player_id,
+                name: p.alias || p.full_name,
+                squadNumber: p.squad_number,
+                overall: p.overall_rating,
+                defense: p.defending_rating || 0,
+                fitness: p.fitness_rating || 0,
+                isGK: p.position_preference?.toLowerCase().includes('gk')
+            })),
+            blueTeam: blueTeam.map(p => ({
+                id: p.player_id,
+                name: p.alias || p.full_name,
+                squadNumber: p.squad_number,
+                overall: p.overall_rating,
+                defense: p.defending_rating || 0,
+                fitness: p.fitness_rating || 0,
+                isGK: p.position_preference?.toLowerCase().includes('gk')
+            })),
             redStats,
             blueStats,
             beefs: Array.from(highBeefs.entries()).map(([playerId, targets]) => ({
@@ -3474,33 +3391,8 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
                 await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']);
             }
         }
-        // Capture game data for notifications BEFORE deleting
-        const cancelGameDataResult = await client.query(
-            'SELECT g.*, v.name as venue_name FROM games g LEFT JOIN venues v ON v.id = g.venue_id WHERE g.id = $1',
-            [gameId]
-        );
-        const cancelGameRow = cancelGameDataResult.rows[0];
-        let cancelGameData = { day: '', time: '', venue: '' };
-        if (cancelGameRow) {
-            const d = new Date(cancelGameRow.game_date);
-            const days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-            cancelGameData = {
-                day: days[d.getDay()],
-                time: `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`,
-                venue: cancelGameRow.venue_name || ''
-            };
-        }
-
         await client.query('DELETE FROM games WHERE id = $1', [gameId]);
         await client.query('COMMIT');
-
-        // Fire-and-forget WhatsApp to all confirmed players
-        const confirmedPlayerIds = registrations.rows.map(r => r.player_id);
-        confirmedPlayerIds.forEach(pid => {
-            sendNotification('game_cancelled', pid, cancelGameData)
-                .catch(err => console.error('WhatsApp game_cancelled error:', err));
-        });
-
         res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -3628,7 +3520,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, tournament_team_count, star_rating } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -3642,41 +3534,8 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
         if (cost_per_player < 0) {
             return res.status(400).json({ error: 'Price cannot be negative' });
         }
-
-        // Fetch current game state
-        const gameCheck = await pool.query(
-            'SELECT team_selection_type, tournament_team_count as current_team_count, teams_generated FROM games WHERE id = $1',
-            [gameId]
-        );
-        if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-        const currentGame = gameCheck.rows[0];
-
-        // If this is a tournament and team count is changing, run guards
-        if (
-            currentGame.team_selection_type === 'tournament' &&
-            tournament_team_count &&
-            parseInt(tournament_team_count) !== parseInt(currentGame.current_team_count)
-        ) {
-            // Block if results already entered
-            const resultsCheck = await pool.query(
-                'SELECT COUNT(*) as count FROM tournament_results WHERE game_id = $1',
-                [gameId]
-            );
-            if (parseInt(resultsCheck.rows[0].count) > 0) {
-                return res.status(400).json({
-                    error: `Cannot switch from ${currentGame.current_team_count} to ${tournament_team_count} teams — match results have already been entered. Delete all results first.`
-                });
-            }
-
-            // Block if teams already drafted
-            if (currentGame.teams_generated) {
-                return res.status(400).json({
-                    error: `Cannot switch team count — teams have already been drafted. Use "Delete Teams" first to reset the draft.`
-                });
-            }
-        }
-
-        // Check current registrations for max_players guard
+        
+        // Check current registrations
         const currentRegs = await pool.query(
             'SELECT COUNT(*) as count FROM registrations WHERE game_id = $1 AND status = $2',
             [gameId, 'confirmed']
@@ -3689,11 +3548,8 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                 error: `Cannot reduce max players to ${max_players}. Currently have ${currentCount} confirmed registrations.` 
             });
         }
-
-        // Build update - include tournament_team_count if applicable
-        const isTournament = currentGame.team_selection_type === 'tournament';
-        const newTeamCount = isTournament && tournament_team_count ? parseInt(tournament_team_count) : currentGame.current_team_count;
-
+        
+        // Update the game (include game_date if provided)
         if (game_date) {
             await pool.query(`
                 UPDATE games 
@@ -3701,26 +3557,29 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     venue_id = $2, 
                     max_players = $3, 
                     cost_per_player = $4,
-                    tournament_team_count = $5,
-                    star_rating = $6
-                WHERE id = $7
-            `, [game_date, venue_id, max_players, cost_per_player, newTeamCount, star_rating || null, gameId]);
+                    star_rating = $5
+                WHERE id = $6
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, gameId]);
+            
+            res.json({ 
+                message: 'Game settings updated successfully',
+                updated: { game_date, venue_id, max_players, cost_per_player, star_rating }
+            });
         } else {
             await pool.query(`
                 UPDATE games 
                 SET venue_id = $1, 
                     max_players = $2, 
                     cost_per_player = $3,
-                    tournament_team_count = $4,
-                    star_rating = $5
-                WHERE id = $6
-            `, [venue_id, max_players, cost_per_player, newTeamCount, star_rating || null, gameId]);
+                    star_rating = $4
+                WHERE id = $5
+            `, [venue_id, max_players, cost_per_player, star_rating || null, gameId]);
+            
+            res.json({ 
+                message: 'Game settings updated successfully',
+                updated: { venue_id, max_players, cost_per_player, star_rating }
+            });
         }
-
-        res.json({ 
-            message: 'Game settings updated successfully',
-            updated: { game_date, venue_id, max_players, cost_per_player, tournament_team_count: newTeamCount }
-        });
         
     } catch (error) {
         console.error('Update game settings error:', error);
@@ -4042,29 +3901,19 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             
             const [redTeamResult, blueTeamResult] = await Promise.all([
                 pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number,
-                           p.overall_rating, p.defending_rating, p.fitness_rating,
-                           p.goalkeeper_rating, p.strength_rating, p.pace_rating,
-                           p.decisions_rating, p.assisting_rating, p.shooting_rating,
-                           r.position_preference
+                    SELECT p.id, p.full_name, p.alias, p.squad_number
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
-                    LEFT JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [redTeamId, gameId]),
+                `, [redTeamId]),
                 pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number,
-                           p.overall_rating, p.defending_rating, p.fitness_rating,
-                           p.goalkeeper_rating, p.strength_rating, p.pace_rating,
-                           p.decisions_rating, p.assisting_rating, p.shooting_rating,
-                           r.position_preference
+                    SELECT p.id, p.full_name, p.alias, p.squad_number
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
-                    LEFT JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [blueTeamId, gameId])
+                `, [blueTeamId])
             ]);
             
             const redGuests = guestsResult.rows
@@ -4073,43 +3922,10 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             const blueGuests = guestsResult.rows
                 .filter(g => g.team_name === 'Blue')
                 .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
-
-            const mapPlayer = p => ({
-                id: p.id,
-                name: p.alias || p.full_name,
-                squadNumber: p.squad_number,
-                overall: p.overall_rating || 0,
-                defense: p.defending_rating || 0,
-                fitness: p.fitness_rating || 0,
-                goalkeeper: p.goalkeeper_rating || 0,
-                strength: p.strength_rating || 0,
-                pace: p.pace_rating || 0,
-                decisions: p.decisions_rating || 0,
-                assisting: p.assisting_rating || 0,
-                shooting: p.shooting_rating || 0,
-                isGK: p.position_preference?.toLowerCase().includes('gk')
-            });
-
-            const redTeam = [...redTeamResult.rows.map(mapPlayer), ...redGuests];
-            const blueTeam = [...blueTeamResult.rows.map(mapPlayer), ...blueGuests];
-
-            const redStats = {
-                overall: redTeam.reduce((s, p) => s + (p.overall || 0), 0),
-                defense: redTeam.reduce((s, p) => s + (p.defense || 0), 0),
-                fitness: redTeam.reduce((s, p) => s + (p.fitness || 0), 0)
-            };
-            const blueStats = {
-                overall: blueTeam.reduce((s, p) => s + (p.overall || 0), 0),
-                defense: blueTeam.reduce((s, p) => s + (p.defense || 0), 0),
-                fitness: blueTeam.reduce((s, p) => s + (p.fitness || 0), 0)
-            };
             
             res.json({
-                redTeam,
-                blueTeam,
-                redStats,
-                blueStats,
-                team_selection_type: gameCheck.rows[0].team_selection_type
+                redTeam: [...redTeamResult.rows, ...redGuests],
+                blueTeam: [...blueTeamResult.rows, ...blueGuests]
             });
         }
         
@@ -4460,7 +4276,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             if (winningPlayerIds.length > 0) {
                 await client.query(
                     `UPDATE players 
-                     SET total_wins = total_wins + 1${isExternal && winningTeam === 'red' ? ', external_wins = external_wins + 1' : ''}
+                     SET total_wins = total_wins + 1
                      WHERE id = ANY($1)`,
                     [winningPlayerIds]
                 );
@@ -4958,7 +4774,9 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
         
-        const venue_photo = getVenuePhoto(game.venue_name) || game.venue_photo;
+        const venue_photo = game.venue_name && venuePhotoMap[game.venue_name] 
+            ? venuePhotoMap[game.venue_name] 
+            : game.venue_photo;
         
         // Get series scoreline if applicable
         let seriesScoreline = null;
@@ -4989,7 +4807,6 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             game_status: game.game_status,
             exclusivity: game.exclusivity,
             teams_confirmed: game.teams_confirmed,
-            teams_generated: game.teams_generated,
             team_selection_type: game.team_selection_type,
             external_opponent: game.external_opponent,
             tf_kit_color: game.tf_kit_color,
@@ -5000,8 +4817,6 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             tournament_name: game.tournament_name,
             tournament_team_count: game.tournament_team_count,
             tournament_results_finalised: game.tournament_results_finalised,
-            series_id: game.series_id,
-            regularity: game.regularity,
             seriesScoreline
         });
         
@@ -5011,167 +4826,76 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
     }
 });
 
-// Get next upcoming game in the same series (for smart CTA on game.html)
-// Get all games in the same series (for series nav on game.html)
-app.get('/api/public/game/:gameUrl/series', async (req, res) => {
-    try {
-        const { gameUrl } = req.params;
-
-        const current = await pool.query(
-            'SELECT id, series_id, game_date FROM games WHERE game_url = $1',
-            [gameUrl]
-        );
-
-        if (current.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-
-        const { series_id, id: currentId } = current.rows[0];
-
-        if (!series_id) return res.json({ series: null }); // one-off
-
-        // Get series name
-        const seriesRow = await pool.query(
-            'SELECT series_name FROM game_series WHERE id = $1',
-            [series_id]
-        );
-        const seriesName = seriesRow.rows[0]?.series_name || null;
-
-        // Get all games in the series ordered by date
-        const allGames = await pool.query(`
-            SELECT
-                g.id,
-                g.game_url,
-                g.game_date,
-                g.game_status,
-                g.winning_team,
-                g.star_rating,
-                g.teams_confirmed,
-                v.name as venue_name
-            FROM games g
-            LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.series_id = $1
-            ORDER BY g.game_date ASC
-        `, [series_id]);
-
-        const games = allGames.rows;
-        const currentIndex = games.findIndex(g => g.id === currentId);
-
-        const prev = currentIndex > 0 ? games[currentIndex - 1] : null;
-        const next = currentIndex < games.length - 1 ? games[currentIndex + 1] : null;
-
-        res.json({
-            series: {
-                name: seriesName,
-                total: games.length,
-                currentIndex,
-                games,
-                prev,
-                next
-            }
-        });
-
-    } catch (error) {
-        console.error('Get series games error:', error);
-        res.status(500).json({ error: 'Failed to get series' });
-    }
-});
-
-app.get('/api/public/game/:gameUrl/next', async (req, res) => {
-    try {
-        const { gameUrl } = req.params;
-
-        // Get the series_id and game_date of the current game
-        const current = await pool.query(
-            'SELECT series_id, game_date FROM games WHERE game_url = $1',
-            [gameUrl]
-        );
-
-        if (current.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-
-        const { series_id, game_date } = current.rows[0];
-
-        if (!series_id) return res.json({ next: null }); // one-off, no series
-
-        // Find the next future game in the same series
-        const next = await pool.query(`
-            SELECT game_url, game_date, max_players,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players
-            FROM games g
-            WHERE series_id = $1
-              AND game_date > $2
-              AND game_status != 'completed'
-            ORDER BY game_date ASC
-            LIMIT 1
-        `, [series_id, game_date]);
-
-        if (next.rows.length === 0) return res.json({ next: null });
-
-        res.json({ next: next.rows[0] });
-
-    } catch (error) {
-        console.error('Get next game error:', error);
-        res.status(500).json({ error: 'Failed to get next game' });
-    }
-});
-
 // Get MOTM data for public game view (no auth required)
 app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
     try {
         const { gameUrl } = req.params;
-        
+
         console.log('Public MOTM request for game URL:', gameUrl);
-        
-        // Get game ID and status from URL
+
         const gameResult = await pool.query(
-            'SELECT id, game_status, motm_voting_ends FROM games WHERE game_url = $1',
+            'SELECT id, game_status, motm_voting_ends, motm_winner_id FROM games WHERE game_url = $1',
             [gameUrl]
         );
-        
+
         if (gameResult.rows.length === 0) {
             console.log('MOTM: Game not found for URL:', gameUrl);
             return res.status(404).json({ error: 'Game not found' });
         }
-        
+
         const game = gameResult.rows[0];
-        console.log('MOTM: Game found:', { id: game.id, status: game.game_status, votingEnds: game.motm_voting_ends });
-        
+        console.log('MOTM: Game found:', { id: game.id, status: game.game_status, votingEnds: game.motm_voting_ends, winnerId: game.motm_winner_id });
+
         if (game.game_status !== 'completed') {
             console.log('MOTM: Game not completed, status:', game.game_status);
             return res.status(400).json({ error: 'Game not completed yet' });
         }
-        
+
         // Get MOTM nominees with vote counts
         const nomineesResult = await pool.query(`
-            SELECT 
+            SELECT
                 p.id as player_id,
                 p.full_name,
                 p.alias,
                 p.squad_number,
+                p.photo_url,
+                p.motm_wins,
+                p.total_appearances,
+                p.total_wins,
                 COUNT(v.id) as vote_count
             FROM motm_nominees mn
             JOIN players p ON p.id = mn.player_id
             LEFT JOIN motm_votes v ON v.voted_for_id = mn.player_id AND v.game_id = mn.game_id
             WHERE mn.game_id = $1
-            GROUP BY p.id, p.full_name, p.alias, p.squad_number
+            GROUP BY p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                     p.motm_wins, p.total_appearances, p.total_wins
             ORDER BY vote_count DESC
         `, [game.id]);
-        
+
         console.log('MOTM: Found', nomineesResult.rows.length, 'nominees for game', game.id);
-        
-        // Check if voting is still open
-        const votingEnds = game.motm_voting_ends ? new Date(game.motm_voting_ends) : new Date(0);
-        const now = new Date();
-        const votingOpen = votingEnds > now;
-        
+
+        const votingEnds  = game.motm_voting_ends ? new Date(game.motm_voting_ends) : new Date(0);
+        const votingOpen  = votingEnds > new Date();
+        const isFinalized = !!game.motm_winner_id;
+
+        // If finalized, include full winner profile
+        let winner = null;
+        if (isFinalized) {
+            winner = nomineesResult.rows.find(n => n.player_id === game.motm_winner_id)
+                  || nomineesResult.rows[0] || null;
+        }
+
         res.json({
-            nominees: nomineesResult.rows,
-            votingEnds: game.motm_voting_ends,
+            nominees:    nomineesResult.rows,
+            votingEnds:  game.motm_voting_ends,
             votingOpen,
+            isFinalized,
+            winner,
             userHasVoted: false
         });
-        
+
     } catch (error) {
         console.error('Get public MOTM error:', error);
-        console.error('MOTM error details:', error.message);
         res.status(500).json({ error: 'Failed to get MOTM data', details: error.message });
     }
 });
@@ -5181,9 +4905,9 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
     try {
         const { gameUrl } = req.params;
         
-        // Get game ID first
+        // Get game ID, type and series_id
         const gameResult = await pool.query(
-            'SELECT id FROM games WHERE game_url = $1',
+            'SELECT id, team_selection_type, series_id FROM games WHERE game_url = $1',
             [gameUrl]
         );
         
@@ -5191,9 +4915,10 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
             return res.status(404).json({ error: 'Game not found' });
         }
         
-        const gameId = gameResult.rows[0].id;
+        const { id: gameId, team_selection_type, series_id } = gameResult.rows[0];
+        const isDraftMemory = team_selection_type === 'draft_memory' && series_id;
         
-        // Get registered players with pair/avoid info
+        // Get registered players — for draft_memory games, also join fixed team memory
         const playersResult = await pool.query(`
             SELECT 
                 p.id,
@@ -5204,25 +4929,30 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                 p.total_appearances,
                 p.motm_wins,
                 p.total_wins,
-                p.tournament_wins,
-                p.external_wins,
                 p.reliability_tier,
                 r.position_preference,
                 r.registered_at,
+                ${isDraftMemory ? 'pft.fixed_team' : 'NULL::text AS fixed_team'},
                 (SELECT json_agg(json_build_object('name', b.name, 'icon', b.icon))
                  FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
                 array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pair_with,
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoid_with
             FROM registrations r
             JOIN players p ON p.id = r.player_id
+            ${isDraftMemory ? `LEFT JOIN player_fixed_teams pft ON pft.player_id = p.id AND pft.series_id = $2` : ''}
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status = 'confirmed'
             GROUP BY p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
-                     p.total_appearances, p.motm_wins, p.total_wins, p.tournament_wins, p.external_wins, p.reliability_tier,
+                     p.total_appearances, p.motm_wins, p.total_wins, p.reliability_tier,
                      r.position_preference, r.registered_at
-            ORDER BY r.registered_at ASC
-        `, [gameId]);
+                     ${isDraftMemory ? ', pft.fixed_team' : ''}
+            ORDER BY 
+                CASE WHEN ${isDraftMemory ? 'pft.fixed_team' : 'NULL'} = 'red' THEN 0
+                     WHEN ${isDraftMemory ? 'pft.fixed_team' : 'NULL'} = 'blue' THEN 2
+                     ELSE 1 END,
+                r.registered_at ASC
+        `, isDraftMemory ? [gameId, series_id] : [gameId]);
         
         res.json(playersResult.rows);
         
@@ -5815,86 +5545,102 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
 });
 
 // Finalize MOTM voting - called manually or by cron job
+// ── Shared MOTM finalize logic (called by endpoint + auto-scheduler) ──────────
+async function runMotmFinalize(gameId) {
+    // Already finalized?
+    const gameResult = await pool.query(
+        `SELECT g.motm_voting_ends, g.motm_winner_id, g.game_date, g.game_url,
+                v.name as venue_name
+         FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+         WHERE g.id = $1`,
+        [gameId]
+    );
+    if (gameResult.rows.length === 0) throw new Error('Game not found');
+    const game = gameResult.rows[0];
+    if (game.motm_winner_id) return { alreadyFinalized: true };
+
+    // Get vote counts
+    const votesResult = await pool.query(`
+        SELECT
+            n.player_id,
+            p.full_name,
+            p.alias,
+            COUNT(v.id) as votes
+        FROM motm_nominees n
+        JOIN players p ON p.id = n.player_id
+        LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
+        WHERE n.game_id = $1
+        GROUP BY n.player_id, p.full_name, p.alias
+        ORDER BY votes DESC
+    `, [gameId]);
+
+    if (votesResult.rows.length === 0) throw new Error('No MOTM nominees found');
+
+    const maxVotes = parseInt(votesResult.rows[0].votes);
+    const winners  = votesResult.rows.filter(r => parseInt(r.votes) === maxVotes);
+    const motmIncrement = 1.0 / winners.length;
+
+    console.log(`MOTM finalize game ${gameId}: ${winners.length} winner(s), ${maxVotes} votes, +${motmIncrement} each`);
+
+    // Award MOTM wins
+    for (const winner of winners) {
+        await pool.query(
+            'UPDATE players SET motm_wins = motm_wins + $1 WHERE id = $2',
+            [motmIncrement, winner.player_id]
+        );
+    }
+
+    // Set official winner on game
+    await pool.query(
+        'UPDATE games SET motm_winner_id = $1 WHERE id = $2',
+        [winners[0].player_id, gameId]
+    );
+
+    // Auto-allocate badges for all winners (non-critical)
+    for (const winner of winners) {
+        try { await autoAllocateBadges(winner.player_id); } catch (e) {
+            console.error(`Badge alloc failed for ${winner.player_id}:`, e.message);
+        }
+    }
+
+    // Send MOTM winner notification (non-critical)
+    const gameDate  = new Date(game.game_date).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+    const gameUrlFull = `https://totalfooty.co.uk/vibecoding/game.html?url=${game.game_url}`;
+    for (const winner of winners) {
+        try {
+            await sendNotification('motm_winner', winner.player_id, {
+                game_date:    gameDate,
+                venue:        game.venue_name || 'the match',
+                game_url:     gameUrlFull,
+            });
+        } catch (e) {
+            console.error(`MOTM notification failed for ${winner.player_id}:`, e.message);
+        }
+    }
+
+    return {
+        alreadyFinalized: false,
+        winners: winners.map(w => ({
+            playerId: w.player_id,
+            name:     w.alias || w.full_name,
+            votes:    maxVotes,
+            motmIncrement
+        }))
+    };
+}
+
+// Admin endpoint — manual finalize (still available as fallback)
 app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
-        
-        // Get game and check if voting has ended
-        const gameResult = await pool.query(
-            'SELECT motm_voting_ends, motm_winner_id FROM games WHERE id = $1',
-            [gameId]
-        );
-        
-        if (gameResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Game not found' });
-        }
-        
-        const game = gameResult.rows[0];
-        
-        if (game.motm_winner_id) {
+        const result = await runMotmFinalize(gameId);
+        if (result.alreadyFinalized) {
             return res.status(400).json({ error: 'MOTM already finalized' });
         }
-        
-        // Get vote counts for all nominees
-        const votesResult = await pool.query(`
-            SELECT 
-                n.player_id,
-                p.full_name,
-                p.alias,
-                COUNT(v.id) as votes
-            FROM motm_nominees n
-            JOIN players p ON p.id = n.player_id
-            LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
-            WHERE n.game_id = $1
-            GROUP BY n.player_id, p.full_name, p.alias
-            ORDER BY votes DESC
-        `, [gameId]);
-        
-        if (votesResult.rows.length === 0) {
-            return res.status(400).json({ error: 'No MOTM nominees found' });
-        }
-        
-        // Find the highest vote count
-        const maxVotes = parseInt(votesResult.rows[0].votes);
-        
-        // Get all players with the max votes (handles ties)
-        const winners = votesResult.rows.filter(r => parseInt(r.votes) === maxVotes);
-        
-        // Calculate MOTM increment (1 divided by number of winners for ties)
-        const motmIncrement = 1.0 / winners.length;
-        
-        console.log(`MOTM finalization: ${winners.length} winner(s) with ${maxVotes} votes each`);
-        console.log(`MOTM increment: ${motmIncrement} per winner`);
-        
-        // Update MOTM wins for all winners
-        for (const winner of winners) {
-            await pool.query(
-                `UPDATE players 
-                 SET motm_wins = motm_wins + $1
-                 WHERE id = $2`,
-                [motmIncrement, winner.player_id]
-            );
-        }
-        
-        // Set the first winner as the "official" winner (for display purposes)
-        await pool.query(
-            'UPDATE games SET motm_winner_id = $1 WHERE id = $2',
-            [winners[0].player_id, gameId]
-        );
-        
-        res.json({ 
-            message: 'MOTM voting finalized',
-            winners: winners.map(w => ({
-                playerId: w.player_id,
-                name: w.full_name || w.alias,
-                votes: maxVotes,
-                motmIncrement: motmIncrement
-            }))
-        });
-        
+        res.json({ message: 'MOTM voting finalized', winners: result.winners });
     } catch (error) {
         console.error('Finalize MOTM error:', error);
-        res.status(500).json({ error: 'Failed to finalize MOTM voting' });
+        res.status(500).json({ error: error.message || 'Failed to finalize MOTM voting' });
     }
 });
 
@@ -6307,77 +6053,6 @@ app.get('/api/admin/whatsapp/logs', authenticateToken, requireAdmin, async (req,
     }
 });
 
-// Send game reminder to all confirmed players for a specific game
-app.post('/api/admin/whatsapp/game-reminder/:gameId', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { gameId } = req.params;
-
-        // Get all confirmed players for this game (with phone numbers)
-        const playersResult = await pool.query(`
-            SELECT p.id, p.phone
-            FROM registrations r
-            JOIN players p ON p.id = r.player_id
-            WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.phone IS NOT NULL AND p.phone != ''
-        `, [gameId]);
-
-        const gameData = await getGameDataForMessage(gameId);
-        if (!gameData) {
-            return res.status(404).json({ error: 'Game not found' });
-        }
-
-        let sent = 0, failed = 0, skipped = 0;
-
-        // Count players with no phone
-        const totalResult = await pool.query(
-            `SELECT COUNT(*) as total FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
-            [gameId]
-        );
-        skipped = parseInt(totalResult.rows[0].total) - playersResult.rows.length;
-
-        for (const player of playersResult.rows) {
-            const result = await sendNotification('game_reminder', player.id, gameData);
-            if (result.success) sent++;
-            else failed++;
-        }
-
-        res.json({ sent, failed, skipped });
-    } catch (error) {
-        console.error('Game reminder error:', error);
-        res.status(500).json({ error: 'Failed to send reminders' });
-    }
-});
-
-// Broadcast custom message to all players with a phone number
-app.post('/api/admin/whatsapp/broadcast', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { message } = req.body;
-        if (!message) return res.status(400).json({ error: 'Message required' });
-
-        const playersResult = await pool.query(`
-            SELECT id, full_name, alias, phone
-            FROM players
-            WHERE phone IS NOT NULL AND phone != ''
-        `);
-
-        const totalResult = await pool.query(`SELECT COUNT(*) as total FROM players`);
-        const skipped = parseInt(totalResult.rows[0].total) - playersResult.rows.length;
-
-        let sent = 0, failed = 0;
-
-        for (const player of playersResult.rows) {
-            const personalised = message.replace(/\[Name\]/g, player.alias || player.full_name);
-            const result = await sendWhatsAppMessage(player.phone, personalised, 'broadcast', player.id);
-            if (result.success) sent++;
-            else failed++;
-        }
-
-        res.json({ sent, failed, skipped });
-    } catch (error) {
-        console.error('Broadcast error:', error);
-        res.status(500).json({ error: 'Failed to broadcast' });
-    }
-});
-
 // ==========================================
 // TOURNAMENT SYSTEM
 // ==========================================
@@ -6762,7 +6437,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             const winnerIds = winningTeamPlayers.rows.map(r => r.player_id);
             if (winnerIds.length > 0) {
                 await client.query(
-                    'UPDATE players SET total_wins = total_wins + 1, tournament_wins = tournament_wins + 1 WHERE id = ANY($1)',
+                    'UPDATE players SET total_wins = total_wins + 1 WHERE id = ANY($1)',
                     [winnerIds]
                 );
             }
@@ -6843,4 +6518,35 @@ app.listen(PORT, () => {
             console.error('✗ Keep-alive error:', error.message);
         }
     }, 5 * 60 * 1000); // 5 minutes (more aggressive)
+
+    // Auto-finalize expired MOTM voting every 10 minutes
+    setInterval(async () => {
+        try {
+            const expired = await pool.query(`
+                SELECT g.id
+                FROM games g
+                WHERE g.motm_voting_ends < NOW()
+                  AND g.motm_winner_id IS NULL
+                  AND g.game_status = 'completed'
+                  AND EXISTS (SELECT 1 FROM motm_nominees mn WHERE mn.game_id = g.id)
+            `);
+
+            if (expired.rows.length === 0) return;
+
+            console.log(`⏰ Auto-finalizing MOTM for ${expired.rows.length} game(s)...`);
+            for (const row of expired.rows) {
+                try {
+                    const result = await runMotmFinalize(row.id);
+                    if (!result.alreadyFinalized) {
+                        const names = result.winners.map(w => w.name).join(' & ');
+                        console.log(`✅ MOTM auto-finalized game ${row.id}: ${names}`);
+                    }
+                } catch (e) {
+                    console.error(`✗ MOTM auto-finalize failed for game ${row.id}:`, e.message);
+                }
+            }
+        } catch (error) {
+            console.error('✗ MOTM scheduler error:', error.message);
+        }
+    }, 10 * 60 * 1000); // 10 minutes
 });
