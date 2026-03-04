@@ -428,8 +428,11 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.total_appearances, 
                     p.motm_wins, 
                     p.total_wins,
+                    p.is_clm_admin,
+                    p.is_organiser,
                     c.balance as credits,
-                    u.email
+                    u.email,
+                    u.role
                 FROM players p
                 LEFT JOIN credits c ON c.player_id = p.id
                 LEFT JOIN users u ON u.id = p.user_id
@@ -438,6 +441,11 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
             
             if (detailsResult.rows.length > 0) {
                 Object.assign(player, detailsResult.rows[0]);
+                // Add frontend-friendly role flags
+                player.isAdmin = player.role === 'admin' || player.role === 'superadmin';
+                player.isSuperAdmin = player.role === 'superadmin';
+                player.isCLMAdmin = player.is_clm_admin || false;
+                player.isOrganiser = player.is_organiser || false;
             }
         } catch (detailsError) {
             console.error('Error fetching details:', detailsError.message);
@@ -446,6 +454,12 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
         
         // Set badges to empty array
         player.badges = [];
+        
+        // Ensure role flags always have defaults
+        if (player.isCLMAdmin === undefined) player.isCLMAdmin = false;
+        if (player.isOrganiser === undefined) player.isOrganiser = false;
+        if (player.isAdmin === undefined) player.isAdmin = false;
+        if (player.isSuperAdmin === undefined) player.isSuperAdmin = false;
         
         console.log('Returning player:', player);
         res.json(player);
