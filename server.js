@@ -9,6 +9,16 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 require('dotenv').config();
 
+// Nodemailer Gmail setup for password reset emails
+const nodemailer = require('nodemailer');
+const emailTransporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: 'totalfooty19@gmail.com',
+        pass: process.env.GMAIL_APP_PASSWORD,
+    },
+});
+
 // Twilio WhatsApp setup
 const twilio = require('twilio');
 const twilioClient = twilio(
@@ -312,6 +322,15 @@ app.post('/api/auth/register', async (req, res) => {
             message: 'Account created successfully', 
             userId,
             playerId 
+        });
+
+        // Non-critical: send welcome email after response
+        setImmediate(async () => {
+            try {
+                await sendNotification('signup', playerId, {});
+            } catch (e) {
+                console.error('Signup notification failed (non-critical):', e.message);
+            }
         });
     } catch (error) {
         console.error('Registration error:', error);
@@ -986,6 +1005,15 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
         );
         
         res.json({ message: 'Credits adjusted' });
+
+        // Non-critical: notify player their balance was updated
+        setImmediate(async () => {
+            try {
+                await sendNotification('balance_updated', req.params.id, {});
+            } catch (e) {
+                console.error('Balance notification failed (non-critical):', e.message);
+            }
+        });
     } catch (error) {
         console.error('Credit adjustment error:', error);
         res.status(500).json({ error: 'Adjustment failed' });
@@ -1107,12 +1135,22 @@ app.put('/api/admin/players/:playerId/badges', authenticateToken, requireAdmin, 
         await pool.query('COMMIT');
         
         res.json({ message: 'Badges updated successfully' });
+
+        // Non-critical: notify player of new badge
+        setImmediate(async () => {
+            try {
+                await sendNotification('badge_awarded', playerId, {});
+            } catch (e) {
+                console.error('Badge notification failed (non-critical):', e.message);
+            }
+        });
     } catch (error) {
         await pool.query('ROLLBACK');
         console.error('Update badges error:', error);
         res.status(500).json({ error: 'Failed to update badges' });
     }
 });
+
 
 // Auto-allocate badges based on player stats
 async function autoAllocateBadges(playerId) {
@@ -1505,43 +1543,77 @@ async function getGameDataForMessage(gameId) {
 }
 
 // Send WhatsApp message via Twilio
-async function sendWhatsAppMessage(playerPhone, message, notificationType, playerId = null) {
+// ── EMAIL NOTIFICATION SENDER ────────────────────────────────────────────────
+// Replaces WhatsApp — sends branded HTML email via Gmail SMTP
+
+const EMAIL_SUBJECTS = {
+    signup:           '👋 Welcome to TotalFooty!',
+    game_registered:  '⚽ You\'re confirmed for football!',
+    backup_added:     '🤞 You\'re on the backup list',
+    backup_promoted:  '🎉 You\'re in — a spot opened up!',
+    dropout_confirmed:'✅ Dropout confirmed',
+    game_cancelled:   '❌ Game cancelled',
+    game_reminder:    '⏰ Game reminder — you\'re playing today!',
+    teams_created:    '📋 Teams are live!',
+    balance_updated:  '💰 Balance updated',
+    badge_awarded:    '🏅 New badge awarded!',
+    motm_voting_open: '🗳️ Vote for Man of the Match',
+    motm_winner:      '🏆 You won Man of the Match!',
+};
+
+function wrapEmailHtml(bodyHtml) {
+    return `
+    <div style="background:#0d0d0d;padding:40px 24px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+        <div style="text-align:center;margin-bottom:32px">
+            <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="display:block;margin:0 auto 12px"/>
+            <p style="color:#555;font-size:11px;letter-spacing:2px;margin:0">COVENTRY FOOTBALL COMMUNITY</p>
+        </div>
+        <div style="background:#1a1a1a;border-radius:8px;padding:28px;border:1px solid #2a2a2a">
+            ${bodyHtml}
+        </div>
+        <p style="color:#333;font-size:11px;text-align:center;margin-top:24px;letter-spacing:1px">
+            TOTALFOOTY — <a href="https://totalfooty.co.uk" style="color:#555;text-decoration:none">totalfooty.co.uk</a>
+        </p>
+    </div>`;
+}
+
+async function sendEmail(playerEmail, playerName, notificationType, messageText) {
     try {
-        // Format phone number to E.164 format
-        let formattedPhone = playerPhone.replace(/\s+/g, '');
-        if (!formattedPhone.startsWith('+')) {
-            if (formattedPhone.startsWith('0')) {
-                formattedPhone = '+44' + formattedPhone.substring(1);
-            } else if (formattedPhone.startsWith('44')) {
-                formattedPhone = '+' + formattedPhone;
-            } else {
-                formattedPhone = '+44' + formattedPhone;
-            }
-        }
-        
-        const twilioMessage = await twilioClient.messages.create({
-            body: message,
-            from: TWILIO_WHATSAPP_NUMBER,
-            to: `whatsapp:${formattedPhone}`
+        const subject = EMAIL_SUBJECTS[notificationType] || 'TotalFooty Notification';
+        // Convert plain text message to HTML (preserve line breaks, linkify URLs)
+        const htmlBody = messageText
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/\n/g, '<br>')
+            .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" style="color:#c0c0c0">$1</a>');
+
+        const html = wrapEmailHtml(`
+            <p style="color:#888;font-size:14px;margin:0 0 16px">Hi ${playerName},</p>
+            <p style="color:#ccc;font-size:15px;line-height:1.7;margin:0">${htmlBody}</p>
+        `);
+
+        await emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to: playerEmail,
+            subject,
+            html,
         });
-        
-        // Log successful send
+
+        // Log to whatsapp_logs table (reusing existing table — same structure)
         await pool.query(`
-            INSERT INTO whatsapp_logs (player_id, notification_type, phone_number, message_content, status, twilio_sid)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        `, [playerId, notificationType, formattedPhone, message, 'sent', twilioMessage.sid]);
-        
-        return { success: true, sid: twilioMessage.sid };
-        
+            INSERT INTO whatsapp_logs (player_id, notification_type, phone_number, message_content, status)
+            VALUES (NULL, $1, $2, $3, 'sent')
+        `, [notificationType, playerEmail, messageText]).catch(() => {});
+
+        console.log(`📧 Email [${notificationType}] → ${playerEmail}`);
+        return { success: true };
     } catch (error) {
-        console.error('WhatsApp send error:', error);
-        
-        // Log failed send
+        console.error(`📧 Email [${notificationType}] FAILED → ${playerEmail}:`, error.message);
         await pool.query(`
             INSERT INTO whatsapp_logs (player_id, notification_type, phone_number, message_content, status, error_message)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        `, [playerId, notificationType, playerPhone, message, 'failed', error.message]);
-        
+            VALUES (NULL, $1, $2, $3, 'failed', $4)
+        `, [notificationType, playerEmail, messageText, error.message]).catch(() => {});
         return { success: false, error: error.message };
     }
 }
@@ -1554,7 +1626,7 @@ async function sendWhatsAppMessage(playerPhone, message, notificationType, playe
 async function getGameDataForNotification(gameId) {
     try {
         const result = await pool.query(`
-            SELECT g.game_date, g.game_time, g.game_url,
+            SELECT g.game_date, g.game_url,
                    v.name as venue_name
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -1565,7 +1637,7 @@ async function getGameDataForNotification(gameId) {
         const date = new Date(g.game_date);
         return {
             day: date.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }),
-            time: g.game_time ? g.game_time.substring(0, 5) : '',
+            time: date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
             venue: g.venue_name || 'TBC',
             gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${g.game_url}`
         };
@@ -1577,26 +1649,34 @@ async function getGameDataForNotification(gameId) {
 
 // Push notification titles per type
 const PUSH_TITLES = {
-    game_registered:  '⚽ You\'re in!',
+    signup:           '👋 Welcome to TotalFooty!',
+    game_registered:  '⚽ You\'re confirmed!',
     backup_added:     '🤞 You\'re on the backup list',
     backup_promoted:  '🎉 You\'re in — spot opened up!',
     dropout_confirmed:'✅ Dropout confirmed',
     game_cancelled:   '❌ Game cancelled',
     game_reminder:    '⏰ Game reminder',
+    teams_created:    '📋 You\'re on the team sheet!',
+    balance_updated:  '💰 Balance updated',
+    badge_awarded:    '🏅 New badge awarded!',
     motm_winner:      '🏆 Man of the Match!',
     motm_voting_open: '🗳️ Vote for MOTM',
 };
 
 // Deep-link screen targets per notification type (used by the app)
 const PUSH_SCREENS = {
+    signup:           'Home',
     game_registered:  'GameDetail',
     backup_added:     'GameDetail',
     backup_promoted:  'GameDetail',
-    dropout_confirmed:'GamesList',
-    game_cancelled:   'GamesList',
+    dropout_confirmed:'Games',
+    game_cancelled:   'Games',
     game_reminder:    'GameDetail',
-    motm_winner:      'CompletedGame',
-    motm_voting_open: 'MOTMVoting',
+    teams_created:    'GameDetail',
+    balance_updated:  'Profile',
+    badge_awarded:    'Profile',
+    motm_winner:      'Completed',
+    motm_voting_open: 'Completed',
 };
 
 // Send a push notification to all FCM tokens registered for a player
@@ -1650,9 +1730,9 @@ async function sendPushNotification(playerId, notificationType, bodyText, extraD
 // Send notification based on type
 async function sendNotification(notificationType, playerId, additionalData = {}) {
     try {
-        // Get player data
+        // Get player data including email
         const playerResult = await pool.query(`
-            SELECT p.id, p.full_name, p.alias, p.phone, c.balance as credits
+            SELECT p.id, p.full_name, p.alias, p.phone, p.email, c.balance as credits
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
             WHERE p.id = $1
@@ -1663,10 +1743,7 @@ async function sendNotification(notificationType, playerId, additionalData = {})
         }
         
         const player = playerResult.rows[0];
-        
-        if (!player.phone) {
-            return { success: false, error: 'Player has no phone number' };
-        }
+        const playerName = player.alias || player.full_name;
         
         // Get message template
         const templateResult = await pool.query(`
@@ -1683,8 +1760,8 @@ async function sendNotification(notificationType, playerId, additionalData = {})
         
         // Prepare data for placeholder replacement
         const messageData = {
-            name: player.alias || player.full_name,
-            balance: player.credits ? parseFloat(player.credits).toFixed(2) : '0.00',
+            name: playerName,
+            balance: player.credits ? `£${parseFloat(player.credits).toFixed(2)}` : '£0.00',
             generic_game_url: 'https://totalfooty.co.uk/vibecoding/',
             profile_url: 'https://totalfooty.co.uk/vibecoding/',
             ...additionalData
@@ -1693,17 +1770,19 @@ async function sendNotification(notificationType, playerId, additionalData = {})
         // Replace placeholders
         const message = replacePlaceholders(template, messageData);
         
-        // Send message
-        // Send WhatsApp message
-        const waResult = await sendWhatsAppMessage(player.phone, message, notificationType, playerId);
+        // Send email (if player has email)
+        let emailResult = { success: false, error: 'No email address' };
+        if (player.email) {
+            emailResult = await sendEmail(player.email, playerName, notificationType, message);
+        }
 
-        // Send push notification in parallel (non-critical — never blocks WhatsApp result)
-        const pushBodyText = message.replace(/\*/g, '').substring(0, 200); // strip markdown bold for push body
+        // Send push notification in parallel (non-critical)
+        const pushBodyText = message.replace(/\*/g, '').substring(0, 200);
         sendPushNotification(playerId, notificationType, pushBodyText, additionalData).catch(e =>
             console.error('Push (parallel) failed:', e.message)
         );
 
-        return waResult;
+        return emailResult;
         
     } catch (error) {
         console.error('Send notification error:', error);
@@ -3461,6 +3540,22 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         
         // Mark teams as generated
         await pool.query('UPDATE games SET teams_generated = TRUE WHERE id = $1', [gameId]);
+
+        // Non-critical: notify all confirmed players that teams are live
+        setImmediate(async () => {
+            try {
+                const gameData = await getGameDataForNotification(gameId);
+                const confirmed = await pool.query(
+                    `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+                    [gameId]
+                );
+                for (const row of confirmed.rows) {
+                    await sendNotification('teams_created', row.player_id, gameData).catch(() => {});
+                }
+            } catch (e) {
+                console.error('Teams created notification failed (non-critical):', e.message);
+            }
+        });
         
         // Calculate stats
         const redStats = {
@@ -3521,59 +3616,122 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
     try {
         const { gameId } = req.params;
         await client.query('BEGIN');
-        const registrations = await client.query(
-            `SELECT player_id, status, backup_type, amount_paid FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
-            [gameId]
-        );
-        const gameResult = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
-        const fallbackCost = parseFloat(gameResult.rows[0]?.cost_per_player || 0);
 
-        // Capture game details for notifications before we delete the game
-        const cancelGameInfo = await client.query(`
-            SELECT g.game_date, g.game_time, g.game_url, v.name as venue_name
-            FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+        // ── 1. Verify the game exists and grab all data needed before deletion ──
+        const gameResult = await client.query(`
+            SELECT g.game_date, g.game_url, g.cost_per_player, g.team_selection_type,
+                   v.name as venue_name
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.id = $1
         `, [gameId]);
-        const cancelGameRow = cancelGameInfo.rows[0] || {};
-        const cancelDate = cancelGameRow.game_date ? new Date(cancelGameRow.game_date).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }) : '';
+
+        if (gameResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Game not found' });
+        }
+
+        const gameRow = gameResult.rows[0];
+        const fallbackCost = parseFloat(gameRow.cost_per_player || 0);
+        const cancelDate = gameRow.game_date
+            ? new Date(gameRow.game_date).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })
+            : '';
         const cancelGameData = {
             day: cancelDate,
-            time: cancelGameRow.game_time ? cancelGameRow.game_time.substring(0, 5) : '',
-            venue: cancelGameRow.venue_name || 'TBC',
-            gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${cancelGameRow.game_url}`
+            time: gameRow.game_date
+                ? new Date(gameRow.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+                : '',
+            venue: gameRow.venue_name || 'TBC',
+            gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${gameRow.game_url}`
         };
+
+        // ── 2. Collect players who need refunds (confirmed + confirmed_backup) ──
+        const registrations = await client.query(
+            `SELECT player_id, status, backup_type, amount_paid FROM registrations
+             WHERE game_id = $1
+             AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
+            [gameId]
+        );
         const cancelledPlayerIds = registrations.rows.map(r => r.player_id);
+
+        // ── 3. Refund registered players ──
         let totalRefunded = 0;
         for (const reg of registrations.rows) {
             const refundAmt = parseFloat(reg.amount_paid || fallbackCost);
             if (refundAmt > 0) {
-                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundAmt, reg.player_id]);
-                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [reg.player_id, refundAmt, 'refund', 'Game cancelled - refund']);
+                await client.query(
+                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                    [refundAmt, reg.player_id]
+                );
+                await client.query(
+                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                    [reg.player_id, refundAmt, 'refund', 'Game cancelled - refund']
+                );
                 totalRefunded++;
             }
         }
-        const guests = await client.query('SELECT invited_by, guest_name, amount_paid FROM game_guests WHERE game_id = $1', [gameId]);
+
+        // ── 4. Refund guest fees ──
+        const guests = await client.query(
+            'SELECT invited_by, guest_name, amount_paid FROM game_guests WHERE game_id = $1',
+            [gameId]
+        );
         for (const guest of guests.rows) {
             const guestRefund = parseFloat(guest.amount_paid || 0);
             if (guestRefund > 0) {
-                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [guestRefund, guest.invited_by]);
-                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']);
+                await client.query(
+                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                    [guestRefund, guest.invited_by]
+                );
+                await client.query(
+                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                    [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']
+                );
             }
         }
-        await client.query('DELETE FROM games WHERE id = $1', [gameId]);
-        await client.query('COMMIT');
-        res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
 
-        // Non-critical: notify all affected players
+        // ── 5. Explicitly delete all child table rows (covers all game types) ──
+        //   tournament_results  — tournament games with scores entered
+        await client.query('DELETE FROM tournament_results WHERE game_id = $1', [gameId]);
+
+        //   motm_votes          — any game that reached voting stage
+        await client.query('DELETE FROM motm_votes WHERE game_id = $1', [gameId]);
+
+        //   team_players        — must go before teams (FK constraint)
+        await client.query(
+            'DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)',
+            [gameId]
+        );
+
+        //   teams               — all game types that had teams generated
+        await client.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+
+        //   game_guests         — all games (cascade would handle but explicit is safer)
+        await client.query('DELETE FROM game_guests WHERE game_id = $1', [gameId]);
+
+        //   registrations       — all games
+        await client.query('DELETE FROM registrations WHERE game_id = $1', [gameId]);
+
+        // ── 6. Delete the game itself ──
+        await client.query('DELETE FROM games WHERE id = $1', [gameId]);
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: `Game deleted. Refunded ${totalRefunded} player${totalRefunded !== 1 ? 's' : ''} and ${guests.rows.length} guest fee${guests.rows.length !== 1 ? 's' : ''}.`
+        });
+
+        // ── 7. Non-critical: notify affected players after response sent ──
         setImmediate(async () => {
             for (const pid of cancelledPlayerIds) {
                 try {
                     await sendNotification('game_cancelled', pid, cancelGameData);
                 } catch (e) {
-                    console.error(`game_cancelled notification failed player ${pid}:`, e.message);
+                    console.error(`game_cancelled notification failed for player ${pid}:`, e.message);
                 }
             }
         });
+
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Delete game error:', error);
@@ -4156,6 +4314,18 @@ app.post('/api/admin/games/:gameId/start-motm', authenticateToken, requireGameMa
         );
         
         res.json({ message: 'MOTM voting started', votingEndsAt: votingEnds });
+
+        // Non-critical: notify all nominees that voting is open
+        setImmediate(async () => {
+            try {
+                const gameData = await getGameDataForNotification(gameId);
+                for (const pid of nominees) {
+                    await sendNotification('motm_voting_open', pid, gameData).catch(() => {});
+                }
+            } catch (e) {
+                console.error('MOTM voting open notification failed (non-critical):', e.message);
+            }
+        });
     } catch (error) {
         console.error('Start MOTM error:', error);
         res.status(500).json({ error: 'Failed to start MOTM voting' });
@@ -6179,21 +6349,19 @@ app.put('/api/admin/whatsapp/templates/:notificationType', authenticateToken, re
     }
 });
 
-// Send test message
+// Send test email
 app.post('/api/admin/whatsapp/test', authenticateToken, requireAdmin, async (req, res) => {
     try {
-        const { phoneNumber, message } = req.body;
-        
-        const result = await sendWhatsAppMessage(phoneNumber, message, 'test', null);
-        
+        const { phoneNumber, message } = req.body; // phoneNumber reused as email address for test
+        const result = await sendEmail(phoneNumber, 'Test', 'game_reminder', message);
         if (result.success) {
-            res.json({ message: 'Test message sent successfully', sid: result.sid });
+            res.json({ message: 'Test email sent successfully' });
         } else {
             res.status(500).json({ error: result.error });
         }
     } catch (error) {
-        console.error('Send test message error:', error);
-        res.status(500).json({ error: 'Failed to send test message' });
+        console.error('Send test email error:', error);
+        res.status(500).json({ error: 'Failed to send test email' });
     }
 });
 
@@ -6739,6 +6907,95 @@ app.delete('/api/push/unregister', authenticateToken, async (req, res) => {
     }
 });
 
+// ── PASSWORD RESET ──────────────────────────────────────────────────────────
+
+// POST /api/auth/forgot-password — request a reset token
+app.post('/api/auth/forgot-password', async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    try {
+        // Always return success to prevent email enumeration
+        const result = await pool.query(
+            'SELECT id, full_name FROM players WHERE LOWER(email) = LOWER($1)',
+            [email.trim()]
+        );
+
+        if (result.rows.length > 0) {
+            const player = result.rows[0];
+            const token = crypto.randomBytes(32).toString('hex');
+            const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+            // Store token
+            await pool.query(
+                `INSERT INTO password_reset_tokens (player_id, token, expires_at)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING`,
+                [player.id, token, expiresAt]
+            );
+
+            // Send email
+            const resetLink = `https://totalfooty-api.onrender.com/reset-password?token=${token}`;
+            await emailTransporter.sendMail({
+                from: '"TotalFooty" <totalfooty19@gmail.com>',
+                to: email.trim(),
+                subject: 'TotalFooty — Reset Your Password',
+                html: `
+                    <div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:500px;margin:0 auto">
+                        <img src="https://totalfooty-api.onrender.com/logo.png" width="80" style="margin-bottom:24px"/>
+                        <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:8px">PASSWORD RESET</h2>
+                        <p style="color:#888;font-size:14px">Hi ${player.full_name},</p>
+                        <p style="color:#888;font-size:14px">You requested a password reset for your TotalFooty account. Click the button below to set a new password.</p>
+                        <a href="${resetLink}" style="display:inline-block;background:#fff;color:#000;padding:14px 28px;border-radius:4px;font-weight:bold;font-size:13px;letter-spacing:2px;text-decoration:none;margin:24px 0">RESET PASSWORD</a>
+                        <p style="color:#555;font-size:12px">This link expires in 1 hour. If you didn't request this, ignore this email.</p>
+                        <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
+                    </div>
+                `,
+            });
+        }
+
+        res.json({ message: 'If an account exists with that email, a reset link has been sent.' });
+    } catch (error) {
+        console.error('Forgot password error:', error);
+        res.status(500).json({ error: 'Failed to process request' });
+    }
+});
+
+// POST /api/auth/reset-password — submit new password with token
+app.post('/api/auth/reset-password', async (req, res) => {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) return res.status(400).json({ error: 'Token and new password are required' });
+    if (newPassword.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    try {
+        const result = await pool.query(
+            `SELECT prt.id, prt.player_id, prt.expires_at, prt.used_at
+             FROM password_reset_tokens prt
+             WHERE prt.token = $1`,
+            [token]
+        );
+
+        if (result.rows.length === 0) return res.status(400).json({ error: 'Invalid or expired reset link' });
+
+        const resetToken = result.rows[0];
+
+        if (resetToken.used_at) return res.status(400).json({ error: 'This reset link has already been used' });
+        if (new Date() > new Date(resetToken.expires_at)) return res.status(400).json({ error: 'This reset link has expired' });
+
+        // Update password
+        const passwordHash = await bcrypt.hash(newPassword, 10);
+        await pool.query('UPDATE players SET password_hash = $1 WHERE id = $2', [passwordHash, resetToken.player_id]);
+
+        // Mark token as used
+        await pool.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [resetToken.id]);
+
+        res.json({ message: 'Password updated successfully' });
+    } catch (error) {
+        console.error('Reset password error:', error);
+        res.status(500).json({ error: 'Failed to reset password' });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
     
@@ -6751,6 +7008,40 @@ app.listen(PORT, () => {
             console.error('✗ Keep-alive error:', error.message);
         }
     }, 5 * 60 * 1000); // 5 minutes (more aggressive)
+
+    // Game reminder — fires 4 hours before each game, checks every 5 minutes
+    setInterval(async () => {
+        try {
+            // Find games starting in the next 4h that haven't had a reminder sent yet
+            const upcoming = await pool.query(`
+                SELECT g.id
+                FROM games g
+                WHERE g.game_date BETWEEN NOW() + INTERVAL '3 hours 55 minutes'
+                  AND NOW() + INTERVAL '4 hours 5 minutes'
+                  AND g.game_status NOT IN ('cancelled', 'completed')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM whatsapp_logs wl
+                      WHERE wl.notification_type = 'game_reminder'
+                        AND wl.message_content LIKE '%' || g.id::text || '%'
+                  )
+            `);
+            for (const row of upcoming.rows) {
+                const gameData = await getGameDataForNotification(row.id);
+                // Tag the message with gameId so we can detect duplicates above
+                gameData.game_id_ref = row.id;
+                const confirmed = await pool.query(
+                    `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+                    [row.id]
+                );
+                for (const reg of confirmed.rows) {
+                    await sendNotification('game_reminder', reg.player_id, gameData).catch(() => {});
+                }
+                console.log(`⏰ Reminders sent for game ${row.id} (${confirmed.rows.length} players)`);
+            }
+        } catch (error) {
+            console.error('✗ Game reminder scheduler error:', error.message);
+        }
+    }, 5 * 60 * 1000); // Check every 5 minutes
 
     // Auto-finalize expired MOTM voting every 10 minutes
     setInterval(async () => {
