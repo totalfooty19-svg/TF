@@ -2103,8 +2103,35 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             GROUP BY p.id, p.full_name, p.alias, p.squad_number, r.position_preference, r.tournament_team_preference
             ORDER BY p.squad_number NULLS LAST, p.alias
         `, [req.params.id]);
-        
-        res.json(result.rows);
+
+        // Append guests so they appear in the registered players list and count
+        const guestsResult = await pool.query(`
+            SELECT 
+                gg.id,
+                gg.guest_name,
+                gg.guest_number,
+                p.alias as inviter_alias,
+                p.full_name as inviter_full_name
+            FROM game_guests gg
+            JOIN players p ON p.id = gg.invited_by
+            WHERE gg.game_id = $1
+            ORDER BY gg.guest_number ASC
+        `, [req.params.id]);
+
+        const guests = guestsResult.rows.map(g => ({
+            player_id: `guest_${g.id}`,
+            full_name: g.guest_name,
+            alias: g.guest_name,
+            squad_number: null,
+            positions: 'Guest',
+            tournament_team_preference: null,
+            pairs: [],
+            avoids: [],
+            is_guest: true,
+            inviter_name: g.inviter_alias || g.inviter_full_name
+        }));
+
+        res.json([...result.rows, ...guests]);
     } catch (error) {
         console.error('Get game players error:', error);
         res.status(500).json({ error: 'Failed to fetch players' });
@@ -2354,6 +2381,17 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         }
         
         res.json({ message, status, backupType: regBackupType });
+
+        // Fire-and-forget WhatsApp notification (after response sent)
+        if (status === 'confirmed') {
+            getGameDataForMessage(gameId)
+                .then(gameData => sendNotification('game_registered', req.user.playerId, gameData || {}))
+                .catch(err => console.error('WhatsApp game_registered error:', err));
+        } else if (status === 'backup') {
+            getGameDataForMessage(gameId)
+                .then(gameData => sendNotification('backup_added', req.user.playerId, gameData || {}))
+                .catch(err => console.error('WhatsApp backup_added error:', err));
+        }
         
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -2814,6 +2852,11 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
                      `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
                      gameId]
                 );
+
+                // Fire-and-forget WhatsApp for promoted player
+                getGameDataForMessage(gameId)
+                    .then(gameData => sendNotification('backup_promoted', promotedPlayer.player_id, gameData || {}))
+                    .catch(err => console.error('WhatsApp backup_promoted error:', err));
             }
         }
         
@@ -2828,6 +2871,13 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         }
         
         res.json({ message, promotedPlayer: promotedPlayer ? { name: promotedPlayer.alias || promotedPlayer.full_name } : null });
+
+        // Fire-and-forget WhatsApp for the player who dropped out (confirmed players only)
+        if (wasConfirmed || wasConfirmedBackup) {
+            getGameDataForMessage(gameId)
+                .then(gameData => sendNotification('dropout_confirmed', req.user.playerId, gameData || {}))
+                .catch(err => console.error('WhatsApp dropout_confirmed error:', err));
+        }
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Drop out error:', error);
@@ -3372,8 +3422,33 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
                 await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']);
             }
         }
+        // Capture game data for notifications BEFORE deleting
+        const cancelGameDataResult = await client.query(
+            'SELECT g.*, v.name as venue_name FROM games g LEFT JOIN venues v ON v.id = g.venue_id WHERE g.id = $1',
+            [gameId]
+        );
+        const cancelGameRow = cancelGameDataResult.rows[0];
+        let cancelGameData = { day: '', time: '', venue: '' };
+        if (cancelGameRow) {
+            const d = new Date(cancelGameRow.game_date);
+            const days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+            cancelGameData = {
+                day: days[d.getDay()],
+                time: `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`,
+                venue: cancelGameRow.venue_name || ''
+            };
+        }
+
         await client.query('DELETE FROM games WHERE id = $1', [gameId]);
         await client.query('COMMIT');
+
+        // Fire-and-forget WhatsApp to all confirmed players
+        const confirmedPlayerIds = registrations.rows.map(r => r.player_id);
+        confirmedPlayerIds.forEach(pid => {
+            sendNotification('game_cancelled', pid, cancelGameData)
+                .catch(err => console.error('WhatsApp game_cancelled error:', err));
+        });
+
         res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -3501,7 +3576,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, tournament_team_count } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -3515,8 +3590,41 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
         if (cost_per_player < 0) {
             return res.status(400).json({ error: 'Price cannot be negative' });
         }
-        
-        // Check current registrations
+
+        // Fetch current game state
+        const gameCheck = await pool.query(
+            'SELECT team_selection_type, tournament_team_count as current_team_count, teams_generated FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const currentGame = gameCheck.rows[0];
+
+        // If this is a tournament and team count is changing, run guards
+        if (
+            currentGame.team_selection_type === 'tournament' &&
+            tournament_team_count &&
+            parseInt(tournament_team_count) !== parseInt(currentGame.current_team_count)
+        ) {
+            // Block if results already entered
+            const resultsCheck = await pool.query(
+                'SELECT COUNT(*) as count FROM tournament_results WHERE game_id = $1',
+                [gameId]
+            );
+            if (parseInt(resultsCheck.rows[0].count) > 0) {
+                return res.status(400).json({
+                    error: `Cannot switch from ${currentGame.current_team_count} to ${tournament_team_count} teams — match results have already been entered. Delete all results first.`
+                });
+            }
+
+            // Block if teams already drafted
+            if (currentGame.teams_generated) {
+                return res.status(400).json({
+                    error: `Cannot switch team count — teams have already been drafted. Use "Delete Teams" first to reset the draft.`
+                });
+            }
+        }
+
+        // Check current registrations for max_players guard
         const currentRegs = await pool.query(
             'SELECT COUNT(*) as count FROM registrations WHERE game_id = $1 AND status = $2',
             [gameId, 'confirmed']
@@ -3529,36 +3637,36 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                 error: `Cannot reduce max players to ${max_players}. Currently have ${currentCount} confirmed registrations.` 
             });
         }
-        
-        // Update the game (include game_date if provided)
+
+        // Build update - include tournament_team_count if applicable
+        const isTournament = currentGame.team_selection_type === 'tournament';
+        const newTeamCount = isTournament && tournament_team_count ? parseInt(tournament_team_count) : currentGame.current_team_count;
+
         if (game_date) {
             await pool.query(`
                 UPDATE games 
                 SET game_date = $1,
                     venue_id = $2, 
                     max_players = $3, 
-                    cost_per_player = $4
-                WHERE id = $5
-            `, [game_date, venue_id, max_players, cost_per_player, gameId]);
-            
-            res.json({ 
-                message: 'Game settings updated successfully',
-                updated: { game_date, venue_id, max_players, cost_per_player }
-            });
+                    cost_per_player = $4,
+                    tournament_team_count = $5
+                WHERE id = $6
+            `, [game_date, venue_id, max_players, cost_per_player, newTeamCount, gameId]);
         } else {
             await pool.query(`
                 UPDATE games 
                 SET venue_id = $1, 
                     max_players = $2, 
-                    cost_per_player = $3
-                WHERE id = $4
-            `, [venue_id, max_players, cost_per_player, gameId]);
-            
-            res.json({ 
-                message: 'Game settings updated successfully',
-                updated: { venue_id, max_players, cost_per_player }
-            });
+                    cost_per_player = $3,
+                    tournament_team_count = $4
+                WHERE id = $5
+            `, [venue_id, max_players, cost_per_player, newTeamCount, gameId]);
         }
+
+        res.json({ 
+            message: 'Game settings updated successfully',
+            updated: { game_date, venue_id, max_players, cost_per_player, tournament_team_count: newTeamCount }
+        });
         
     } catch (error) {
         console.error('Update game settings error:', error);
@@ -5994,6 +6102,77 @@ app.get('/api/admin/whatsapp/logs', authenticateToken, requireAdmin, async (req,
     } catch (error) {
         console.error('Get WhatsApp logs error:', error);
         res.status(500).json({ error: 'Failed to get logs' });
+    }
+});
+
+// Send game reminder to all confirmed players for a specific game
+app.post('/api/admin/whatsapp/game-reminder/:gameId', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+
+        // Get all confirmed players for this game (with phone numbers)
+        const playersResult = await pool.query(`
+            SELECT p.id, p.phone
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.phone IS NOT NULL AND p.phone != ''
+        `, [gameId]);
+
+        const gameData = await getGameDataForMessage(gameId);
+        if (!gameData) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+
+        let sent = 0, failed = 0, skipped = 0;
+
+        // Count players with no phone
+        const totalResult = await pool.query(
+            `SELECT COUNT(*) as total FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        skipped = parseInt(totalResult.rows[0].total) - playersResult.rows.length;
+
+        for (const player of playersResult.rows) {
+            const result = await sendNotification('game_reminder', player.id, gameData);
+            if (result.success) sent++;
+            else failed++;
+        }
+
+        res.json({ sent, failed, skipped });
+    } catch (error) {
+        console.error('Game reminder error:', error);
+        res.status(500).json({ error: 'Failed to send reminders' });
+    }
+});
+
+// Broadcast custom message to all players with a phone number
+app.post('/api/admin/whatsapp/broadcast', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { message } = req.body;
+        if (!message) return res.status(400).json({ error: 'Message required' });
+
+        const playersResult = await pool.query(`
+            SELECT id, full_name, alias, phone
+            FROM players
+            WHERE phone IS NOT NULL AND phone != ''
+        `);
+
+        const totalResult = await pool.query(`SELECT COUNT(*) as total FROM players`);
+        const skipped = parseInt(totalResult.rows[0].total) - playersResult.rows.length;
+
+        let sent = 0, failed = 0;
+
+        for (const player of playersResult.rows) {
+            const personalised = message.replace(/\[Name\]/g, player.alias || player.full_name);
+            const result = await sendWhatsAppMessage(player.phone, personalised, 'broadcast', player.id);
+            if (result.success) sent++;
+            else failed++;
+        }
+
+        res.json({ sent, failed, skipped });
+    } catch (error) {
+        console.error('Broadcast error:', error);
+        res.status(500).json({ error: 'Failed to broadcast' });
     }
 });
 
