@@ -2020,7 +2020,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         const { 
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
             exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor,
-            tournamentTeamCount, tournamentName
+            tournamentTeamCount, tournamentName, starRating
         } = req.body;
         
         // CLM admins can only create CLM-exclusive games
@@ -2070,13 +2070,14 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     `INSERT INTO games (
                         venue_id, game_date, max_players, cost_per_player, format, regularity, 
                         exclusivity, position_type, game_url, series_id, 
-                        team_selection_type, external_opponent, tf_kit_color, opp_kit_color
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                        team_selection_type, external_opponent, tf_kit_color, opp_kit_color, star_rating
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                     RETURNING id`,
                     [
                         venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
                         gameExclusivity, positionType || 'outfield_gk', gameUrl, 
-                        seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null
+                        seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
+                        starRating || null
                     ]
                 );
                 
@@ -2111,15 +2112,16 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     venue_id, game_date, max_players, cost_per_player, format, regularity, 
                     exclusivity, position_type, game_url, series_id,
                     team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
-                    tournament_team_count, tournament_name
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    tournament_team_count, tournament_name, star_rating
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
                     gameExclusivity, positionType || 'outfield_gk', gameUrl,
                     seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
                     selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
-                    selType === 'tournament' ? (tournamentName || null) : null
+                    selType === 'tournament' ? (tournamentName || null) : null,
+                    starRating || null
                 ]
             );
             
@@ -3626,7 +3628,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, tournament_team_count } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, tournament_team_count, star_rating } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -3699,18 +3701,20 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     venue_id = $2, 
                     max_players = $3, 
                     cost_per_player = $4,
-                    tournament_team_count = $5
-                WHERE id = $6
-            `, [game_date, venue_id, max_players, cost_per_player, newTeamCount, gameId]);
+                    tournament_team_count = $5,
+                    star_rating = $6
+                WHERE id = $7
+            `, [game_date, venue_id, max_players, cost_per_player, newTeamCount, star_rating || null, gameId]);
         } else {
             await pool.query(`
                 UPDATE games 
                 SET venue_id = $1, 
                     max_players = $2, 
                     cost_per_player = $3,
-                    tournament_team_count = $4
-                WHERE id = $5
-            `, [venue_id, max_players, cost_per_player, newTeamCount, gameId]);
+                    tournament_team_count = $4,
+                    star_rating = $5
+                WHERE id = $6
+            `, [venue_id, max_players, cost_per_player, newTeamCount, star_rating || null, gameId]);
         }
 
         res.json({ 
@@ -4985,6 +4989,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             game_status: game.game_status,
             exclusivity: game.exclusivity,
             teams_confirmed: game.teams_confirmed,
+            teams_generated: game.teams_generated,
             team_selection_type: game.team_selection_type,
             external_opponent: game.external_opponent,
             tf_kit_color: game.tf_kit_color,
@@ -4995,12 +5000,116 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             tournament_name: game.tournament_name,
             tournament_team_count: game.tournament_team_count,
             tournament_results_finalised: game.tournament_results_finalised,
+            series_id: game.series_id,
+            regularity: game.regularity,
             seriesScoreline
         });
         
     } catch (error) {
         console.error('Get public game details error:', error);
         res.status(500).json({ error: 'Failed to get game details' });
+    }
+});
+
+// Get next upcoming game in the same series (for smart CTA on game.html)
+// Get all games in the same series (for series nav on game.html)
+app.get('/api/public/game/:gameUrl/series', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+
+        const current = await pool.query(
+            'SELECT id, series_id, game_date FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+
+        if (current.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+
+        const { series_id, id: currentId } = current.rows[0];
+
+        if (!series_id) return res.json({ series: null }); // one-off
+
+        // Get series name
+        const seriesRow = await pool.query(
+            'SELECT series_name FROM game_series WHERE id = $1',
+            [series_id]
+        );
+        const seriesName = seriesRow.rows[0]?.series_name || null;
+
+        // Get all games in the series ordered by date
+        const allGames = await pool.query(`
+            SELECT
+                g.id,
+                g.game_url,
+                g.game_date,
+                g.game_status,
+                g.winning_team,
+                g.star_rating,
+                g.teams_confirmed,
+                v.name as venue_name
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.series_id = $1
+            ORDER BY g.game_date ASC
+        `, [series_id]);
+
+        const games = allGames.rows;
+        const currentIndex = games.findIndex(g => g.id === currentId);
+
+        const prev = currentIndex > 0 ? games[currentIndex - 1] : null;
+        const next = currentIndex < games.length - 1 ? games[currentIndex + 1] : null;
+
+        res.json({
+            series: {
+                name: seriesName,
+                total: games.length,
+                currentIndex,
+                games,
+                prev,
+                next
+            }
+        });
+
+    } catch (error) {
+        console.error('Get series games error:', error);
+        res.status(500).json({ error: 'Failed to get series' });
+    }
+});
+
+app.get('/api/public/game/:gameUrl/next', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+
+        // Get the series_id and game_date of the current game
+        const current = await pool.query(
+            'SELECT series_id, game_date FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+
+        if (current.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+
+        const { series_id, game_date } = current.rows[0];
+
+        if (!series_id) return res.json({ next: null }); // one-off, no series
+
+        // Find the next future game in the same series
+        const next = await pool.query(`
+            SELECT game_url, game_date, max_players,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') as current_players
+            FROM games g
+            WHERE series_id = $1
+              AND game_date > $2
+              AND game_status != 'completed'
+            ORDER BY game_date ASC
+            LIMIT 1
+        `, [series_id, game_date]);
+
+        if (next.rows.length === 0) return res.json({ next: null });
+
+        res.json({ next: next.rows[0] });
+
+    } catch (error) {
+        console.error('Get next game error:', error);
+        res.status(500).json({ error: 'Failed to get next game' });
     }
 });
 
