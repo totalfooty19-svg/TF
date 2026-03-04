@@ -17,6 +17,23 @@ const twilioClient = twilio(
 );
 const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+447864872538';
 
+// Firebase Admin Setup (for push notifications)
+let firebaseMessaging = null;
+try {
+    const admin = require('firebase-admin');
+    const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (serviceAccountJson) {
+        const serviceAccount = JSON.parse(serviceAccountJson);
+        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+        firebaseMessaging = admin.messaging();
+        console.log('✅ Firebase Admin initialised — push notifications enabled');
+    } else {
+        console.warn('⚠️  FIREBASE_SERVICE_ACCOUNT_JSON not set — push notifications disabled');
+    }
+} catch (e) {
+    console.error('❌ Firebase Admin init failed:', e.message);
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -1529,6 +1546,107 @@ async function sendWhatsAppMessage(playerPhone, message, notificationType, playe
     }
 }
 
+// ==========================================
+// PUSH NOTIFICATION HELPERS (FCM)
+// ==========================================
+
+// Look up game date/time/venue for notification template variables
+async function getGameDataForNotification(gameId) {
+    try {
+        const result = await pool.query(`
+            SELECT g.game_date, g.game_time, g.game_url,
+                   v.name as venue_name
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.id = $1
+        `, [gameId]);
+        if (result.rows.length === 0) return {};
+        const g = result.rows[0];
+        const date = new Date(g.game_date);
+        return {
+            day: date.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }),
+            time: g.game_time ? g.game_time.substring(0, 5) : '',
+            venue: g.venue_name || 'TBC',
+            gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${g.game_url}`
+        };
+    } catch (e) {
+        console.error('getGameDataForNotification error:', e.message);
+        return {};
+    }
+}
+
+// Push notification titles per type
+const PUSH_TITLES = {
+    game_registered:  '⚽ You\'re in!',
+    backup_added:     '🤞 You\'re on the backup list',
+    backup_promoted:  '🎉 You\'re in — spot opened up!',
+    dropout_confirmed:'✅ Dropout confirmed',
+    game_cancelled:   '❌ Game cancelled',
+    game_reminder:    '⏰ Game reminder',
+    motm_winner:      '🏆 Man of the Match!',
+    motm_voting_open: '🗳️ Vote for MOTM',
+};
+
+// Deep-link screen targets per notification type (used by the app)
+const PUSH_SCREENS = {
+    game_registered:  'GameDetail',
+    backup_added:     'GameDetail',
+    backup_promoted:  'GameDetail',
+    dropout_confirmed:'GamesList',
+    game_cancelled:   'GamesList',
+    game_reminder:    'GameDetail',
+    motm_winner:      'CompletedGame',
+    motm_voting_open: 'MOTMVoting',
+};
+
+// Send a push notification to all FCM tokens registered for a player
+async function sendPushNotification(playerId, notificationType, bodyText, extraData = {}) {
+    if (!firebaseMessaging) return { success: false, error: 'Firebase not initialised' };
+    try {
+        const tokenResult = await pool.query(
+            'SELECT fcm_token FROM fcm_tokens WHERE player_id = $1',
+            [playerId]
+        );
+        if (tokenResult.rows.length === 0) {
+            return { success: false, error: 'No FCM token registered for player' };
+        }
+        const tokens = tokenResult.rows.map(r => r.fcm_token);
+        const title = PUSH_TITLES[notificationType] || 'TotalFooty';
+        const screen = PUSH_SCREENS[notificationType] || 'Home';
+        const messageData = Object.fromEntries(
+            Object.entries({ ...extraData, screen, notificationType })
+                  .map(([k, v]) => [k, String(v || '')])
+        );
+
+        const results = await Promise.allSettled(
+            tokens.map(token => firebaseMessaging.send({
+                token,
+                notification: { title, body: bodyText },
+                data: messageData,
+                android: { priority: 'high', notification: { channelId: 'totalfooty_default' } }
+            }))
+        );
+
+        // Remove stale/invalid tokens automatically
+        for (let i = 0; i < results.length; i++) {
+            if (results[i].status === 'rejected') {
+                const errCode = results[i].reason?.errorInfo?.code || '';
+                if (errCode.includes('registration-token-not-registered') || errCode.includes('invalid-registration-token')) {
+                    await pool.query('DELETE FROM fcm_tokens WHERE fcm_token = $1', [tokens[i]]).catch(() => {});
+                    console.log(`🗑️  Removed stale FCM token for player ${playerId}`);
+                }
+            }
+        }
+
+        const sent = results.filter(r => r.status === 'fulfilled').length;
+        console.log(`📲 Push [${notificationType}] player ${playerId}: ${sent}/${tokens.length} sent`);
+        return { success: sent > 0, sent, total: tokens.length };
+    } catch (error) {
+        console.error('sendPushNotification error:', error.message);
+        return { success: false, error: error.message };
+    }
+}
+
 // Send notification based on type
 async function sendNotification(notificationType, playerId, additionalData = {}) {
     try {
@@ -1576,7 +1694,16 @@ async function sendNotification(notificationType, playerId, additionalData = {})
         const message = replacePlaceholders(template, messageData);
         
         // Send message
-        return await sendWhatsAppMessage(player.phone, message, notificationType, playerId);
+        // Send WhatsApp message
+        const waResult = await sendWhatsAppMessage(player.phone, message, notificationType, playerId);
+
+        // Send push notification in parallel (non-critical — never blocks WhatsApp result)
+        const pushBodyText = message.replace(/\*/g, '').substring(0, 200); // strip markdown bold for push body
+        sendPushNotification(playerId, notificationType, pushBodyText, additionalData).catch(e =>
+            console.error('Push (parallel) failed:', e.message)
+        );
+
+        return waResult;
         
     } catch (error) {
         console.error('Send notification error:', error);
@@ -2373,6 +2500,17 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         }
         
         res.json({ message, status, backupType: regBackupType, fixedTeam });
+
+        // Non-critical: fire notifications after response is sent
+        setImmediate(async () => {
+            try {
+                const gameData = await getGameDataForNotification(gameId);
+                const notifType = status === 'confirmed' ? 'game_registered' : 'backup_added';
+                await sendNotification(notifType, req.user.playerId, gameData);
+            } catch (e) {
+                console.error('Registration notification failed (non-critical):', e.message);
+            }
+        });
         
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -2847,6 +2985,21 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         }
         
         res.json({ message, promotedPlayer: promotedPlayer ? { name: promotedPlayer.alias || promotedPlayer.full_name } : null });
+
+        // Non-critical: fire notifications after response
+        setImmediate(async () => {
+            try {
+                const gameData = await getGameDataForNotification(gameId);
+                if (wasConfirmed || wasConfirmedBackup) {
+                    await sendNotification('dropout_confirmed', req.user.playerId, gameData);
+                }
+                if (promotedPlayer) {
+                    await sendNotification('backup_promoted', promotedPlayer.player_id, gameData);
+                }
+            } catch (e) {
+                console.error('Dropout notification failed (non-critical):', e.message);
+            }
+        });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Drop out error:', error);
@@ -3374,6 +3527,22 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
         );
         const gameResult = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
         const fallbackCost = parseFloat(gameResult.rows[0]?.cost_per_player || 0);
+
+        // Capture game details for notifications before we delete the game
+        const cancelGameInfo = await client.query(`
+            SELECT g.game_date, g.game_time, g.game_url, v.name as venue_name
+            FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.id = $1
+        `, [gameId]);
+        const cancelGameRow = cancelGameInfo.rows[0] || {};
+        const cancelDate = cancelGameRow.game_date ? new Date(cancelGameRow.game_date).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }) : '';
+        const cancelGameData = {
+            day: cancelDate,
+            time: cancelGameRow.game_time ? cancelGameRow.game_time.substring(0, 5) : '',
+            venue: cancelGameRow.venue_name || 'TBC',
+            gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${cancelGameRow.game_url}`
+        };
+        const cancelledPlayerIds = registrations.rows.map(r => r.player_id);
         let totalRefunded = 0;
         for (const reg of registrations.rows) {
             const refundAmt = parseFloat(reg.amount_paid || fallbackCost);
@@ -3394,6 +3563,17 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
         await client.query('DELETE FROM games WHERE id = $1', [gameId]);
         await client.query('COMMIT');
         res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
+
+        // Non-critical: notify all affected players
+        setImmediate(async () => {
+            for (const pid of cancelledPlayerIds) {
+                try {
+                    await sendNotification('game_cancelled', pid, cancelGameData);
+                } catch (e) {
+                    console.error(`game_cancelled notification failed player ${pid}:`, e.message);
+                }
+            }
+        });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Delete game error:', error);
@@ -5526,6 +5706,11 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                          `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
                          gameId]
                     );
+                    // Send push + WhatsApp notification to promoted player
+                    const promoGameData = await getGameDataForNotification(gameId);
+                    sendNotification('backup_promoted', promotedPlayer.player_id, promoGameData).catch(e =>
+                        console.error('backup_promoted notification (admin remove) failed:', e.message)
+                    );
                 } catch (notifErr) {
                     console.error('Notification insert failed (non-critical):', notifErr.message);
                 }
@@ -6503,6 +6688,54 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
         res.status(500).json({ error: 'Failed to finalise tournament', details: error.message });
     } finally {
         client.release();
+    }
+});
+
+// ==========================================
+// PUSH NOTIFICATION TOKEN MANAGEMENT
+// ==========================================
+
+// Register a player's FCM device token (called on app launch / permission grant)
+app.post('/api/push/register', authenticateToken, async (req, res) => {
+    try {
+        const { fcmToken, deviceName } = req.body;
+        if (!fcmToken) return res.status(400).json({ error: 'fcmToken is required' });
+
+        await pool.query(`
+            INSERT INTO fcm_tokens (player_id, fcm_token, device_name, last_used_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (player_id, fcm_token)
+            DO UPDATE SET last_used_at = NOW(), device_name = EXCLUDED.device_name
+        `, [req.user.playerId, fcmToken, deviceName || null]);
+
+        res.json({ message: 'Push token registered' });
+    } catch (error) {
+        console.error('Push register error:', error);
+        res.status(500).json({ error: 'Failed to register push token' });
+    }
+});
+
+// Unregister a player's FCM token (called on logout or permission revoke)
+app.delete('/api/push/unregister', authenticateToken, async (req, res) => {
+    try {
+        const { fcmToken } = req.body;
+        if (fcmToken) {
+            // Remove specific token
+            await pool.query(
+                'DELETE FROM fcm_tokens WHERE player_id = $1 AND fcm_token = $2',
+                [req.user.playerId, fcmToken]
+            );
+        } else {
+            // Remove all tokens for this player (full logout)
+            await pool.query(
+                'DELETE FROM fcm_tokens WHERE player_id = $1',
+                [req.user.playerId]
+            );
+        }
+        res.json({ message: 'Push token unregistered' });
+    } catch (error) {
+        console.error('Push unregister error:', error);
+        res.status(500).json({ error: 'Failed to unregister push token' });
     }
 });
 
