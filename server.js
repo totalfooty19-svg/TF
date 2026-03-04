@@ -5312,6 +5312,100 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
     }
 });
 
+// ── GET all games in a series + prev/next/currentIndex for the series navigator ──
+app.get('/api/public/game/:gameUrl/series', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+
+        // Look up the current game and its series_id
+        const gameResult = await pool.query(
+            'SELECT id, series_id FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+
+        const { id: currentGameId, series_id } = gameResult.rows[0];
+
+        // No series — return empty so front end hides the nav
+        if (!series_id) {
+            return res.json({ series: null });
+        }
+
+        // Fetch ALL games in the series ordered by date ascending
+        const seriesResult = await pool.query(`
+            SELECT g.id, g.game_url, g.game_date, g.game_status, g.max_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
+            FROM games g
+            WHERE g.series_id = $1
+            ORDER BY g.game_date ASC
+        `, [series_id]);
+
+        const games = seriesResult.rows;
+        const currentIndex = games.findIndex(g => g.id === currentGameId);
+
+        const prev = currentIndex > 0 ? games[currentIndex - 1] : null;
+        const next = currentIndex < games.length - 1 ? games[currentIndex + 1] : null;
+
+        res.json({
+            series: {
+                games,
+                currentIndex,
+                prev,
+                next
+            }
+        });
+
+    } catch (error) {
+        console.error('Get series nav error:', error);
+        res.status(500).json({ error: 'Failed to get series data' });
+    }
+});
+
+// ── GET the next future game in a series (for CTA "Sign up for next week") ──
+app.get('/api/public/game/:gameUrl/next', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+
+        // Look up the current game's series and date
+        const gameResult = await pool.query(
+            'SELECT id, series_id, game_date FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        if (gameResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+
+        const { series_id, game_date } = gameResult.rows[0];
+
+        if (!series_id) {
+            return res.json({ next: null });
+        }
+
+        // Find the next game in the series that is after the current game's date
+        // and is not completed — so players can actually sign up
+        const nextResult = await pool.query(`
+            SELECT g.id, g.game_url, g.game_date, g.max_players, g.game_status,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
+            FROM games g
+            WHERE g.series_id = $1
+              AND g.game_date > $2
+              AND g.game_status != 'completed'
+            ORDER BY g.game_date ASC
+            LIMIT 1
+        `, [series_id, game_date]);
+
+        res.json({ next: nextResult.rows[0] || null });
+
+    } catch (error) {
+        console.error('Get next series game error:', error);
+        res.status(500).json({ error: 'Failed to get next game' });
+    }
+});
+
 // Vote for MOTM
 app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => {
     try {
