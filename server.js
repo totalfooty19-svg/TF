@@ -1530,9 +1530,23 @@ app.post('/api/admin/discipline', authenticateToken, requireAdmin, async (req, r
             [playerId, gameId, points, reason, req.user.userId]
         );
         
-        // Tier is auto-updated by database trigger
+        // Explicitly recalculate tier after discipline record
+        try {
+            const tierResult = await pool.query(
+                'SELECT calculate_player_tier($1) as new_tier', [playerId]
+            );
+            const newTier = tierResult.rows[0]?.new_tier;
+            if (newTier) {
+                await pool.query(
+                    'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                    [newTier, playerId]
+                );
+            }
+        } catch (tierError) {
+            console.error('Failed to recalculate tier:', tierError.message);
+        }
         
-        res.json({ message: 'Discipline points added. Tier updated automatically.' });
+        res.json({ message: 'Discipline points added. Tier recalculated.' });
     } catch (error) {
         console.error('Add discipline error:', error);
         res.status(500).json({ error: 'Failed to add discipline points' });
@@ -1587,8 +1601,8 @@ app.get('/api/players/:playerId/discipline', authenticateToken, async (req, res)
 
 // Helper function
 function getNextTierThreshold(currentPoints) {
-    if (currentPoints === 0) return { points: 1, tier: 'silver', direction: 'down' };
-    if (currentPoints <= 3) return { points: 0, tier: 'gold', direction: 'up' };
+    if (currentPoints <= 1) return { points: 2, tier: 'silver', direction: 'down' };
+    if (currentPoints <= 3) return { points: 1, tier: 'gold', direction: 'up' };
     if (currentPoints <= 6) return { points: 3, tier: 'silver', direction: 'up' };
     if (currentPoints <= 11) return { points: 6, tier: 'bronze', direction: 'up' };
     return { points: 11, tier: 'white', direction: 'up' };
@@ -1860,16 +1874,18 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             game.venue_photo = venuePhotoMap[game.venue_name];
         }
         
-        // Check if current user has a +1 guest on this game
+        // Check if current user has guest(s) on this game
         if (req.user && req.user.playerId) {
             try {
                 const guestCheck = await pool.query(
-                    'SELECT id, guest_name FROM game_guests WHERE game_id = $1 AND invited_by = $2',
+                    'SELECT id, guest_name, guest_number, overall_rating FROM game_guests WHERE game_id = $1 AND invited_by = $2 ORDER BY guest_number ASC',
                     [req.params.id, req.user.playerId]
                 );
+                game.my_guests = guestCheck.rows;
                 game.my_guest = guestCheck.rows.length > 0 ? guestCheck.rows[0] : null;
             } catch (guestErr) {
-                game.my_guest = null; // Table may not exist yet
+                game.my_guests = [];
+                game.my_guest = null;
             }
         }
         
@@ -2292,16 +2308,13 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'You must be registered for this game to add a +1' });
         }
 
-        // Check player hasn't already added a guest to this game
-        const existingGuest = await client.query(
-            'SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2',
+        // Count how many guests this player already has on this game
+        const existingGuests = await client.query(
+            'SELECT COUNT(*) as count FROM game_guests WHERE game_id = $1 AND invited_by = $2',
             [gameId, playerId]
         );
-        if (existingGuest.rows.length > 0) {
-            await client.query('ROLLBACK');
-            client.release();
-            return res.status(400).json({ error: 'You have already added a +1 to this game' });
-        }
+        const guestCount = parseInt(existingGuests.rows[0].count);
+        const nextGuestNumber = guestCount + 1;
 
         // Lock game row and check capacity
         const gameLock = await client.query(
@@ -2334,7 +2347,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         if (totalPlayers >= parseInt(game.max_players)) {
             await client.query('ROLLBACK');
             client.release();
-            return res.status(400).json({ error: 'Game is full - no space for a +1' });
+            return res.status(400).json({ error: 'Game is full - no space for another guest' });
         }
 
         // Check player has enough credits to pay for guest
@@ -2346,7 +2359,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < cost) {
             await client.query('ROLLBACK');
             client.release();
-            return res.status(400).json({ error: `Insufficient credits. You need ${cost.toFixed(2)} to add a +1.` });
+            return res.status(400).json({ error: `Insufficient credits. You need £${cost.toFixed(2)} to add a guest.` });
         }
 
         // Deduct credits from the inviting player
@@ -2359,18 +2372,18 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             [playerId, -cost, 'game_fee', `+1 guest (${guestName.trim()}) for game`]
         );
 
-        // Get player's overall rating, guest gets -1
+        // Get player's overall rating, guest gets -2
         const playerRating = await client.query(
             'SELECT overall_rating FROM players WHERE id = $1',
             [playerId]
         );
-        const guestRating = Math.max(0, (playerRating.rows[0]?.overall_rating || 0) - 1);
+        const guestRating = Math.max(0, (playerRating.rows[0]?.overall_rating || 0) - 2);
 
         // Insert guest record
         await client.query(
-            `INSERT INTO game_guests (game_id, invited_by, guest_name, overall_rating, amount_paid)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [gameId, playerId, guestName.trim(), guestRating, cost]
+            `INSERT INTO game_guests (game_id, invited_by, guest_name, overall_rating, amount_paid, guest_number)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [gameId, playerId, guestName.trim(), guestRating, cost, nextGuestNumber]
         );
 
         // Get player's referral code for the refer-a-friend prompt
@@ -2383,8 +2396,10 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         await client.query('COMMIT');
 
         res.json({
-            message: `${guestName.trim()} has been added as your +1!`,
+            message: `${guestName.trim()} has been added as your guest #${nextGuestNumber}!`,
             guestRating,
+            guestNumber: nextGuestNumber,
+            totalGuests: nextGuestNumber,
             amountCharged: cost,
             referralLink: referralCode ? `https://totalfooty.co.uk/vibecoding/register.html?ref=${referralCode}` : null,
             referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
@@ -2404,6 +2419,7 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
     try {
         const gameId = req.params.id;
         const playerId = req.user.playerId;
+        const { guestId } = req.body;
 
         await client.query('BEGIN');
 
@@ -2423,15 +2439,25 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
             return res.status(400).json({ error: 'Cannot remove guest - teams already generated.' });
         }
 
-        // Find and delete guest
-        const guestResult = await client.query(
-            'DELETE FROM game_guests WHERE game_id = $1 AND invited_by = $2 RETURNING guest_name, amount_paid',
-            [gameId, playerId]
-        );
+        // Find and delete the specific guest (or the most recent one if no guestId given)
+        let guestResult;
+        if (guestId) {
+            guestResult = await client.query(
+                'DELETE FROM game_guests WHERE id = $1 AND game_id = $2 AND invited_by = $3 RETURNING guest_name, amount_paid, guest_number',
+                [guestId, gameId, playerId]
+            );
+        } else {
+            // Fallback: remove the last-added guest for this player
+            guestResult = await client.query(
+                'DELETE FROM game_guests WHERE id = (SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2 ORDER BY guest_number DESC LIMIT 1) RETURNING guest_name, amount_paid, guest_number',
+                [gameId, playerId]
+            );
+        }
+
         if (guestResult.rows.length === 0) {
             await client.query('ROLLBACK');
             client.release();
-            return res.status(404).json({ error: 'No +1 guest found for this game' });
+            return res.status(404).json({ error: 'No guest found for this game' });
         }
 
         const guest = guestResult.rows[0];
@@ -2445,14 +2471,26 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
             );
             await client.query(
                 'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [playerId, refundAmt, 'refund', `+1 guest (${guest.guest_name}) removed - refund`]
+                [playerId, refundAmt, 'refund', `Guest (${guest.guest_name}) removed - refund`]
+            );
+        }
+
+        // Re-number remaining guests for this player so numbers stay sequential
+        const remaining = await client.query(
+            'SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2 ORDER BY guest_number ASC',
+            [gameId, playerId]
+        );
+        for (let i = 0; i < remaining.rows.length; i++) {
+            await client.query(
+                'UPDATE game_guests SET guest_number = $1 WHERE id = $2',
+                [i + 1, remaining.rows[i].id]
             );
         }
 
         await client.query('COMMIT');
 
         res.json({
-            message: `${guest.guest_name} removed. ${refundAmt.toFixed(2)} refunded to your balance.`
+            message: `${guest.guest_name} removed. £${refundAmt.toFixed(2)} refunded to your balance.`
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -2579,25 +2617,26 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
             );
         }
         
-        // Remove guest if this player had a +1, and refund the guest fee
+        // Remove ALL guests if this player had any, and refund guest fees
         const guestCheck = await client.query(
             'DELETE FROM game_guests WHERE game_id = $1 AND invited_by = $2 RETURNING guest_name, amount_paid',
             [gameId, req.user.playerId]
         );
         let guestRefunded = null;
         if (guestCheck.rows.length > 0) {
-            const guestRefundAmt = parseFloat(guestCheck.rows[0].amount_paid || 0);
-            if (guestRefundAmt > 0) {
+            const totalGuestRefund = guestCheck.rows.reduce((sum, g) => sum + parseFloat(g.amount_paid || 0), 0);
+            const guestNames = guestCheck.rows.map(g => g.guest_name).join(', ');
+            if (totalGuestRefund > 0) {
                 await client.query(
                     'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                    [guestRefundAmt, req.user.playerId]
+                    [totalGuestRefund, req.user.playerId]
                 );
                 await client.query(
                     'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [req.user.playerId, guestRefundAmt, 'refund', '+1 guest removed - dropout refund']
+                    [req.user.playerId, totalGuestRefund, 'refund', `${guestCheck.rows.length} guest(s) removed - dropout refund`]
                 );
             }
-            guestRefunded = { name: guestCheck.rows[0].guest_name, amount: guestRefundAmt };
+            guestRefunded = { names: guestNames, count: guestCheck.rows.length, amount: totalGuestRefund };
         }
         
         // Delete registration (cascade deletes preferences)
@@ -2606,35 +2645,57 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         // If a confirmed player dropped out, try to promote a backup
         let promotedPlayer = null;
         if (wasConfirmed) {
+            // Get GK slot info for validation
+            const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : 2;
+            const gkCountResult = await client.query(
+                `SELECT COUNT(*) as gk_count FROM registrations 
+                 WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'`,
+                [gameId]
+            );
+            const currentGKs = parseInt(gkCountResult.rows[0].gk_count) || 0;
+            
             // If a GK dropped out, first check for GK backups
             if (wasGKOnly) {
-                const gkBackup = await client.query(`
-                    SELECT r.id, r.player_id, r.backup_type, p.full_name, p.alias
+                const gkBackups = await client.query(`
+                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'gk_backup'
                     ORDER BY r.registered_at ASC
-                    LIMIT 1
                 `, [gameId]);
                 
-                if (gkBackup.rows.length > 0) {
-                    promotedPlayer = gkBackup.rows[0];
+                // Loop through GK backups - check credits for each
+                for (const candidate of gkBackups.rows) {
+                    const creditCheck = await client.query(
+                        'SELECT balance FROM credits WHERE player_id = $1',
+                        [candidate.player_id]
+                    );
+                    const balance = creditCheck.rows.length > 0 ? parseFloat(creditCheck.rows[0].balance) : 0;
+                    if (balance >= cost) {
+                        promotedPlayer = candidate;
+                        break;
+                    }
                 }
             }
             
-            // If no GK backup was promoted, check confirmed backups (first come first served)
+            // If no GK backup was promoted, check confirmed backups (already paid - no credit check needed)
             if (!promotedPlayer) {
-                const confirmedBackup = await client.query(`
-                    SELECT r.id, r.player_id, r.backup_type, p.full_name, p.alias
+                const confirmedBackups = await client.query(`
+                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'confirmed_backup'
                     ORDER BY r.registered_at ASC
-                    LIMIT 1
                 `, [gameId]);
                 
-                if (confirmedBackup.rows.length > 0) {
-                    promotedPlayer = confirmedBackup.rows[0];
+                // Loop through confirmed backups - check GK slot limits
+                for (const candidate of confirmedBackups.rows) {
+                    const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
+                    if (isGK && currentGKs >= maxGKSlots) {
+                        continue; // Skip — would exceed GK limit
+                    }
+                    promotedPlayer = candidate;
+                    break;
                 }
             }
             
@@ -2776,33 +2837,38 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         
         const players = playersResult.rows;
         
-        // Also fetch +1 guests for this game
+        // Also fetch +N guests for this game (multi-guest)
         const guestsResult = await pool.query(`
-            SELECT g.id as guest_id, g.guest_name, g.overall_rating, g.invited_by
+            SELECT g.id as guest_id, g.guest_name, g.overall_rating, g.invited_by, g.guest_number
             FROM game_guests g
             WHERE g.game_id = $1
+            ORDER BY g.invited_by, g.guest_number
         `, [gameId]);
         
-        // Merge guests into player pool (as outfield, no preferences)
+        // Build guest groups: map of invited_by -> array of guest objects
+        const guestGroups = new Map();
         for (const guest of guestsResult.rows) {
-            players.push({
+            if (!guestGroups.has(guest.invited_by)) {
+                guestGroups.set(guest.invited_by, []);
+            }
+            guestGroups.get(guest.invited_by).push({
                 reg_id: null,
                 player_id: `guest_${guest.guest_id}`,
                 full_name: guest.guest_name,
-                alias: `${guest.guest_name} (+1)`,
+                alias: `${guest.guest_name} (Guest)`,
                 squad_number: null,
                 overall_rating: guest.overall_rating || 0,
                 goalkeeper_rating: 0,
                 defending_rating: 0,
                 fitness_rating: 0,
                 position_preference: 'outfield',
-                pairs: [guest.invited_by],  // pair guest with their inviter
+                pairs: [guest.invited_by],
                 avoids: [],
                 is_guest: true
             });
         }
         
-        if (players.length < 2) {
+        if (players.length + guestsResult.rows.length < 2) {
             return res.status(400).json({ error: 'Need at least 2 players to generate teams' });
         }
         
@@ -2831,7 +2897,9 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             console.log('Beef table not found, skipping beef checks');
         }
         
-        // ALGORITHM - PRIORITY ORDER
+        // ===================================================
+        // ALGORITHM — GUEST-FIRST INTERTWINED PICKING
+        // ===================================================
         const redTeam = [];
         const blueTeam = [];
         
@@ -2843,6 +2911,113 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         if (goalkeepers.length >= 2) blueTeam.push(goalkeepers[1]);
         if (goalkeepers.length >= 3) outfield.push(...goalkeepers.slice(2)); // Extra GKs as outfield
         
+        // Separate parents (players who brought guests) from solo players
+        const parentPlayers = [];
+        const soloPlayers = [];
+        
+        for (const player of outfield) {
+            if (guestGroups.has(player.player_id)) {
+                parentPlayers.push({
+                    parent: player,
+                    guests: guestGroups.get(player.player_id),
+                    totalRating: (player.overall_rating || 0) + 
+                        guestGroups.get(player.player_id).reduce((sum, g) => sum + (g.overall_rating || 0), 0)
+                });
+            } else {
+                soloPlayers.push(player);
+            }
+        }
+        
+        // Check placed GKs for guest groups — their guests must join them
+        const gkParentGroups = [];
+        for (let i = 0; i < Math.min(goalkeepers.length, 2); i++) {
+            const gk = goalkeepers[i];
+            if (guestGroups.has(gk.player_id)) {
+                gkParentGroups.push({
+                    parent: gk,
+                    guests: guestGroups.get(gk.player_id),
+                    team: i === 0 ? 'red' : 'blue'
+                });
+            }
+        }
+        
+        // Sort parent groups by total rating descending
+        parentPlayers.sort((a, b) => b.totalRating - a.totalRating);
+        
+        // Sort solo players by overall rating descending
+        soloPlayers.sort((a, b) => (b.overall_rating || 0) - (a.overall_rating || 0));
+        
+        // Helper: find and remove closest-rated solo player to a target rating
+        const findClosestSolo = (targetRating, availableSolos) => {
+            if (availableSolos.length === 0) return null;
+            let bestIdx = 0;
+            let bestDiff = Math.abs((availableSolos[0].overall_rating || 0) - targetRating);
+            for (let i = 1; i < availableSolos.length; i++) {
+                const diff = Math.abs((availableSolos[i].overall_rating || 0) - targetRating);
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    bestIdx = i;
+                }
+            }
+            return availableSolos.splice(bestIdx, 1)[0];
+        };
+        
+        // PHASE 0: Place guests for GKs who brought them
+        console.log(`\n=== PHASE 0: GK Guest Placement ===`);
+        for (const gkGroup of gkParentGroups) {
+            const targetTeam = gkGroup.team === 'red' ? redTeam : blueTeam;
+            const opposingTeam = gkGroup.team === 'red' ? blueTeam : redTeam;
+            const teamLabel = gkGroup.team.toUpperCase();
+            const oppLabel = gkGroup.team === 'red' ? 'BLUE' : 'RED';
+            
+            for (const guest of gkGroup.guests) {
+                targetTeam.push(guest);
+                console.log(`  GK Guest ${guest.full_name} (OVR ${guest.overall_rating}) → ${teamLabel}`);
+                
+                const balancePlayer = findClosestSolo(guest.overall_rating || 0, soloPlayers);
+                if (balancePlayer) {
+                    opposingTeam.push(balancePlayer);
+                    console.log(`  Balance ${balancePlayer.full_name} (OVR ${balancePlayer.overall_rating}) → ${oppLabel}`);
+                }
+            }
+        }
+        
+        // PHASE 1: Place outfield guest groups with intertwined picking
+        console.log(`\n=== PHASE 1: Guest Group Placement ===`);
+        console.log(`${parentPlayers.length} parent groups, ${soloPlayers.length} solo players available`);
+        
+        let nextTeamForGroup = 'red';
+        
+        for (const group of parentPlayers) {
+            const targetTeam = nextTeamForGroup === 'red' ? redTeam : blueTeam;
+            const opposingTeam = nextTeamForGroup === 'red' ? blueTeam : redTeam;
+            const teamLabel = nextTeamForGroup.toUpperCase();
+            const oppLabel = nextTeamForGroup === 'red' ? 'BLUE' : 'RED';
+            
+            targetTeam.push(group.parent);
+            console.log(`  Parent ${group.parent.full_name} (OVR ${group.parent.overall_rating}) → ${teamLabel}`);
+            
+            const matchPlayer = findClosestSolo(group.parent.overall_rating || 0, soloPlayers);
+            if (matchPlayer) {
+                opposingTeam.push(matchPlayer);
+                console.log(`  Match ${matchPlayer.full_name} (OVR ${matchPlayer.overall_rating}) → ${oppLabel}`);
+            }
+            
+            for (const guest of group.guests) {
+                targetTeam.push(guest);
+                console.log(`  Guest ${guest.full_name} (OVR ${guest.overall_rating}) → ${teamLabel}`);
+                
+                const balancePlayer = findClosestSolo(guest.overall_rating || 0, soloPlayers);
+                if (balancePlayer) {
+                    opposingTeam.push(balancePlayer);
+                    console.log(`  Balance ${balancePlayer.full_name} (OVR ${balancePlayer.overall_rating}) → ${oppLabel}`);
+                }
+            }
+            
+            nextTeamForGroup = nextTeamForGroup === 'red' ? 'blue' : 'red';
+        }
+        
+        // PHASE 2: Remaining solo players via standard priority algorithm
         // Helper functions
         const hasHighBeef = (player, team) => {
             const beefs = highBeefs.get(player.player_id) || [];
@@ -2862,11 +3037,12 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             return (player.avoids || []).some(pid => team.find(tp => tp.player_id === pid));
         };
         
-        // Allocate outfield players
-        console.log(`Starting allocation for ${outfield.length} outfield players`);
+        // Allocate remaining solo players (not consumed by Phase 0/1 matching)
+        console.log(`\n=== PHASE 2: Solo Player Placement ===`);
+        console.log(`${soloPlayers.length} solo players remaining`);
         console.log(`Red starts with ${redTeam.length}, Blue starts with ${blueTeam.length}`);
         
-        for (const player of outfield) {
+        for (const player of soloPlayers) {
             let assignToRed = null; // null = undecided
             
             // CRITICAL: Always maintain equal team sizes (ABSOLUTE PRIORITY)
@@ -3463,20 +3639,39 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
         const redTeamId = redTeamResult.rows[0].id;
         const blueTeamId = blueTeamResult.rows[0].id;
         
-        // Insert red team players
+        // Reset guest team assignments before re-confirming
+        await pool.query("UPDATE game_guests SET team_name = NULL WHERE game_id = $1", [gameId]);
+        
+        // Insert red team players (handle guests separately)
         for (const playerId of redTeam) {
-            await pool.query(
-                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                [redTeamId, playerId]
-            );
+            if (typeof playerId === 'string' && playerId.startsWith('guest_')) {
+                const guestDbId = playerId.replace('guest_', '');
+                await pool.query(
+                    "UPDATE game_guests SET team_name = 'Red' WHERE id = $1",
+                    [guestDbId]
+                );
+            } else {
+                await pool.query(
+                    'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                    [redTeamId, playerId]
+                );
+            }
         }
         
-        // Insert blue team players
+        // Insert blue team players (handle guests separately)
         for (const playerId of blueTeam) {
-            await pool.query(
-                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
-                [blueTeamId, playerId]
-            );
+            if (typeof playerId === 'string' && playerId.startsWith('guest_')) {
+                const guestDbId = playerId.replace('guest_', '');
+                await pool.query(
+                    "UPDATE game_guests SET team_name = 'Blue' WHERE id = $1",
+                    [guestDbId]
+                );
+            } else {
+                await pool.query(
+                    'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                    [blueTeamId, playerId]
+                );
+            }
         }
         
         // Mark teams as confirmed and set status
@@ -3539,9 +3734,23 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             `, [blueTeamId])
         ]);
         
+        // Also fetch guests assigned to teams
+        const guestsResult = await pool.query(
+            `SELECT id, guest_name, overall_rating, team_name, invited_by
+             FROM game_guests WHERE game_id = $1 AND team_name IS NOT NULL`,
+            [gameId]
+        );
+        
+        const redGuests = guestsResult.rows
+            .filter(g => g.team_name === 'Red')
+            .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
+        const blueGuests = guestsResult.rows
+            .filter(g => g.team_name === 'Blue')
+            .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
+        
         res.json({
-            redTeam: redTeamResult.rows,
-            blueTeam: blueTeamResult.rows
+            redTeam: [...redTeamResult.rows, ...redGuests],
+            blueTeam: [...blueTeamResult.rows, ...blueGuests]
         });
         
     } catch (error) {
@@ -3728,13 +3937,32 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                     
                     // Award discipline points if late dropout
                     if (isLateDropout) {
-                        const disciplinePoints = game.format === '11-a-side' ? 3 : 2;
+                        const formatLower = (game.format || '').toLowerCase().replace(/\s+/g, '');
+                        const is11aSide = formatLower.includes('11') &&
+                            (formatLower.includes('side') || formatLower.includes('v') || formatLower.includes('x'));
+                        const disciplinePoints = is11aSide ? 3 : 2;
                         
                         await pool.query(
                             `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
                              VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
                             [playerId, gameId, disciplinePoints]
                         );
+                        
+                        // Explicitly recalculate tier after late dropout
+                        try {
+                            const tierResult = await pool.query(
+                                'SELECT calculate_player_tier($1) as new_tier', [playerId]
+                            );
+                            const newTier = tierResult.rows[0]?.new_tier;
+                            if (newTier) {
+                                await pool.query(
+                                    'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                                    [newTier, playerId]
+                                );
+                            }
+                        } catch (tierError) {
+                            console.error('Failed to recalculate tier after late dropout:', tierError.message);
+                        }
                     }
                 }
             }
@@ -3796,13 +4024,20 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         
         await client.query('BEGIN');
         
+        // Get game type for vs_external handling
+        const gameTypeResult = await client.query(
+            'SELECT team_selection_type FROM games WHERE id = $1', [gameId]
+        );
+        const isExternal = gameTypeResult.rows[0]?.team_selection_type === 'vs_external';
+        const shouldHaveMotm = !(isExternal && winningTeam === 'blue');
+        
         // 1. Update game winning team and status
         console.log('Step 1: Updating game status...');
         await client.query(
             `UPDATE games 
              SET winning_team = $1, 
                  game_status = 'completed',
-                 motm_voting_ends = NOW() + INTERVAL '24 hours'
+                 motm_voting_ends = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'}
              WHERE id = $2`,
             [winningTeam, gameId]
         );
@@ -3835,16 +4070,26 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             console.log(`Updated appearances for ${showedUpPlayerIds.length} players`);
         }
         
-        // Update wins for winning team players (from actual team assignment, NOT motm nominees)
+        // Update wins for winning team players
         if (winningTeam && winningTeam !== 'draw') {
-            const winningTeamName = winningTeam === 'red' ? 'Red' : 'Blue';
-            const winningPlayersResult = await client.query(`
-                SELECT tp.player_id FROM team_players tp
-                JOIN teams t ON t.id = tp.team_id
-                WHERE t.game_id = $1 AND t.team_name = $2
-            `, [gameId, winningTeamName]);
+            let winningPlayerIds = [];
             
-            const winningPlayerIds = winningPlayersResult.rows.map(r => r.player_id);
+            if (isExternal && winningTeam === 'red') {
+                // TF wins: all confirmed players who showed up get the win
+                winningPlayerIds = showedUpPlayerIds;
+            } else if (isExternal && winningTeam === 'blue') {
+                // Opponent wins: no TF players get wins
+                winningPlayerIds = [];
+            } else {
+                // Standard game: get winners from team_players table
+                const winningTeamName = winningTeam === 'red' ? 'Red' : 'Blue';
+                const winningPlayersResult = await client.query(`
+                    SELECT tp.player_id FROM team_players tp
+                    JOIN teams t ON t.id = tp.team_id
+                    WHERE t.game_id = $1 AND t.team_name = $2
+                `, [gameId, winningTeamName]);
+                winningPlayerIds = winningPlayersResult.rows.map(r => r.player_id);
+            }
             
             if (winningPlayerIds.length > 0) {
                 await client.query(
@@ -3853,7 +4098,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                      WHERE id = ANY($1)`,
                     [winningPlayerIds]
                 );
-                console.log(`Updated wins for ${winningPlayerIds.length} winning team players (${winningTeamName})`);
+                console.log(`Updated wins for ${winningPlayerIds.length} winning players`);
             }
         } else if (winningTeam === 'draw') {
             console.log('Game was a draw - no wins awarded');
@@ -3865,7 +4110,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             if (record.points > 0) {
                 const offenseTypes = {
                     'on_time': 'On Time',
-                    'late_drop': 'Late Drop Out',
+                    'not_ready': 'Not Ready',
                     '5_10_late': '5-10 Minutes Late',
                     '10_late': '10+ Minutes Late',
                     'no_show': 'No Show'
@@ -3876,6 +4121,30 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                      VALUES ($1, $2, $3, $4, $5)`,
                     [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
                 );
+            }
+        }
+        
+        // 3b. Explicitly recalculate tiers for disciplined players
+        const disciplinedPlayerIds = (disciplineRecords || [])
+            .filter(d => d.points > 0)
+            .map(d => d.playerId);
+        
+        const uniqueDisciplinedIds = [...new Set(disciplinedPlayerIds)];
+        
+        for (const dpId of uniqueDisciplinedIds) {
+            try {
+                const tierResult = await client.query(
+                    'SELECT calculate_player_tier($1) as new_tier', [dpId]
+                );
+                const newTier = tierResult.rows[0]?.new_tier;
+                if (newTier) {
+                    await client.query(
+                        'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                        [newTier, dpId]
+                    );
+                }
+            } catch (tierError) {
+                console.error('Failed to recalculate tier for player:', dpId, tierError.message);
             }
         }
         
@@ -3899,19 +4168,23 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             );
         }
         
-        // 5. Create MOTM nominees
+        // 5. Create MOTM nominees (skip if external game where opponent won)
         console.log('Step 5: Creating MOTM nominees...');
         let nomineesInserted = 0;
-        for (const playerId of motmNominees || []) {
-            await client.query(
-                `INSERT INTO motm_nominees (game_id, player_id)
-                 VALUES ($1, $2)
-                 ON CONFLICT DO NOTHING`,
-                [gameId, playerId]
-            );
-            nomineesInserted++;
+        if (shouldHaveMotm) {
+            for (const playerId of motmNominees || []) {
+                await client.query(
+                    `INSERT INTO motm_nominees (game_id, player_id)
+                     VALUES ($1, $2)
+                     ON CONFLICT DO NOTHING`,
+                    [gameId, playerId]
+                );
+                nomineesInserted++;
+            }
+            console.log(`Inserted ${nomineesInserted} MOTM nominees`);
+        } else {
+            console.log('External game - opponent won, skipping MOTM nominees');
         }
-        console.log(`Inserted ${nomineesInserted} MOTM nominees`);
         
         // Verify nominees were saved
         const nomineeCheck = await client.query(
@@ -4091,6 +4364,24 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             photo_url: p.photo_url,
             isGK: p.position === 'goalkeeper'
         }));
+        
+        // Also fetch guests assigned to teams
+        const guestsTeamResult = await pool.query(
+            `SELECT id, guest_name, team_name FROM game_guests WHERE game_id = $1 AND team_name IS NOT NULL`,
+            [game.id]
+        );
+        for (const guest of guestsTeamResult.rows) {
+            const guestObj = {
+                id: `guest_${guest.id}`,
+                name: `${guest.guest_name}`,
+                squadNumber: null,
+                photo_url: null,
+                isGK: false,
+                isGuest: true
+            };
+            if (guest.team_name === 'Red') redTeam.push(guestObj);
+            else if (guest.team_name === 'Blue') blueTeam.push(guestObj);
+        }
         
         // Get MOTM data if game is completed
         let motmNominees = [];
@@ -4620,12 +4911,43 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
             return res.status(400).json({ error: 'Player already registered' });
         }
         
-        // Get game cost
+        // Get game details for capacity + GK checks
         const gameResult = await pool.query(
-            'SELECT cost_per_player FROM games WHERE id = $1',
+            'SELECT cost_per_player, max_players, team_selection_type FROM games WHERE id = $1',
             [gameId]
         );
-        const cost = parseFloat(gameResult.rows[0].cost_per_player);
+        const game = gameResult.rows[0];
+        const cost = parseFloat(game.cost_per_player);
+        
+        // Check capacity (confirmed registrations + guests)
+        const countResult = await pool.query(
+            `SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed') +
+                    (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS total`,
+            [gameId]
+        );
+        if (parseInt(countResult.rows[0].total) >= parseInt(game.max_players)) {
+            return res.status(400).json({
+                error: `Game is full (${game.max_players}/${game.max_players}). Remove a player first.`
+            });
+        }
+        
+        // Check GK slot limits if adding as GK
+        const posValue = position || 'outfield';
+        const isGK = posValue.trim().toUpperCase() === 'GK';
+        if (isGK) {
+            const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : 2;
+            const gkCount = await pool.query(
+                `SELECT COUNT(*) as gk_count FROM registrations
+                 WHERE game_id = $1 AND status = 'confirmed'
+                 AND UPPER(TRIM(position_preference)) = 'GK'`,
+                [gameId]
+            );
+            if (parseInt(gkCount.rows[0].gk_count) >= maxGKSlots) {
+                return res.status(400).json({
+                    error: `GK slots full (${maxGKSlots} max). Change position or remove an existing GK.`
+                });
+            }
+        }
         
         // Check/deduct credits
         const creditResult = await pool.query(
@@ -4689,6 +5011,42 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             return res.status(400).json({ error: 'Player already registered' });
         }
         
+        // Get game details for capacity + GK checks
+        const gameCheck = await pool.query(
+            'SELECT max_players, team_selection_type FROM games WHERE id = $1',
+            [gameId]
+        );
+        
+        // Check capacity (confirmed registrations + guests)
+        const countResult = await pool.query(
+            `SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed') +
+                    (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS total`,
+            [gameId]
+        );
+        if (parseInt(countResult.rows[0].total) >= parseInt(gameCheck.rows[0].max_players)) {
+            return res.status(400).json({
+                error: `Game is full (${gameCheck.rows[0].max_players}/${gameCheck.rows[0].max_players}). Remove a player first.`
+            });
+        }
+        
+        // Check GK slot limits if adding as GK
+        const posValue = position || 'outfield';
+        const isGK = posValue.trim().toUpperCase() === 'GK';
+        if (isGK) {
+            const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : 2;
+            const gkCount = await pool.query(
+                `SELECT COUNT(*) as gk_count FROM registrations
+                 WHERE game_id = $1 AND status = 'confirmed'
+                 AND UPPER(TRIM(position_preference)) = 'GK'`,
+                [gameId]
+            );
+            if (parseInt(gkCount.rows[0].gk_count) >= maxGKSlots) {
+                return res.status(400).json({
+                    error: `GK slots full (${maxGKSlots} max). Change position or remove an existing GK.`
+                });
+            }
+        }
+        
         // Get player credits
         const creditResult = await pool.query(
             'SELECT balance FROM credits WHERE player_id = $1',
@@ -4749,9 +5107,9 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             return res.status(403).json({ error: 'Game must be locked by you to edit players' });
         }
         
-        // Get registration details
+        // Get registration details (include position + status for backup promotion)
         const regResult = await pool.query(
-            'SELECT player_id FROM registrations WHERE id = $1 AND game_id = $2',
+            'SELECT player_id, status, position_preference FROM registrations WHERE id = $1 AND game_id = $2',
             [registrationId, gameId]
         );
         
@@ -4759,11 +5117,14 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             return res.status(404).json({ error: 'Registration not found' });
         }
         
-        const playerId = regResult.rows[0].player_id;
+        const removedReg = regResult.rows[0];
+        const playerId = removedReg.player_id;
+        const wasConfirmed = removedReg.status === 'confirmed';
+        const wasGKOnly = removedReg.position_preference?.trim().toUpperCase() === 'GK';
         
-        // Get game cost
+        // Get game cost and type
         const gameResult = await pool.query(
-            'SELECT cost_per_player FROM games WHERE id = $1',
+            'SELECT cost_per_player, team_selection_type FROM games WHERE id = $1',
             [gameId]
         );
         const cost = parseFloat(gameResult.rows[0].cost_per_player);
@@ -4785,7 +5146,91 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             [registrationId]
         );
         
-        res.json({ message: 'Player removed successfully' });
+        // Try to promote a backup if a confirmed player was removed
+        let promotedPlayer = null;
+        if (wasConfirmed) {
+            const maxGKSlots = gameResult.rows[0].team_selection_type === 'vs_external' ? 1 : 2;
+            const gkCountResult = await pool.query(
+                `SELECT COUNT(*) as gk_count FROM registrations 
+                 WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'`,
+                [gameId]
+            );
+            const currentGKs = parseInt(gkCountResult.rows[0].gk_count) || 0;
+            
+            // If a GK was removed, try GK backups first
+            if (wasGKOnly) {
+                const gkBackups = await pool.query(`
+                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'gk_backup'
+                    ORDER BY r.registered_at ASC
+                `, [gameId]);
+                
+                for (const candidate of gkBackups.rows) {
+                    const creditCheck = await pool.query(
+                        'SELECT balance FROM credits WHERE player_id = $1', [candidate.player_id]
+                    );
+                    if (parseFloat(creditCheck.rows[0]?.balance || 0) >= cost) {
+                        promotedPlayer = candidate;
+                        break;
+                    }
+                }
+            }
+            
+            // Then try confirmed backups (with GK slot check)
+            if (!promotedPlayer) {
+                const confirmedBackups = await pool.query(`
+                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'confirmed_backup'
+                    ORDER BY r.registered_at ASC
+                `, [gameId]);
+                
+                for (const candidate of confirmedBackups.rows) {
+                    const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
+                    if (isGK && currentGKs >= maxGKSlots) continue;
+                    promotedPlayer = candidate;
+                    break;
+                }
+            }
+            
+            if (promotedPlayer) {
+                await pool.query(
+                    `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
+                    [promotedPlayer.id]
+                );
+                
+                if (promotedPlayer.backup_type !== 'confirmed_backup') {
+                    await pool.query(
+                        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+                        [cost, promotedPlayer.player_id]
+                    );
+                    await pool.query(
+                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                        [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
+                    );
+                }
+                
+                try {
+                    await pool.query(
+                        `INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, 'backup_promoted', $2, $3)`,
+                        [promotedPlayer.player_id,
+                         `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
+                         gameId]
+                    );
+                } catch (notifErr) {
+                    console.error('Notification insert failed (non-critical):', notifErr.message);
+                }
+            }
+        }
+        
+        const msg = promotedPlayer 
+            ? `Player removed. ${promotedPlayer.alias || promotedPlayer.full_name} promoted from backup.`
+            : 'Player removed successfully';
+        
+        res.json({ message: msg, promotedPlayer: promotedPlayer ? { name: promotedPlayer.alias || promotedPlayer.full_name } : null });
         
     } catch (error) {
         console.error('Remove player error:', error);
