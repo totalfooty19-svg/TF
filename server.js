@@ -7461,11 +7461,6 @@ app.post('/api/auth/reset-password', async (req, res) => {
     }
 });
 
-// FIX-043: Catch-all 404 handler (must be after all routes)
-app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
-
-// FIX-037: Global handlers for unhandled errors/rejections so background tasks don't crash silently
-process.on('unhandledRejection', (reason) => {
 // ==========================================
 // REPORTING MODULE
 // ==========================================
@@ -7732,6 +7727,11 @@ app.get('/api/reports/players/list', authenticateToken, requireReportAccess, asy
     } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
+// FIX-043: Catch-all 404 handler (must be after all routes)
+app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
+
+// FIX-037: Global handlers for unhandled errors/rejections so background tasks don't crash silently
+process.on('unhandledRejection', (reason) => {
     console.error('Unhandled Promise Rejection:', reason);
 });
 process.on('uncaughtException', (err) => {
