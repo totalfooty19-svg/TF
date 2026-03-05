@@ -1543,384 +1543,63 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
     }
 });
 
-
-// Update player (admin)
-app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { playerId } = req.params;
-        const {
-            goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
-            pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            total_wins, tournament_wins, external_wins, squad_number, phone, balance
-        } = req.body;
-        
-        // TF Verified lock — only admin/superadmin can edit stats; CLM admins are blocked
-        const isAdminOrAbove = req.user.role === 'admin' || req.user.role === 'superadmin';
-        if (!isAdminOrAbove) {
-            const lockCheck = await pool.query(
-                `SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
-                 WHERE pb.player_id = $1 AND b.name = 'TF Verified'`,
-                [playerId]
-            );
-            if (lockCheck.rows.length > 0) {
-                return res.status(403).json({ error: 'Stats are locked. Only an admin can edit a TF Verified player.' });
-            }
-        }
-
-        // Calculate overall rating
-        const overall_rating = (defending_rating || 0) + (strength_rating || 0) + (fitness_rating || 0) + 
-                              (pace_rating || 0) + (decisions_rating || 0) + (assisting_rating || 0) + (shooting_rating || 0);
-        
-        // FIX-090: Check squad number uniqueness before updating
-        if (squad_number !== undefined && squad_number !== null) {
-            const squadCheck = await pool.query(
-                'SELECT id FROM players WHERE squad_number = $1 AND id != $2',
-                [squad_number, playerId]
-            );
-            if (squadCheck.rows.length > 0) {
-                return res.status(400).json({ error: `Squad number ${squad_number} is already assigned to another player` });
-            }
-        }
-
-        // Update player ratings and stats
-        await pool.query(`
-            UPDATE players SET
-                goalkeeper_rating = $1,
-                defending_rating = $2,
-                strength_rating = $3,
-                fitness_rating = $4,
-                pace_rating = $5,
-                decisions_rating = $6,
-                assisting_rating = $7,
-                shooting_rating = $8,
-                overall_rating = $9,
-                total_wins = $10,
-                tournament_wins = $11,
-                external_wins = $12,
-                squad_number = $13,
-                phone = $14
-            WHERE id = $15
-        `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
-            pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            overall_rating, total_wins, tournament_wins ?? 0, external_wins ?? 0,
-            squad_number, phone, playerId]);
-        
-        // FIX-053: Update balance with audit trail if changed
-        if (balance !== undefined) {
-            const prevResult = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
-            const prevBalance = prevResult.rows.length > 0 ? parseFloat(prevResult.rows[0].balance) : 0;
-            const newBalance = parseFloat(balance);
-            const diff = parseFloat((newBalance - prevBalance).toFixed(2));
-            await pool.query('UPDATE credits SET balance = $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [newBalance, playerId]);
-            if (diff !== 0) {
-                await pool.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description, admin_id) VALUES ($1, $2, $3, $4, $5)',
-                    [playerId, diff, 'admin_adjustment', `Direct balance set to £${newBalance.toFixed(2)} by admin`, req.user.userId]
-                );
-            }
-        }
-        
-        res.json({ message: 'Player updated successfully' });
-    } catch (error) {
-        console.error('Update player error:', error);
-        res.status(500).json({ error: 'Failed to update player' });
-    }
-});
-
-// Delete player (admin only)
-app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (req, res) => {
-    const client = await pool.connect();
-    try {
-        const { playerId } = req.params;
-        
-        await client.query('BEGIN');
-        
-        // Delete player (cascade will handle related records)
-        const result = await client.query('DELETE FROM players WHERE id = $1 RETURNING full_name, alias', [playerId]);
-        
-        if (result.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Player not found' });
-        }
-        
-        await client.query('COMMIT');
-        
-        res.json({ 
-            message: 'Player deleted successfully',
-            player: result.rows[0]
-        });
-    } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        console.error('Delete player error:', error);
-        res.status(500).json({ error: 'Failed to delete player' });
-    } finally {
-        client.release();
-    }
-});
+// Bulk upload / update players from CSV
 
 // ==========================================
-// BADGES SYSTEM
+// WHATSAPP SERVICE
 // ==========================================
 
-// Get all badges
-app.get('/api/badges', authenticateToken, async (req, res) => {
-    try {
-        const result = await pool.query(
-            'SELECT * FROM badges ORDER BY name'
-        );
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Get badges error:', error);
-        res.status(500).json({ error: 'Failed to get badges' });
-    }
-});
-
-// Update player badges (admin only)
-app.put('/api/admin/players/:playerId/badges', authenticateToken, requireAdmin, async (req, res) => {
-    const client = await pool.connect();
-    try {
-        const { playerId } = req.params;
-        const { badgeIds } = req.body;
-        
-        await client.query('BEGIN');
-        
-        // Remove all existing badges
-        await client.query('DELETE FROM player_badges WHERE player_id = $1', [playerId]);
-        
-        // Add new badges
-        for (const badgeId of badgeIds) {
-            await client.query(
-                'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2)',
-                [playerId, badgeId]
-            );
-        }
-        
-        await client.query('COMMIT');
-        
-        res.json({ message: 'Badges updated successfully' });
-
-        // Non-critical: notify player of new badge
-        setImmediate(async () => {
-            try {
-                await sendNotification('badge_awarded', playerId, {});
-            } catch (e) {
-                console.error('Badge notification failed (non-critical):', e.message);
-            }
-        });
-    } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        console.error('Update badges error:', error);
-        res.status(500).json({ error: 'Failed to update badges' });
-    } finally {
-        client.release();
-    }
-});
-
-
-// Auto-allocate badges based on player stats
-async function autoAllocateBadges(playerId) {
-    try {
-        // Get player stats
-        const playerResult = await pool.query(`
-            SELECT 
-                p.id,
-                p.total_appearances,
-                p.motm_wins,
-                p.created_at,
-                (SELECT json_agg(badge_id) FROM player_badges WHERE player_id = p.id) as current_badge_ids
-            FROM players p
-            WHERE p.id = $1
-        `, [playerId]);
-        
-        if (playerResult.rows.length === 0) return;
-        
-        const player = playerResult.rows[0];
-        const currentBadgeIds = player.current_badge_ids || [];
-        
-        // Get all auto-allocated badges
-        const badgesResult = await pool.query(`
-            SELECT id, name FROM badges WHERE is_auto_allocated = TRUE
-        `);
-        
-        const badgesToAward = [];
-        const badgesToRemove = [];
-        
-        for (const badge of badgesResult.rows) {
-            const shouldHave = await checkBadgeCriteria(badge.name, player);
-            const hasNow = currentBadgeIds.includes(badge.id);
-            
-            // Award badges if criteria met
-            if (shouldHave && !hasNow) {
-                badgesToAward.push(badge.id);
-            }
-            
-            // ONLY remove "New" badge - preserve all other badges
-            if (!shouldHave && hasNow && badge.name === 'New') {
-                badgesToRemove.push(badge.id);
-            }
-        }
-        
-        // Award new badges
-        for (const badgeId of badgesToAward) {
-            await pool.query(
-                'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                [playerId, badgeId]
-            );
-        }
-        
-        // Remove "New" badge if no longer applicable
-        for (const badgeId of badgesToRemove) {
-            await pool.query(
-                'DELETE FROM player_badges WHERE player_id = $1 AND badge_id = $2',
-                [playerId, badgeId]
-            );
-        }
-        
-        return { awarded: badgesToAward.length, removed: badgesToRemove.length };
-        
-    } catch (error) {
-        console.error('Auto allocate badges error:', error);
-        return null;
-    }
+// Helper function to replace placeholders in message templates
+function replacePlaceholders(template, data) {
+    let message = template;
+    
+    // Replace all placeholders with actual data
+    message = message.replace(/\[Name\]/g, data.name || '');
+    message = message.replace(/\[Day\]/g, data.day || '');
+    message = message.replace(/\[Time\]/g, data.time || '');
+    message = message.replace(/\[Venue\]/g, data.venue || '');
+    message = message.replace(/\[gameurl\]/g, data.gameurl || '');
+    message = message.replace(/\[Balance\]/g, data.balance || '0.00');
+    message = message.replace(/\[generic_game_url\]/g, data.generic_game_url || 'https://totalfooty.co.uk/vibecoding/');
+    message = message.replace(/\[profile_url\]/g, data.profile_url || 'https://totalfooty.co.uk/vibecoding/');
+    
+    return message;
 }
 
-async function checkBadgeCriteria(badgeName, player) {
-    switch (badgeName) {
-        case '100 Apps':
-            return player.total_appearances >= 100;
-            
-        case '250 Apps':
-            return player.total_appearances >= 250;
-            
-        case '15 MOTM':
-            return player.motm_wins >= 15;
-            
-        case 'MOTM Streak':
-            // Won MOTM in 3 consecutive completed games they played in
-            try {
-                const streakResult = await pool.query(`
-                    SELECT g.id, g.motm_winner_id
-                    FROM games g
-                    JOIN team_players tp ON tp.player_id = $1
-                    JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
-                    WHERE g.game_status = 'completed' AND g.motm_winner_id IS NOT NULL
-                    ORDER BY g.game_date DESC
-                    LIMIT 3
-                `, [player.id]);
-                
-                if (streakResult.rows.length < 3) return false;
-                return streakResult.rows.every(row => row.motm_winner_id === player.id);
-            } catch (err) {
-                console.error('MOTM streak check error:', err.message);
-                return false;
-            }
-            
-        case 'New':
-            // Less than 30 days since account creation
-            if (!player.created_at) return false;
-            const accountAge = (Date.now() - new Date(player.created_at)) / (1000 * 60 * 60 * 24);
-            return accountAge < 30;
-            
-        default:
-            return false;
-    }
+// Helper function to format game data for WhatsApp messages
+async function getGameDataForMessage(gameId) {
+    const gameResult = await pool.query(`
+        SELECT g.*, v.name as venue_name, g.game_url
+        FROM games g
+        LEFT JOIN venues v ON v.id = g.venue_id
+        WHERE g.id = $1
+    `, [gameId]);
+    
+    if (gameResult.rows.length === 0) return null;
+    
+    const game = gameResult.rows[0];
+    const gameDate = new Date(game.game_date);
+    
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const day = days[gameDate.getDay()];
+    
+    const hours = gameDate.getHours().toString().padStart(2, '0');
+    const minutes = gameDate.getMinutes().toString().padStart(2, '0');
+    const time = `${hours}:${minutes}`;
+    
+    const gameurl = `https://totalfooty.co.uk/vibecoding/game.html?url=${game.game_url}`;
+    
+    return {
+        day,
+        time,
+        venue: game.venue_name,
+        gameurl
+    };
 }
 
-// Endpoint to trigger badge auto-allocation
-app.post('/api/admin/players/:playerId/auto-badges', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { playerId } = req.params;
-        const result = await autoAllocateBadges(playerId);
-        
-        if (result) {
-            res.json({ 
-                message: 'Badges updated',
-                awarded: result.awarded,
-                removed: result.removed
-            });
-        } else {
-            res.status(500).json({ error: 'Failed to allocate badges' });
-        }
-    } catch (error) {
-        console.error('Auto badge allocation error:', error);
-        res.status(500).json({ error: 'Failed to allocate badges' });
-    }
-});
-
-// Auto-allocate badges for all players
-app.post('/api/admin/badges/auto-allocate-all', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const playersResult = await pool.query('SELECT id FROM players');
-        let totalAwarded = 0;
-        let totalRemoved = 0;
-        
-        for (const player of playersResult.rows) {
-            const result = await autoAllocateBadges(player.id);
-            if (result) {
-                totalAwarded += result.awarded;
-                totalRemoved += result.removed;
-            }
-        }
-        
-        res.json({ 
-            message: 'All players processed',
-            totalAwarded,
-            totalRemoved,
-            playersProcessed: playersResult.rows.length
-        });
-    } catch (error) {
-        console.error('Auto allocate all error:', error);
-        res.status(500).json({ error: 'Failed to allocate badges' });
-    }
-});
-
-// Admin: manually link a player's referrer
-app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { playerId } = req.params;
-        const { referredBy } = req.body;
-        
-        if (!referredBy) {
-            return res.status(400).json({ error: 'referredBy (player ID) is required' });
-        }
-        
-        // Verify both players exist
-        const playerCheck = await pool.query('SELECT id, alias, full_name, referred_by FROM players WHERE id = $1', [playerId]);
-        if (playerCheck.rows.length === 0) {
-            return res.status(404).json({ error: 'Player not found' });
-        }
-        
-        const referrerCheck = await pool.query('SELECT id, alias, full_name FROM players WHERE id = $1', [referredBy]);
-        if (referrerCheck.rows.length === 0) {
-            return res.status(404).json({ error: 'Referrer not found' });
-        }
-        
-        // Prevent self-referral
-        if (playerId === referredBy) {
-            return res.status(400).json({ error: 'A player cannot refer themselves' });
-        }
-        
-        // Update referred_by
-        await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referredBy, playerId]);
-        
-        const player = playerCheck.rows[0];
-        const referrer = referrerCheck.rows[0];
-        console.log(`Admin manually linked referral: ${player.alias || player.full_name} referred by ${referrer.alias || referrer.full_name}`);
-        
-        res.json({ 
-            message: `${player.alias || player.full_name} is now linked as referred by ${referrer.alias || referrer.full_name}`,
-            player: { id: playerId, name: player.alias || player.full_name },
-            referrer: { id: referredBy, name: referrer.alias || referrer.full_name }
-        });
-    } catch (error) {
-        console.error('Admin set referral error:', error);
-        res.status(500).json({ error: 'Failed to set referral' });
-    }
-});
-
-// ==========================================
-// EMAIL HELPERS (Gmail SMTP via Nodemailer)
-// ==========================================
+// Send WhatsApp message via Twilio
+// ── EMAIL NOTIFICATION SENDER ────────────────────────────────────────────────
+// Replaces WhatsApp — sends branded HTML email via Gmail SMTP
 
 const EMAIL_SUBJECTS = {
     signup:           '👋 Welcome to TotalFooty!',
@@ -1955,19 +1634,19 @@ function wrapEmailHtml(bodyHtml, footerExtra = '') {
     </div>`;
 }
 
-// Build the signup welcome email — bespoke branded HTML, not template-driven
+// Build the signup welcome email — bespoke branded HTML with WhatsApp community link
 function buildSignupEmailHtml(safeName) {
     const body = `
         <p style="color:#888;font-size:14px;margin:0 0 16px">Hi ${safeName},</p>
         <p style="color:#fff;font-size:20px;font-weight:900;margin:0 0 8px;letter-spacing:1px">WELCOME TO TOTAL FOOTY ⚽</p>
         <p style="color:#ccc;font-size:15px;line-height:1.7;margin:0 0 20px">
-            You're now part of Coventry's grassroots football community. 
+            You're now part of Coventry's grassroots football community.
             Your account is active and ready — log in to check upcoming games, top up your credits, and get booked in.
         </p>
         <div style="border-top:1px solid #2a2a2a;padding-top:20px;margin-top:4px">
             <p style="color:#888;font-size:12px;letter-spacing:1px;margin:0 0 12px">YOUR TIER</p>
             <p style="color:#C0C0C0;font-size:14px;line-height:1.6;margin:0 0 20px">
-                You start on <strong style="color:#C0C0C0">🥈 SILVER</strong> — meaning you can see games 3 days ahead. 
+                You start on <strong style="color:#C0C0C0">🥈 SILVER</strong> — meaning you can see games 3 days ahead.
                 Play regularly and on time to earn 🥇 Gold status and 28-day early access.
             </p>
         </div>
@@ -2021,12 +1700,13 @@ async function sendEmail(playerEmail, playerName, notificationType, messageText)
             html,
         });
 
-        // Log to whatsapp_logs table (reused as notification log)
+        // Log to whatsapp_logs table (reusing existing table — same structure)
         await pool.query(`
             INSERT INTO whatsapp_logs (player_id, notification_type, phone_number, message_content, status)
             VALUES (NULL, $1, $2, $3, 'sent')
         `, [notificationType, playerEmail, messageText]).catch(() => {});
 
+        // FIX-050: Redact email address in server logs
         const redacted = playerEmail.replace(/(.).+(@.+)/, '$1***$2');
         console.log(`📧 Email [${notificationType}] → ${redacted}`);
         return { success: true };
@@ -2592,8 +2272,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         if (!parsedMax || parsedMax < 2 || parsedMax > 100) return res.status(400).json({ error: 'Max players must be between 2 and 100' });
         const parsedCost = parseFloat(costPerPlayer);
         if (isNaN(parsedCost) || parsedCost < 0 || parsedCost > 1000) return res.status(400).json({ error: 'Cost per player must be between £0 and £1000' });
-        const validFormats = ['5-a-side', '6-a-side', '7-a-side', '8-a-side', '9-a-side', '11-a-side'];
-        if (!validFormats.includes(format)) return res.status(400).json({ error: 'Invalid game format' });
+        if (!format || !format.trim() || format.trim().length > 75) return res.status(400).json({ error: 'Format is required and must be under 75 characters' });
         if (!['weekly', 'one-off'].includes(regularity)) return res.status(400).json({ error: 'Regularity must be weekly or one-off' });
 
         // FIX-084: Validate venue exists before creating games (prevents FK violation 500 error)
@@ -6897,6 +6576,51 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
 // ==========================================
 
 
+// ==========================================
+// TOURNAMENT SYSTEM
+// ==========================================
+
+function calculateLeagueTable(results, teamNames) {
+    const table = {};
+    for (const name of teamNames) {
+        table[name] = { team: name, played: 0, won: 0, drawn: 0, lost: 0, gf: 0, ga: 0, gd: 0, points: 0 };
+    }
+    
+    for (const r of results) {
+        const a = r.team_a_name;
+        const b = r.team_b_name;
+        if (!table[a] || !table[b]) continue;
+        
+        table[a].played++;
+        table[b].played++;
+        table[a].gf += r.team_a_score;
+        table[a].ga += r.team_b_score;
+        table[b].gf += r.team_b_score;
+        table[b].ga += r.team_a_score;
+        
+        if (r.team_a_score > r.team_b_score) {
+            table[a].won++;
+            table[a].points += 3;
+            table[b].lost++;
+        } else if (r.team_b_score > r.team_a_score) {
+            table[b].won++;
+            table[b].points += 3;
+            table[a].lost++;
+        } else {
+            table[a].drawn++;
+            table[b].drawn++;
+            table[a].points += 1;
+            table[b].points += 1;
+        }
+    }
+    
+    // Calculate GD and sort
+    const sorted = Object.values(table).map(t => ({ ...t, gd: t.gf - t.ga }));
+    sorted.sort((a, b) => b.points - a.points || b.gd - a.gd || b.gf - a.gf || a.team.localeCompare(b.team));
+    return sorted;
+}
+
+// Enter a tournament match result
 app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
@@ -7457,227 +7181,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     }
 });
 
-
-// ── GAME CHAT ─────────────────────────────────────────────────────────────────
-
-// GET /api/public/game/:gameUrl/messages — read-only public chat feed (for game.html)
-// Only returns 'chat' scope messages. No auth required.
-app.get('/api/public/game/:gameUrl/messages', async (req, res) => {
-    const { gameUrl } = req.params;
-    const { since } = req.query;
-
-    try {
-        const gameRes = await pool.query('SELECT id FROM games WHERE game_url = $1', [gameUrl]);
-        if (gameRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-        const gameId = gameRes.rows[0].id;
-
-        const sinceClause = since ? 'AND gm.created_at > $2' : '';
-        const params = since ? [gameId, since] : [gameId];
-
-        const result = await pool.query(`
-            SELECT
-                gm.id,
-                gm.scope,
-                gm.message,
-                gm.created_at,
-                COALESCE(p.alias, p.full_name, 'Unknown') AS player_name
-            FROM game_messages gm
-            JOIN players p ON p.id = gm.player_id
-            WHERE gm.game_id = $1
-              AND gm.scope = 'chat'
-              AND gm.deleted_at IS NULL
-              ${sinceClause}
-            ORDER BY gm.created_at ASC
-        `, params);
-
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Public get messages error:', error);
-        res.status(500).json({ error: 'Failed to fetch messages' });
-    }
-});
-
-// GET /api/games/:gameId/messages — authenticated fetch (for mobile app)
-// Returns chat scope + team scope messages visible to the requesting player
-app.get('/api/games/:gameId/messages', authenticateToken, async (req, res) => {
-    const { gameId } = req.params;
-    const { since } = req.query;
-
-    try {
-        const gameCheck = await pool.query('SELECT id FROM games WHERE id = $1', [gameId]);
-        if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-
-        const teamRes = await pool.query(`
-            SELECT tp.team_id FROM team_players tp
-            JOIN teams t ON t.id = tp.team_id
-            WHERE tp.player_id = $1 AND t.game_id = $2 LIMIT 1
-        `, [req.user.playerId, gameId]);
-        const myTeamId = teamRes.rows[0]?.team_id || null;
-
-        const sinceClause = since ? 'AND gm.created_at > $3' : '';
-        const params = since ? [gameId, myTeamId, since] : [gameId, myTeamId];
-
-        const result = await pool.query(`
-            SELECT
-                gm.id, gm.game_id, gm.player_id, gm.scope, gm.message, gm.created_at,
-                COALESCE(p.alias, p.full_name, 'Unknown') AS player_alias,
-                p.full_name AS player_name
-            FROM game_messages gm
-            JOIN players p ON p.id = gm.player_id
-            WHERE gm.game_id = $1
-              AND gm.deleted_at IS NULL
-              AND (
-                  gm.scope = 'chat'
-                  OR (gm.scope = 'team' AND gm.team_id = $2 AND $2 IS NOT NULL)
-              )
-              ${sinceClause}
-            ORDER BY gm.created_at ASC
-        `, params);
-
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Get messages error:', error);
-        res.status(500).json({ error: 'Failed to fetch messages' });
-    }
-});
-
-// POST /api/games/:gameId/messages — post a message (mobile app users only)
-// Body: { message: string, scope: 'chat' | 'team' }
-app.post('/api/games/:gameId/messages', authenticateToken, async (req, res) => {
-    const { gameId } = req.params;
-    const { message, scope = 'chat' } = req.body;
-
-    if (!message || typeof message !== 'string' || message.trim().length === 0) {
-        return res.status(400).json({ error: 'Message is required' });
-    }
-    if (message.trim().length > 500) {
-        return res.status(400).json({ error: 'Message must be 500 characters or fewer' });
-    }
-    if (!['chat', 'team'].includes(scope)) {
-        return res.status(400).json({ error: 'scope must be "chat" or "team"' });
-    }
-
-    try {
-        const gameCheck = await pool.query('SELECT id, game_status FROM games WHERE id = $1', [gameId]);
-        if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-        if (gameCheck.rows[0].game_status === 'cancelled') {
-            return res.status(403).json({ error: 'Chat is disabled for cancelled games' });
-        }
-
-        let teamId = null;
-        if (scope === 'team') {
-            const teamRes = await pool.query(`
-                SELECT tp.team_id FROM team_players tp
-                JOIN teams t ON t.id = tp.team_id
-                WHERE tp.player_id = $1 AND t.game_id = $2 LIMIT 1
-            `, [req.user.playerId, gameId]);
-            if (teamRes.rows.length === 0) {
-                return res.status(403).json({ error: 'You are not assigned to a team in this game' });
-            }
-            teamId = teamRes.rows[0].team_id;
-        }
-
-        const result = await pool.query(`
-            INSERT INTO game_messages (game_id, player_id, team_id, scope, message)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING
-                id, game_id, player_id, scope, message, created_at,
-                (SELECT COALESCE(alias, full_name, 'Unknown') FROM players WHERE id = $2) AS player_alias,
-                (SELECT full_name FROM players WHERE id = $2) AS player_name
-        `, [gameId, req.user.playerId, teamId, scope, message.trim()]);
-
-        res.status(201).json(result.rows[0]);
-    } catch (error) {
-        console.error('Post message error:', error);
-        res.status(500).json({ error: 'Failed to post message' });
-    }
-});
-
-// DELETE /api/admin/messages/:messageId — soft-delete a message (admin only)
-app.delete('/api/admin/messages/:messageId', authenticateToken, requireAdmin, async (req, res) => {
-    const { messageId } = req.params;
-    try {
-        const result = await pool.query(
-            'UPDATE game_messages SET deleted_at = NOW() WHERE id = $1 RETURNING id',
-            [messageId]
-        );
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Message not found' });
-        res.json({ message: 'Message deleted', id: messageId });
-    } catch (error) {
-        console.error('Delete message error:', error);
-        res.status(500).json({ error: 'Failed to delete message' });
-    }
-});
-
-// ── ADMIN: UNBAN PLAYER ───────────────────────────────────────────────────────
-
-// POST /api/admin/players/:id/unban — superadmin only, clears discipline and adds 1 warning point
-app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, async (req, res) => {
-    const { id } = req.params;
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        // Get current tier before clearing
-        const currentTierResult = await client.query(
-            'SELECT reliability_tier FROM players WHERE id = $1',
-            [id]
-        );
-        const oldTier = currentTierResult.rows[0]?.reliability_tier || 'unknown';
-
-        // Count and clear all existing discipline records for this player
-        const countResult = await client.query(
-            'SELECT COUNT(*) AS cnt FROM discipline_records WHERE player_id = $1',
-            [id]
-        );
-        const disciplineRecordsRemoved = parseInt(countResult.rows[0]?.cnt || 0);
-
-        await client.query('DELETE FROM discipline_records WHERE player_id = $1', [id]);
-
-        // Add a single warning-level discipline point (clean slate but flagged)
-        await client.query(`
-            INSERT INTO discipline_records (player_id, points, reason, recorded_by)
-            VALUES ($1, 1, 'Reinstated after ban', $2)
-        `, [id, req.user.playerId]);
-
-        // Recalculate tier (1 point with sufficient appearances = silver)
-        const tierResult = await client.query(
-            'SELECT calculate_player_tier($1) AS new_tier',
-            [id]
-        );
-        const newTier = tierResult.rows[0]?.new_tier || 'silver';
-
-        await client.query(
-            'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-            [newTier, id]
-        );
-
-        // Insert reinstatement notification for the player
-        await client.query(`
-            INSERT INTO notifications (player_id, type, message)
-            VALUES ($1, 'account_reinstated', '✅ Your account has been reinstated. Welcome back.')
-        `, [id]);
-
-        await client.query('COMMIT');
-
-        // Fire push notification (non-blocking)
-        sendPushNotification(id, 'account_reinstated', '✅ Your account has been reinstated. Welcome back.').catch(() => {});
-
-        res.json({
-            message: 'Player unbanned successfully',
-            oldTier,
-            newTier,
-            disciplineRecordsRemoved
-        });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Unban error:', error);
-        res.status(500).json({ error: 'Failed to unban player' });
-    } finally {
-        client.release();
-    }
-});
-
 // FIX-076: PUT /api/auth/change-password — authenticated password change (no email flow needed)
 app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
     try {
@@ -7776,6 +7279,14 @@ app.get('/api/reports/games', authenticateToken, requireReportAccess, async (req
                 -- Signups (confirmed registrations)
                 COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed')
                                                           AS signups,
+
+                -- Web sign-ins
+                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed' AND (r.registration_source = 'web' OR r.registration_source IS NULL))
+                                                          AS web_signins,
+
+                -- App sign-ins
+                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed' AND r.registration_source = 'app')
+                                                          AS app_signins,
 
                 -- Backup count
                 COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'backup')
@@ -7995,6 +7506,210 @@ app.get('/api/reports/players/list', authenticateToken, requireReportAccess, asy
         );
         res.json(r.rows);
     } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+
+// ── ADMIN: UNBAN PLAYER ───────────────────────────────────────────────────────
+
+// POST /api/admin/players/:id/unban — superadmin only, clears discipline and adds 1 warning point
+app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Get current tier before clearing
+        const currentTierResult = await client.query(
+            'SELECT reliability_tier FROM players WHERE id = $1',
+            [id]
+        );
+        const oldTier = currentTierResult.rows[0]?.reliability_tier || 'unknown';
+
+        // Count and clear all existing discipline records for this player
+        const countResult = await client.query(
+            'SELECT COUNT(*) AS cnt FROM discipline_records WHERE player_id = $1',
+            [id]
+        );
+        const disciplineRecordsRemoved = parseInt(countResult.rows[0]?.cnt || 0);
+
+        await client.query('DELETE FROM discipline_records WHERE player_id = $1', [id]);
+
+        // Add a single warning-level discipline point (clean slate but flagged)
+        await client.query(`
+            INSERT INTO discipline_records (player_id, points, reason, recorded_by)
+            VALUES ($1, 1, 'Reinstated after ban', $2)
+        `, [id, req.user.playerId]);
+
+        // Recalculate tier (1 point with sufficient appearances = silver)
+        const tierResult = await client.query(
+            'SELECT calculate_player_tier($1) AS new_tier',
+            [id]
+        );
+        const newTier = tierResult.rows[0]?.new_tier || 'silver';
+
+        await client.query(
+            'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+            [newTier, id]
+        );
+
+        // Insert reinstatement notification for the player
+        await client.query(`
+            INSERT INTO notifications (player_id, type, message)
+            VALUES ($1, 'account_reinstated', '✅ Your account has been reinstated. Welcome back.')
+        `, [id]);
+
+        await client.query('COMMIT');
+
+        // Fire push notification (non-blocking)
+        sendPushNotification(id, 'account_reinstated', '✅ Your account has been reinstated. Welcome back.').catch(() => {});
+
+        res.json({
+            message: 'Player unbanned successfully',
+            oldTier,
+            newTier,
+            disciplineRecordsRemoved
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Unban error:', error);
+        res.status(500).json({ error: 'Failed to unban player' });
+    } finally {
+        client.release();
+    }
+});
+
+// ── GAME CHAT ─────────────────────────────────────────────────────────────────
+
+// GET /api/public/game/:gameUrl/messages — read-only public chat feed (no auth required)
+app.get('/api/public/game/:gameUrl/messages', async (req, res) => {
+    const { gameUrl } = req.params;
+    const { since } = req.query;
+    try {
+        const gameRes = await pool.query('SELECT id FROM games WHERE game_url = $1', [gameUrl]);
+        if (gameRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const gameId = gameRes.rows[0].id;
+        const sinceClause = since ? 'AND gm.created_at > $2' : '';
+        const params = since ? [gameId, since] : [gameId];
+        const result = await pool.query(`
+            SELECT
+                gm.id,
+                gm.scope,
+                gm.message,
+                gm.created_at,
+                COALESCE(p.alias, p.full_name, 'Unknown') AS player_name
+            FROM game_messages gm
+            JOIN players p ON p.id = gm.player_id
+            WHERE gm.game_id = $1
+              AND gm.scope = 'chat'
+              AND gm.deleted_at IS NULL
+              ${sinceClause}
+            ORDER BY gm.created_at ASC
+        `, params);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Public get messages error:', error);
+        res.status(500).json({ error: 'Failed to fetch messages' });
+    }
+});
+
+// GET /api/games/:gameId/messages — authenticated fetch (mobile app)
+app.get('/api/games/:gameId/messages', authenticateToken, async (req, res) => {
+    const { gameId } = req.params;
+    const { since } = req.query;
+    try {
+        const gameCheck = await pool.query('SELECT id FROM games WHERE id = $1', [gameId]);
+        if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const teamRes = await pool.query(`
+            SELECT tp.team_id FROM team_players tp
+            JOIN teams t ON t.id = tp.team_id
+            WHERE tp.player_id = $1 AND t.game_id = $2 LIMIT 1
+        `, [req.user.playerId, gameId]);
+        const myTeamId = teamRes.rows[0]?.team_id || null;
+        const sinceClause = since ? 'AND gm.created_at > $3' : '';
+        const params = since ? [gameId, myTeamId, since] : [gameId, myTeamId];
+        const result = await pool.query(`
+            SELECT
+                gm.id, gm.game_id, gm.player_id, gm.scope, gm.message, gm.created_at,
+                COALESCE(p.alias, p.full_name, 'Unknown') AS player_alias,
+                p.full_name AS player_name
+            FROM game_messages gm
+            JOIN players p ON p.id = gm.player_id
+            WHERE gm.game_id = $1
+              AND gm.deleted_at IS NULL
+              AND (
+                  gm.scope = 'chat'
+                  OR (gm.scope = 'team' AND gm.team_id = $2 AND $2 IS NOT NULL)
+              )
+              ${sinceClause}
+            ORDER BY gm.created_at ASC
+        `, params);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get messages error:', error);
+        res.status(500).json({ error: 'Failed to fetch messages' });
+    }
+});
+
+// POST /api/games/:gameId/messages — post a message
+app.post('/api/games/:gameId/messages', authenticateToken, async (req, res) => {
+    const { gameId } = req.params;
+    const { message, scope = 'chat' } = req.body;
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+        return res.status(400).json({ error: 'Message is required' });
+    }
+    if (message.trim().length > 500) {
+        return res.status(400).json({ error: 'Message must be 500 characters or fewer' });
+    }
+    if (!['chat', 'team'].includes(scope)) {
+        return res.status(400).json({ error: 'scope must be "chat" or "team"' });
+    }
+    try {
+        const gameCheck = await pool.query('SELECT id, game_status FROM games WHERE id = $1', [gameId]);
+        if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        if (gameCheck.rows[0].game_status === 'cancelled') {
+            return res.status(403).json({ error: 'Chat is disabled for cancelled games' });
+        }
+        let teamId = null;
+        if (scope === 'team') {
+            const teamRes = await pool.query(`
+                SELECT tp.team_id FROM team_players tp
+                JOIN teams t ON t.id = tp.team_id
+                WHERE tp.player_id = $1 AND t.game_id = $2 LIMIT 1
+            `, [req.user.playerId, gameId]);
+            if (teamRes.rows.length === 0) {
+                return res.status(403).json({ error: 'You are not assigned to a team in this game' });
+            }
+            teamId = teamRes.rows[0].team_id;
+        }
+        const result = await pool.query(`
+            INSERT INTO game_messages (game_id, player_id, team_id, scope, message)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING
+                id, game_id, player_id, scope, message, created_at,
+                (SELECT COALESCE(alias, full_name, 'Unknown') FROM players WHERE id = $2) AS player_alias,
+                (SELECT full_name FROM players WHERE id = $2) AS player_name
+        `, [gameId, req.user.playerId, teamId, scope, message.trim()]);
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Post message error:', error);
+        res.status(500).json({ error: 'Failed to post message' });
+    }
+});
+
+// DELETE /api/admin/messages/:messageId — soft-delete a message (admin only)
+app.delete('/api/admin/messages/:messageId', authenticateToken, requireAdmin, async (req, res) => {
+    const { messageId } = req.params;
+    try {
+        const result = await pool.query(
+            'UPDATE game_messages SET deleted_at = NOW() WHERE id = $1 RETURNING id',
+            [messageId]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Message not found' });
+        res.json({ message: 'Message deleted', id: messageId });
+    } catch (error) {
+        console.error('Delete message error:', error);
+        res.status(500).json({ error: 'Failed to delete message' });
+    }
 });
 
 // FIX-043: Catch-all 404 handler (must be after all routes)
