@@ -2740,8 +2740,8 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, amount_paid, registration_source)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'web') RETURNING id`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, amount_paid)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
              status === 'confirmed' ? game.cost_per_player : 0]
@@ -5957,8 +5957,8 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         
             // Add player
             await txClient.query(
-                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, registration_source)
-                 VALUES ($1, $2, 'confirmed', $3, $4, 'admin')`,
+                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
+                 VALUES ($1, $2, 'confirmed', $3, $4)`,
                 [gameId, playerId, position || 'outfield', cost]
             );
 
@@ -6075,8 +6075,8 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         
         // Add player
         await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, registration_source)
-             VALUES ($1, $2, 'confirmed', $3, $4, 'admin')`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
+             VALUES ($1, $2, 'confirmed', $3, $4)`,
             [gameId, playerId, position || 'outfield', customCharge]
         );
         
@@ -7400,6 +7400,75 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     }
 });
 
+// ── ADMIN: UNBAN PLAYER ───────────────────────────────────────────────────────
+
+// POST /api/admin/players/:id/unban — superadmin only, clears discipline and adds 1 warning point
+app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Get current tier before clearing
+        const currentTierResult = await client.query(
+            'SELECT reliability_tier FROM players WHERE id = $1',
+            [id]
+        );
+        const oldTier = currentTierResult.rows[0]?.reliability_tier || 'unknown';
+
+        // Count and clear all existing discipline records for this player
+        const countResult = await client.query(
+            'SELECT COUNT(*) AS cnt FROM discipline_records WHERE player_id = $1',
+            [id]
+        );
+        const disciplineRecordsRemoved = parseInt(countResult.rows[0]?.cnt || 0);
+
+        await client.query('DELETE FROM discipline_records WHERE player_id = $1', [id]);
+
+        // Add a single warning-level discipline point (clean slate but flagged)
+        await client.query(`
+            INSERT INTO discipline_records (player_id, points, reason, recorded_by)
+            VALUES ($1, 1, 'Reinstated after ban', $2)
+        `, [id, req.user.playerId]);
+
+        // Recalculate tier (1 point with sufficient appearances = silver)
+        const tierResult = await client.query(
+            'SELECT calculate_player_tier($1) AS new_tier',
+            [id]
+        );
+        const newTier = tierResult.rows[0]?.new_tier || 'silver';
+
+        await client.query(
+            'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+            [newTier, id]
+        );
+
+        // Insert reinstatement notification for the player
+        await client.query(`
+            INSERT INTO notifications (player_id, type, message)
+            VALUES ($1, 'account_reinstated', '✅ Your account has been reinstated. Welcome back.')
+        `, [id]);
+
+        await client.query('COMMIT');
+
+        // Fire push notification (non-blocking)
+        sendPushNotification(id, 'account_reinstated', '✅ Your account has been reinstated. Welcome back.').catch(() => {});
+
+        res.json({
+            message: 'Player unbanned successfully',
+            oldTier,
+            newTier,
+            disciplineRecordsRemoved
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Unban error:', error);
+        res.status(500).json({ error: 'Failed to unban player' });
+    } finally {
+        client.release();
+    }
+});
+
 // FIX-076: PUT /api/auth/change-password — authenticated password change (no email flow needed)
 app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
     try {
@@ -7461,6 +7530,11 @@ app.post('/api/auth/reset-password', async (req, res) => {
     }
 });
 
+// FIX-043: Catch-all 404 handler (must be after all routes)
+app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
+
+// FIX-037: Global handlers for unhandled errors/rejections so background tasks don't crash silently
+process.on('unhandledRejection', (reason) => {
 // ==========================================
 // REPORTING MODULE
 // ==========================================
@@ -7498,14 +7572,6 @@ app.get('/api/reports/games', authenticateToken, requireReportAccess, async (req
                 -- Signups (confirmed registrations)
                 COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed')
                                                           AS signups,
-
-                -- Web sign-ins
-                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed' AND (r.registration_source = 'web' OR r.registration_source IS NULL))
-                                                          AS web_signins,
-
-                -- App sign-ins
-                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed' AND r.registration_source = 'app')
-                                                          AS app_signins,
 
                 -- Backup count
                 COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'backup')
@@ -7727,11 +7793,6 @@ app.get('/api/reports/players/list', authenticateToken, requireReportAccess, asy
     } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
-// FIX-043: Catch-all 404 handler (must be after all routes)
-app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
-
-// FIX-037: Global handlers for unhandled errors/rejections so background tasks don't crash silently
-process.on('unhandledRejection', (reason) => {
     console.error('Unhandled Promise Rejection:', reason);
 });
 process.on('uncaughtException', (err) => {
