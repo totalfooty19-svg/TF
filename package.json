@@ -1,7 +1,7 @@
 {
   "name": "totalfooty-api",
   "version": "2.0.0",
-  "description": "Total Footy Backend API with WhatsApp Support",
+  "description": "Total Footy Backend API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -15,11 +15,12 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "express-rate-limit": "^7.0.0",
     "firebase-admin": "^12.0.0",
+    "helmet": "^7.0.0",
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^6.9.9",
-    "pg": "^8.11.3",
-    "twilio": "^4.20.0"
+    "pg": "^8.11.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
