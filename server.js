@@ -98,13 +98,22 @@ if (!SUPERADMIN_EMAIL) console.warn('WARNING: SUPERADMIN_EMAIL not set — auto-
 // MIDDLEWARE
 // ==========================================
 
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Access denied' });
     
-    jwt.verify(token, JWT_SECRET, (err, user) => {
+    jwt.verify(token, JWT_SECRET, async (err, user) => {
         if (err) return res.status(403).json({ error: 'Invalid token' });
+        // FIX-075: Verify player still exists (deleted players should lose access immediately)
+        try {
+            const playerExists = await pool.query('SELECT id FROM players WHERE id = $1', [user.playerId]);
+            if (playerExists.rows.length === 0) {
+                return res.status(401).json({ error: 'Account no longer exists' });
+            }
+        } catch (e) {
+            return res.status(500).json({ error: 'Authentication error' });
+        }
         req.user = user;
         next();
     });
@@ -305,39 +314,34 @@ app.post('/api/auth/register', async (req, res) => {
                     }
                     
                     if (referrerId) {
-                        // Set referred_by on new player
-                        await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referrerId, playerId]);
-                        console.log('Player ' + playerId + ' referred by ' + referrerId);
-                        
-                        // CLM badge inheritance: if referrer has CLM badge, new player gets it too
-                        const referrerCLM = await pool.query(
-                            "SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'CLM'",
-                            [referrerId]
-                        );
-                        if (referrerCLM.rows.length > 0) {
-                            const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
-                            if (clmBadge.rows.length > 0) {
-                                await pool.query(
-                                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                                    [playerId, clmBadge.rows[0].id]
+                        // FIX-065: Block self-referral
+                        if (referrerId === playerId) {
+                            console.log('Referral skipped: self-referral detected for player ' + playerId);
+                        } else {
+                            // FIX-065: Block circular chain (referrer was referred by this new player)
+                            const circularCheck = await pool.query('SELECT referred_by FROM players WHERE id = $1', [referrerId]);
+                            if (circularCheck.rows[0]?.referred_by === playerId) {
+                                console.log('Referral skipped: circular chain detected');
+                            } else {
+                                // Set referred_by on new player
+                                await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referrerId, playerId]);
+
+                                // FIX-066: CLM badge auto-inheritance REMOVED — CLM access must be admin-granted only
+
+                                // Misfits badge inheritance (social group, kept intentionally)
+                                const referrerMisfits = await pool.query(
+                                    "SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'Misfits'",
+                                    [referrerId]
                                 );
-                                console.log('CLM badge inherited from referrer ' + referrerId + ' to ' + playerId);
-                            }
-                        }
-                        
-                        // Misfits badge inheritance: if referrer has Misfits badge, new player gets it too
-                        const referrerMisfits = await pool.query(
-                            "SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'Misfits'",
-                            [referrerId]
-                        );
-                        if (referrerMisfits.rows.length > 0) {
-                            const misfitsBadge = await pool.query("SELECT id FROM badges WHERE name = 'Misfits'");
-                            if (misfitsBadge.rows.length > 0) {
-                                await pool.query(
-                                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                                    [playerId, misfitsBadge.rows[0].id]
-                                );
-                                console.log('Misfits badge inherited from referrer ' + referrerId + ' to ' + playerId);
+                                if (referrerMisfits.rows.length > 0) {
+                                    const misfitsBadge = await pool.query("SELECT id FROM badges WHERE name = 'Misfits'");
+                                    if (misfitsBadge.rows.length > 0) {
+                                        await pool.query(
+                                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                                            [playerId, misfitsBadge.rows[0].id]
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -572,6 +576,37 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
 app.get('/api/players', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(`
+            WITH player_stats AS (
+                SELECT
+                    r.player_id,
+                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_date >= NOW() - INTERVAL '3 months') AS apps_3m,
+                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_date >= DATE_TRUNC('year', NOW()))   AS apps_year
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                WHERE r.status = 'confirmed' AND g.game_status = 'completed'
+                GROUP BY r.player_id
+            ),
+            motm_stats AS (
+                SELECT
+                    motm_winner_id AS player_id,
+                    COUNT(*) FILTER (WHERE game_date >= NOW() - INTERVAL '3 months')     AS motm_3m,
+                    COUNT(*) FILTER (WHERE game_date >= DATE_TRUNC('year', NOW()))        AS motm_year
+                FROM games WHERE motm_winner_id IS NOT NULL
+                GROUP BY motm_winner_id
+            ),
+            win_stats AS (
+                SELECT
+                    r.player_id,
+                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_date >= NOW() - INTERVAL '3 months') AS wins_3m,
+                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_date >= DATE_TRUNC('year', NOW()))   AS wins_year
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                JOIN team_players tp ON tp.player_id = r.player_id
+                JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                WHERE r.status = 'confirmed' AND g.game_status = 'completed'
+                  AND LOWER(g.winning_team) = LOWER(t.team_name)
+                GROUP BY r.player_id
+            )
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
                 p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
@@ -583,60 +618,18 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                 p.goalkeeper_rating,
                 (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
                  FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
-                
-                -- Last 3 months stats
-                (SELECT COUNT(DISTINCT r.game_id)
-                 FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 WHERE r.player_id = p.id 
-                 AND r.status = 'confirmed'
-                 AND g.game_status = 'completed'
-                 AND g.game_date >= NOW() - INTERVAL '3 months') as apps_3m,
-                
-                (SELECT COUNT(*)
-                 FROM games g
-                 WHERE g.motm_winner_id = p.id
-                 AND g.game_date >= NOW() - INTERVAL '3 months') as motm_3m,
-                
-                (SELECT COUNT(DISTINCT r.game_id)
-                 FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 JOIN team_players tp ON tp.player_id = r.player_id
-                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
-                 WHERE r.player_id = p.id
-                 AND r.status = 'confirmed'
-                 AND g.game_status = 'completed'
-                 AND LOWER(g.winning_team) = LOWER(t.team_name)
-                 AND g.game_date >= NOW() - INTERVAL '3 months') as wins_3m,
-                
-                -- Calendar year stats
-                (SELECT COUNT(DISTINCT r.game_id)
-                 FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 WHERE r.player_id = p.id 
-                 AND r.status = 'confirmed'
-                 AND g.game_status = 'completed'
-                 AND g.game_date >= DATE_TRUNC('year', NOW())) as apps_year,
-                
-                (SELECT COUNT(*)
-                 FROM games g
-                 WHERE g.motm_winner_id = p.id
-                 AND g.game_date >= DATE_TRUNC('year', NOW())) as motm_year,
-                
-                (SELECT COUNT(DISTINCT r.game_id)
-                 FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 JOIN team_players tp ON tp.player_id = r.player_id
-                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
-                 WHERE r.player_id = p.id
-                 AND r.status = 'confirmed'
-                 AND g.game_status = 'completed'
-                 AND LOWER(g.winning_team) = LOWER(t.team_name)
-                 AND g.game_date >= DATE_TRUNC('year', NOW())) as wins_year
-                
+                COALESCE(ps.apps_3m, 0)   AS apps_3m,
+                COALESCE(ms.motm_3m, 0)   AS motm_3m,
+                COALESCE(ws.wins_3m, 0)   AS wins_3m,
+                COALESCE(ps.apps_year, 0) AS apps_year,
+                COALESCE(ms.motm_year, 0) AS motm_year,
+                COALESCE(ws.wins_year, 0) AS wins_year
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
             LEFT JOIN users u ON u.id = p.user_id
+            LEFT JOIN player_stats ps ON ps.player_id = p.id
+            LEFT JOIN motm_stats ms ON ms.player_id = p.id
+            LEFT JOIN win_stats ws ON ws.player_id = p.id
             ORDER BY p.squad_number NULLS LAST, p.full_name
             LIMIT 500
         `);
@@ -820,6 +813,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
             LEFT JOIN credits c ON c.player_id = p.id
             LEFT JOIN users u ON u.id = p.user_id
             ORDER BY p.squad_number NULLS LAST, p.full_name
+            LIMIT 200
         `);
 
         // All badges for the badge matrix headers
@@ -946,8 +940,17 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
 });
 
 app.put('/api/players/me', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
     try {
         const { fullName, alias, email, phone } = req.body;
+
+        // FIX-078: Guard against undefined/null fullName (was crashing with TypeError)
+        if (!fullName?.trim()) return res.status(400).json({ error: 'Full name is required' });
+
+        // FIX-079: Field length validation
+        if (fullName.trim().length > 100) return res.status(400).json({ error: 'Full name: max 100 characters' });
+        if (alias?.length > 50) return res.status(400).json({ error: 'Alias: max 50 characters' });
+        if (phone?.length > 20) return res.status(400).json({ error: 'Phone: max 20 characters' });
         
         // Split name into first and last
         const nameParts = fullName.trim().split(/\s+/);
@@ -964,9 +967,12 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
                 return res.status(400).json({ error: 'Email already in use by another account' });
             }
         }
+
+        // FIX-091: Wrap both UPDATEs in a transaction — prevents partial profile update
+        await client.query('BEGIN');
         
         // Update player
-        await pool.query(
+        await client.query(
             `UPDATE players SET 
              full_name = $1, 
              first_name = $2, 
@@ -980,16 +986,20 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
         
         // Update email in users table
         if (email) {
-            await pool.query(
+            await client.query(
                 'UPDATE users SET email = $1 WHERE id = $2',
                 [email.toLowerCase(), req.user.userId]
             );
         }
-        
+
+        await client.query('COMMIT');
         res.json({ message: 'Profile updated successfully' });
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Update profile error:', error);
         res.status(500).json({ error: 'Update failed' });
+    } finally {
+        client.release();
     }
 });
 
@@ -1096,6 +1106,17 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         const overall_rating = (defending_rating || 0) + (strength_rating || 0) + (fitness_rating || 0) + 
                               (pace_rating || 0) + (decisions_rating || 0) + (assisting_rating || 0) + (shooting_rating || 0);
         
+        // FIX-090: Check squad number uniqueness before updating
+        if (squad_number !== undefined && squad_number !== null) {
+            const squadCheck = await pool.query(
+                'SELECT id FROM players WHERE squad_number = $1 AND id != $2',
+                [squad_number, playerId]
+            );
+            if (squadCheck.rows.length > 0) {
+                return res.status(400).json({ error: `Squad number ${squad_number} is already assigned to another player` });
+            }
+        }
+
         // Update player ratings and stats
         await pool.query(`
             UPDATE players SET
@@ -1887,12 +1908,18 @@ async function sendNotification(notificationType, playerId, additionalData = {})
 app.post('/api/admin/discipline', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { playerId, gameId, points, reason } = req.body;
+
+        // FIX-082/FIX-099: Validate required fields and points bounds
+        if (!playerId || !gameId) return res.status(400).json({ error: 'playerId and gameId are required' });
+        const pts = parseInt(points);
+        if (isNaN(pts) || pts < 1 || pts > 10) return res.status(400).json({ error: 'Points must be a whole number between 1 and 10' });
+        if (!reason?.trim()) return res.status(400).json({ error: 'Reason is required' });
         
         // Add discipline record
         await pool.query(
             `INSERT INTO discipline_records (player_id, game_id, points, reason, recorded_by)
              VALUES ($1, $2, $3, $4, $5)`,
-            [playerId, gameId, points, reason, req.user.userId]
+            [playerId, gameId, pts, reason.trim(), req.user.userId]
         );
         
         // Explicitly recalculate tier after discipline record
@@ -2128,17 +2155,31 @@ app.get('/api/games', authenticateToken, async (req, res) => {
 // Get completed games
 app.get('/api/games/completed', authenticateToken, async (req, res) => {
     try {
+        // FIX-074: Add pagination and replace correlated subqueries with JOIN aggregation
+        const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+        const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                   COALESCE(rc.confirmed_count, 0) + COALESCE(gc.guest_count, 0) AS current_players,
                    p.full_name as motm_winner_name,
                    p.alias as motm_winner_alias
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN players p ON p.id = g.motm_winner_id
+            LEFT JOIN (
+                SELECT game_id, COUNT(*) AS confirmed_count
+                FROM registrations WHERE status = 'confirmed'
+                GROUP BY game_id
+            ) rc ON rc.game_id = g.id
+            LEFT JOIN (
+                SELECT game_id, COUNT(*) AS guest_count
+                FROM game_guests GROUP BY game_id
+            ) gc ON gc.game_id = g.id
             WHERE g.game_status = 'completed'
             ORDER BY g.game_date DESC
-        `);
+            LIMIT $1 OFFSET $2
+        `, [limit, offset]);
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -2186,6 +2227,24 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         }
         
         const game = gameResult.rows[0];
+
+        // FIX-067: Enforce exclusivity — non-admins cannot access CLM/allstars games without the badge
+        const isAdminUser = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!isAdminUser && game.exclusivity === 'clm') {
+            const hasCLM = await pool.query(
+                `SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'CLM'`,
+                [req.user.playerId]
+            );
+            if (!hasCLM.rows.length) return res.status(403).json({ error: 'Access denied' });
+        }
+        if (!isAdminUser && game.exclusivity === 'allstars') {
+            const hasAllstars = await pool.query(
+                `SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'Allstars'`,
+                [req.user.playerId]
+            );
+            if (!hasAllstars.rows.length) return res.status(403).json({ error: 'Access denied' });
+        }
+
         game.max_gk_slots = game.team_selection_type === 'vs_external' ? 1 : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4) : 2;
         game.gk_count = parseInt(game.gk_count) || 0;
         
@@ -2277,6 +2336,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         const validFormats = ['5-a-side', '6-a-side', '7-a-side', '8-a-side', '9-a-side', '11-a-side'];
         if (!validFormats.includes(format)) return res.status(400).json({ error: 'Invalid game format' });
         if (!['weekly', 'one-off'].includes(regularity)) return res.status(400).json({ error: 'Regularity must be weekly or one-off' });
+
+        // FIX-084: Validate venue exists before creating games (prevents FK violation 500 error)
+        const venueCheck = await pool.query('SELECT id FROM venues WHERE id = $1', [venueId]);
+        if (venueCheck.rows.length === 0) return res.status(400).json({ error: 'Invalid venue' });
         
         // CLM admins can only create CLM-exclusive games
         const isCLMAdminOnly = req.user.role !== 'admin' && req.user.role !== 'superadmin';
@@ -2296,54 +2359,65 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         const createdGames = [];
         
         if (regularity === 'weekly') {
-            // FIX-019: Use sequence for race-condition-free series ID generation
-            // Requires: CREATE SEQUENCE IF NOT EXISTS game_series_name_seq START 1; (in migrations_to_run.sql)
-            const seqResult = await pool.query("SELECT nextval('game_series_name_seq') as n");
-            const seriesIdValue = `TF${String(seqResult.rows[0].n).padStart(4, '0')}`;
+            // FIX-068: Wrap entire series + 26 game INSERTs in a single transaction to prevent partial series
+            const wClient = await pool.connect();
+            try {
+                await wClient.query('BEGIN');
+
+                // FIX-019: Use sequence for race-condition-free series ID generation
+                const seqResult = await wClient.query("SELECT nextval('game_series_name_seq') as n");
+                const seriesIdValue = `TF${String(seqResult.rows[0].n).padStart(4, '0')}`;
             
-            // Create series record for draft_memory and vs_external games
-            let seriesUuid = null;
-            const selType = teamSelectionType || 'normal';
-            if (selType === 'draft_memory' || selType === 'vs_external') {
-                const seriesResult = await pool.query(
-                    'INSERT INTO game_series (series_name, series_type) VALUES ($1, $2) RETURNING id',
-                    [seriesIdValue, selType]
-                );
-                seriesUuid = seriesResult.rows[0].id;
+                // Create series record for draft_memory and vs_external games
+                let seriesUuid = null;
+                const selType = teamSelectionType || 'normal';
+                if (selType === 'draft_memory' || selType === 'vs_external') {
+                    const seriesResult = await wClient.query(
+                        'INSERT INTO game_series (series_name, series_type) VALUES ($1, $2) RETURNING id',
+                        [seriesIdValue, selType]
+                    );
+                    seriesUuid = seriesResult.rows[0].id;
+                }
+            
+                // Create 26 weeks of games (6 months)
+                for (let week = 0; week < 26; week++) {
+                    const weekDate = new Date(gameDate);
+                    weekDate.setDate(weekDate.getDate() + (week * 7));
+                    
+                    const gameUrl = crypto.randomBytes(6).toString('hex');
+                    const gameNumber = String(week + 1).padStart(2, '0');
+                    const fullSeriesId = `${seriesIdValue}-${gameNumber}`;
+                    
+                    const result = await wClient.query(
+                        `INSERT INTO games (
+                            venue_id, game_date, max_players, cost_per_player, format, regularity, 
+                            exclusivity, position_type, game_url, series_id, 
+                            team_selection_type, external_opponent, tf_kit_color, opp_kit_color, star_rating
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                        RETURNING id`,
+                        [
+                            venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
+                            gameExclusivity, positionType || 'outfield_gk', gameUrl, 
+                            seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
+                            starRating || null
+                        ]
+                    );
+                    
+                    createdGames.push({ id: result.rows[0].id, gameUrl, date: weekDate, seriesId: fullSeriesId });
+                }
+
+                await wClient.query('COMMIT');
+                res.json({ 
+                    message: `Created 26 weekly games (series ${seriesIdValue})`,
+                    seriesId: seriesIdValue,
+                    games: createdGames 
+                });
+            } catch (e) {
+                await wClient.query('ROLLBACK').catch(() => {});
+                throw e;
+            } finally {
+                wClient.release();
             }
-            
-            // Create 26 weeks of games (6 months)
-            for (let week = 0; week < 26; week++) {
-                const weekDate = new Date(gameDate);
-                weekDate.setDate(weekDate.getDate() + (week * 7));
-                
-                const gameUrl = crypto.randomBytes(6).toString('hex');
-                const gameNumber = String(week + 1).padStart(2, '0');
-                const fullSeriesId = `${seriesIdValue}-${gameNumber}`; // e.g., "TF0001-01"
-                
-                const result = await pool.query(
-                    `INSERT INTO games (
-                        venue_id, game_date, max_players, cost_per_player, format, regularity, 
-                        exclusivity, position_type, game_url, series_id, 
-                        team_selection_type, external_opponent, tf_kit_color, opp_kit_color, star_rating
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                    RETURNING id`,
-                    [
-                        venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
-                        gameExclusivity, positionType || 'outfield_gk', gameUrl, 
-                        seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
-                        starRating || null
-                    ]
-                );
-                
-                createdGames.push({ id: result.rows[0].id, gameUrl, date: weekDate, seriesId: fullSeriesId });
-            }
-            
-            res.json({ 
-                message: `Created 26 weekly games (series ${seriesIdValue})`,
-                seriesId: seriesIdValue,
-                games: createdGames 
-            });
         } else {
             // Create single one-off game
             const gameUrl = crypto.randomBytes(6).toString('hex');
@@ -2410,7 +2484,13 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             ORDER BY p.squad_number NULLS LAST, p.alias
         `, [req.params.id]);
         
-        res.json(result.rows);
+        // FIX-070: Strip pair/avoid preferences for non-admins — sensitive interpersonal data
+        const isAdminReq = req.user.role === 'admin' || req.user.role === 'superadmin';
+        const players = isAdminReq
+            ? result.rows
+            : result.rows.map(({ pairs, avoids, ...safe }) => safe);
+
+        res.json(players);
     } catch (error) {
         console.error('Get game players error:', error);
         res.status(500).json({ error: 'Failed to fetch players' });
@@ -2723,6 +2803,12 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: "Please provide the guest's name (at least 2 characters)" });
         }
 
+        // FIX-080: Guest name max length
+        if (guestName.trim().length > 50) {
+            client.release();
+            return res.status(400).json({ error: 'Guest name must be 50 characters or fewer' });
+        }
+
         await client.query('BEGIN');
 
         // Check player is registered and confirmed for this game
@@ -2746,7 +2832,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
 
         // Lock game row and check capacity
         const gameLock = await client.query(
-            'SELECT max_players, cost_per_player, player_editing_locked, teams_generated FROM games WHERE id = $1 FOR UPDATE',
+            'SELECT max_players, cost_per_player, player_editing_locked, teams_generated, game_status FROM games WHERE id = $1 FOR UPDATE',
             [gameId]
         );
         if (gameLock.rows.length === 0) {
@@ -2756,6 +2842,13 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         }
 
         const game = gameLock.rows[0];
+
+        // FIX-081: Block guest addition for non-active games
+        if (!['available', 'confirmed'].includes(game.game_status)) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: 'This game is no longer accepting guests' });
+        }
 
         if (game.player_editing_locked) {
             await client.query('ROLLBACK');
@@ -3129,6 +3222,28 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
                     if (isGK && currentGKs >= maxGKSlots) {
                         continue; // Skip — would exceed GK limit
                     }
+                    promotedPlayer = candidate;
+                    break;
+                }
+            }
+            
+            // Also try normal_backup if no confirmed_backup found — but check credits first (FIX-064)
+            if (!promotedPlayer) {
+                const normalBackups = await client.query(`
+                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'normal_backup'
+                    ORDER BY r.registered_at ASC
+                `, [gameId]);
+
+                for (const candidate of normalBackups.rows) {
+                    const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
+                    if (isGK && currentGKs >= maxGKSlots) continue;
+                    // FIX-064: Check balance before promoting — skip if insufficient
+                    const backupCredit = await client.query('SELECT balance FROM credits WHERE player_id = $1', [candidate.player_id]);
+                    const backupBalance = parseFloat(backupCredit.rows[0]?.balance || 0);
+                    if (backupBalance < cost) continue; // Skip — insufficient funds
                     promotedPlayer = candidate;
                     break;
                 }
@@ -3939,6 +4054,15 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
         if (cost_per_player < 0) {
             return res.status(400).json({ error: 'Price cannot be negative' });
         }
+
+        // FIX-069: Block updates on completed or cancelled games
+        const statusCheck = await pool.query('SELECT game_status, cost_per_player FROM games WHERE id = $1', [gameId]);
+        if (statusCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const currentStatus = statusCheck.rows[0].game_status;
+        const oldCost = parseFloat(statusCheck.rows[0].cost_per_player);
+        if (['completed', 'cancelled'].includes(currentStatus)) {
+            return res.status(400).json({ error: 'Cannot modify a completed or cancelled game' });
+        }
         
         // Check current registrations
         const currentRegs = await pool.query(
@@ -3965,11 +4089,6 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     star_rating = $5
                 WHERE id = $6
             `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, gameId]);
-            
-            res.json({ 
-                message: 'Game settings updated successfully',
-                updated: { game_date, venue_id, max_players, cost_per_player, star_rating }
-            });
         } else {
             await pool.query(`
                 UPDATE games 
@@ -3979,12 +4098,32 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     star_rating = $4
                 WHERE id = $5
             `, [venue_id, max_players, cost_per_player, star_rating || null, gameId]);
-            
-            res.json({ 
-                message: 'Game settings updated successfully',
-                updated: { venue_id, max_players, cost_per_player, star_rating }
+        }
+
+        // FIX-098: Notify confirmed players if cost changed
+        const newCost = parseFloat(cost_per_player);
+        if (oldCost !== newCost) {
+            const regs = await pool.query(
+                "SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'",
+                [gameId]
+            );
+            setImmediate(async () => {
+                for (const row of regs.rows) {
+                    try {
+                        await sendNotification('cost_changed', row.player_id, {
+                            gameId,
+                            oldCost: oldCost.toFixed(2),
+                            newCost: newCost.toFixed(2)
+                        });
+                    } catch (e) { /* non-critical */ }
+                }
             });
         }
+        
+        res.json({ 
+            message: 'Game settings updated successfully',
+            updated: { game_date, venue_id, max_players, cost_per_player, star_rating }
+        });
         
     } catch (error) {
         console.error('Update game settings error:', error);
@@ -4445,6 +4584,9 @@ app.post('/api/games/:gameId/vote-motm', authenticateToken, async (req, res) => 
             [gameId]
         );
         
+        // FIX-092: Guard against invalid/non-existent game ID (was crashing with TypeError)
+        if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+
         const game = gameResult.rows[0];
         if (!game.motm_voting_ends || new Date() > new Date(game.motm_voting_ends)) {
             return res.status(400).json({ error: 'Voting is closed' });
@@ -4629,33 +4771,43 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
     try {
         const { gameId } = req.params;
         const { winningTeam, disciplineRecords, beefEntries, motmNominees } = req.body;
-        
+
+        // FIX-062: Whitelist winningTeam before any DB work
+        const validTeams = ['red', 'blue', 'draw', 'Red', 'Blue', 'Draw'];
+        if (!validTeams.includes(winningTeam)) {
+            return res.status(400).json({ error: `Invalid winning team. Must be one of: ${validTeams.join(', ')}` });
+        }
+
+        // FIX-097: Combine both type queries into one — also grab series_id for FIX-086
+        const gameTypeCheck = await pool.query('SELECT team_selection_type, game_status, series_id FROM games WHERE id = $1', [gameId]);
+        const gameType = gameTypeCheck.rows[0]?.team_selection_type;
+        const gameStatus = gameTypeCheck.rows[0]?.game_status;
+        const seriesUuidFromCheck = gameTypeCheck.rows[0]?.series_id;
+
         // Block tournament games — must use /finalise-tournament instead
-        const tournCheck = await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId]);
-        if (tournCheck.rows[0]?.team_selection_type === 'tournament') {
+        if (gameType === 'tournament') {
             return res.status(400).json({ error: 'Tournament games must be completed via the Finalise Tournament flow' });
         }
-        
-        console.log('Complete game request:', {
-            gameId,
-            winningTeam,
-            disciplineRecordsCount: disciplineRecords?.length || 0,
-            beefEntriesCount: beefEntries?.length || 0,
-            motmNomineesCount: motmNominees?.length || 0,
-            motmNomineeIds: motmNominees
-        });
+
+        // FIX-061: Prevent double-completion — stats would be doubled
+        if (gameStatus === 'completed') {
+            return res.status(400).json({ error: 'Game has already been completed' });
+        }
+
+        const isExternal = gameType === 'vs_external';
         
         await client.query('BEGIN');
-        
-        // Get game type for vs_external handling
-        const gameTypeResult = await client.query(
-            'SELECT team_selection_type FROM games WHERE id = $1', [gameId]
-        );
-        const isExternal = gameTypeResult.rows[0]?.team_selection_type === 'vs_external';
+
+        // FIX-061: Lock the row and re-check inside transaction to prevent races
+        const statusCheck = await client.query('SELECT game_status FROM games WHERE id = $1 FOR UPDATE', [gameId]);
+        if (statusCheck.rows[0]?.game_status === 'completed') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Game has already been completed' });
+        }
+
         const shouldHaveMotm = !(isExternal && winningTeam === 'blue');
         
         // 1. Update game winning team and status
-        console.log('Step 1: Updating game status...');
         await client.query(
             `UPDATE games 
              SET winning_team = $1, 
@@ -4666,7 +4818,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         );
         
         // 2. Get all players in the game
-        console.log('Step 2: Getting players and updating stats...');
         const playersResult = await client.query(
             `SELECT DISTINCT player_id FROM registrations 
              WHERE game_id = $1 AND status = 'confirmed'`,
@@ -4690,7 +4841,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                  WHERE id = ANY($1)`,
                 [showedUpPlayerIds]
             );
-            console.log(`Updated appearances for ${showedUpPlayerIds.length} players`);
         }
         
         // Update wins for winning team players
@@ -4724,11 +4874,9 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 console.log(`Updated wins for ${winningPlayerIds.length} winning players`);
             }
         } else if (winningTeam === 'draw') {
-            console.log('Game was a draw - no wins awarded');
         }
         
         // 3. Save discipline records (only for offenses, not on_time)
-        console.log('Step 3: Saving discipline records...');
         // FIX-022: Only process discipline for players who were actually in the game
         const confirmedPlayerSet = new Set(allPlayerIds);
         for (const record of disciplineRecords || []) {
@@ -4776,7 +4924,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         }
         
         // 4. Save beef entries (bidirectional)
-        console.log('Step 4: Saving beef entries...');
         for (const beef of beefEntries || []) {
             await client.query(
                 `INSERT INTO beef (player_id, target_player_id, rating)
@@ -4796,7 +4943,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         }
         
         // 5. Create MOTM nominees (skip if external game where opponent won)
-        console.log('Step 5: Creating MOTM nominees...');
         let nomineesInserted = 0;
         if (shouldHaveMotm) {
             for (const playerId of motmNominees || []) {
@@ -4808,52 +4954,29 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 );
                 nomineesInserted++;
             }
-            console.log(`Inserted ${nomineesInserted} MOTM nominees`);
         } else {
-            console.log('External game - opponent won, skipping MOTM nominees');
         }
         
-        // Verify nominees were saved
-        const nomineeCheck = await client.query(
-            'SELECT COUNT(*) as count FROM motm_nominees WHERE game_id = $1',
-            [gameId]
-        );
-        console.log(`Verified ${nomineeCheck.rows[0].count} nominees in database for game ${gameId}`);
-        
+        // FIX-086: Series score update moved INSIDE transaction to prevent orphaned scores on crash
+        if (seriesUuidFromCheck && (gameType === 'draft_memory' || gameType === 'vs_external')) {
+            const seriesCol = winningTeam === 'red' ? 'red_wins' : winningTeam === 'blue' ? 'blue_wins' : 'draws';
+            await client.query(`UPDATE game_series SET ${seriesCol} = ${seriesCol} + 1 WHERE id = $1`, [seriesUuidFromCheck]);
+        }
+
         await client.query('COMMIT');
-        console.log('Complete game transaction committed successfully!');
+        // FIX-063: Single summary log replacing all step-by-step debug logs
+        console.log(`Game ${gameId} completed. Winner: ${winningTeam}. MOTM nominees: ${nomineesInserted}`);
         
-        // 6. Auto-allocate badges OUTSIDE transaction (non-critical)
-        for (const playerId of allPlayerIds) {
-            try {
-                await autoAllocateBadges(playerId);
-            } catch (badgeError) {
-                console.error(`Failed to auto-allocate badges for player ${playerId}:`, badgeError.message);
-            }
-        }
-        
-        // 7. Update series scoreline (non-critical, outside transaction)
-        try {
-            const seriesCheck = await pool.query(
-                'SELECT series_id, team_selection_type FROM games WHERE id = $1',
-                [gameId]
-            );
-            const seriesUuid = seriesCheck.rows[0]?.series_id;
-            const selType = seriesCheck.rows[0]?.team_selection_type;
-            
-            if (seriesUuid && (selType === 'draft_memory' || selType === 'vs_external')) {
-                if (winningTeam === 'red') {
-                    await pool.query('UPDATE game_series SET red_wins = red_wins + 1 WHERE id = $1', [seriesUuid]);
-                } else if (winningTeam === 'blue') {
-                    await pool.query('UPDATE game_series SET blue_wins = blue_wins + 1 WHERE id = $1', [seriesUuid]);
-                } else if (winningTeam === 'draw') {
-                    await pool.query('UPDATE game_series SET draws = draws + 1 WHERE id = $1', [seriesUuid]);
+        // FIX-085: Auto-allocate badges OUTSIDE transaction in setImmediate (was N+1 inside transaction)
+        setImmediate(async () => {
+            for (const playerId of allPlayerIds) {
+                try {
+                    await autoAllocateBadges(playerId);
+                } catch (badgeError) {
+                    console.error(`Failed to auto-allocate badges for player ${playerId}:`, badgeError.message);
                 }
-                console.log(`Updated series ${seriesUuid} scoreline: ${winningTeam}`);
             }
-        } catch (seriesErr) {
-            console.error('Series scoreline update failed (non-critical):', seriesErr.message);
-        }
+        });
         
         res.json({ 
             message: 'Game completed successfully',
@@ -4864,7 +4987,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Complete game error:', error);
-        console.error('Error stack:', error.stack);
         res.status(500).json({ 
             error: 'Failed to complete game'
         });
@@ -6159,7 +6281,9 @@ app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
 });
 
 // Public: Validate a referral code (for registration page)
-app.get('/api/public/referral/:code', async (req, res) => {
+// FIX-095: Rate limit to prevent code enumeration (20 req / 10 min per IP)
+const referralCodeLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, standardHeaders: true, message: { error: 'Too many requests, please try again later' } });
+app.get('/api/public/referral/:code', referralCodeLimiter, async (req, res) => {
     try {
         const { code } = req.params;
         
@@ -6213,11 +6337,12 @@ app.get('/api/public/referral/:code', async (req, res) => {
 });
 
 // Public: Get any player's referral link (for profile/directory pages)
+// FIX-094: Player name removed from response — unauthenticated callers should not scrape player names
 app.get('/api/public/player/:playerId/referral', async (req, res) => {
     try {
         const { playerId } = req.params;
         const result = await pool.query(
-            'SELECT referral_code, alias, full_name FROM players WHERE id = $1',
+            'SELECT referral_code FROM players WHERE id = $1',
             [playerId]
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
@@ -6226,8 +6351,8 @@ app.get('/api/public/player/:playerId/referral', async (req, res) => {
             referralCode: p.referral_code,
             referralLink: p.referral_code
                 ? 'https://totalfooty.co.uk/vibecoding/?ref=' + p.referral_code
-                : null,
-            playerName: p.alias || p.full_name
+                : null
+            // FIX-094: playerName intentionally omitted
         });
     } catch (error) {
         console.error('Get player referral error:', error);
@@ -7057,11 +7182,11 @@ app.post('/api/auth/forgot-password', async (req, res) => {
             const token = crypto.randomBytes(32).toString('hex');
             const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-            // Store token
+            // FIX-077: ON CONFLICT DO UPDATE so re-requests get a fresh token and email
             await pool.query(
                 `INSERT INTO password_reset_tokens (player_id, token, expires_at)
                  VALUES ($1, $2, $3)
-                 ON CONFLICT DO NOTHING`,
+                 ON CONFLICT (player_id) DO UPDATE SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at, used_at = NULL`,
                 [player.id, token, expiresAt]
             );
 
@@ -7073,7 +7198,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
                 subject: 'TotalFooty — Reset Your Password',
                 html: `
                     <div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:500px;margin:0 auto">
-                        <img src="https://totalfooty-api.onrender.com/logo.png" width="80" style="margin-bottom:24px"/>
+                        <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
                         <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:8px">PASSWORD RESET</h2>
                         <p style="color:#888;font-size:14px">Hi ${player.full_name},</p>
                         <p style="color:#888;font-size:14px">You requested a password reset for your TotalFooty account. Click the button below to set a new password.</p>
@@ -7089,6 +7214,29 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     } catch (error) {
         console.error('Forgot password error:', error);
         res.status(500).json({ error: 'Failed to process request' });
+    }
+});
+
+// FIX-076: PUT /api/auth/change-password — authenticated password change (no email flow needed)
+app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+        if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Both current and new password are required' });
+        if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
+
+        const userResult = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.userId]);
+        if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
+        const valid = await bcrypt.compare(currentPassword, userResult.rows[0].password_hash);
+        if (!valid) return res.status(403).json({ error: 'Current password is incorrect' });
+
+        const hash = await bcrypt.hash(newPassword, 10);
+        await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.user.userId]);
+
+        res.json({ message: 'Password updated successfully' });
+    } catch (error) {
+        console.error('Change password error:', error);
+        res.status(500).json({ error: 'Failed to change password' });
     }
 });
 
