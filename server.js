@@ -2740,8 +2740,8 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, amount_paid)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, amount_paid, registration_source)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'web') RETURNING id`,
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
              status === 'confirmed' ? game.cost_per_player : 0]
@@ -5957,8 +5957,8 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         
             // Add player
             await txClient.query(
-                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
-                 VALUES ($1, $2, 'confirmed', $3, $4)`,
+                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, registration_source)
+                 VALUES ($1, $2, 'confirmed', $3, $4, 'admin')`,
                 [gameId, playerId, position || 'outfield', cost]
             );
 
@@ -6075,8 +6075,8 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         
         // Add player
         await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
-             VALUES ($1, $2, 'confirmed', $3, $4)`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, registration_source)
+             VALUES ($1, $2, 'confirmed', $3, $4, 'admin')`,
             [gameId, playerId, position || 'outfield', customCharge]
         );
         
@@ -7503,6 +7503,14 @@ app.get('/api/reports/games', authenticateToken, requireReportAccess, async (req
                 -- Signups (confirmed registrations)
                 COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed')
                                                           AS signups,
+
+                -- Web sign-ins
+                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed' AND (r.registration_source = 'web' OR r.registration_source IS NULL))
+                                                          AS web_signins,
+
+                -- App sign-ins
+                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed' AND r.registration_source = 'app')
+                                                          AS app_signins,
 
                 -- Backup count
                 COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'backup')
