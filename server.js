@@ -260,7 +260,7 @@ app.post('/api/auth/register', async (req, res) => {
         // Create player - simple insert with just the fields we know exist
         const playerResult = await pool.query(
             `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver') RETURNING id`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold') RETURNING id`,
             [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield']
         );
         const playerId = playerResult.rows[0].id;
@@ -425,7 +425,7 @@ app.post('/api/auth/login', async (req, res) => {
                 fullName: player.full_name,
                 alias: player.alias,
                 role: user.role,
-                isAdmin: user.role === 'admin' || user.role === 'superadmin',
+                isAdmin: user.role === 'superadmin',
                 isSuperAdmin: user.role === 'superadmin',
                 isCLMAdmin: player.is_clm_admin || false,
                 isOrganiser: player.is_organiser || false,
@@ -530,6 +530,8 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.total_appearances, 
                     p.motm_wins, 
                     p.total_wins,
+                    p.tournament_wins,
+                    p.external_wins,
                     p.is_clm_admin,
                     p.is_organiser,
                     c.balance as credits,
@@ -544,7 +546,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
             if (detailsResult.rows.length > 0) {
                 Object.assign(player, detailsResult.rows[0]);
                 // Add frontend-friendly role flags
-                player.isAdmin = player.role === 'admin' || player.role === 'superadmin';
+                player.isAdmin = player.role === 'superadmin';
                 player.isSuperAdmin = player.role === 'superadmin';
                 player.isCLMAdmin = player.is_clm_admin || false;
                 player.isOrganiser = player.is_organiser || false;
@@ -610,6 +612,7 @@ app.get('/api/players', authenticateToken, async (req, res) => {
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
                 p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
+                p.tournament_wins, p.external_wins, p.player_number,
                 p.phone, u.email,
                 p.is_clm_admin, p.is_organiser,
                 c.balance as credits,
@@ -655,15 +658,43 @@ app.get('/api/players', authenticateToken, async (req, res) => {
     }
 });
 
-// ==========================================
-// ADMIN PLAYERS GRID — all data for manage-players.html
-// ==========================================
+// CLM players — only players who have the CLM badge (for CLM admin manage page)
+app.get('/api/clm/players', authenticateToken, async (req, res) => {
+    try {
+        // Must be CLM admin, admin, or superadmin
+        const isCLMAdmin = req.user.isCLMAdmin;
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!isCLMAdmin && !isAdmin) {
+            return res.status(403).json({ error: 'CLM admin access required' });
+        }
+
+        const result = await pool.query(`
+            SELECT
+                p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
+                p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
+                p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
+                p.goalkeeper_rating,
+                (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
+                 FROM player_badges pb2 JOIN badges b ON pb2.badge_id = b.id WHERE pb2.player_id = p.id) as badges
+            FROM players p
+            JOIN player_badges pb ON pb.player_id = p.id
+            JOIN badges b ON b.id = pb.badge_id AND b.name = 'CLM'
+            ORDER BY p.squad_number NULLS LAST, p.full_name
+        `);
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching CLM players:', error);
+        res.status(500).json({ error: 'Failed to fetch CLM players' });
+    }
+});
 app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
-                p.reliability_tier,
+                p.reliability_tier, p.player_number,
                 p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
                 p.goalkeeper_rating,
@@ -677,6 +708,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
 
                 -- GAME STATS: all time
                 p.total_appearances, p.total_wins, p.motm_wins,
+                p.tournament_wins, p.external_wins,
 
                 -- GAME STATS: last 3 months
                 (SELECT COUNT(DISTINCT r.game_id)
@@ -871,9 +903,35 @@ app.get('/api/players/:id', authenticateToken, async (req, res) => {
         // Return different data based on viewer
         const isOwnProfile = player.user_id === req.user.userId;
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        const isCLMAdmin = req.user.isCLMAdmin;
         
         if (isOwnProfile || isAdmin) {
             res.json(player); // Full data
+        } else if (isCLMAdmin) {
+            // CLM admins get ratings but not sensitive personal data
+            res.json({
+                id: player.id,
+                alias: player.alias,
+                full_name: player.full_name,
+                squad_number: player.squad_number,
+                photo_url: player.photo_url,
+                total_appearances: player.total_appearances,
+                motm_wins: player.motm_wins,
+                total_wins: player.total_wins,
+                tournament_wins: player.tournament_wins,
+                external_wins: player.external_wins,
+                reliability_tier: player.reliability_tier,
+                badges: player.badges,
+                overall_rating: player.overall_rating,
+                defending_rating: player.defending_rating,
+                strength_rating: player.strength_rating,
+                fitness_rating: player.fitness_rating,
+                pace_rating: player.pace_rating,
+                decisions_rating: player.decisions_rating,
+                assisting_rating: player.assisting_rating,
+                shooting_rating: player.shooting_rating,
+                goalkeeper_rating: player.goalkeeper_rating,
+            });
         } else {
             // Public view - limited data
             res.json({
@@ -1035,10 +1093,29 @@ app.post('/api/players/me/photo', authenticateToken, async (req, res) => {
     }
 });
 
-app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, async (req, res) => {
+app.put('/api/admin/players/:id/stats', authenticateToken, async (req, res) => {
+    // Allow: superadmin, admin, CLM admin (they can edit stats but not admin decisions)
+    const role = req.user.role;
+    const isCLMAdmin = req.user.isCLMAdmin;
+    if (role !== 'admin' && role !== 'superadmin' && !isCLMAdmin) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
     try {
         const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper } = req.body;
-        
+        const isAdminOrAbove = role === 'admin' || role === 'superadmin';
+
+        // TF Verified lock — only admin/superadmin can edit stats; CLM admins are blocked
+        if (!isAdminOrAbove) {
+            const lockCheck = await pool.query(
+                `SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                 WHERE pb.player_id = $1 AND b.name = 'TF Verified'`,
+                [req.params.id]
+            );
+            if (lockCheck.rows.length > 0) {
+                return res.status(403).json({ error: 'Stats are locked. Only an admin can edit a TF Verified player.' });
+            }
+        }
+
         await pool.query(
             `UPDATE players SET 
              overall_rating = $1, defending_rating = $2, strength_rating = $3,
@@ -1099,9 +1176,22 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         const {
             goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            total_wins, squad_number, phone, balance
+            total_wins, tournament_wins, external_wins, squad_number, phone, balance
         } = req.body;
         
+        // TF Verified lock — only admin/superadmin can edit stats; CLM admins are blocked
+        const isAdminOrAbove = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!isAdminOrAbove) {
+            const lockCheck = await pool.query(
+                `SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                 WHERE pb.player_id = $1 AND b.name = 'TF Verified'`,
+                [playerId]
+            );
+            if (lockCheck.rows.length > 0) {
+                return res.status(403).json({ error: 'Stats are locked. Only an admin can edit a TF Verified player.' });
+            }
+        }
+
         // Calculate overall rating
         const overall_rating = (defending_rating || 0) + (strength_rating || 0) + (fitness_rating || 0) + 
                               (pace_rating || 0) + (decisions_rating || 0) + (assisting_rating || 0) + (shooting_rating || 0);
@@ -1130,12 +1220,15 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 shooting_rating = $8,
                 overall_rating = $9,
                 total_wins = $10,
-                squad_number = $11,
-                phone = $12
-            WHERE id = $13
+                tournament_wins = $11,
+                external_wins = $12,
+                squad_number = $13,
+                phone = $14
+            WHERE id = $15
         `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            overall_rating, total_wins, squad_number, phone, playerId]);
+            overall_rating, total_wins, tournament_wins ?? 0, external_wins ?? 0,
+            squad_number, phone, playerId]);
         
         // FIX-053: Update balance with audit trail if changed
         if (balance !== undefined) {
@@ -1502,7 +1595,7 @@ app.post('/api/admin/players/bulk-upload', authenticateToken, requireAdmin, asyn
                 const goalkeeper = parseInt(p.gk) || 0;
                 const overall = defending + strength + pace + fitness + decisions + assisting + shooting;
                 const credits = parseFloat(p.credits) || 0;
-                const tier = (p.tier || 'silver').toLowerCase();
+                const tier = (p.tier || 'gold').toLowerCase();
                 const position = (p.position || 'outfield').toLowerCase();
                 
                 // Try to find existing player by full_name
@@ -1994,7 +2087,7 @@ app.get('/api/players/:playerId/discipline', authenticateToken, async (req, res)
         res.json({
             records,
             totalPoints: pointsSum,
-            currentTier: tierResult.rows[0]?.reliability_tier || 'silver',
+            currentTier: tierResult.rows[0]?.reliability_tier || 'gold',
             nextTierAt: getNextTierThreshold(pointsSum)
         });
     } catch (error) {
@@ -2051,7 +2144,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             [req.user.playerId]
         );
         
-        const tier = playerResult.rows[0]?.reliability_tier || 'silver';
+        const tier = playerResult.rows[0]?.reliability_tier || 'gold';
         
         // Check if player has TF All Star badge
         const allStarBadgeResult = await pool.query(`
@@ -2089,7 +2182,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
         
         const result = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    g.teams_generated,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
@@ -2113,39 +2206,17 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             ORDER BY g.game_date DESC
         `, [req.user.playerId]);
         
-        // Map venue names to their photo URLs
-        const venuePhotoMap = {
-            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
-            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
-            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
-        };
-        
-        // Add venue photos based on venue name
-        const gamesWithPhotos = result.rows.map(game => {
-            if (game.venue_name && venuePhotoMap[game.venue_name]) {
-                game.venue_photo = venuePhotoMap[game.venue_name];
-            }
-            return game;
-        });
-        
         // Log first game to check teams_generated field
-        if (gamesWithPhotos.length > 0) {
+        if (result.rows.length > 0) {
             console.log('Sample game data:', {
-                id: gamesWithPhotos[0].id,
-                current_players: gamesWithPhotos[0].current_players,
-                max_players: gamesWithPhotos[0].max_players,
-                teams_generated: gamesWithPhotos[0].teams_generated
+                id: result.rows[0].id,
+                current_players: result.rows[0].current_players,
+                max_players: result.rows[0].max_players,
+                teams_generated: result.rows[0].teams_generated
             });
         }
         
-        res.json(gamesWithPhotos);
+        res.json(result.rows);
     } catch (error) {
         console.error('Error fetching games:', error);
         res.status(500).json({ error: 'Failed to fetch games' });
@@ -2160,7 +2231,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
         const offset = Math.max(parseInt(req.query.offset) || 0, 0);
 
         const result = await pool.query(`
-            SELECT g.*, v.name as venue_name,
+            SELECT g.*, v.name as venue_name, v.photo_url as venue_photo,
                    COALESCE(rc.confirmed_count, 0) + COALESCE(gc.guest_count, 0) AS current_players,
                    p.full_name as motm_winner_name,
                    p.alias as motm_winner_alias
@@ -2181,25 +2252,10 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             LIMIT $1 OFFSET $2
         `, [limit, offset]);
         
-        // Map venue names to their photo URLs
-        const venuePhotoMap = {
-            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
-            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
-            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
-        };
-        
         // Format the response
         const games = result.rows.map(game => ({
             ...game,
             motm_winner_name: game.motm_winner_alias || game.motm_winner_name,
-            venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null,
             game_time: new Date(game.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
             game_day: new Date(game.game_date).toLocaleDateString('en-US', { weekday: 'long' })
         }));
@@ -2214,7 +2270,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
 app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         const gameResult = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count
             FROM games g
@@ -2277,24 +2333,6 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         `, [req.params.id]);
         
         game.backup_players = backupsResult.rows;
-        
-        // Map venue names to their photo URLs
-        const venuePhotoMap = {
-            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
-            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
-            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
-        };
-        
-        if (game.venue_name && venuePhotoMap[game.venue_name]) {
-            game.venue_photo = venuePhotoMap[game.venue_name];
-        }
         
         // Check if current user has guest(s) on this game
         if (req.user && req.user.playerId) {
@@ -3412,6 +3450,11 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 p.goalkeeper_rating,
                 p.defending_rating,
                 p.fitness_rating,
+                p.strength_rating,
+                p.pace_rating,
+                p.decisions_rating,
+                p.assisting_rating,
+                p.shooting_rating,
                 r.position_preference,
                 array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
@@ -3420,7 +3463,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status = 'confirmed'
-            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.fitness_rating, r.position_preference
+            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.fitness_rating, p.strength_rating, p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating, r.position_preference
             ORDER BY p.overall_rating DESC
         `, [gameId]);
         
@@ -3806,13 +3849,23 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         const redStats = {
             overall: redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0),
             defense: redTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
-            fitness: redTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
+            fitness: redTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0),
+            strength: redTeam.reduce((sum, p) => sum + (p.strength_rating || 0), 0),
+            pace: redTeam.reduce((sum, p) => sum + (p.pace_rating || 0), 0),
+            decisions: redTeam.reduce((sum, p) => sum + (p.decisions_rating || 0), 0),
+            assisting: redTeam.reduce((sum, p) => sum + (p.assisting_rating || 0), 0),
+            shooting: redTeam.reduce((sum, p) => sum + (p.shooting_rating || 0), 0)
         };
         
         const blueStats = {
             overall: blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0),
             defense: blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
-            fitness: blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
+            fitness: blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0),
+            strength: blueTeam.reduce((sum, p) => sum + (p.strength_rating || 0), 0),
+            pace: blueTeam.reduce((sum, p) => sum + (p.pace_rating || 0), 0),
+            decisions: blueTeam.reduce((sum, p) => sum + (p.decisions_rating || 0), 0),
+            assisting: blueTeam.reduce((sum, p) => sum + (p.assisting_rating || 0), 0),
+            shooting: blueTeam.reduce((sum, p) => sum + (p.shooting_rating || 0), 0)
         };
         
         res.json({
@@ -3824,6 +3877,12 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 overall: p.overall_rating,
                 defense: p.defending_rating || 0,
                 fitness: p.fitness_rating || 0,
+                strength: p.strength_rating || 0,
+                pace: p.pace_rating || 0,
+                decisions: p.decisions_rating || 0,
+                assisting: p.assisting_rating || 0,
+                shooting: p.shooting_rating || 0,
+                gk: p.goalkeeper_rating || 0,
                 isGK: p.position_preference?.toLowerCase().includes('gk')
             })),
             blueTeam: blueTeam.map(p => ({
@@ -3833,6 +3892,12 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 overall: p.overall_rating,
                 defense: p.defending_rating || 0,
                 fitness: p.fitness_rating || 0,
+                strength: p.strength_rating || 0,
+                pace: p.pace_rating || 0,
+                decisions: p.decisions_rating || 0,
+                assisting: p.assisting_rating || 0,
+                shooting: p.shooting_rating || 0,
+                gk: p.goalkeeper_rating || 0,
                 isGK: p.position_preference?.toLowerCase().includes('gk')
             })),
             redStats,
@@ -4464,31 +4529,82 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             
             const [redTeamResult, blueTeamResult] = await Promise.all([
                 pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number
+                    SELECT p.id, p.full_name, p.alias, p.squad_number,
+                           p.overall_rating, p.defending_rating, p.fitness_rating,
+                           p.strength_rating, p.pace_rating, p.decisions_rating,
+                           p.assisting_rating, p.shooting_rating, p.goalkeeper_rating,
+                           r.position_preference,
+                           (SELECT json_agg(json_build_object('id', b.id, 'name', b.name))
+                            FROM player_badges pb JOIN badges b ON pb.badge_id = b.id
+                            WHERE pb.player_id = p.id) as badges
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
+                    LEFT JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [redTeamId]),
+                `, [redTeamId, gameId]),
                 pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number
+                    SELECT p.id, p.full_name, p.alias, p.squad_number,
+                           p.overall_rating, p.defending_rating, p.fitness_rating,
+                           p.strength_rating, p.pace_rating, p.decisions_rating,
+                           p.assisting_rating, p.shooting_rating, p.goalkeeper_rating,
+                           r.position_preference,
+                           (SELECT json_agg(json_build_object('id', b.id, 'name', b.name))
+                            FROM player_badges pb JOIN badges b ON pb.badge_id = b.id
+                            WHERE pb.player_id = p.id) as badges
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
+                    LEFT JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [blueTeamId])
+                `, [blueTeamId, gameId])
             ]);
             
+            const mapPlayer = (p, isGuest = false) => ({
+                id: p.id,
+                name: isGuest ? p.alias : (p.alias || p.full_name),
+                squadNumber: p.squad_number,
+                overall:   p.overall_rating   || 0,
+                defense:   p.defending_rating  || 0,
+                fitness:   p.fitness_rating    || 0,
+                strength:  p.strength_rating   || 0,
+                pace:      p.pace_rating       || 0,
+                decisions: p.decisions_rating  || 0,
+                assisting: p.assisting_rating  || 0,
+                shooting:  p.shooting_rating   || 0,
+                gk:        p.goalkeeper_rating || 0,
+                isGK:      p.position_preference?.toLowerCase().includes('gk'),
+                badges:    p.badges || [],
+                isGuest
+            });
+
             const redGuests = guestsResult.rows
                 .filter(g => g.team_name === 'Red')
-                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
+                .map(g => ({ id: `guest_${g.id}`, alias: `${g.guest_name} (Guest)`, squad_number: null, overall_rating: g.overall_rating, defending_rating: 0, fitness_rating: 0, strength_rating: 0, pace_rating: 0, decisions_rating: 0, assisting_rating: 0, shooting_rating: 0, goalkeeper_rating: 0, position_preference: null, isGuest: true }));
             const blueGuests = guestsResult.rows
                 .filter(g => g.team_name === 'Blue')
-                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
-            
+                .map(g => ({ id: `guest_${g.id}`, alias: `${g.guest_name} (Guest)`, squad_number: null, overall_rating: g.overall_rating, defending_rating: 0, fitness_rating: 0, strength_rating: 0, pace_rating: 0, decisions_rating: 0, assisting_rating: 0, shooting_rating: 0, goalkeeper_rating: 0, position_preference: null, isGuest: true }));
+
+            const redPlayers  = [...redTeamResult.rows.map(p => mapPlayer(p)), ...redGuests.map(p => mapPlayer(p, true))];
+            const bluePlayers = [...blueTeamResult.rows.map(p => mapPlayer(p)), ...blueGuests.map(p => mapPlayer(p, true))];
+
+            const calcStats = (team) => ({
+                overall:   team.reduce((s, p) => s + p.overall,   0),
+                defense:   team.reduce((s, p) => s + p.defense,   0),
+                fitness:   team.reduce((s, p) => s + p.fitness,   0),
+                strength:  team.reduce((s, p) => s + p.strength,  0),
+                pace:      team.reduce((s, p) => s + p.pace,      0),
+                decisions: team.reduce((s, p) => s + p.decisions, 0),
+                assisting: team.reduce((s, p) => s + p.assisting, 0),
+                shooting:  team.reduce((s, p) => s + p.shooting,  0),
+            });
+
             res.json({
-                redTeam: [...redTeamResult.rows, ...redGuests],
-                blueTeam: [...blueTeamResult.rows, ...blueGuests]
+                redTeam:   redPlayers,
+                blueTeam:  bluePlayers,
+                redStats:  calcStats(redPlayers),
+                blueStats: calcStats(bluePlayers),
+                confirmed: true
             });
         }
         
@@ -4871,6 +4987,13 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                      WHERE id = ANY($1)`,
                     [winningPlayerIds]
                 );
+                // Also increment external_wins if this is a vs_external game
+                if (isExternal) {
+                    await client.query(
+                        `UPDATE players SET external_wins = external_wins + 1 WHERE id = ANY($1)`,
+                        [winningPlayerIds]
+                    );
+                }
                 console.log(`Updated wins for ${winningPlayerIds.length} winning players`);
             }
         } else if (winningTeam === 'draw') {
@@ -5330,24 +5453,6 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
         
         const game = gameResult.rows[0];
         
-        // Map venue names to their photo URLs (override database)
-        const venuePhotoMap = {
-            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
-            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
-            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
-        };
-        
-        const venue_photo = game.venue_name && venuePhotoMap[game.venue_name] 
-            ? venuePhotoMap[game.venue_name] 
-            : game.venue_photo;
-        
         // Get series scoreline if applicable
         let seriesScoreline = null;
         if (game.series_id) {
@@ -5369,7 +5474,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             venue_id: game.venue_id,
             venue_name: game.venue_name,
             venue_address: game.venue_address,
-            venue_photo: venue_photo,
+            venue_photo: game.venue_photo,
             format: game.format,
             max_players: game.max_players,
             current_players: game.current_players,
@@ -5633,6 +5738,8 @@ app.get('/api/public/player/:playerId', async (req, res) => {
                 reliability_tier: player.reliability_tier,
                 total_appearances: appearances,
                 total_wins: wins,
+                tournament_wins: player.tournament_wins || 0,
+                external_wins: player.external_wins || 0,
                 motm_wins: motmWins,
                 win_ratio: winRatio,
                 motm_ratio: motmRatio
@@ -5873,12 +5980,13 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
 
 // Add player with custom discount (admin)
 app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requireCLMAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
         const { gameId } = req.params;
         const { playerId, customAmount, position } = req.body;
         
-        // Check if game is locked by this admin
-        const lockCheck = await pool.query(
+        // Check if game is locked by this admin (pre-transaction read)
+        const lockCheck = await client.query(
             'SELECT locked_by FROM games WHERE id = $1 AND player_editing_locked = TRUE',
             [gameId]
         );
@@ -5888,7 +5996,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         }
         
         // Check if player already registered
-        const existingReg = await pool.query(
+        const existingReg = await client.query(
             'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, playerId]
         );
@@ -5898,13 +6006,13 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         }
         
         // Get game details for capacity + GK checks
-        const gameCheck = await pool.query(
+        const gameCheck = await client.query(
             'SELECT max_players, team_selection_type, tournament_team_count FROM games WHERE id = $1',
             [gameId]
         );
         
         // Check capacity (confirmed registrations + guests)
-        const countResult = await pool.query(
+        const countResult = await client.query(
             `SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed') +
                     (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS total`,
             [gameId]
@@ -5920,7 +6028,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         const isGK = posValue.trim().toUpperCase() === 'GK';
         if (isGK) {
             const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : gameCheck.rows[0].team_selection_type === 'tournament' ? (gameCheck.rows[0].tournament_team_count || 4) : 2;
-            const gkCount = await pool.query(
+            const gkCount = await client.query(
                 `SELECT COUNT(*) as gk_count FROM registrations
                  WHERE game_id = $1 AND status = 'confirmed'
                  AND UPPER(TRIM(position_preference)) = 'GK'`,
@@ -5934,7 +6042,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         }
         
         // Get player credits
-        const creditResult = await pool.query(
+        const creditResult = await client.query(
             'SELECT balance FROM credits WHERE player_id = $1',
             [playerId]
         );
@@ -5950,41 +6058,48 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             return res.status(400).json({ error: `Player only has £${currentBalance.toFixed(2)} but custom charge is £${customCharge.toFixed(2)}` });
         }
         
+        await client.query('BEGIN');
+
         // Deduct custom amount from player credits
-        await pool.query(
+        await client.query(
             'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
             [customCharge, playerId]
         );
         
         // Record transaction
-        await pool.query(
+        await client.query(
             `INSERT INTO credit_transactions (player_id, amount, type, description)
              VALUES ($1, $2, $3, $4)`,
             [playerId, -customCharge, 'game_fee', `Game registration (custom charge: £${customCharge.toFixed(2)})`]
         );
         
         // Add player
-        await pool.query(
+        await client.query(
             `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
              VALUES ($1, $2, 'confirmed', $3, $4)`,
             [gameId, playerId, position || 'outfield', customCharge]
         );
         
+        await client.query('COMMIT');
         res.json({ message: 'Player added with custom charge' });
         
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Add player with discount error:', error);
         res.status(500).json({ error: 'Failed to add player with discount' });
+    } finally {
+        client.release();
     }
 });
 
 // Remove player from game (admin)
 app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticateToken, requireCLMAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
         const { gameId, registrationId } = req.params;
         
         // Check if game is locked by this admin
-        const lockCheck = await pool.query(
+        const lockCheck = await client.query(
             'SELECT locked_by FROM games WHERE id = $1 AND player_editing_locked = TRUE',
             [gameId]
         );
@@ -5993,13 +6108,16 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             return res.status(403).json({ error: 'Game must be locked by you to edit players' });
         }
         
+        await client.query('BEGIN');
+
         // Get registration details (include position + status for backup promotion)
-        const regResult = await pool.query(
+        const regResult = await client.query(
             'SELECT player_id, status, position_preference FROM registrations WHERE id = $1 AND game_id = $2',
             [registrationId, gameId]
         );
         
         if (regResult.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Registration not found' });
         }
         
@@ -6009,25 +6127,25 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         const wasGKOnly = removedReg.position_preference?.trim().toUpperCase() === 'GK';
         
         // Get game cost and type
-        const gameResult = await pool.query(
+        const gameResult = await client.query(
             'SELECT cost_per_player, team_selection_type, tournament_team_count FROM games WHERE id = $1',
             [gameId]
         );
         const cost = parseFloat(gameResult.rows[0].cost_per_player);
         
         // Refund credits
-        await pool.query(
+        await client.query(
             'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
             [cost, playerId]
         );
         
-        await pool.query(
+        await client.query(
             'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
             [playerId, cost, 'refund', `Admin removed from game ${gameId}`]
         );
         
         // Delete registration
-        await pool.query(
+        await client.query(
             'DELETE FROM registrations WHERE id = $1',
             [registrationId]
         );
@@ -6036,7 +6154,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         let promotedPlayer = null;
         if (wasConfirmed) {
             const maxGKSlots = gameResult.rows[0].team_selection_type === 'vs_external' ? 1 : gameResult.rows[0].team_selection_type === 'tournament' ? (gameResult.rows[0].tournament_team_count || 4) : 2;
-            const gkCountResult = await pool.query(
+            const gkCountResult = await client.query(
                 `SELECT COUNT(*) as gk_count FROM registrations 
                  WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'`,
                 [gameId]
@@ -6045,7 +6163,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             
             // If a GK was removed, try GK backups first
             if (wasGKOnly) {
-                const gkBackups = await pool.query(`
+                const gkBackups = await client.query(`
                     SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
@@ -6054,7 +6172,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                 `, [gameId]);
                 
                 for (const candidate of gkBackups.rows) {
-                    const creditCheck = await pool.query(
+                    const creditCheck = await client.query(
                         'SELECT balance FROM credits WHERE player_id = $1', [candidate.player_id]
                     );
                     if (parseFloat(creditCheck.rows[0]?.balance || 0) >= cost) {
@@ -6066,7 +6184,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             
             // Then try confirmed backups (with GK slot check)
             if (!promotedPlayer) {
-                const confirmedBackups = await pool.query(`
+                const confirmedBackups = await client.query(`
                     SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
@@ -6083,37 +6201,41 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             }
             
             if (promotedPlayer) {
-                await pool.query(
+                await client.query(
                     `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
                     [promotedPlayer.id]
                 );
                 
                 if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                    await pool.query(
+                    await client.query(
                         'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
                         [cost, promotedPlayer.player_id]
                     );
-                    await pool.query(
+                    await client.query(
                         'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
                         [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
                     );
                 }
-                
-                try {
-                    await pool.query(
-                        `INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, 'backup_promoted', $2, $3)`,
-                        [promotedPlayer.player_id,
-                         `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
-                         gameId]
-                    );
-                    // Send push + WhatsApp notification to promoted player
-                    const promoGameData = await getGameDataForNotification(gameId);
-                    sendNotification('backup_promoted', promotedPlayer.player_id, promoGameData).catch(e =>
-                        console.error('backup_promoted notification (admin remove) failed:', e.message)
-                    );
-                } catch (notifErr) {
-                    console.error('Notification insert failed (non-critical):', notifErr.message);
-                }
+            }
+        }
+        
+        await client.query('COMMIT');
+
+        // Send notifications outside transaction (non-critical)
+        if (promotedPlayer) {
+            try {
+                await pool.query(
+                    `INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, 'backup_promoted', $2, $3)`,
+                    [promotedPlayer.player_id,
+                     `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${parseFloat(gameResult.rows[0].cost_per_player).toFixed(2)} has been deducted from your balance.`}`,
+                     gameId]
+                );
+                const promoGameData = await getGameDataForNotification(gameId);
+                sendNotification('backup_promoted', promotedPlayer.player_id, promoGameData).catch(e =>
+                    console.error('backup_promoted notification (admin remove) failed:', e.message)
+                );
+            } catch (notifErr) {
+                console.error('Notification insert failed (non-critical):', notifErr.message);
             }
         }
         
@@ -6124,8 +6246,11 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         res.json({ message: msg, promotedPlayer: promotedPlayer ? { name: promotedPlayer.alias || promotedPlayer.full_name } : null });
         
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Remove player error:', error);
         res.status(500).json({ error: 'Failed to remove player' });
+    } finally {
+        client.release();
     }
 });
 
@@ -6448,6 +6573,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
 
 // Superadmin: Toggle CLM admin or Organiser flag on a player
 app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
         const { playerId } = req.params;
         const { is_clm_admin, is_organiser, role } = req.body;
@@ -6462,12 +6588,16 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
         }
         // Safety: cannot demote yourself
         if (role !== undefined) {
-            const selfCheck = await pool.query('SELECT user_id FROM players WHERE id = $1', [playerId]);
+            const selfCheck = await client.query('SELECT user_id FROM players WHERE id = $1', [playerId]);
             if (selfCheck.rows[0]?.user_id === req.user.userId) {
                 return res.status(403).json({ error: 'Cannot change your own role' });
             }
         }
         
+        if (is_clm_admin === undefined && is_organiser === undefined && role === undefined) {
+            return res.status(400).json({ error: 'No flags to update' });
+        }
+
         const updates = [];
         const values = [];
         let idx = 1;
@@ -6482,11 +6612,13 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
             values.push(!!is_organiser);
             idx++;
         }
+
+        await client.query('BEGIN');
         
         // Update players table flags
         if (updates.length > 0) {
             values.push(playerId);
-            await pool.query(
+            await client.query(
                 'UPDATE players SET ' + updates.join(', ') + ' WHERE id = $' + idx,
                 values
             );
@@ -6494,21 +6626,17 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
         
         // Update users.role if provided
         if (role !== undefined) {
-            const userResult = await pool.query('SELECT user_id FROM players WHERE id = $1', [playerId]);
+            const userResult = await client.query('SELECT user_id FROM players WHERE id = $1', [playerId]);
             if (userResult.rows.length > 0) {
-                await pool.query('UPDATE users SET role = $1 WHERE id = $2', [role, userResult.rows[0].user_id]);
+                await client.query('UPDATE users SET role = $1 WHERE id = $2', [role, userResult.rows[0].user_id]);
             }
-        }
-        
-        if (updates.length === 0 && role === undefined) {
-            return res.status(400).json({ error: 'No flags to update' });
         }
         
         // Auto-grant CLM badge if setting CLM admin
         if (is_clm_admin) {
-            const cb = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
+            const cb = await client.query("SELECT id FROM badges WHERE name = 'CLM'");
             if (cb.rows.length > 0) {
-                await pool.query(
+                await client.query(
                     'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
                     [playerId, cb.rows[0].id]
                 );
@@ -6517,14 +6645,16 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
         
         // Auto-grant Organiser badge if setting organiser
         if (is_organiser) {
-            const ob = await pool.query("SELECT id FROM badges WHERE name = 'Organiser'");
+            const ob = await client.query("SELECT id FROM badges WHERE name = 'Organiser'");
             if (ob.rows.length > 0) {
-                await pool.query(
+                await client.query(
                     'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
                     [playerId, ob.rows[0].id]
                 );
             }
         }
+
+        await client.query('COMMIT');
         
         const updated = await pool.query(
             `SELECT p.id, p.alias, p.full_name, p.is_clm_admin, p.is_organiser, u.role as user_role 
@@ -6533,8 +6663,11 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
         );
         res.json({ message: 'Role flags updated', player: updated.rows[0] });
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Update role flags error:', error);
         res.status(500).json({ error: 'Failed to update role flags' });
+    } finally {
+        client.release();
     }
 });
 
@@ -6606,8 +6739,25 @@ app.post('/api/admin/whatsapp/test', authenticateToken, requireAdmin, async (req
 app.post('/api/admin/whatsapp/send', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { playerId, notificationType, additionalData } = req.body;
+
+        // FIX-108: Whitelist valid notification types — prevent arbitrary template injection
+        const ALLOWED_NOTIFICATION_TYPES = [
+            'signup', 'game_registered', 'backup_added', 'backup_promoted',
+            'game_reminder', 'teams_created', 'game_cancelled', 'balance_updated',
+            'badge_awarded', 'motm_voting_open', 'motm_winner'
+        ];
+        if (!notificationType || !ALLOWED_NOTIFICATION_TYPES.includes(notificationType)) {
+            return res.status(400).json({ error: 'Invalid notification type' });
+        }
+
+        // FIX-108: Verify playerId exists in players table
+        if (!playerId) return res.status(400).json({ error: 'playerId is required' });
+        const playerCheck = await pool.query('SELECT id FROM players WHERE id = $1', [playerId]);
+        if (playerCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
         
-        const result = await sendNotification(notificationType, playerId, additionalData);
+        const result = await sendNotification(notificationType, playerId, additionalData || {});
         
         if (result.success) {
             res.json({ message: 'Notification sent successfully' });
@@ -6948,7 +7098,40 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
     try {
         const { gameId } = req.params;
         const { disciplineRecords, motmNominees } = req.body;
-        
+
+        // FIX-109: Validate disciplineRecords before starting transaction
+        if (disciplineRecords && Array.isArray(disciplineRecords)) {
+            // Get confirmed players for this game to validate against
+            const confirmedCheck = await pool.query(
+                `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+                [gameId]
+            );
+            const confirmedIds = new Set(confirmedCheck.rows.map(r => r.player_id));
+            for (const record of disciplineRecords) {
+                if (!confirmedIds.has(record.playerId)) {
+                    return res.status(400).json({ error: `Discipline record references player not in this game: ${record.playerId}` });
+                }
+                const pts = parseInt(record.points);
+                if (isNaN(pts) || pts < 1 || pts > 10) {
+                    return res.status(400).json({ error: `Discipline points must be between 1 and 10` });
+                }
+            }
+        }
+
+        // FIX-109: Validate motmNominees against confirmed registrations
+        if (motmNominees && Array.isArray(motmNominees) && motmNominees.length > 0) {
+            const confirmedCheck2 = await pool.query(
+                `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+                [gameId]
+            );
+            const confirmedIds2 = new Set(confirmedCheck2.rows.map(r => r.player_id));
+            for (const nomineeId of motmNominees) {
+                if (!confirmedIds2.has(nomineeId)) {
+                    return res.status(400).json({ error: `MOTM nominee is not a confirmed player in this game: ${nomineeId}` });
+                }
+            }
+        }
+
         await client.query('BEGIN');
         
         // Validate game is a tournament and not already finalised
@@ -7034,7 +7217,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             const winnerIds = winningTeamPlayers.rows.map(r => r.player_id);
             if (winnerIds.length > 0) {
                 await client.query(
-                    'UPDATE players SET total_wins = total_wins + 1 WHERE id = ANY($1)',
+                    'UPDATE players SET total_wins = total_wins + 1, tournament_wins = tournament_wins + 1 WHERE id = ANY($1)',
                     [winnerIds]
                 );
             }
@@ -7283,6 +7466,264 @@ app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 // FIX-037: Global handlers for unhandled errors/rejections so background tasks don't crash silently
 process.on('unhandledRejection', (reason) => {
+// ==========================================
+// REPORTING MODULE
+// ==========================================
+
+// Middleware: admin or CLM admin only
+const requireReportAccess = async (req, res, next) => {
+    try {
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (isAdmin) { req.reportRole = 'admin'; return next(); }
+        const r = await pool.query('SELECT is_clm_admin FROM players WHERE id = $1', [req.user.playerId]);
+        if (r.rows[0]?.is_clm_admin) { req.reportRole = 'clm'; return next(); }
+        return res.status(403).json({ error: 'Report access denied' });
+    } catch (e) { res.status(500).json({ error: 'Auth error' }); }
+};
+
+// ── REPORT: By Game ───────────────────────────────────────────────────────────
+app.get('/api/reports/games', authenticateToken, requireReportAccess, async (req, res) => {
+    try {
+        const isCLM = req.reportRole === 'clm';
+        const clmFilter = isCLM ? "AND g.exclusivity = 'clm'" : '';
+
+        const result = await pool.query(`
+            SELECT
+                g.id,
+                g.game_date,
+                v.name                                    AS venue_name,
+                g.format,
+                COALESCE(g.exclusivity, 'open')           AS exclusivity,
+                g.max_players,
+                g.cost_per_player,
+                g.game_status,
+                g.winning_team,
+                COALESCE(mp.alias, mp.full_name, '—')     AS motm_winner,
+
+                -- Signups (confirmed registrations)
+                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed')
+                                                          AS signups,
+
+                -- Backup count
+                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'backup')
+                                                          AS backup_count,
+
+                -- Guest count
+                COUNT(DISTINCT gg.id)                     AS guest_count,
+
+                -- Total players on the day (confirmed + guests)
+                COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'confirmed')
+                + COUNT(DISTINCT gg.id)                   AS total_players,
+
+                -- MOTM total votes cast
+                COUNT(DISTINCT mv.id)                     AS motm_votes_total,
+
+                -- Revenue: player fees + guest fees
+                COALESCE(SUM(r.amount_paid) FILTER (WHERE r.status = 'confirmed'), 0)
+                + COALESCE(SUM(gg.amount_paid), 0)        AS revenue
+
+            FROM games g
+            LEFT JOIN venues v         ON v.id  = g.venue_id
+            LEFT JOIN players mp       ON mp.id = g.motm_winner_id
+            LEFT JOIN registrations r  ON r.game_id = g.id
+            LEFT JOIN game_guests gg   ON gg.game_id = g.id
+            LEFT JOIN motm_votes mv    ON mv.game_id = g.id
+            WHERE g.game_status = 'completed'
+            ${clmFilter}
+            GROUP BY g.id, v.name, mp.alias, mp.full_name
+            ORDER BY g.game_date DESC
+        `);
+
+        res.json(result.rows);
+    } catch (e) {
+        console.error('Report/games error:', e);
+        res.status(500).json({ error: 'Failed to generate game report' });
+    }
+});
+
+// ── REPORT: By Player ─────────────────────────────────────────────────────────
+app.get('/api/reports/players', authenticateToken, requireReportAccess, async (req, res) => {
+    try {
+        if (req.reportRole === 'clm') {
+            return res.status(403).json({ error: 'CLM admins do not have access to the player report' });
+        }
+
+        const result = await pool.query(`
+            SELECT
+                p.id,
+                COALESCE(p.alias, p.full_name)            AS name,
+                p.full_name,
+                p.alias,
+                p.squad_number,
+                p.reliability_tier                        AS tier,
+
+                -- Appearances & wins (from stored columns)
+                p.total_appearances                       AS appearances,
+                p.motm_wins,
+                p.total_wins,
+                p.tournament_wins,
+                p.external_wins,
+
+                -- Ratings
+                p.overall_rating,
+                p.defending_rating,
+                p.strength_rating,
+                p.fitness_rating,
+                p.pace_rating,
+                p.decisions_rating,
+                p.assisting_rating,
+                p.shooting_rating,
+                p.goalkeeper_rating,
+
+                -- Badges
+                COUNT(DISTINCT pb.badge_id)               AS badge_count,
+                COALESCE(
+                    (SELECT json_agg(b2.name ORDER BY b2.name)
+                     FROM player_badges pb2 JOIN badges b2 ON b2.id = pb2.badge_id
+                     WHERE pb2.player_id = p.id), '[]'::json
+                )                                         AS badge_names,
+
+                -- Discipline
+                COALESCE(
+                    (SELECT SUM(dr.points) FROM discipline_records dr WHERE dr.player_id = p.id), 0
+                )                                         AS disc_points,
+                COALESCE(
+                    (SELECT COUNT(*) FROM discipline_records dr WHERE dr.player_id = p.id
+                     AND dr.offense_type ILIKE '%drop%'), 0
+                )                                         AS dropouts,
+
+                -- Referrals
+                (SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id)
+                                                          AS referrals_count,
+                COALESCE(
+                    (SELECT SUM(ABS(ct2.amount))
+                     FROM credit_transactions ct2
+                     JOIN players ref ON ref.id = ct2.player_id
+                     WHERE ref.referred_by = p.id AND ct2.type = 'game_fee'), 0
+                )                                         AS referral_revenue,
+
+                -- Guests brought
+                (SELECT COUNT(*) FROM game_guests gg WHERE gg.invited_by = p.id)
+                                                          AS guests_added,
+
+                -- Revenue (money spent on games)
+                COALESCE(
+                    (SELECT SUM(ABS(ct.amount))
+                     FROM credit_transactions ct
+                     WHERE ct.player_id = p.id AND ct.type = 'game_fee'), 0
+                )                                         AS revenue_spent
+
+            FROM players p
+            LEFT JOIN player_badges pb ON pb.player_id = p.id
+            GROUP BY p.id
+            ORDER BY p.squad_number NULLS LAST, p.full_name
+        `);
+
+        res.json(result.rows);
+    } catch (e) {
+        console.error('Report/players error:', e);
+        res.status(500).json({ error: 'Failed to generate player report' });
+    }
+});
+
+// ── REPORT: Player × Game ─────────────────────────────────────────────────────
+app.get('/api/reports/player/:playerId/games', authenticateToken, requireReportAccess, async (req, res) => {
+    try {
+        if (req.reportRole === 'clm') {
+            return res.status(403).json({ error: 'CLM admins do not have access to player-by-game reports' });
+        }
+
+        const { playerId } = req.params;
+
+        const result = await pool.query(`
+            SELECT
+                g.id                                      AS game_id,
+                g.game_date,
+                v.name                                    AS venue_name,
+                COALESCE(g.format, '—')                   AS format,
+                COALESCE(g.exclusivity, 'open')           AS exclusivity,
+                g.winning_team,
+                COALESCE(mp.alias, mp.full_name, '—')     AS motm_winner,
+
+                -- Player's registration status for this game
+                r.status                                  AS player_status,
+                COALESCE(r.amount_paid, 0)                AS amount_paid,
+
+                -- Guests this player brought to this game
+                (SELECT COUNT(*) FROM game_guests gg
+                 WHERE gg.game_id = g.id AND gg.invited_by = $1)
+                                                          AS guest_count,
+
+                -- Player's team
+                t.team_name                               AS player_team,
+
+                -- Result: W / L / D / —
+                CASE
+                    WHEN t.team_name IS NULL OR g.winning_team IS NULL THEN '—'
+                    WHEN LOWER(t.team_name) = LOWER(g.winning_team)    THEN 'W'
+                    WHEN g.winning_team = 'Draw'                        THEN 'D'
+                    ELSE 'L'
+                END                                       AS result,
+
+                -- MOTM votes this player received
+                COUNT(DISTINCT mv_recv.id)                AS motm_votes_received,
+
+                -- Did this player vote?
+                EXISTS(
+                    SELECT 1 FROM motm_votes mv_cast
+                    WHERE mv_cast.game_id = g.id AND mv_cast.voter_id = $1
+                )                                         AS did_vote_motm,
+
+                -- Who did they vote for?
+                COALESCE(
+                    (SELECT COALESCE(vp.alias, vp.full_name)
+                     FROM motm_votes mv_cast2
+                     JOIN players vp ON vp.id = mv_cast2.voted_for_id
+                     WHERE mv_cast2.game_id = g.id AND mv_cast2.voter_id = $1
+                     LIMIT 1), '—'
+                )                                         AS voted_for_name
+
+            FROM registrations r
+            JOIN games g          ON g.id  = r.game_id
+            LEFT JOIN venues v    ON v.id  = g.venue_id
+            LEFT JOIN players mp  ON mp.id = g.motm_winner_id
+            LEFT JOIN team_players tp ON tp.player_id = $1
+            LEFT JOIN teams t     ON t.id = tp.team_id AND t.game_id = g.id
+            LEFT JOIN motm_votes mv_recv ON mv_recv.game_id = g.id AND mv_recv.voted_for_id = $1
+            WHERE r.player_id = $1
+            AND g.game_status = 'completed'
+            GROUP BY g.id, v.name, mp.alias, mp.full_name, r.status, r.amount_paid, t.team_name
+            ORDER BY g.game_date DESC
+        `, [playerId]);
+
+        // Also return player summary
+        const playerInfo = await pool.query(
+            `SELECT id, COALESCE(alias, full_name) as name, alias, full_name, squad_number FROM players WHERE id = $1`,
+            [playerId]
+        );
+
+        res.json({
+            player: playerInfo.rows[0] || null,
+            games: result.rows
+        });
+    } catch (e) {
+        console.error('Report/player-games error:', e);
+        res.status(500).json({ error: 'Failed to generate player-game report' });
+    }
+});
+
+// ── Players list for report selector ─────────────────────────────────────────
+app.get('/api/reports/players/list', authenticateToken, requireReportAccess, async (req, res) => {
+    try {
+        if (req.reportRole === 'clm') return res.json([]);
+        const r = await pool.query(
+            `SELECT id, COALESCE(alias, full_name) as name, squad_number
+             FROM players ORDER BY squad_number NULLS LAST, full_name`
+        );
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+
     console.error('Unhandled Promise Rejection:', reason);
 });
 process.on('uncaughtException', (err) => {
