@@ -3616,122 +3616,59 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
     try {
         const { gameId } = req.params;
         await client.query('BEGIN');
-
-        // ── 1. Verify the game exists and grab all data needed before deletion ──
-        const gameResult = await client.query(`
-            SELECT g.game_date, g.game_url, g.cost_per_player, g.team_selection_type,
-                   v.name as venue_name
-            FROM games g
-            LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.id = $1
-        `, [gameId]);
-
-        if (gameResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Game not found' });
-        }
-
-        const gameRow = gameResult.rows[0];
-        const fallbackCost = parseFloat(gameRow.cost_per_player || 0);
-        const cancelDate = gameRow.game_date
-            ? new Date(gameRow.game_date).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })
-            : '';
-        const cancelGameData = {
-            day: cancelDate,
-            time: gameRow.game_date
-                ? new Date(gameRow.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
-                : '',
-            venue: gameRow.venue_name || 'TBC',
-            gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${gameRow.game_url}`
-        };
-
-        // ── 2. Collect players who need refunds (confirmed + confirmed_backup) ──
         const registrations = await client.query(
-            `SELECT player_id, status, backup_type, amount_paid FROM registrations
-             WHERE game_id = $1
-             AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
+            `SELECT player_id, status, backup_type, amount_paid FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
             [gameId]
         );
-        const cancelledPlayerIds = registrations.rows.map(r => r.player_id);
+        const gameResult = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
+        const fallbackCost = parseFloat(gameResult.rows[0]?.cost_per_player || 0);
 
-        // ── 3. Refund registered players ──
+        // Capture game details for notifications before we delete the game
+        const cancelGameInfo = await client.query(`
+            SELECT g.game_date, g.game_url, v.name as venue_name
+            FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.id = $1
+        `, [gameId]);
+        const cancelGameRow = cancelGameInfo.rows[0] || {};
+        const cancelDate = cancelGameRow.game_date ? new Date(cancelGameRow.game_date).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }) : '';
+        const cancelGameData = {
+            day: cancelDate,
+            time: cancelGameRow.game_date ? new Date(cancelGameRow.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '',
+            venue: cancelGameRow.venue_name || 'TBC',
+            gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${cancelGameRow.game_url}`
+        };
+        const cancelledPlayerIds = registrations.rows.map(r => r.player_id);
         let totalRefunded = 0;
         for (const reg of registrations.rows) {
             const refundAmt = parseFloat(reg.amount_paid || fallbackCost);
             if (refundAmt > 0) {
-                await client.query(
-                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                    [refundAmt, reg.player_id]
-                );
-                await client.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [reg.player_id, refundAmt, 'refund', 'Game cancelled - refund']
-                );
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundAmt, reg.player_id]);
+                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [reg.player_id, refundAmt, 'refund', 'Game cancelled - refund']);
                 totalRefunded++;
             }
         }
-
-        // ── 4. Refund guest fees ──
-        const guests = await client.query(
-            'SELECT invited_by, guest_name, amount_paid FROM game_guests WHERE game_id = $1',
-            [gameId]
-        );
+        const guests = await client.query('SELECT invited_by, guest_name, amount_paid FROM game_guests WHERE game_id = $1', [gameId]);
         for (const guest of guests.rows) {
             const guestRefund = parseFloat(guest.amount_paid || 0);
             if (guestRefund > 0) {
-                await client.query(
-                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                    [guestRefund, guest.invited_by]
-                );
-                await client.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']
-                );
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [guestRefund, guest.invited_by]);
+                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']);
             }
         }
-
-        // ── 5. Explicitly delete all child table rows (covers all game types) ──
-        //   tournament_results  — tournament games with scores entered
-        await client.query('DELETE FROM tournament_results WHERE game_id = $1', [gameId]);
-
-        //   motm_votes          — any game that reached voting stage
-        await client.query('DELETE FROM motm_votes WHERE game_id = $1', [gameId]);
-
-        //   team_players        — must go before teams (FK constraint)
-        await client.query(
-            'DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)',
-            [gameId]
-        );
-
-        //   teams               — all game types that had teams generated
-        await client.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
-
-        //   game_guests         — all games (cascade would handle but explicit is safer)
-        await client.query('DELETE FROM game_guests WHERE game_id = $1', [gameId]);
-
-        //   registrations       — all games
-        await client.query('DELETE FROM registrations WHERE game_id = $1', [gameId]);
-
-        // ── 6. Delete the game itself ──
         await client.query('DELETE FROM games WHERE id = $1', [gameId]);
-
         await client.query('COMMIT');
+        res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
 
-        res.json({
-            message: `Game deleted. Refunded ${totalRefunded} player${totalRefunded !== 1 ? 's' : ''} and ${guests.rows.length} guest fee${guests.rows.length !== 1 ? 's' : ''}.`
-        });
-
-        // ── 7. Non-critical: notify affected players after response sent ──
+        // Non-critical: notify all affected players
         setImmediate(async () => {
             for (const pid of cancelledPlayerIds) {
                 try {
                     await sendNotification('game_cancelled', pid, cancelGameData);
                 } catch (e) {
-                    console.error(`game_cancelled notification failed for player ${pid}:`, e.message);
+                    console.error(`game_cancelled notification failed player ${pid}:`, e.message);
                 }
             }
         });
-
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Delete game error:', error);
@@ -5309,100 +5246,6 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
     } catch (error) {
         console.error('Get public game players error:', error);
         res.status(500).json({ error: 'Failed to get players' });
-    }
-});
-
-// ── GET all games in a series + prev/next/currentIndex for the series navigator ──
-app.get('/api/public/game/:gameUrl/series', async (req, res) => {
-    try {
-        const { gameUrl } = req.params;
-
-        // Look up the current game and its series_id
-        const gameResult = await pool.query(
-            'SELECT id, series_id FROM games WHERE game_url = $1',
-            [gameUrl]
-        );
-        if (gameResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Game not found' });
-        }
-
-        const { id: currentGameId, series_id } = gameResult.rows[0];
-
-        // No series — return empty so front end hides the nav
-        if (!series_id) {
-            return res.json({ series: null });
-        }
-
-        // Fetch ALL games in the series ordered by date ascending
-        const seriesResult = await pool.query(`
-            SELECT g.id, g.game_url, g.game_date, g.game_status, g.max_players,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
-                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
-            FROM games g
-            WHERE g.series_id = $1
-            ORDER BY g.game_date ASC
-        `, [series_id]);
-
-        const games = seriesResult.rows;
-        const currentIndex = games.findIndex(g => g.id === currentGameId);
-
-        const prev = currentIndex > 0 ? games[currentIndex - 1] : null;
-        const next = currentIndex < games.length - 1 ? games[currentIndex + 1] : null;
-
-        res.json({
-            series: {
-                games,
-                currentIndex,
-                prev,
-                next
-            }
-        });
-
-    } catch (error) {
-        console.error('Get series nav error:', error);
-        res.status(500).json({ error: 'Failed to get series data' });
-    }
-});
-
-// ── GET the next future game in a series (for CTA "Sign up for next week") ──
-app.get('/api/public/game/:gameUrl/next', async (req, res) => {
-    try {
-        const { gameUrl } = req.params;
-
-        // Look up the current game's series and date
-        const gameResult = await pool.query(
-            'SELECT id, series_id, game_date FROM games WHERE game_url = $1',
-            [gameUrl]
-        );
-        if (gameResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Game not found' });
-        }
-
-        const { series_id, game_date } = gameResult.rows[0];
-
-        if (!series_id) {
-            return res.json({ next: null });
-        }
-
-        // Find the next game in the series that is after the current game's date
-        // and is not completed — so players can actually sign up
-        const nextResult = await pool.query(`
-            SELECT g.id, g.game_url, g.game_date, g.max_players, g.game_status,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
-                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
-            FROM games g
-            WHERE g.series_id = $1
-              AND g.game_date > $2
-              AND g.game_status != 'completed'
-            ORDER BY g.game_date ASC
-            LIMIT 1
-        `, [series_id, game_date]);
-
-        res.json({ next: nextResult.rows[0] || null });
-
-    } catch (error) {
-        console.error('Get next series game error:', error);
-        res.status(500).json({ error: 'Failed to get next game' });
     }
 });
 
