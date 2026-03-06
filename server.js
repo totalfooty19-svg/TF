@@ -32,6 +32,18 @@ const PORT = process.env.PORT || 3000;
 // FIX-054: Required for correct client IP on Render (behind load balancer)
 app.set('trust proxy', 1);
 
+// CORS MUST be first — before rate limiters, before helmet, before everything.
+// If CORS comes after rate limiters, any 429 response has no CORS headers and
+// the browser treats it as a CORS failure, blocking ALL subsequent requests.
+const CORS_ORIGINS = ['https://totalfooty.co.uk', 'https://www.totalfooty.co.uk'];
+app.use(cors({
+    origin: CORS_ORIGINS,
+    credentials: true,
+    optionsSuccessStatus: 200, // Some browsers (IE11) choke on 204
+}));
+// Explicitly handle OPTIONS preflight for all routes so rate limiters never intercept it
+app.options('*', cors({ origin: CORS_ORIGINS, credentials: true, optionsSuccessStatus: 200 }));
+
 // FIX-011: Security headers — SEC-003: HSTS enabled, SEC-004: referrerPolicy added
 const helmet = require('helmet');
 app.use(helmet({
@@ -48,6 +60,7 @@ app.disable('x-powered-by');
 
 // SEC-005: Enforce JSON Content-Type on all API responses
 app.use('/api', (req, res, next) => {
+    if (req.method === 'OPTIONS') return next(); // Don't override preflight Content-Type
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     next();
 });
@@ -61,6 +74,7 @@ const authLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     skipSuccessfulRequests: false,
+    skip: (req) => req.method === 'OPTIONS', // Never rate-limit preflight requests
 });
 // SEC-001: Registration rate limit — prevents bulk account farming
 const registerLimiter = rateLimit({
@@ -69,6 +83,7 @@ const registerLimiter = rateLimit({
     message: { error: 'Too many accounts created. Please try again later.' },
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
 });
 // SEC-002: Stricter limit for password reset to prevent token enumeration
 const resetLimiter = rateLimit({
@@ -77,14 +92,12 @@ const resetLimiter = rateLimit({
     message: { error: 'Too many reset requests. Please try again in an hour.' },
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', registerLimiter);
 app.use('/api/auth/forgot-password', authLimiter);
 app.use('/api/auth/reset-password', resetLimiter);
-
-// SEC-006: CORS — API server removed from allowed origins to prevent self-relay attacks
-app.use(cors({ origin: ['https://totalfooty.co.uk', 'https://www.totalfooty.co.uk'], credentials: true }));
 
 // FIX-036: Global 500kb body limit (photo upload route overrides to 5mb below)
 app.use((req, res, next) => {
