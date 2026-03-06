@@ -7778,17 +7778,27 @@ app.post('/api/auth/forgot-password', async (req, res) => {
             const token = crypto.randomBytes(32).toString('hex');
             const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-            // FIX-077: ON CONFLICT DO UPDATE so re-requests get a fresh token and email
-            await pool.query(
-                `INSERT INTO password_reset_tokens (player_id, token, expires_at)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (player_id) DO UPDATE SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at, used_at = NULL`,
-                [player.id, token, expiresAt]
-            );
+            // Upsert token — try ON CONFLICT first, fall back to DELETE+INSERT if constraint missing
+            try {
+                await pool.query(
+                    `INSERT INTO password_reset_tokens (player_id, token, expires_at)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (player_id) DO UPDATE SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at, used_at = NULL`,
+                    [player.id, token, expiresAt]
+                );
+            } catch (upsertErr) {
+                // Unique constraint may not exist — fall back to delete + insert
+                console.warn('Reset token upsert failed, falling back to delete+insert:', upsertErr.message);
+                await pool.query('DELETE FROM password_reset_tokens WHERE player_id = $1', [player.id]);
+                await pool.query(
+                    'INSERT INTO password_reset_tokens (player_id, token, expires_at) VALUES ($1, $2, $3)',
+                    [player.id, token, expiresAt]
+                );
+            }
 
-            // Send email
+            // Send email — decoupled from main try/catch so email failure doesn't 500 the request
             const resetLink = `https://totalfooty.co.uk/vibecoding/reset-password.html?token=${token}`;
-            await emailTransporter.sendMail({
+            emailTransporter.sendMail({
                 from: '"TotalFooty" <totalfooty19@gmail.com>',
                 to: email.trim(),
                 subject: 'TotalFooty — Reset Your Password',
@@ -7803,12 +7813,19 @@ app.post('/api/auth/forgot-password', async (req, res) => {
                         <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
                     </div>
                 `,
+            }).then(() => {
+                console.log(`Password reset email sent to ${email.trim()}`);
+            }).catch(emailErr => {
+                // Log the real reason — check Render logs if email not arriving
+                console.error('Password reset email FAILED:', emailErr.message);
+                console.error('Check: GMAIL_APP_PASSWORD env var set correctly on Render?');
             });
         }
 
+        // Always return success — don't reveal whether email exists or if email send failed
         res.json({ message: 'If an account exists with that email, a reset link has been sent.' });
     } catch (error) {
-        console.error('Forgot password error:', error);
+        console.error('Forgot password DB error:', error);
         res.status(500).json({ error: 'Failed to process request' });
     }
 });
