@@ -19,7 +19,7 @@ const emailTransporter = nodemailer.createTransport({
     },
 });
 
-// (Twilio removed — was imported but never called)
+
 
 // Push notifications are sent via the Expo Push API (https://exp.host/--/api/v2/push/send).
 // The mobile app uses Expo's getExpoPushTokenAsync() which returns ExponentPushToken[...] tokens.
@@ -125,6 +125,38 @@ const csrfProtect = (req, res, next) => {
 app.use('/api', csrfProtect);
 
 // SEC-008: Audit log — tamper-evident record of privileged actions
+
+// BST/DST helper: add N weeks to a game date while preserving wall-clock time in Europe/London.
+// Standard Date.setDate() operates in UTC, so crossing a DST boundary shifts the stored hour by 1.
+// This function extracts the London local hour/minute from the original date, adds weeks to the
+// calendar date, then returns the UTC instant that gives the same wall-clock time in London.
+function addWeeksLondon(isoDateStr, weeks) {
+    const orig = new Date(isoDateStr);
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Europe/London',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
+    });
+    const parts = fmt.formatToParts(orig);
+    const get = (type) => parseInt(parts.find(p => p.type === type)?.value || '0');
+    const year = get('year'), month = get('month'), day = get('day');
+    const hour = get('hour'), minute = get('minute'), second = get('second');
+
+    // Build target date: same wall-clock time but weeks * 7 days later (JS Date handles month overflow)
+    const target = new Date(Date.UTC(year, month - 1, day + weeks * 7, hour, minute, second));
+
+    // Check what London hour this UTC instant corresponds to (may differ across DST boundary)
+    const checkParts = fmt.formatToParts(target);
+    const checkHour = parseInt(checkParts.find(p => p.type === 'hour')?.value || '0');
+
+    // Correct for DST shift (±1 hour at boundary)
+    const hourDiff = checkHour - hour;
+    if (hourDiff !== 0) {
+        return new Date(target.getTime() - hourDiff * 3600 * 1000);
+    }
+    return target;
+}
 async function auditLog(pool, adminId, action, targetId, detail = '') {
     try {
         await pool.query(
@@ -502,6 +534,26 @@ app.post('/api/auth/register', async (req, res) => {
             } catch (e) {
                 console.error('Signup notification failed (non-critical):', e.message);
             }
+            // #14: Notify admin of new signup
+            try {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to: 'totalfooty19@gmail.com',
+                    subject: '🆕 New Player Signup — TotalFooty',
+                    html: wrapEmailHtml(`
+                        <p style="color:#888;font-size:14px;margin:0 0 16px">New account created</p>
+                        <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
+                            <tr><td style="padding:6px 0;color:#888;width:120px;">Full Name</td><td style="font-weight:900;">${fullName.trim()}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Alias</td><td>${playerAlias}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Email</td><td>${email}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Mobile</td><td>${phone.trim()}</td></tr>
+                            ${ref ? `<tr><td style="padding:6px 0;color:#888;">Referral</td><td>${ref}</td></tr>` : ''}
+                        </table>
+                    `)
+                });
+            } catch (e) {
+                console.error('Admin signup notification failed (non-critical):', e.message);
+            }
         });
     } catch (error) {
         console.error('Registration error:', error);
@@ -790,6 +842,8 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                 p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
                 p.goalkeeper_rating,
+                COALESCE(p.is_featured, false) AS is_featured,
+                p.social_tiktok, p.social_instagram, p.social_youtube, p.social_facebook,
                 (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
                  FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
                 COALESCE(ps.apps_3m, 0)   AS apps_3m,
@@ -827,6 +881,8 @@ app.get('/api/players', authenticateToken, async (req, res) => {
                     overall_rating, defending_rating, strength_rating, fitness_rating,
                     pace_rating, decisions_rating, assisting_rating, shooting_rating, goalkeeper_rating,
                     ...safe } = p;
+                // safe includes: id, alias, full_name, squad_number, photo_url, reliability_tier,
+                //   total_appearances, motm_wins, total_wins, badges, stats, is_featured, social_*
                 return safe;
             });
             res.json(safeRows);
@@ -845,12 +901,12 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
         const result = await pool.query(`
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
-                p.reliability_tier,
+                p.reliability_tier, p.phone,
                 p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
                 p.goalkeeper_rating,
                 p.is_clm_admin, p.is_organiser,
-                u.role as user_role,
+                u.role as user_role, u.email,
                 c.balance as credits,
 
                 -- Badges with IDs
@@ -989,7 +1045,38 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg
                  JOIN games g ON g.id = gg.game_id
                  WHERE gg.invited_by = p.id AND g.exclusivity = 'clm'
-                 AND g.game_date >= DATE_TRUNC('year', NOW())), 0) as clm_revenue_year
+                 AND g.game_date >= DATE_TRUNC('year', NOW())), 0) as clm_revenue_year,
+
+                -- FEATURED PROFILE & SOCIALS
+                COALESCE(p.is_featured, false) as is_featured,
+                p.social_tiktok,
+                p.social_instagram,
+                p.social_youtube,
+                p.social_facebook,
+
+                -- DISCIPLINE: all-time total points
+                COALESCE((
+                    SELECT SUM(dr.points) FROM discipline_records dr WHERE dr.player_id = p.id
+                ), 0) as disc_points_total,
+
+                -- DISCIPLINE: revolving — last 10 completed games only (not manual entries)
+                COALESCE((
+                    SELECT SUM(dr.points)
+                    FROM discipline_records dr
+                    WHERE dr.player_id = p.id
+                    AND dr.game_id IN (
+                        SELECT r.game_id FROM registrations r
+                        JOIN games g2 ON g2.id = r.game_id
+                        WHERE r.player_id = p.id AND r.status = 'confirmed'
+                        AND g2.game_status = 'completed'
+                        ORDER BY g2.game_date DESC LIMIT 10
+                    )
+                ), 0) as disc_points_revolving,
+
+                -- DISCIPLINE: most recent offense type
+                (SELECT dr.offense_type FROM discipline_records dr
+                 WHERE dr.player_id = p.id AND dr.game_id IS NOT NULL
+                 ORDER BY dr.id DESC LIMIT 1) as last_offense
 
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
@@ -1037,7 +1124,22 @@ app.get('/api/players/:id', authenticateToken, async (req, res) => {
         const result = await pool.query(`
             SELECT p.*, c.balance as credits, u.email,
             (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
-             FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
+             FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
+            COALESCE((SELECT SUM(dr.points) FROM discipline_records dr WHERE dr.player_id = p.id), 0) as disc_points_total,
+            COALESCE((
+                SELECT SUM(dr.points) FROM discipline_records dr
+                WHERE dr.player_id = p.id
+                AND dr.game_id IN (
+                    SELECT r.game_id FROM registrations r
+                    JOIN games g2 ON g2.id = r.game_id
+                    WHERE r.player_id = p.id AND r.status = 'confirmed'
+                    AND g2.game_status = 'completed'
+                    ORDER BY g2.game_date DESC LIMIT 10
+                )
+            ), 0) as disc_points_revolving,
+            (SELECT dr.offense_type FROM discipline_records dr
+             WHERE dr.player_id = p.id AND dr.game_id IS NOT NULL
+             ORDER BY dr.id DESC LIMIT 1) as last_offense
             FROM players p
             LEFT JOIN credits c ON c.player_id = p.id
             LEFT JOIN users u ON u.id = p.user_id
@@ -1098,11 +1200,17 @@ app.get('/api/players/:id', authenticateToken, async (req, res) => {
                 total_appearances: player.total_appearances,
                 total_wins:       player.total_wins,
                 motm_wins:        player.motm_wins,
+                overall_rating:   player.overall_rating,
                 win_percent,
                 motm_percent,
                 tournament_wins,
                 external_game_wins,
                 badges:           player.badges,
+                // Socials are public — players opt in by adding them
+                social_tiktok:    player.social_tiktok,
+                social_instagram: player.social_instagram,
+                social_youtube:   player.social_youtube,
+                social_facebook:  player.social_facebook,
             });
         }
     } catch (error) {
@@ -1331,7 +1439,8 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         const {
             goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            total_wins, squad_number, phone, balance
+            total_wins, squad_number, phone, balance, alias,
+            is_featured, social_tiktok, social_instagram, social_youtube, social_facebook
         } = req.body;
         
         // Calculate overall rating
@@ -1363,11 +1472,20 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 overall_rating = $9,
                 total_wins = $10,
                 squad_number = $11,
-                phone = $12
-            WHERE id = $13
+                phone = $12,
+                alias = COALESCE($13, alias),
+                is_featured = COALESCE($14, is_featured),
+                social_tiktok = $15,
+                social_instagram = $16,
+                social_youtube = $17,
+                social_facebook = $18
+            WHERE id = $19
         `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            overall_rating, total_wins, squad_number, phone, playerId]);
+            overall_rating, total_wins, squad_number, phone, alias || null,
+            is_featured !== undefined ? is_featured : null,
+            social_tiktok || null, social_instagram || null, social_youtube || null, social_facebook || null,
+            playerId]);
         
         // FIX-053: Update balance with audit trail if changed
         if (balance !== undefined) {
@@ -1402,7 +1520,25 @@ app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, asyn
         
         await client.query('BEGIN');
         
-        // Delete player (cascade will handle related records)
+        // Explicitly remove all records that reference this player before deleting
+        // (cannot rely on CASCADE being set consistently across all tables)
+        await client.query('DELETE FROM registration_preferences WHERE registration_id IN (SELECT id FROM registrations WHERE player_id = $1)', [playerId]);
+        await client.query('DELETE FROM registration_preferences WHERE target_player_id = $1', [playerId]);
+        await client.query('DELETE FROM registrations WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id IN (SELECT game_id FROM registrations WHERE player_id = $1))', [playerId]);
+        await client.query('DELETE FROM game_guests WHERE invited_by = $1', [playerId]);
+        await client.query('DELETE FROM player_fixed_teams WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM player_badges WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM credit_transactions WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM credits WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM discipline_records WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM whatsapp_logs WHERE player_id = $1', [playerId]);
+        await client.query('UPDATE players SET referred_by = NULL WHERE referred_by = $1', [playerId]);
+        await client.query('UPDATE games SET motm_winner_id = NULL WHERE motm_winner_id = $1', [playerId]);
+        // audit_logs rows with admin_id or target_id — null them rather than delete (preserve audit trail)
+        await client.query('UPDATE audit_logs SET admin_id = NULL WHERE admin_id = $1', [playerId]).catch(() => {});
+        
+        // Delete player (cascade will handle remaining user record link)
         const result = await client.query('DELETE FROM players WHERE id = $1 RETURNING full_name, alias', [playerId]);
         
         if (result.rows.length === 0) {
@@ -1557,26 +1693,14 @@ async function autoAllocateBadges(playerId) {
 
 async function checkBadgeCriteria(badgeName, player) {
     switch (badgeName) {
-        case '50 Apps':
-            return player.total_appearances >= 50;
-            
         case '100 Apps':
             return player.total_appearances >= 100;
             
         case '250 Apps':
             return player.total_appearances >= 250;
             
-        case '500 Apps':
-            return player.total_appearances >= 500;
-            
-        case '5 MOTM':
-            return player.motm_wins >= 5;
-            
         case '15 MOTM':
             return player.motm_wins >= 15;
-            
-        case '30 MOTM':
-            return player.motm_wins >= 30;
             
         case 'MOTM Streak':
             // Won MOTM in 3 consecutive completed games they played in
@@ -1701,623 +1825,9 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
     }
 });
 
-// Bulk upload / update players from CSV
-app.post('/api/admin/players/bulk-upload', authenticateToken, requireAdmin, async (req, res) => {
-    const client = await pool.connect();
-    try {
-        const { players } = req.body;
-        
-        if (!players || !Array.isArray(players) || players.length === 0) {
-            return res.status(400).json({ error: 'No player data provided' });
-        }
-
-        // FIX-038: Limit bulk import size
-        if (players.length > 200) {
-            return res.status(400).json({ error: 'Max 200 players per import' });
-        }
-        
-        await client.query('BEGIN');
-        
-        let created = 0;
-        let updated = 0;
-        let errors = [];
-        
-        for (const p of players) {
-            try {
-                const name = (p.name || '').trim();
-                if (!name) {
-                    errors.push(`Skipped empty row`);
-                    continue;
-                }
-                
-                // Parse ratings (Mental = decisions_rating)
-                const defending = parseInt(p.defence) || 0;
-                const strength = parseInt(p.strength) || 0;
-                const pace = parseInt(p.pace) || 0;
-                const fitness = parseInt(p.fitness) || 0;
-                const decisions = parseInt(p.mental) || 0;
-                const assisting = parseInt(p.assisting) || 0;
-                const shooting = parseInt(p.shooting) || 0;
-                const goalkeeper = parseInt(p.gk) || 0;
-                const overall = defending + strength + pace + fitness + decisions + assisting + shooting;
-                const credits = parseFloat(p.credits) || 0;
-                const tier = (p.tier || 'silver').toLowerCase();
-                const position = (p.position || 'outfield').toLowerCase();
-                
-                // Try to find existing player by full_name
-                const existing = await client.query(
-                    'SELECT id FROM players WHERE LOWER(full_name) = LOWER($1)',
-                    [name]
-                );
-                
-                if (existing.rows.length > 0) {
-                    // Update existing player
-                    const playerId = existing.rows[0].id;
-                    await client.query(`
-                        UPDATE players SET
-                            defending_rating = $1, strength_rating = $2, pace_rating = $3,
-                            fitness_rating = $4, decisions_rating = $5, assisting_rating = $6,
-                            shooting_rating = $7, goalkeeper_rating = $8, overall_rating = $9,
-                            reliability_tier = $10, position = $11
-                        WHERE id = $12
-                    `, [defending, strength, pace, fitness, decisions, assisting, shooting,
-                        goalkeeper, overall, tier, position, playerId]);
-                    
-                    // Update credits
-                    await client.query(
-                        'UPDATE credits SET balance = $1 WHERE player_id = $2',
-                        [credits, playerId]
-                    );
-                    
-                    updated++;
-                } else {
-                    // Create new user + player
-                    const nameParts = name.split(/\s+/);
-                    const firstName = nameParts[0];
-                    const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : firstName;
-                    const safeEmail = name.toLowerCase().replace(/[^a-z0-9]/g, '.') + '@totalfooty.import';
-                    // FIX-038: Unique random password per imported player
-                    const tempRaw = crypto.randomBytes(8).toString('hex');
-                    const tempPassword = await bcrypt.hash(tempRaw, 10);
-                    
-                    const userResult = await client.query(
-                        'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id',
-                        [safeEmail, tempPassword, 'player']
-                    );
-                    
-                    const playerResult = await client.query(`
-                        INSERT INTO players (user_id, full_name, first_name, last_name, alias, position,
-                            defending_rating, strength_rating, pace_rating, fitness_rating,
-                            decisions_rating, assisting_rating, shooting_rating, goalkeeper_rating,
-                            overall_rating, reliability_tier)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-                        RETURNING id
-                    `, [userResult.rows[0].id, name, firstName, lastName, firstName, position,
-                        defending, strength, pace, fitness, decisions, assisting, shooting,
-                        goalkeeper, overall, tier]);
-                    
-                    await client.query(
-                        'INSERT INTO credits (player_id, balance) VALUES ($1, $2)',
-                        [playerResult.rows[0].id, credits]
-                    );
-                    
-                    // Generate referral code
-                    const referralCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
-                    await client.query(
-                        'UPDATE players SET referral_code = $1 WHERE id = $2',
-                        [referralCode, playerResult.rows[0].id]
-                    );
-                    
-                    created++;
-                }
-            } catch (rowError) {
-                errors.push(`${p.name || 'Unknown'}: ${rowError.message}`);
-            }
-        }
-        
-        await client.query('COMMIT');
-        
-        res.json({
-            message: `Import complete: ${created} created, ${updated} updated`,
-            created,
-            updated,
-            errors: errors.length > 0 ? errors : undefined
-        });
-        
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Bulk upload error:', error);
-        res.status(500).json({ error: 'Bulk upload failed: ' + error.message });
-    } finally {
-        client.release();
-    }
-});
 
 // ==========================================
-// WHATSAPP SERVICE
-// ==========================================
-
-// Helper function to replace placeholders in message templates
-function replacePlaceholders(template, data) {
-    let message = template;
-    
-    // Replace all placeholders with actual data
-    message = message.replace(/\[Name\]/g, data.name || '');
-    message = message.replace(/\[Day\]/g, data.day || '');
-    message = message.replace(/\[Time\]/g, data.time || '');
-    message = message.replace(/\[Venue\]/g, data.venue || '');
-    message = message.replace(/\[gameurl\]/g, data.gameurl || '');
-    message = message.replace(/\[Balance\]/g, data.balance || '0.00');
-    message = message.replace(/\[generic_game_url\]/g, data.generic_game_url || 'https://totalfooty.co.uk/vibecoding/');
-    message = message.replace(/\[profile_url\]/g, data.profile_url || 'https://totalfooty.co.uk/vibecoding/');
-    
-    return message;
-}
-
-// Helper function to format game data for WhatsApp messages
-async function getGameDataForMessage(gameId) {
-    const gameResult = await pool.query(`
-        SELECT g.*, v.name as venue_name, g.game_url
-        FROM games g
-        LEFT JOIN venues v ON v.id = g.venue_id
-        WHERE g.id = $1
-    `, [gameId]);
-    
-    if (gameResult.rows.length === 0) return null;
-    
-    const game = gameResult.rows[0];
-    const gameDate = new Date(game.game_date);
-    
-    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-    const day = days[gameDate.getDay()];
-    
-    const hours = gameDate.getHours().toString().padStart(2, '0');
-    const minutes = gameDate.getMinutes().toString().padStart(2, '0');
-    const time = `${hours}:${minutes}`;
-    
-    const gameurl = `https://totalfooty.co.uk/vibecoding/game.html?url=${game.game_url}`;
-    
-    return {
-        day,
-        time,
-        venue: game.venue_name,
-        gameurl
-    };
-}
-
-// Send WhatsApp message via Twilio
-// ── EMAIL NOTIFICATION SENDER ────────────────────────────────────────────────
-// Replaces WhatsApp — sends branded HTML email via Gmail SMTP
-
-const EMAIL_SUBJECTS = {
-    signup:           '👋 Welcome to TotalFooty!',
-    game_registered:  '⚽ You\'re confirmed for football!',
-    backup_added:     '🤞 You\'re on the backup list',
-    backup_promoted:  '🎉 You\'re in — a spot opened up!',
-    dropout_confirmed:'✅ Dropout confirmed',
-    game_cancelled:   '❌ Game cancelled',
-    game_reminder:    '⏰ Game reminder — you\'re playing today!',
-    teams_created:    '📋 Teams are live!',
-    balance_updated:  '💰 Balance updated',
-    badge_awarded:    '🏅 New badge awarded!',
-    motm_voting_open: '🗳️ Vote for Man of the Match',
-    motm_winner:      '🏆 You won Man of the Match!',
-};
-
-function wrapEmailHtml(bodyHtml) {
-    return `
-    <div style="background:#0d0d0d;padding:40px 24px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
-        <div style="text-align:center;margin-bottom:32px">
-            <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="display:block;margin:0 auto 12px"/>
-            <p style="color:#555;font-size:11px;letter-spacing:2px;margin:0">COVENTRY FOOTBALL COMMUNITY</p>
-        </div>
-        <div style="background:#1a1a1a;border-radius:8px;padding:28px;border:1px solid #2a2a2a">
-            ${bodyHtml}
-        </div>
-        <p style="color:#333;font-size:11px;text-align:center;margin-top:24px;letter-spacing:1px">
-            TOTALFOOTY — <a href="https://totalfooty.co.uk" style="color:#555;text-decoration:none">totalfooty.co.uk</a>
-        </p>
-    </div>`;
-}
-
-async function sendEmail(playerEmail, playerName, notificationType, messageText) {
-    try {
-        // FIX-035: Escape player name to prevent HTML injection in emails
-        const safeName = (playerName || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        const subject = EMAIL_SUBJECTS[notificationType] || 'TotalFooty Notification';
-        // Convert plain text message to HTML (preserve line breaks, linkify URLs)
-        const htmlBody = messageText
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/\n/g, '<br>')
-            .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" style="color:#c0c0c0">$1</a>');
-
-        const html = wrapEmailHtml(`
-            <p style="color:#888;font-size:14px;margin:0 0 16px">Hi ${safeName},</p>
-            <p style="color:#ccc;font-size:15px;line-height:1.7;margin:0">${htmlBody}</p>
-        `);
-
-        await emailTransporter.sendMail({
-            from: '"TotalFooty" <totalfooty19@gmail.com>',
-            to: playerEmail,
-            subject,
-            html,
-        });
-
-        // Log to whatsapp_logs table (reusing existing table — same structure)
-        await pool.query(`
-            INSERT INTO whatsapp_logs (player_id, notification_type, phone_number, message_content, status)
-            VALUES (NULL, $1, $2, $3, 'sent')
-        `, [notificationType, playerEmail, messageText]).catch(() => {});
-
-        // FIX-050: Redact email address in server logs
-        const redacted = playerEmail.replace(/(.).+(@.+)/, '$1***$2');
-        console.log(`📧 Email [${notificationType}] → ${redacted}`);
-        return { success: true };
-    } catch (error) {
-        const redacted = playerEmail.replace(/(.).+(@.+)/, '$1***$2');
-        console.error(`📧 Email [${notificationType}] FAILED → ${redacted}:`, error.message);
-        await pool.query(`
-            INSERT INTO whatsapp_logs (player_id, notification_type, phone_number, message_content, status, error_message)
-            VALUES (NULL, $1, $2, $3, 'failed', $4)
-        `, [notificationType, playerEmail, messageText, error.message]).catch(() => {});
-        return { success: false, error: error.message };
-    }
-}
-
-// ==========================================
-// PUSH NOTIFICATION HELPERS (FCM)
-// ==========================================
-
-// Look up game date/time/venue for notification template variables
-async function getGameDataForNotification(gameId) {
-    try {
-        const result = await pool.query(`
-            SELECT g.game_date, g.game_url,
-                   v.name as venue_name
-            FROM games g
-            LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.id = $1
-        `, [gameId]);
-        if (result.rows.length === 0) return {};
-        const g = result.rows[0];
-        const date = new Date(g.game_date);
-        return {
-            day: date.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }),
-            time: date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
-            venue: g.venue_name || 'TBC',
-            gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${g.game_url}`
-        };
-    } catch (e) {
-        console.error('getGameDataForNotification error:', e.message);
-        return {};
-    }
-}
-
-// Push notification titles per type
-const PUSH_TITLES = {
-    signup:              '👋 Welcome to TotalFooty!',
-    game_registered:     '⚽ You\'re confirmed!',
-    backup_added:        '🤞 You\'re on the backup list',
-    backup_promoted:     '🎉 You\'re in — spot opened up!',
-    dropout_confirmed:   '✅ Dropout confirmed',
-    game_cancelled:      '❌ Game cancelled',
-    game_reminder:       '⏰ Game reminder',
-    teams_created:       '📋 You\'re on the team sheet!',
-    balance_updated:     '💰 Balance updated',
-    cost_changed:        '💰 Game cost updated',
-    badge_awarded:       '🏅 New badge awarded!',
-    motm_winner:         '🏆 Man of the Match!',
-    motm_voting_open:    '🗳️ Vote for MOTM',
-    new_dm:              '💬 New message',
-    account_reinstated:  '✅ Account reinstated',
-    account_suspended:   '⛔ Account suspended',
-    tier_upgraded:       '📈 Tier upgraded',
-    tier_changed:        '📉 Tier changed',
-};
-
-// Deep-link screen targets per notification type (used by the app)
-const PUSH_SCREENS = {
-    signup:              'Home',
-    game_registered:     'GameDetail',
-    backup_added:        'GameDetail',
-    backup_promoted:     'GameDetail',
-    dropout_confirmed:   'Games',
-    game_cancelled:      'Games',
-    game_reminder:       'GameDetail',
-    teams_created:       'GameDetail',
-    balance_updated:     'Profile',
-    cost_changed:        'Profile',
-    badge_awarded:       'Profile',
-    motm_winner:         'Completed',
-    motm_voting_open:    'Completed',
-    new_dm:              'Messages',
-    account_reinstated:  'Home',
-    account_suspended:   'Home',
-    tier_upgraded:       'Profile',
-    tier_changed:        'Profile',
-};
-
-// Send push notifications to all Expo tokens registered for a player.
-// Uses the Expo Push API — the only delivery method that works with
-// ExponentPushToken[...] tokens produced by getExpoPushTokenAsync() in the app.
-async function sendPushNotification(playerId, notificationType, bodyText, extraData = {}) {
-    try {
-        const tokenResult = await pool.query(
-            'SELECT fcm_token FROM fcm_tokens WHERE player_id = $1',
-            [playerId]
-        );
-        if (tokenResult.rows.length === 0) {
-            return { success: false, error: 'No push token registered for player' };
-        }
-
-        const title  = PUSH_TITLES[notificationType]  || 'TotalFooty';
-        const screen = PUSH_SCREENS[notificationType] || 'Home';
-
-        // Build one message object per token
-        const messages = tokenResult.rows.map(r => ({
-            to:    r.fcm_token,
-            sound: 'default',
-            title,
-            body:  bodyText,
-            data:  { notificationType, screen, ...extraData },
-        }));
-
-        const response = await fetch('https://exp.host/--/api/v2/push/send', {
-            method:  'POST',
-            headers: {
-                'Accept':       'application/json',
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(messages),
-        });
-
-        if (!response.ok) {
-            const errText = await response.text().catch(() => response.status);
-            console.error(`Expo push HTTP error for player ${playerId}:`, errText);
-            return { success: false, error: `Expo API returned ${response.status}` };
-        }
-
-        const result = await response.json();
-        const data   = result.data || [];
-
-        // Log per-token errors; remove tokens that are no longer valid
-        let sent = 0;
-        for (let i = 0; i < data.length; i++) {
-            const item  = data[i];
-            const token = messages[i]?.to;
-            if (item.status === 'ok') {
-                sent++;
-            } else {
-                const details = item.details || {};
-                // DeviceNotRegistered = token expired/revoked — safe to remove
-                if (details.error === 'DeviceNotRegistered' || details.error === 'InvalidCredentials') {
-                    await pool.query('DELETE FROM fcm_tokens WHERE fcm_token = $1', [token]).catch(() => {});
-                    console.log(`Removed stale Expo token for player ${playerId}`);
-                } else {
-                    console.warn(`Expo push error for player ${playerId}:`, details.error);
-                }
-            }
-        }
-
-        console.log(`Push [${notificationType}] player ${playerId}: ${sent}/${messages.length} sent`);
-        return { success: sent > 0, sent, total: messages.length };
-    } catch (error) {
-        console.error('sendPushNotification error:', error.message);
-        return { success: false, error: error.message };
-    }
-}
-// Send notification based on type
-async function sendNotification(notificationType, playerId, additionalData = {}) {
-    try {
-        // Get player data including email via users table
-        const playerResult = await pool.query(`
-            SELECT p.id, p.full_name, p.alias, p.phone, u.email, c.balance as credits
-            FROM players p
-            LEFT JOIN credits c ON c.player_id = p.id
-            LEFT JOIN users u ON u.id = p.user_id
-            WHERE p.id = $1
-        `, [playerId]);
-        
-        if (playerResult.rows.length === 0) {
-            return { success: false, error: 'Player not found' };
-        }
-        
-        const player = playerResult.rows[0];
-        const playerName = player.alias || player.full_name;
-        
-        // Get message template
-        const templateResult = await pool.query(`
-            SELECT message_template 
-            FROM whatsapp_templates 
-            WHERE notification_type = $1 AND is_active = TRUE
-        `, [notificationType]);
-        
-        if (templateResult.rows.length === 0) {
-            return { success: false, error: 'Message template not found' };
-        }
-        
-        const template = templateResult.rows[0].message_template;
-        
-        // Prepare data for placeholder replacement
-        const messageData = {
-            name: playerName,
-            balance: player.credits ? `£${parseFloat(player.credits).toFixed(2)}` : '£0.00',
-            generic_game_url: 'https://totalfooty.co.uk/vibecoding/',
-            profile_url: 'https://totalfooty.co.uk/vibecoding/',
-            ...additionalData
-        };
-        
-        // Replace placeholders
-        const message = replacePlaceholders(template, messageData);
-        
-        // Send email (if player has email)
-        let emailResult = { success: false, error: 'No email address' };
-        if (player.email) {
-            emailResult = await sendEmail(player.email, playerName, notificationType, message);
-        }
-
-        // Send push notification in parallel (non-critical)
-        const pushBodyText = message.replace(/\*/g, '').substring(0, 200);
-        sendPushNotification(playerId, notificationType, pushBodyText, additionalData).catch(e =>
-            console.error('Push (parallel) failed:', e.message)
-        );
-
-        return emailResult;
-        
-    } catch (error) {
-        console.error('Send notification error:', error);
-        return { success: false, error: error.message };
-    }
-}
-
-// ==========================================
-// DISCIPLINE SYSTEM
-// ==========================================
-
-// Add discipline points
-app.post('/api/admin/discipline', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { playerId, gameId, points, reason } = req.body;
-
-        // FIX-082/FIX-099: Validate required fields and points bounds
-        if (!playerId || !gameId) return res.status(400).json({ error: 'playerId and gameId are required' });
-        const pts = parseInt(points);
-        if (isNaN(pts) || pts < 1 || pts > 10) return res.status(400).json({ error: 'Points must be a whole number between 1 and 10' });
-        if (!reason?.trim()) return res.status(400).json({ error: 'Reason is required' });
-        
-        // Add discipline record
-        await pool.query(
-            `INSERT INTO discipline_records (player_id, game_id, points, reason, recorded_by)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [playerId, gameId, pts, reason.trim(), req.user.userId]
-        );
-        
-        // Explicitly recalculate tier after discipline record
-        try {
-            const tierResult = await pool.query(
-                'SELECT calculate_player_tier($1) as new_tier', [playerId]
-            );
-            const newTier = tierResult.rows[0]?.new_tier;
-            if (newTier) {
-                await pool.query(
-                    'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-                    [newTier, playerId]
-                );
-            }
-        } catch (tierError) {
-            console.error('Failed to recalculate tier:', tierError.message);
-        }
-
-        // SEC-029: Audit every discipline action
-        await auditLog(pool, req.user.playerId, 'discipline_added', playerId,
-            `game=${gameId} pts=${pts} reason="${reason.trim()}"`);
-        
-        res.json({ message: 'Discipline points added. Tier recalculated.' });
-    } catch (error) {
-        console.error('Add discipline error:', error);
-        res.status(500).json({ error: 'Failed to add discipline points' });
-    }
-});
-
-// Get player discipline history
-app.get('/api/players/:playerId/discipline', authenticateToken, async (req, res) => {
-    try {
-        const { playerId } = req.params;
-        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
-
-        // FIX-045: Players can only view their own discipline history
-        if (!isAdmin && playerId !== req.user.playerId) {
-            return res.status(403).json({ error: 'You can only view your own discipline history' });
-        }
-        
-        // Get last 10 games worth of discipline
-        const result = await pool.query(`
-            SELECT 
-                dr.id,
-                dr.points,
-                dr.reason,
-                dr.recorded_at,
-                g.game_date,
-                g.format,
-                v.name as venue_name,
-                admin.email as recorded_by_email
-            FROM discipline_records dr
-            JOIN games g ON g.id = dr.game_id
-            LEFT JOIN venues v ON v.id = g.venue_id
-            LEFT JOIN users admin ON admin.id = dr.recorded_by
-            WHERE dr.player_id = $1
-            ORDER BY g.game_date DESC
-            LIMIT 10
-        `, [playerId]);
-        
-        // Calculate current points
-        const pointsSum = result.rows.reduce((sum, r) => sum + (r.points || 0), 0);
-        
-        // Get current tier
-        const tierResult = await pool.query(
-            'SELECT reliability_tier FROM players WHERE id = $1',
-            [playerId]
-        );
-        
-        // FIX-045: Strip admin email from non-admin responses
-        const records = isAdmin ? result.rows : result.rows.map(r => {
-            const { recorded_by_email, ...safe } = r;
-            return safe;
-        });
-
-        res.json({
-            records,
-            totalPoints: pointsSum,
-            currentTier: tierResult.rows[0]?.reliability_tier || 'silver',
-            nextTierAt: getNextTierThreshold(pointsSum)
-        });
-    } catch (error) {
-        console.error('Get discipline error:', error);
-        res.status(500).json({ error: 'Failed to fetch discipline history' });
-    }
-});
-
-// Helper function
-function getNextTierThreshold(currentPoints) {
-    if (currentPoints <= 1) return { points: 2, tier: 'silver', direction: 'down' };
-    if (currentPoints <= 3) return { points: 1, tier: 'gold', direction: 'up' };
-    if (currentPoints <= 6) return { points: 3, tier: 'silver', direction: 'up' };
-    if (currentPoints <= 11) return { points: 6, tier: 'bronze', direction: 'up' };
-    return { points: 11, tier: 'white', direction: 'up' };
-}
-
-// Recalculate all player tiers (admin utility)
-app.post('/api/admin/recalculate-tiers', authenticateToken, requireSuperAdmin, async (req, res) => {
-    try {
-        // FIX-020: Single query instead of N+1 loop
-        const result = await pool.query('UPDATE players SET reliability_tier = calculate_player_tier(id)');
-        res.json({ message: `Recalculated tiers for ${result.rowCount} players` });
-    } catch (error) {
-        console.error('Recalculate tiers error:', error);
-        res.status(500).json({ error: 'Failed to recalculate tiers' });
-    }
-});
-
-// Continuing in next message due to length...
-
-// ==========================================
-// ==========================================
-// VENUES
-// ==========================================
-
-app.get('/api/venues', authenticateToken, async (req, res) => {
-    try {
-        const result = await pool.query('SELECT DISTINCT ON (name) id, name, address, postcode FROM venues ORDER BY name, id');
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Error fetching venues:', error);
-        res.status(500).json({ error: 'Failed to fetch venues' });
-    }
-});
-
-// GAMES
+// GAMES API
 // ==========================================
 
 app.get('/api/games', authenticateToken, async (req, res) => {
@@ -2403,6 +1913,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
@@ -2471,6 +1982,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
@@ -2574,6 +2086,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
@@ -2751,6 +2264,16 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
 // Get players registered for a specific game
 app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
     try {
+        // Check if this is a draft_memory game so we can join fixed_team data
+        const gameInfo = await pool.query(
+            'SELECT team_selection_type, series_id FROM games WHERE id = $1',
+            [req.params.id]
+        );
+        const isDraftMemory = gameInfo.rows.length > 0 &&
+            gameInfo.rows[0].team_selection_type === 'draft_memory' &&
+            gameInfo.rows[0].series_id;
+        const seriesId = isDraftMemory ? gameInfo.rows[0].series_id : null;
+
         const result = await pool.query(`
             SELECT 
                 p.id as player_id,
@@ -2764,6 +2287,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 r.position_preference as position_preference,
                 r.tournament_team_preference,
                 t.team_name,
+                ${isDraftMemory ? 'pft.fixed_team' : 'NULL::text AS fixed_team'},
                 array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
             FROM registrations r
@@ -2771,13 +2295,18 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             LEFT JOIN team_players tp ON tp.player_id = p.id
                 AND tp.team_id IN (SELECT id FROM teams WHERE game_id = $1)
             LEFT JOIN teams t ON t.id = tp.team_id
+            ${isDraftMemory ? `LEFT JOIN player_fixed_teams pft ON pft.player_id = p.id AND pft.series_id = $2` : ''}
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status IN ('confirmed', 'backup')
             GROUP BY p.id, p.full_name, p.alias, p.squad_number, r.status, r.backup_type,
                      r.position_preference, r.tournament_team_preference, t.team_name
-            ORDER BY CASE r.status WHEN 'confirmed' THEN 1 WHEN 'backup' THEN 2 ELSE 3 END, p.squad_number NULLS LAST, p.alias
-        `, [req.params.id]);
+                     ${isDraftMemory ? ', pft.fixed_team' : ''}
+            ORDER BY 
+                CASE r.status WHEN 'confirmed' THEN 1 WHEN 'backup' THEN 2 ELSE 3 END,
+                ${isDraftMemory ? "CASE pft.fixed_team WHEN 'red' THEN 0 WHEN 'blue' THEN 2 ELSE 1 END," : ''}
+                p.squad_number NULLS LAST, p.alias
+        `, isDraftMemory ? [req.params.id, seriesId] : [req.params.id]);
         
         // FIX-070: Strip pair/avoid preferences for non-admins — sensitive interpersonal data
         const isAdminReq = req.user.role === 'admin' || req.user.role === 'superadmin';
@@ -2954,7 +2483,7 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
                     [req.user.playerId]
                 );
                 
-                if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < parseFloat(game.cost_per_player)) {
+                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                 }
@@ -2979,7 +2508,7 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
                 [req.user.playerId]
             );
             
-            if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < parseFloat(game.cost_per_player)) {
+            if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
@@ -3525,7 +3054,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
             // Also try normal_backup if no confirmed_backup found — but check credits first (FIX-064)
             if (!promotedPlayer) {
                 const normalBackups = await client.query(`
-                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias, p.reliability_tier
+                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'normal_backup'
@@ -3535,8 +3064,6 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
                 for (const candidate of normalBackups.rows) {
                     const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
                     if (isGK && currentGKs >= maxGKSlots) continue;
-                    // SEC-020: Skip suspended players (white/black tier) from backup promotion
-                    if (['white', 'black'].includes(candidate.reliability_tier)) continue;
                     // FIX-064: Check balance before promoting — skip if insufficient
                     const backupCredit = await client.query('SELECT balance FROM credits WHERE player_id = $1', [candidate.player_id]);
                     const backupBalance = parseFloat(backupCredit.rows[0]?.balance || 0);
@@ -4197,6 +3724,15 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
                 await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']);
             }
         }
+        await client.query('DELETE FROM motm_votes WHERE game_id = $1', [gameId]);
+        await client.query('DELETE FROM motm_nominees WHERE game_id = $1', [gameId]);
+        await client.query('DELETE FROM tournament_results WHERE game_id = $1', [gameId]);
+        await client.query('DELETE FROM game_messages WHERE game_id = $1', [gameId]);
+        await client.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)', [gameId]);
+        await client.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+        await client.query('DELETE FROM game_guests WHERE game_id = $1', [gameId]);
+        await client.query('DELETE FROM registrations WHERE game_id = $1', [gameId]);
+        await client.query('UPDATE discipline_records SET game_id = NULL WHERE game_id = $1', [gameId]);
         await client.query('DELETE FROM games WHERE id = $1', [gameId]);
         await client.query('COMMIT');
         res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
@@ -4313,7 +3849,18 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
             }
         }
         
-        // Delete only FUTURE games in series (cascade handles registrations + game_guests)
+        // Delete only FUTURE games in series — explicit deletes to avoid FK constraint failures
+        for (const gid of gameIds) {
+            await client.query('DELETE FROM motm_votes WHERE game_id = $1', [gid]);
+            await client.query('DELETE FROM motm_nominees WHERE game_id = $1', [gid]);
+            await client.query('DELETE FROM tournament_results WHERE game_id = $1', [gid]);
+            await client.query('DELETE FROM game_messages WHERE game_id = $1', [gid]);
+            await client.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)', [gid]);
+            await client.query('DELETE FROM teams WHERE game_id = $1', [gid]);
+            await client.query('DELETE FROM game_guests WHERE game_id = $1', [gid]);
+            await client.query('DELETE FROM registrations WHERE game_id = $1', [gid]);
+            await client.query('UPDATE discipline_records SET game_id = NULL WHERE game_id = $1', [gid]);
+        }
         await client.query(
             'DELETE FROM games WHERE id = ANY($1::uuid[])',
             [gameIds]
@@ -4333,11 +3880,11 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
     }
 });
 
-// Update game settings (venue, max players, price)
+// Update game settings (venue, max players, price, tournament team count)
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -4375,7 +3922,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
             });
         }
         
-        // Update the game (include game_date if provided)
+        // Update the game (include game_date if provided, tournament_team_count if provided)
         if (game_date) {
             await pool.query(`
                 UPDATE games 
@@ -4383,18 +3930,20 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     venue_id = $2, 
                     max_players = $3, 
                     cost_per_player = $4,
-                    star_rating = $5
-                WHERE id = $6
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, gameId]);
+                    star_rating = $5,
+                    tournament_team_count = COALESCE($6, tournament_team_count)
+                WHERE id = $7
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, gameId]);
         } else {
             await pool.query(`
                 UPDATE games 
                 SET venue_id = $1, 
                     max_players = $2, 
                     cost_per_player = $3,
-                    star_rating = $4
-                WHERE id = $5
-            `, [venue_id, max_players, cost_per_player, star_rating || null, gameId]);
+                    star_rating = $4,
+                    tournament_team_count = COALESCE($5, tournament_team_count)
+                WHERE id = $6
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, gameId]);
         }
 
         // FIX-098: Notify confirmed players if cost changed
@@ -4419,12 +3968,78 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
         
         res.json({ 
             message: 'Game settings updated successfully',
-            updated: { game_date, venue_id, max_players, cost_per_player, star_rating }
+            updated: { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count }
         });
         
     } catch (error) {
         console.error('Update game settings error:', error);
         res.status(500).json({ error: 'Failed to update game settings' });
+    }
+});
+
+// Update ALL future games in a weekly series (venue, players, cost, star rating, time)
+app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCLMAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { gameId } = req.params;
+        const { venue_id, max_players, cost_per_player, star_rating, new_time } = req.body;
+
+        if (!venue_id || !max_players || cost_per_player === undefined) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+
+        const gameResult = await client.query('SELECT series_id FROM games WHERE id = $1', [gameId]);
+        if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const seriesId = gameResult.rows[0].series_id;
+        if (!seriesId) return res.status(400).json({ error: 'This game is not part of a series' });
+
+        // Get all future games in the series
+        const futureGames = await client.query(
+            'SELECT id, game_date FROM games WHERE series_id = $1 AND game_date > NOW() ORDER BY game_date',
+            [seriesId]
+        );
+
+        if (futureGames.rows.length === 0) {
+            return res.json({ message: 'No future games found in this series', updated: 0 });
+        }
+
+        await client.query('BEGIN');
+
+        for (const g of futureGames.rows) {
+            if (new_time) {
+                // Apply new wall-clock time to each game's date, using London timezone
+                const [hours, minutes] = new_time.split(':').map(Number);
+                const gameDate = new Date(g.game_date);
+                // Build a London-local datetime string and convert to UTC
+                const londonDateStr = gameDate.toLocaleDateString('en-GB', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' });
+                const [day, month, year] = londonDateStr.split('/');
+                const paddedH = String(hours).padStart(2, '0');
+                const paddedM = String(minutes).padStart(2, '0');
+                const londonLocal = `${year}-${month}-${day}T${paddedH}:${paddedM}:00`;
+                const offset = new Date(new Date(londonLocal).toLocaleString('en-US', { timeZone: 'Europe/London' })) - new Date(londonLocal);
+                const utcDate = new Date(new Date(londonLocal).getTime() - offset);
+
+                await client.query(
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, game_date=$5 WHERE id=$6',
+                    [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), g.id]
+                );
+            } else {
+                await client.query(
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4 WHERE id=$5',
+                    [venue_id, max_players, cost_per_player, star_rating || null, g.id]
+                );
+            }
+        }
+
+        await client.query('COMMIT');
+        res.json({ message: `Updated ${futureGames.rows.length} future games in series`, updated: futureGames.rows.length });
+
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Series settings update error:', error);
+        res.status(500).json({ error: 'Failed to update series settings' });
+    } finally {
+        client.release();
     }
 });
 
@@ -5622,6 +5237,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.team_selection_type, g.external_opponent, g.tf_kit_color, g.opp_kit_color,
                    g.winning_team, g.motm_voting_ends, g.motm_winner_id, g.tournament_name,
                    g.tournament_team_count, g.tournament_results_finalised, g.series_id,
+                   g.regularity,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
             FROM games g
@@ -5645,6 +5261,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/powerleague.jpg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
         };
@@ -5692,12 +5309,98 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             tournament_name: game.tournament_name,
             tournament_team_count: game.tournament_team_count,
             tournament_results_finalised: game.tournament_results_finalised,
+            series_id: game.series_id || null,
+            regularity: game.regularity || null,
             seriesScoreline
         });
         
     } catch (error) {
         console.error('Get public game details error:', error);
         res.status(500).json({ error: 'Failed to get game details' });
+    }
+});
+
+// ── GET /api/public/game/:gameUrl/series ─────────────────────────────────────
+// Returns all games in the same series, ordered by date, with prev/next/position
+app.get('/api/public/game/:gameUrl/series', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+
+        // Get the current game's series_id
+        const gameResult = await pool.query(
+            'SELECT id, series_id, game_date FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const { id: gameId, series_id } = gameResult.rows[0];
+
+        if (!series_id) return res.json({ series: null });
+
+        // Get all games in the series ordered by date
+        const seriesResult = await pool.query(`
+            SELECT g.id, g.game_url, g.game_date, g.game_status, g.max_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+            FROM games g
+            WHERE g.series_id = $1
+            ORDER BY g.game_date ASC
+        `, [series_id]);
+
+        const games = seriesResult.rows;
+        const currentIndex = games.findIndex(g => g.id === gameId);
+        if (currentIndex === -1) return res.json({ series: null });
+
+        const prev = currentIndex > 0 ? games[currentIndex - 1] : null;
+        const next = currentIndex < games.length - 1 ? games[currentIndex + 1] : null;
+
+        res.json({
+            series: {
+                games,
+                currentIndex,
+                prev: prev ? { game_url: prev.game_url, game_date: prev.game_date, game_status: prev.game_status } : null,
+                next: next ? { game_url: next.game_url, game_date: next.game_date, game_status: next.game_status } : null,
+                total: games.length
+            }
+        });
+    } catch (error) {
+        console.error('Series nav error:', error);
+        res.status(500).json({ error: 'Failed to load series' });
+    }
+});
+
+// ── GET /api/public/game/:gameUrl/next ────────────────────────────────────────
+// Returns the next upcoming game in the same series (for CTA "Sign up for next week")
+app.get('/api/public/game/:gameUrl/next', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+
+        // Get current game's series_id and date
+        const gameResult = await pool.query(
+            'SELECT series_id, game_date FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const { series_id, game_date } = gameResult.rows[0];
+
+        if (!series_id) return res.json({ next: null });
+
+        // Find the next game in series that is in the future and not cancelled
+        const nextResult = await pool.query(`
+            SELECT g.game_url, g.game_date, g.max_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+            FROM games g
+            WHERE g.series_id = $1
+              AND g.game_date > $2
+              AND g.game_status != 'cancelled'
+            ORDER BY g.game_date ASC
+            LIMIT 1
+        `, [series_id, game_date]);
+
+        res.json({ next: nextResult.rows.length > 0 ? nextResult.rows[0] : null });
+    } catch (error) {
+        console.error('Next game error:', error);
+        res.status(500).json({ error: 'Failed to load next game' });
     }
 });
 
@@ -5734,13 +5437,16 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
                 p.alias,
                 p.squad_number,
                 p.photo_url,
-                -- SEC-024: motm_wins, total_appearances, total_wins omitted — require auth to access
+                p.motm_wins,
+                p.total_appearances,
+                p.total_wins,
                 COUNT(v.id) as vote_count
             FROM motm_nominees mn
             JOIN players p ON p.id = mn.player_id
             LEFT JOIN motm_votes v ON v.voted_for_id = mn.player_id AND v.game_id = mn.game_id
             WHERE mn.game_id = $1
-            GROUP BY p.id, p.full_name, p.alias, p.squad_number, p.photo_url
+            GROUP BY p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                     p.motm_wins, p.total_appearances, p.total_wins
             ORDER BY vote_count DESC
         `, [game.id]);
 
@@ -5750,21 +5456,15 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
         const votingOpen  = votingEnds > new Date();
         const isFinalized = !!game.motm_winner_id;
 
-        // SEC-023: Hide individual vote counts while voting is open — prevents strategic last-minute voting
-        const nominees = nomineesResult.rows.map(n => ({
-            ...n,
-            vote_count: votingOpen ? undefined : n.vote_count,
-        }));
-
         // If finalized, include full winner profile
         let winner = null;
         if (isFinalized) {
-            winner = nominees.find(n => n.player_id === game.motm_winner_id)
-                  || nominees[0] || null;
+            winner = nomineesResult.rows.find(n => n.player_id === game.motm_winner_id)
+                  || nomineesResult.rows[0] || null;
         }
 
         res.json({
-            nominees,
+            nominees:    nomineesResult.rows,
             votingEnds:  game.motm_voting_ends,
             votingOpen,
             isFinalized,
@@ -5888,24 +5588,22 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
 });
 
 // Get player profile (public)
-// SEC-034: Public player profile — SELECT * replaced with explicit column list, sensitive fields omitted
 app.get('/api/public/player/:playerId', async (req, res) => {
     try {
         const { playerId } = req.params;
         
-        // Restrict to public-safe columns only (no phone, email, reliability_tier internals, etc.)
-        const cols = `id, alias, full_name, squad_number, photo_url, reliability_tier,
-                      total_appearances, total_wins, motm_wins, position`;
-
+        // Get player by ID or squad number
         let playerResult;
         if (isNaN(playerId)) {
+            // UUID
             playerResult = await pool.query(
-                `SELECT ${cols} FROM players WHERE id = $1`,
+                'SELECT * FROM players WHERE id = $1',
                 [playerId]
             );
         } else {
+            // Squad number
             playerResult = await pool.query(
-                `SELECT ${cols} FROM players WHERE squad_number = $1`,
+                'SELECT * FROM players WHERE squad_number = $1',
                 [parseInt(playerId)]
             );
         }
@@ -5925,9 +5623,12 @@ app.get('/api/public/player/:playerId', async (req, res) => {
             ORDER BY b.name
         `, [player.id]);
         
+        // Calculate win ratio
         const appearances = player.total_appearances || 0;
         const wins = player.total_wins || 0;
         const winRatio = appearances > 0 ? ((wins / appearances) * 100).toFixed(1) : '0.0';
+        
+        // Calculate MOTM ratio
         const motmWins = parseFloat(player.motm_wins || 0);
         const motmRatio = appearances > 0 ? ((motmWins / appearances) * 100).toFixed(1) : '0.0';
         
@@ -5942,8 +5643,7 @@ app.get('/api/public/player/:playerId', async (req, res) => {
                 total_wins: wins,
                 motm_wins: motmWins,
                 win_ratio: winRatio,
-                motm_ratio: motmRatio,
-                position: player.position,
+                motm_ratio: motmRatio
             },
             badges: badgesResult.rows
         });
@@ -5963,18 +5663,13 @@ app.post('/api/admin/games/:gameId/lock', authenticateToken, requireCLMAdmin, as
     try {
         const { gameId } = req.params;
         
-        // FIX-041: Atomic acquire — SEC-021: auto-release stale locks older than 30 minutes
+        // FIX-041: Atomic acquire — single UPDATE avoids check-then-act race condition
         const result = await pool.query(`
             UPDATE games
             SET player_editing_locked = TRUE,
                 locked_by = $1,
                 locked_at = NOW()
-            WHERE id = $2
-              AND (
-                player_editing_locked = FALSE
-                OR locked_by = $1
-                OR locked_at < NOW() - INTERVAL '30 minutes'
-              )
+            WHERE id = $2 AND (player_editing_locked = FALSE OR locked_by = $1)
             RETURNING id`,
             [req.user.playerId, gameId]
         );
@@ -6593,10 +6288,52 @@ app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
     }
 });
 
-// Public: Validate a referral code (for registration page)
+});
+
+// #15: Player top-up request — emails admin and logs the request
+app.post('/api/players/me/topup-request', authenticateToken, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        const playerId = req.user.playerId;
+        const playerResult = await pool.query(
+            'SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+            [playerId]
+        );
+        if (playerResult.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+        const player = playerResult.rows[0];
+        const displayName = player.alias || player.full_name;
+        const amountStr = amount ? `£${parseFloat(amount).toFixed(2)}` : 'Amount not specified';
+
+        setImmediate(async () => {
+            try {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to: 'totalfooty19@gmail.com',
+                    subject: `💰 Top-Up Request — ${displayName}`,
+                    html: wrapEmailHtml(`
+                        <p style="color:#888;font-size:14px;margin:0 0 16px">Player has requested a credit top-up</p>
+                        <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
+                            <tr><td style="padding:6px 0;color:#888;width:120px;">Player</td><td style="font-weight:900;">${displayName}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Email</td><td>${player.email}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Player ID</td><td style="font-family:monospace;">${playerId}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Requested</td><td style="font-weight:900;color:#00cc66;">${amountStr}</td></tr>
+                        </table>
+                        <p style="color:#888;font-size:13px;margin-top:16px;">Once you receive their bank transfer, use the admin panel to add the credits.</p>
+                    `)
+                });
+            } catch (e) {
+                console.error('Top-up request email failed (non-critical):', e.message);
+            }
+        });
+
+        res.json({ message: 'Top-up request submitted. Admin will be in touch.' });
+    } catch (error) {
+        console.error('Top-up request error:', error);
+        res.status(500).json({ error: 'Failed to submit top-up request' });
+    }
+});
 // FIX-095: Rate limit to prevent code enumeration (20 req / 10 min per IP)
-// SEC-033: Referral code validation — tightened from 20/10min to 5/hr to prevent brute-force enumeration
-const referralCodeLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many referral attempts. Please try again later.' } });
+const referralCodeLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, standardHeaders: true, message: { error: 'Too many requests, please try again later' } });
 app.get('/api/public/referral/:code', referralCodeLimiter, async (req, res) => {
     try {
         const { code } = req.params;
@@ -6604,8 +6341,9 @@ app.get('/api/public/referral/:code', referralCodeLimiter, async (req, res) => {
         // Look up in players table first, then referrals
         let referrer = null;
         const pRef = await pool.query(
-            // SEC-018: Badge membership (CLM, Misfits) removed from public response — prevents group enumeration
-            `SELECT p.id, p.alias, p.full_name
+            `SELECT p.id, p.alias, p.full_name,
+             EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm,
+             EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'Misfits') as has_misfits
              FROM players p WHERE p.referral_code = $1`,
             [code.toUpperCase()]
         );
@@ -6614,7 +6352,9 @@ app.get('/api/public/referral/:code', referralCodeLimiter, async (req, res) => {
             referrer = pRef.rows[0];
         } else {
             const rRef = await pool.query(
-                `SELECT p.id, p.alias, p.full_name
+                `SELECT p.id, p.alias, p.full_name,
+                 EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm,
+                 EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'Misfits') as has_misfits
                  FROM referrals r JOIN players p ON r.referrer_id = p.id WHERE r.referral_code = $1`,
                 [code.toUpperCase()]
             );
@@ -6628,7 +6368,18 @@ app.get('/api/public/referral/:code', referralCodeLimiter, async (req, res) => {
         res.json({
             valid: true,
             referrerName: referrer.alias || referrer.full_name,
-            message: `You have been referred by ${referrer.alias || referrer.full_name}! Welcome to Total Footy.`
+            hasCLM: referrer.has_clm,
+            hasMisfits: referrer.has_misfits,
+            message: (() => {
+                const badges = [];
+                if (referrer.has_clm) badges.push('CLM');
+                if (referrer.has_misfits) badges.push('Misfits');
+                const name = referrer.alias || referrer.full_name;
+                if (badges.length > 0) {
+                    return `You have been referred by ${name}! You will receive ${badges.join(' + ')} access upon registration.`;
+                }
+                return `You have been referred by ${name}! Welcome to Total Footy.`;
+            })()
         });
     } catch (error) {
         console.error('Validate referral error:', error);
@@ -6831,22 +6582,6 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
              FROM players p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
             [playerId]
         );
-
-        // SEC-031: Bump token_version on role change — forces re-login, invalidates stale JWTs
-        await pool.query(
-            `UPDATE users SET token_version = COALESCE(token_version, 0) + 1
-             WHERE id = (SELECT user_id FROM players WHERE id = $1)`,
-            [playerId]
-        );
-
-        // SEC-032: Audit role change
-        const detail = [
-            role !== undefined ? `role=${role}` : null,
-            is_clm_admin !== undefined ? `clm_admin=${is_clm_admin}` : null,
-            is_organiser !== undefined ? `organiser=${is_organiser}` : null,
-        ].filter(Boolean).join(' ');
-        await auditLog(pool, req.user.playerId, 'role_change', playerId, detail);
-
         res.json({ message: 'Role flags updated', player: updated.rows[0] });
     } catch (error) {
         console.error('Update role flags error:', error);
@@ -6862,136 +6597,7 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
 // WHATSAPP ADMIN ENDPOINTS
 // ==========================================
 
-// Get all message templates
-app.get('/api/admin/whatsapp/templates', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT * FROM whatsapp_templates 
-            ORDER BY notification_type
-        `);
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Get templates error:', error);
-        res.status(500).json({ error: 'Failed to get templates' });
-    }
-});
 
-// Update message template
-app.put('/api/admin/whatsapp/templates/:notificationType', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { notificationType } = req.params;
-        const { message_template, trigger_description, is_active } = req.body;
-
-        if (!message_template || typeof message_template !== 'string') {
-            return res.status(400).json({ error: 'message_template is required' });
-        }
-        if (message_template.length > 2000) {
-            return res.status(400).json({ error: 'Template too long (max 2000 chars)' });
-        }
-
-        // SEC-041: Block HTML/script tags in templates — these are plain-text messages, not HTML
-        if (/<[a-zA-Z]/.test(message_template)) {
-            return res.status(400).json({ error: 'Templates must be plain text — HTML tags are not allowed' });
-        }
-
-        // SEC-042: Only allow recognised placeholders — unknown ones could be used to probe internal data
-        const ALLOWED_PLACEHOLDERS = ['[Name]', '[Day]', '[Time]', '[Venue]', '[gameurl]',
-                                      '[Balance]', '[generic_game_url]', '[profile_url]'];
-        const usedPlaceholders = message_template.match(/\[[^\]]+\]/g) || [];
-        const invalid = usedPlaceholders.filter(p => !ALLOWED_PLACEHOLDERS.includes(p));
-        if (invalid.length > 0) {
-            return res.status(400).json({ error: `Unknown placeholder(s): ${invalid.join(', ')}` });
-        }
-        
-        await pool.query(`
-            UPDATE whatsapp_templates 
-            SET message_template = $1, 
-                trigger_description = $2,
-                is_active = $3,
-                updated_at = NOW()
-            WHERE notification_type = $4
-        `, [message_template, trigger_description, is_active, notificationType]);
-        
-        res.json({ message: 'Template updated successfully' });
-    } catch (error) {
-        console.error('Update template error:', error);
-        res.status(500).json({ error: 'Failed to update template' });
-    }
-});
-
-// Send test email
-app.post('/api/admin/whatsapp/test', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { message } = req.body;
-        // FIX-039: Only send to the requesting admin's own email — prevents phishing abuse
-        const adminResult = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
-        const adminEmail = adminResult.rows[0]?.email;
-        if (!adminEmail) return res.status(400).json({ error: 'Cannot determine your email address' });
-        const result = await sendEmail(adminEmail, 'Test', 'game_reminder', message);
-        if (result.success) {
-            res.json({ message: 'Test email sent successfully' });
-        } else {
-            res.status(500).json({ error: result.error });
-        }
-    } catch (error) {
-        console.error('Send test email error:', error);
-        res.status(500).json({ error: 'Failed to send test email' });
-    }
-});
-
-// Send notification to player
-app.post('/api/admin/whatsapp/send', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { playerId, notificationType, additionalData } = req.body;
-        
-        // SEC-019: Whitelist permitted notification types — prevents arbitrary message injection
-        const ALLOWED_NOTIFICATION_TYPES = [
-            'game_registered', 'backup_added', 'backup_promoted', 'dropout_confirmed',
-            'game_cancelled', 'game_reminder', 'teams_created', 'balance_updated',
-            'badge_awarded', 'motm_voting_open', 'motm_winner', 'cost_changed',
-            'account_reinstated', 'account_suspended', 'tier_upgraded', 'tier_changed'
-        ];
-        if (!ALLOWED_NOTIFICATION_TYPES.includes(notificationType)) {
-            return res.status(400).json({ error: 'Invalid notification type' });
-        }
-        
-        const result = await sendNotification(notificationType, playerId, additionalData);
-        
-        if (result.success) {
-            res.json({ message: 'Notification sent successfully' });
-        } else {
-            res.status(500).json({ error: result.error });
-        }
-    } catch (error) {
-        console.error('Send notification error:', error);
-        res.status(500).json({ error: 'Failed to send notification' });
-    }
-});
-
-// Get WhatsApp logs
-app.get('/api/admin/whatsapp/logs', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        // FIX-044: Parse and cap limit/offset
-        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-        const offset = Math.max(parseInt(req.query.offset) || 0, 0);
-        
-        const result = await pool.query(`
-            SELECT 
-                wl.*,
-                p.full_name,
-                p.alias
-            FROM whatsapp_logs wl
-            LEFT JOIN players p ON p.id = wl.player_id
-            ORDER BY wl.created_at DESC
-            LIMIT $1 OFFSET $2
-        `, [limit, offset]);
-        
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Get WhatsApp logs error:', error);
-        res.status(500).json({ error: 'Failed to get logs' });
-    }
-});
 
 // ==========================================
 // TOURNAMENT SYSTEM
@@ -7568,6 +7174,45 @@ app.post('/api/players/me/notifications/mark-read', authenticateToken, async (re
 
 // ── ADMIN: UNBAN PLAYER ───────────────────────────────────────────────────────
 
+// POST /api/admin/players/:id/discipline — manually add discipline points (admin only)
+// Points number only — no reason required. Recalculates tier immediately.
+app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { points } = req.body;
+
+    const pts = parseInt(points);
+    if (!pts || pts < 1 || pts > 20) {
+        return res.status(400).json({ error: 'Points must be between 1 and 20' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Insert manual record (game_id NULL = manual admin entry)
+        await client.query(`
+            INSERT INTO discipline_records (player_id, game_id, points, offense_type, recorded_by)
+            VALUES ($1, NULL, $2, 'Manual (admin)', $3)
+        `, [id, pts, req.user.playerId]);
+
+        // Immediately recalculate tier
+        const tierResult = await client.query(
+            'SELECT calculate_player_tier($1) AS new_tier', [id]
+        );
+        const newTier = tierResult.rows[0]?.new_tier || 'silver';
+        await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, id]);
+
+        await client.query('COMMIT');
+        res.json({ success: true, newTier, pointsAdded: pts });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Add discipline points error:', error);
+        res.status(500).json({ error: 'Failed to add discipline points' });
+    } finally {
+        client.release();
+    }
+});
+
 // POST /api/admin/players/:id/unban — superadmin only, clears discipline and adds 1 warning point
 app.post('/api/admin/players/:id/unban', authenticateToken, requireAdmin, async (req, res) => {
     const { id } = req.params;
@@ -8142,7 +7787,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
             );
 
             // Send email
-            const resetLink = `https://totalfooty.co.uk/reset-password.html?token=${token}`;
+            const resetLink = `https://totalfooty.co.uk/vibecoding/reset-password.html?token=${token}`;
             await emailTransporter.sendMail({
                 from: '"TotalFooty" <totalfooty19@gmail.com>',
                 to: email.trim(),
