@@ -19,6 +19,21 @@ const emailTransporter = nodemailer.createTransport({
     },
 });
 
+// Email wrapper — consistent TotalFooty branded shell for all admin notification emails
+function wrapEmailHtml(bodyContent) {
+    return `
+        <div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:560px;margin:0 auto;border-radius:8px;">
+            <img src="https://totalfooty.co.uk/assets/logo.png" width="70" style="margin-bottom:20px;display:block;"/>
+            <div style="border-top:2px solid #333;padding-top:24px;">
+                ${bodyContent}
+            </div>
+            <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;border-top:1px solid #222;padding-top:16px;">
+                TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY
+            </p>
+        </div>
+    `;
+}
+
 
 
 // Push notifications are sent via the Expo Push API (https://exp.host/--/api/v2/push/send).
@@ -193,8 +208,8 @@ const fairnessLimiter = rateLimit({
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    // SEC-011: rejectUnauthorized true enforces valid server cert — prevents MITM on DB connection
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false,
+    // SEC-011: rejectUnauthorized false required for Render's self-signed DB certs
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
     max: 10,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
@@ -6288,8 +6303,6 @@ app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
     }
 });
 
-});
-
 // #15: Player top-up request — emails admin and logs the request
 app.post('/api/players/me/topup-request', authenticateToken, async (req, res) => {
     try {
@@ -6304,26 +6317,25 @@ app.post('/api/players/me/topup-request', authenticateToken, async (req, res) =>
         const displayName = player.alias || player.full_name;
         const amountStr = amount ? `£${parseFloat(amount).toFixed(2)}` : 'Amount not specified';
 
-        setImmediate(async () => {
-            try {
-                await emailTransporter.sendMail({
-                    from: '"TotalFooty" <totalfooty19@gmail.com>',
-                    to: 'totalfooty19@gmail.com',
-                    subject: `💰 Top-Up Request — ${displayName}`,
-                    html: wrapEmailHtml(`
-                        <p style="color:#888;font-size:14px;margin:0 0 16px">Player has requested a credit top-up</p>
-                        <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
-                            <tr><td style="padding:6px 0;color:#888;width:120px;">Player</td><td style="font-weight:900;">${displayName}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Email</td><td>${player.email}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Player ID</td><td style="font-family:monospace;">${playerId}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Requested</td><td style="font-weight:900;color:#00cc66;">${amountStr}</td></tr>
-                        </table>
-                        <p style="color:#888;font-size:13px;margin-top:16px;">Once you receive their bank transfer, use the admin panel to add the credits.</p>
-                    `)
-                });
-            } catch (e) {
-                console.error('Top-up request email failed (non-critical):', e.message);
-            }
+        emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to: 'totalfooty19@gmail.com',
+            subject: `💰 Top-Up Request — ${displayName}`,
+            html: wrapEmailHtml(`
+                <p style="color:#888;font-size:14px;margin:0 0 16px">Player has requested a credit top-up</p>
+                <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
+                    <tr><td style="padding:6px 0;color:#888;width:120px;">Player</td><td style="font-weight:900;">${displayName}</td></tr>
+                    <tr><td style="padding:6px 0;color:#888;">Email</td><td>${player.email}</td></tr>
+                    <tr><td style="padding:6px 0;color:#888;">Player ID</td><td style="font-family:monospace;">${playerId}</td></tr>
+                    <tr><td style="padding:6px 0;color:#888;">Requested</td><td style="font-weight:900;color:#00cc66;">${amountStr}</td></tr>
+                </table>
+                <p style="color:#888;font-size:13px;margin-top:16px;">Once you receive their bank transfer, use the admin panel to add the credits.</p>
+            `)
+        }).then(() => {
+            console.log(`Top-up request email sent for player ${playerId} (${displayName})`);
+        }).catch(e => {
+            console.error('Top-up request email FAILED:', e.message);
+            console.error('Check: GMAIL_APP_PASSWORD env var set correctly on Render?');
         });
 
         res.json({ message: 'Top-up request submitted. Admin will be in touch.' });
