@@ -6659,8 +6659,6 @@ app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
     }
 });
 
-});
-
 // #15: Player top-up request — emails admin and logs the request
 app.post('/api/players/me/topup-request', authenticateToken, async (req, res) => {
     try {
