@@ -19,21 +19,6 @@ const emailTransporter = nodemailer.createTransport({
     },
 });
 
-// Email wrapper — consistent TotalFooty branded shell for all admin notification emails
-function wrapEmailHtml(bodyContent) {
-    return `
-        <div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:560px;margin:0 auto;border-radius:8px;">
-            <img src="https://totalfooty.co.uk/assets/logo.png" width="70" style="margin-bottom:20px;display:block;"/>
-            <div style="border-top:2px solid #333;padding-top:24px;">
-                ${bodyContent}
-            </div>
-            <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;border-top:1px solid #222;padding-top:16px;">
-                TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY
-            </p>
-        </div>
-    `;
-}
-
 
 
 // Push notifications are sent via the Expo Push API (https://exp.host/--/api/v2/push/send).
@@ -208,8 +193,8 @@ const fairnessLimiter = rateLimit({
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    // SEC-011: rejectUnauthorized false required for Render's self-signed DB certs
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    // SEC-011: rejectUnauthorized true enforces valid server cert — prevents MITM on DB connection
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false,
     max: 10,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
@@ -2291,6 +2276,10 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
 
         const result = await pool.query(`
             SELECT 
+                r.id as registration_id,
+                r.registered_by_player_id,
+                reg_by.alias as registered_by_alias,
+                reg_by.full_name as registered_by_full_name,
                 p.id as player_id,
                 p.id,
                 p.full_name,
@@ -2307,6 +2296,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
             FROM registrations r
             JOIN players p ON p.id = r.player_id
+            LEFT JOIN players reg_by ON reg_by.id = r.registered_by_player_id
             LEFT JOIN team_players tp ON tp.player_id = p.id
                 AND tp.team_id IN (SELECT id FROM teams WHERE game_id = $1)
             LEFT JOIN teams t ON t.id = tp.team_id
@@ -2314,7 +2304,8 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status IN ('confirmed', 'backup')
-            GROUP BY p.id, p.full_name, p.alias, p.squad_number, r.status, r.backup_type,
+            GROUP BY r.id, r.registered_by_player_id, reg_by.alias, reg_by.full_name,
+                     p.id, p.full_name, p.alias, p.squad_number, r.status, r.backup_type,
                      r.position_preference, r.tournament_team_preference, t.team_name
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY 
@@ -2868,6 +2859,363 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
     }
 });
 
+// POST /api/games/:id/register-friend
+// A confirmed player signs up another registered player for the same game.
+// Credits are deducted from the registering player. Friend's tier window applies.
+// If the registering player holds the exclusivity badge, the friend is exempt from that check.
+app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { friendPlayerId, position, backupType } = req.body;
+        const gameId = req.params.id;
+        const registeringPlayerId = req.user.playerId;
+        const positionValue = position || 'outfield';
+
+        if (!friendPlayerId) {
+            return res.status(400).json({ error: 'friendPlayerId is required' });
+        }
+        if (String(friendPlayerId) === String(registeringPlayerId)) {
+            return res.status(400).json({ error: 'You cannot sign yourself up via this route' });
+        }
+
+        await client.query('BEGIN');
+
+        // Lock game row to prevent race conditions
+        const gameLock = await client.query(`
+            SELECT max_players, cost_per_player, exclusivity,
+                   player_editing_locked, team_selection_type, position_type, tournament_team_count,
+                   series_id, game_status, game_date
+            FROM games WHERE id = $1 FOR UPDATE
+        `, [gameId]);
+
+        if (gameLock.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Game not found' });
+        }
+
+        const game = gameLock.rows[0];
+
+        if (!['available', 'confirmed'].includes(game.game_status)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This game is no longer accepting registrations' });
+        }
+
+        if (game.player_editing_locked) {
+            await client.query('ROLLBACK');
+            return res.status(423).json({ error: 'Game is currently being edited by an admin. Please try again in a few minutes.' });
+        }
+
+        // Registering player must be confirmed in this game
+        const myReg = await client.query(
+            "SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'",
+            [gameId, registeringPlayerId]
+        );
+        if (myReg.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'You must be confirmed in this game to sign up a friend' });
+        }
+
+        // Fetch friend details
+        const friendResult = await client.query(
+            'SELECT id, alias, full_name, reliability_tier FROM players WHERE id = $1',
+            [friendPlayerId]
+        );
+        if (friendResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        const friend = friendResult.rows[0];
+        const friendName = friend.alias || friend.full_name;
+
+        // Banned tiers cannot be registered
+        if (friend.reliability_tier === 'white' || friend.reliability_tier === 'black') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: `${friendName} is not eligible to register for games` });
+        }
+
+        // Friend must not already be registered (any status)
+        const existingReg = await client.query(
+            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+            [gameId, friendPlayerId]
+        );
+        if (existingReg.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: `${friendName} is already registered for this game` });
+        }
+
+        // Tier timing window — apply the FRIEND's tier, as if they registered themselves
+        const friendTier = friend.reliability_tier || 'silver';
+        let hoursAhead = 72;
+        if (friendTier === 'gold') hoursAhead = 28 * 24;
+        if (friendTier === 'bronze') hoursAhead = 24;
+
+        const windowCheck = await client.query(
+            `SELECT 1 FROM games WHERE id = $1 AND game_date <= CURRENT_TIMESTAMP + ($2 || ' hours')::INTERVAL`,
+            [gameId, hoursAhead.toString()]
+        );
+        if (windowCheck.rows.length === 0) {
+            const tierLabel = friendTier.charAt(0).toUpperCase() + friendTier.slice(1);
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: `This game isn't open for ${friendName}'s tier (${tierLabel}) yet` });
+        }
+
+        // Exclusivity badge checks:
+        // If the REGISTERING player holds the badge, the friend is exempt — they are vouching for them.
+        // If neither holds the badge, registration is blocked.
+        if (game.exclusivity === 'allstars') {
+            const regBadge = await client.query(`
+                SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name = 'TF All Star'
+            `, [registeringPlayerId]);
+            if (regBadge.rows.length === 0) {
+                const friendBadge = await client.query(`
+                    SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                    WHERE pb.player_id = $1 AND b.name = 'TF All Star'
+                `, [friendPlayerId]);
+                if (friendBadge.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(403).json({ error: `This is an All Star game. Neither you nor ${friendName} has the required badge.` });
+                }
+            }
+        }
+
+        if (game.exclusivity === 'clm') {
+            const regBadge = await client.query(`
+                SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name = 'CLM'
+            `, [registeringPlayerId]);
+            if (regBadge.rows.length === 0) {
+                const friendBadge = await client.query(`
+                    SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                    WHERE pb.player_id = $1 AND b.name = 'CLM'
+                `, [friendPlayerId]);
+                if (friendBadge.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(403).json({ error: `This is a CLM exclusive game. Neither you nor ${friendName} has the required badge.` });
+                }
+            }
+        }
+
+        if (game.exclusivity === 'misfits') {
+            const regBadge = await client.query(`
+                SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name = 'Misfits'
+            `, [registeringPlayerId]);
+            if (regBadge.rows.length === 0) {
+                const friendBadge = await client.query(`
+                    SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                    WHERE pb.player_id = $1 AND b.name = 'Misfits'
+                `, [friendPlayerId]);
+                if (friendBadge.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(403).json({ error: `This is a Misfits game. Neither you nor ${friendName} has the required badge.` });
+                }
+            }
+        }
+
+        // Current player count
+        const countResult = await client.query(
+            "SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS current_players",
+            [gameId]
+        );
+        const currentPlayers = parseInt(countResult.rows[0].current_players);
+        const isFull = currentPlayers >= parseInt(game.max_players);
+
+        // GK slot check
+        const isGKOnly = positionValue.trim().toUpperCase() === 'GK';
+        if (!isFull && isGKOnly) {
+            const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4) : 2;
+            const gkCount = await client.query(`
+                SELECT COUNT(*) as gk_count FROM registrations
+                WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'
+            `, [gameId]);
+            if (parseInt(gkCount.rows[0].gk_count) >= maxGKSlots) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ error: `GK spots are full. Please choose a different position for ${friendName}.` });
+            }
+        }
+
+        // Determine status and handle credit deduction from REGISTERING PLAYER
+        let status, regBackupType = null;
+
+        if (isFull) {
+            if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    error: 'game_full',
+                    message: 'Game is full. Please choose a backup option for your friend.',
+                    currentPlayers,
+                    maxPlayers: parseInt(game.max_players)
+                });
+            }
+            if (backupType === 'gk_backup' && !isGKOnly) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'GK Backup requires GK as the only selected position.' });
+            }
+            status = 'backup';
+            regBackupType = backupType;
+
+            if (backupType === 'confirmed_backup') {
+                const creditResult = await client.query('SELECT balance FROM credits WHERE player_id = $1', [registeringPlayerId]);
+                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
+                }
+                await client.query('UPDATE credits SET balance = balance - $1 WHERE player_id = $2', [game.cost_per_player, registeringPlayerId]);
+                await client.query(
+                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                    [registeringPlayerId, -game.cost_per_player, 'game_fee', `Confirmed backup for ${friendName} in game ${gameId}`]
+                );
+            }
+        } else {
+            status = 'confirmed';
+            const creditResult = await client.query('SELECT balance FROM credits WHERE player_id = $1', [registeringPlayerId]);
+            if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'Insufficient credits' });
+            }
+            await client.query('UPDATE credits SET balance = balance - $1 WHERE player_id = $2', [game.cost_per_player, registeringPlayerId]);
+            await client.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [registeringPlayerId, -game.cost_per_player, 'game_fee', `Registration for ${friendName} in game ${gameId}`]
+            );
+        }
+
+        // Insert registration under friend's player_id, recording who paid
+        await client.query(
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid, registered_by_player_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+                gameId, friendPlayerId, status, positionValue, regBackupType,
+                (status === 'confirmed' || regBackupType === 'confirmed_backup') ? game.cost_per_player : 0,
+                registeringPlayerId
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        let message;
+        if (status === 'confirmed') {
+            message = `${friendName} has been registered! £${parseFloat(game.cost_per_player).toFixed(2)} deducted from your balance.`;
+        } else if (regBackupType === 'confirmed_backup') {
+            message = `${friendName} has been added to the confirmed backup list. £${parseFloat(game.cost_per_player).toFixed(2)} deducted from your balance.`;
+        } else {
+            message = `${friendName} has been added to the backup list.`;
+        }
+
+        res.json({ message, status, backupType: regBackupType });
+
+        // Non-critical: notify friend and registering player, and send emails — fires after response
+        setImmediate(async () => {
+            try {
+                // Fetch names and emails for both players
+                const regPlayerResult = await pool.query(
+                    'SELECT p.alias, p.full_name, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+                    [registeringPlayerId]
+                );
+                const friendEmailResult = await pool.query(
+                    'SELECT p.alias, p.full_name, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+                    [friendPlayerId]
+                );
+                const regName = regPlayerResult.rows[0]?.alias || regPlayerResult.rows[0]?.full_name || 'A teammate';
+                const regEmail = regPlayerResult.rows[0]?.email;
+                const friendFullName = friendEmailResult.rows[0]?.full_name || friendName;
+                const friendEmail = friendEmailResult.rows[0]?.email;
+
+                const gameData = await getGameDataForNotification(gameId);
+                const gameDate = gameData.game_date || gameData.day || 'upcoming game';
+                const venue = gameData.venue || 'the venue';
+                const gameUrl = `https://totalfooty.co.uk/vibecoding/game.html?url=${gameData.game_url || ''}`;
+
+                // Push notification to friend
+                const notifType = status === 'confirmed' ? 'game_registered' : 'backup_added';
+                const friendNotifMsg = status === 'confirmed'
+                    ? `${regName} has signed you up for ${gameDate} at ${venue}!`
+                    : `${regName} has put you on the backup list for ${gameDate} at ${venue}.`;
+                await pool.query(
+                    'INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, $2, $3, $4)',
+                    [friendPlayerId, notifType, friendNotifMsg, gameId]
+                );
+                await sendNotification(notifType, friendPlayerId, gameData);
+
+                // Push notification to registering player
+                const regNotifMsg = status === 'confirmed'
+                    ? `You signed up ${friendName} for ${gameDate} at ${venue}. £${parseFloat(game.cost_per_player).toFixed(2)} deducted.`
+                    : `You added ${friendName} to the backup list for ${gameDate} at ${venue}.`;
+                await pool.query(
+                    'INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, $2, $3, $4)',
+                    [registeringPlayerId, 'friend_registered', regNotifMsg, gameId]
+                );
+
+                // Email to friend
+                if (friendEmail) {
+                    const friendEmailBody = status === 'confirmed'
+                        ? `<p style="color:#888;font-size:14px;margin:0 0 8px;">Hi ${friendFullName},</p>
+                           <p style="color:#888;font-size:14px;margin:0 0 20px;"><strong style="color:#fff;">${regName}</strong> has signed you up for a game on TotalFooty!</p>
+                           <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;margin-bottom:20px;">
+                               <tr><td style="padding:6px 0;color:#888;width:80px;">Date</td><td style="font-weight:900;">${gameDate}</td></tr>
+                               <tr><td style="padding:6px 0;color:#888;">Venue</td><td style="font-weight:900;">${venue}</td></tr>
+                               <tr><td style="padding:6px 0;color:#888;">Status</td><td style="font-weight:900;color:#00ff41;">✅ Confirmed</td></tr>
+                           </table>
+                           <a href="${gameUrl}" style="display:inline-block;background:#fff;color:#000;padding:14px 28px;border-radius:4px;font-weight:bold;font-size:13px;letter-spacing:2px;text-decoration:none;">VIEW GAME</a>`
+                        : `<p style="color:#888;font-size:14px;margin:0 0 8px;">Hi ${friendFullName},</p>
+                           <p style="color:#888;font-size:14px;margin:0 0 20px;"><strong style="color:#fff;">${regName}</strong> has added you to the backup list for a game on TotalFooty.</p>
+                           <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;margin-bottom:20px;">
+                               <tr><td style="padding:6px 0;color:#888;width:80px;">Date</td><td style="font-weight:900;">${gameDate}</td></tr>
+                               <tr><td style="padding:6px 0;color:#888;">Venue</td><td style="font-weight:900;">${venue}</td></tr>
+                               <tr><td style="padding:6px 0;color:#888;">Status</td><td style="font-weight:900;color:#FFA500;">⏳ Backup</td></tr>
+                           </table>
+                           <a href="${gameUrl}" style="display:inline-block;background:#fff;color:#000;padding:14px 28px;border-radius:4px;font-weight:bold;font-size:13px;letter-spacing:2px;text-decoration:none;">VIEW GAME</a>`;
+
+                    await emailTransporter.sendMail({
+                        from: '"TotalFooty" <totalfooty19@gmail.com>',
+                        to: friendEmail,
+                        subject: `⚽ ${regName} signed you up — TotalFooty`,
+                        html: `<div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
+                            <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
+                            <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:20px;">YOU'VE BEEN SIGNED UP</h2>
+                            ${friendEmailBody}
+                            <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
+                        </div>`
+                    }).catch(e => console.error('Friend registration email to friend failed (non-critical):', e.message));
+                }
+
+                // Email to registering player
+                if (regEmail) {
+                    await emailTransporter.sendMail({
+                        from: '"TotalFooty" <totalfooty19@gmail.com>',
+                        to: regEmail,
+                        subject: `✅ You signed up ${friendName} — TotalFooty`,
+                        html: `<div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
+                            <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
+                            <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:20px;">FRIEND REGISTERED</h2>
+                            <p style="color:#888;font-size:14px;margin:0 0 20px;">You signed up <strong style="color:#fff;">${friendName}</strong> for a game.</p>
+                            <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;margin-bottom:20px;">
+                                <tr><td style="padding:6px 0;color:#888;width:80px;">Date</td><td style="font-weight:900;">${gameDate}</td></tr>
+                                <tr><td style="padding:6px 0;color:#888;">Venue</td><td style="font-weight:900;">${venue}</td></tr>
+                                <tr><td style="padding:6px 0;color:#888;">Status</td><td style="font-weight:900;color:${status === 'confirmed' ? '#00ff41' : '#FFA500'};">${status === 'confirmed' ? '✅ Confirmed' : '⏳ Backup'}</td></tr>
+                                ${status === 'confirmed' || regBackupType === 'confirmed_backup' ? `<tr><td style="padding:6px 0;color:#888;">Deducted</td><td style="font-weight:900;color:#ff3366;">-£${parseFloat(game.cost_per_player).toFixed(2)}</td></tr>` : ''}
+                            </table>
+                            <a href="${gameUrl}" style="display:inline-block;background:#fff;color:#000;padding:14px 28px;border-radius:4px;font-weight:bold;font-size:13px;letter-spacing:2px;text-decoration:none;">VIEW GAME</a>
+                            <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
+                        </div>`
+                    }).catch(e => console.error('Friend registration email to registering player failed (non-critical):', e.message));
+                }
+
+            } catch (e) {
+                console.error('Friend registration notification failed (non-critical):', e.message);
+            }
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Register friend error:', error);
+        res.status(500).json({ error: 'Registration failed' });
+    } finally {
+        client.release();
+    }
+});
+
 // Check GK slot availability for a game
 app.get('/api/games/:id/gk-slots', authenticateToken, async (req, res) => {
     try {
@@ -2955,9 +3303,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         
         const cost = parseFloat(gameCheck.rows[0].cost_per_player);
         
-        // Get the dropping player's registration
+        // Get the dropping player's registration — also fetch who paid (registered_by_player_id)
         const regResult = await client.query(
-            'SELECT id, status, backup_type, position_preference FROM registrations WHERE game_id = $1 AND player_id = $2',
+            'SELECT id, status, backup_type, position_preference, registered_by_player_id FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
         
@@ -2970,17 +3318,22 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         const wasConfirmed = droppingReg.status === 'confirmed';
         const wasConfirmedBackup = droppingReg.backup_type === 'confirmed_backup';
         const wasGKOnly = droppingReg.position_preference?.trim().toUpperCase() === 'GK';
+        // If someone else paid for this registration, refund them — not the dropping player
+        const refundTargetId = droppingReg.registered_by_player_id || req.user.playerId;
         
         // Refund if they paid (confirmed players or confirmed backups)
         if (wasConfirmed || wasConfirmedBackup) {
             await client.query(
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                [cost, req.user.playerId]
+                [cost, refundTargetId]
             );
             
+            const refundDesc = refundTargetId !== req.user.playerId
+                ? `Dropout refund for ${req.user.playerId} (paid by you)`
+                : 'Dropped out of game - refund';
             await client.query(
                 'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [req.user.playerId, cost, 'refund', `Dropped out of game - refund`]
+                [refundTargetId, cost, 'refund', refundDesc]
             );
         }
         
@@ -3121,9 +3474,16 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         
         await client.query('COMMIT');
         
-        let message = wasConfirmed || wasConfirmedBackup 
-            ? `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.`
-            : 'Successfully removed from backup list.';
+        let message;
+        if (wasConfirmed || wasConfirmedBackup) {
+            if (refundTargetId !== req.user.playerId) {
+                message = `Successfully dropped out. £${cost.toFixed(2)} refunded to the player who signed you up.`;
+            } else {
+                message = `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.`;
+            }
+        } else {
+            message = 'Successfully removed from backup list.';
+        }
             
         if (promotedPlayer) {
             message += ` ${promotedPlayer.alias || promotedPlayer.full_name} has been promoted from the backup list.`;
@@ -3701,7 +4061,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
         const { gameId } = req.params;
         await client.query('BEGIN');
         const registrations = await client.query(
-            `SELECT player_id, status, backup_type, amount_paid FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
+            `SELECT player_id, status, backup_type, amount_paid, registered_by_player_id FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
             [gameId]
         );
         const gameResult = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
@@ -3725,9 +4085,10 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
         let totalRefunded = 0;
         for (const reg of registrations.rows) {
             const refundAmt = parseFloat(reg.amount_paid || fallbackCost);
+            const refundTarget = reg.registered_by_player_id || reg.player_id;
             if (refundAmt > 0) {
-                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundAmt, reg.player_id]);
-                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [reg.player_id, refundAmt, 'refund', 'Game cancelled - refund']);
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundAmt, refundTarget]);
+                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [refundTarget, refundAmt, 'refund', 'Game cancelled - refund']);
                 totalRefunded++;
             }
         }
@@ -3824,20 +4185,21 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
         for (const gid of gameIds) {
             // Refund all players who paid (confirmed + confirmed_backup)
             const registrations = await client.query(
-                `SELECT player_id, amount_paid FROM registrations WHERE game_id = $1 
+                `SELECT player_id, amount_paid, registered_by_player_id FROM registrations WHERE game_id = $1 
                  AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
                 [gid]
             );
             for (const reg of registrations.rows) {
                 const refundAmt = parseFloat(reg.amount_paid || cost);
+                const refundTarget = reg.registered_by_player_id || reg.player_id;
                 if (refundAmt > 0) {
                     await client.query(
                         'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                        [refundAmt, reg.player_id]
+                        [refundAmt, refundTarget]
                     );
                     await client.query(
                         'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                        [reg.player_id, refundAmt, 'refund', 'Series ' + seriesName + ' cancelled - refund']
+                        [refundTarget, refundAmt, 'refund', 'Series ' + seriesName + ' cancelled - refund']
                     );
                     totalRefunded++;
                 }
@@ -6006,19 +6368,9 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
     try {
         const { gameId, registrationId } = req.params;
         
-        // Check if game is locked by this admin
-        const lockCheck = await pool.query(
-            'SELECT locked_by FROM games WHERE id = $1 AND player_editing_locked = TRUE',
-            [gameId]
-        );
-        
-        if (lockCheck.rows.length === 0 || lockCheck.rows[0].locked_by !== req.user.playerId) {
-            return res.status(403).json({ error: 'Game must be locked by you to edit players' });
-        }
-        
-        // Get registration details (include position + status for backup promotion)
+        // Get registration details (include position + status + who paid for backup promotion and correct refund)
         const regResult = await pool.query(
-            'SELECT player_id, status, position_preference FROM registrations WHERE id = $1 AND game_id = $2',
+            'SELECT player_id, status, backup_type, position_preference, registered_by_player_id FROM registrations WHERE id = $1 AND game_id = $2',
             [registrationId, gameId]
         );
         
@@ -6029,7 +6381,10 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         const removedReg = regResult.rows[0];
         const playerId = removedReg.player_id;
         const wasConfirmed = removedReg.status === 'confirmed';
+        const wasConfirmedBackup = removedReg.backup_type === 'confirmed_backup';
         const wasGKOnly = removedReg.position_preference?.trim().toUpperCase() === 'GK';
+        // If a friend was registered by someone else, refund that person — not the friend
+        const refundTargetId = removedReg.registered_by_player_id || playerId;
         
         // Get game cost and type
         const gameResult = await pool.query(
@@ -6038,16 +6393,21 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         );
         const cost = parseFloat(gameResult.rows[0].cost_per_player);
         
-        // Refund credits
-        await pool.query(
-            'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-            [cost, playerId]
-        );
-        
-        await pool.query(
-            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-            [playerId, cost, 'refund', `Admin removed from game ${gameId}`]
-        );
+        // Only refund if they actually paid (confirmed or confirmed_backup)
+        if (wasConfirmed || wasConfirmedBackup) {
+            await pool.query(
+                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                [cost, refundTargetId]
+            );
+            
+            const refundDesc = refundTargetId !== playerId
+                ? `Admin removed ${playerId} from game — refund to original payer`
+                : `Admin removed from game ${gameId}`;
+            await pool.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [refundTargetId, cost, 'refund', refundDesc]
+            );
+        }
         
         // Delete registration
         await pool.query(
@@ -6317,25 +6677,26 @@ app.post('/api/players/me/topup-request', authenticateToken, async (req, res) =>
         const displayName = player.alias || player.full_name;
         const amountStr = amount ? `£${parseFloat(amount).toFixed(2)}` : 'Amount not specified';
 
-        emailTransporter.sendMail({
-            from: '"TotalFooty" <totalfooty19@gmail.com>',
-            to: 'totalfooty19@gmail.com',
-            subject: `💰 Top-Up Request — ${displayName}`,
-            html: wrapEmailHtml(`
-                <p style="color:#888;font-size:14px;margin:0 0 16px">Player has requested a credit top-up</p>
-                <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
-                    <tr><td style="padding:6px 0;color:#888;width:120px;">Player</td><td style="font-weight:900;">${displayName}</td></tr>
-                    <tr><td style="padding:6px 0;color:#888;">Email</td><td>${player.email}</td></tr>
-                    <tr><td style="padding:6px 0;color:#888;">Player ID</td><td style="font-family:monospace;">${playerId}</td></tr>
-                    <tr><td style="padding:6px 0;color:#888;">Requested</td><td style="font-weight:900;color:#00cc66;">${amountStr}</td></tr>
-                </table>
-                <p style="color:#888;font-size:13px;margin-top:16px;">Once you receive their bank transfer, use the admin panel to add the credits.</p>
-            `)
-        }).then(() => {
-            console.log(`Top-up request email sent for player ${playerId} (${displayName})`);
-        }).catch(e => {
-            console.error('Top-up request email FAILED:', e.message);
-            console.error('Check: GMAIL_APP_PASSWORD env var set correctly on Render?');
+        setImmediate(async () => {
+            try {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to: 'totalfooty19@gmail.com',
+                    subject: `💰 Top-Up Request — ${displayName}`,
+                    html: wrapEmailHtml(`
+                        <p style="color:#888;font-size:14px;margin:0 0 16px">Player has requested a credit top-up</p>
+                        <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
+                            <tr><td style="padding:6px 0;color:#888;width:120px;">Player</td><td style="font-weight:900;">${displayName}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Email</td><td>${player.email}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Player ID</td><td style="font-family:monospace;">${playerId}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Requested</td><td style="font-weight:900;color:#00cc66;">${amountStr}</td></tr>
+                        </table>
+                        <p style="color:#888;font-size:13px;margin-top:16px;">Once you receive their bank transfer, use the admin panel to add the credits.</p>
+                    `)
+                });
+            } catch (e) {
+                console.error('Top-up request email failed (non-critical):', e.message);
+            }
         });
 
         res.json({ message: 'Top-up request submitted. Admin will be in touch.' });
