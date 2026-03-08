@@ -1520,30 +1520,21 @@ app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, asyn
         
         await client.query('BEGIN');
 
-        const safeQuery = async (sql, params) => {
-            try { await client.query(sql, params); } catch (e) {
-                console.warn('Delete player cleanup warning (non-fatal):', e.message);
-                // Re-throw only if the transaction itself is broken
-                if (e.code === '25P02') throw e;
-            }
-        };
-
-        await safeQuery('UPDATE registrations SET registered_by_player_id = NULL WHERE registered_by_player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM registration_preferences WHERE registration_id IN (SELECT id FROM registrations WHERE player_id = $1)', [playerId]);
-        await safeQuery('DELETE FROM registration_preferences WHERE target_player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM team_players WHERE player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM registrations WHERE player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM notifications WHERE player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM game_guests WHERE invited_by = $1', [playerId]);
-        await safeQuery('DELETE FROM player_fixed_teams WHERE player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM player_badges WHERE player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM credit_transactions WHERE player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM credits WHERE player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM discipline_records WHERE player_id = $1', [playerId]);
-        await safeQuery('DELETE FROM whatsapp_logs WHERE player_id = $1', [playerId]);
-        await safeQuery('UPDATE players SET referred_by = NULL WHERE referred_by = $1', [playerId]);
-        await safeQuery('UPDATE games SET motm_winner_id = NULL WHERE motm_winner_id = $1', [playerId]);
-        await safeQuery('UPDATE audit_logs SET admin_id = NULL WHERE admin_id = $1', [playerId]);
+        await client.query('UPDATE registrations SET registered_by_player_id = NULL WHERE registered_by_player_id = $1', [playerId]);
+        await client.query('DELETE FROM registration_preferences WHERE registration_id IN (SELECT id FROM registrations WHERE player_id = $1)', [playerId]);
+        await client.query('DELETE FROM registration_preferences WHERE target_player_id = $1', [playerId]);
+        await client.query('DELETE FROM team_players WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM registrations WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM notifications WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM game_guests WHERE invited_by = $1', [playerId]);
+        await client.query('DELETE FROM player_fixed_teams WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM player_badges WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM credit_transactions WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM credits WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM discipline_records WHERE player_id = $1', [playerId]);
+        await client.query('DELETE FROM whatsapp_logs WHERE player_id = $1', [playerId]);
+        await client.query('UPDATE players SET referred_by = NULL WHERE referred_by = $1', [playerId]);
+        await client.query('UPDATE games SET motm_winner_id = NULL WHERE motm_winner_id = $1', [playerId]);
         
         // Delete player (cascade will handle remaining user record link)
         const result = await client.query('DELETE FROM players WHERE id = $1 RETURNING full_name, alias', [playerId]);
