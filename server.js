@@ -2276,6 +2276,10 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
 
         const result = await pool.query(`
             SELECT 
+                r.id as registration_id,
+                r.registered_by_player_id,
+                reg_by.alias as registered_by_alias,
+                reg_by.full_name as registered_by_full_name,
                 p.id as player_id,
                 p.id,
                 p.full_name,
@@ -2292,6 +2296,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
             FROM registrations r
             JOIN players p ON p.id = r.player_id
+            LEFT JOIN players reg_by ON reg_by.id = r.registered_by_player_id
             LEFT JOIN team_players tp ON tp.player_id = p.id
                 AND tp.team_id IN (SELECT id FROM teams WHERE game_id = $1)
             LEFT JOIN teams t ON t.id = tp.team_id
@@ -2299,7 +2304,8 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status IN ('confirmed', 'backup')
-            GROUP BY p.id, p.full_name, p.alias, p.squad_number, r.status, r.backup_type,
+            GROUP BY r.id, r.registered_by_player_id, reg_by.alias, reg_by.full_name,
+                     p.id, p.full_name, p.alias, p.squad_number, r.status, r.backup_type,
                      r.position_preference, r.tournament_team_preference, t.team_name
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY 
