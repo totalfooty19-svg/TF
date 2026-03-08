@@ -6362,19 +6362,9 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
     try {
         const { gameId, registrationId } = req.params;
         
-        // Check if game is locked by this admin
-        const lockCheck = await pool.query(
-            'SELECT locked_by FROM games WHERE id = $1 AND player_editing_locked = TRUE',
-            [gameId]
-        );
-        
-        if (lockCheck.rows.length === 0 || lockCheck.rows[0].locked_by !== req.user.playerId) {
-            return res.status(403).json({ error: 'Game must be locked by you to edit players' });
-        }
-        
-        // Get registration details (include position + status for backup promotion)
+        // Get registration details (include position + status + who paid for backup promotion and correct refund)
         const regResult = await pool.query(
-            'SELECT player_id, status, position_preference FROM registrations WHERE id = $1 AND game_id = $2',
+            'SELECT player_id, status, backup_type, position_preference, registered_by_player_id FROM registrations WHERE id = $1 AND game_id = $2',
             [registrationId, gameId]
         );
         
@@ -6385,7 +6375,10 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         const removedReg = regResult.rows[0];
         const playerId = removedReg.player_id;
         const wasConfirmed = removedReg.status === 'confirmed';
+        const wasConfirmedBackup = removedReg.backup_type === 'confirmed_backup';
         const wasGKOnly = removedReg.position_preference?.trim().toUpperCase() === 'GK';
+        // If a friend was registered by someone else, refund that person — not the friend
+        const refundTargetId = removedReg.registered_by_player_id || playerId;
         
         // Get game cost and type
         const gameResult = await pool.query(
@@ -6394,16 +6387,21 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         );
         const cost = parseFloat(gameResult.rows[0].cost_per_player);
         
-        // Refund credits
-        await pool.query(
-            'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-            [cost, playerId]
-        );
-        
-        await pool.query(
-            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-            [playerId, cost, 'refund', `Admin removed from game ${gameId}`]
-        );
+        // Only refund if they actually paid (confirmed or confirmed_backup)
+        if (wasConfirmed || wasConfirmedBackup) {
+            await pool.query(
+                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                [cost, refundTargetId]
+            );
+            
+            const refundDesc = refundTargetId !== playerId
+                ? `Admin removed ${playerId} from game — refund to original payer`
+                : `Admin removed from game ${gameId}`;
+            await pool.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [refundTargetId, cost, 'refund', refundDesc]
+            );
+        }
         
         // Delete registration
         await pool.query(
