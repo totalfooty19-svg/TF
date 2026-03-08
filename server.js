@@ -1521,11 +1521,23 @@ app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, asyn
         await client.query('BEGIN');
         
         // Explicitly remove all records that reference this player before deleting
-        // (cannot rely on CASCADE being set consistently across all tables)
+        // ORDER MATTERS — dependencies must be cleared before the rows they reference
+
+        // 1. Null out registered_by_player_id on any registrations this player paid for
+        await client.query('UPDATE registrations SET registered_by_player_id = NULL WHERE registered_by_player_id = $1', [playerId]);
+
+        // 2. Clear registration preferences (references registrations.id)
         await client.query('DELETE FROM registration_preferences WHERE registration_id IN (SELECT id FROM registrations WHERE player_id = $1)', [playerId]);
         await client.query('DELETE FROM registration_preferences WHERE target_player_id = $1', [playerId]);
+
+        // 3. Remove team_players BEFORE registrations (uses game_id from registrations)
+        await client.query('DELETE FROM team_players WHERE player_id = $1', [playerId]);
+
+        // 4. Now safe to delete registrations
         await client.query('DELETE FROM registrations WHERE player_id = $1', [playerId]);
-        await client.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id IN (SELECT game_id FROM registrations WHERE player_id = $1))', [playerId]);
+
+        // 5. Everything else
+        await client.query('DELETE FROM notifications WHERE player_id = $1', [playerId]);
         await client.query('DELETE FROM game_guests WHERE invited_by = $1', [playerId]);
         await client.query('DELETE FROM player_fixed_teams WHERE player_id = $1', [playerId]);
         await client.query('DELETE FROM player_badges WHERE player_id = $1', [playerId]);
@@ -1535,7 +1547,6 @@ app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, asyn
         await client.query('DELETE FROM whatsapp_logs WHERE player_id = $1', [playerId]);
         await client.query('UPDATE players SET referred_by = NULL WHERE referred_by = $1', [playerId]);
         await client.query('UPDATE games SET motm_winner_id = NULL WHERE motm_winner_id = $1', [playerId]);
-        // audit_logs rows with admin_id or target_id — null them rather than delete (preserve audit trail)
         await client.query('UPDATE audit_logs SET admin_id = NULL WHERE admin_id = $1', [playerId]).catch(() => {});
         
         // Delete player (cascade will handle remaining user record link)
