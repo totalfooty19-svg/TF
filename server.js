@@ -2283,8 +2283,10 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 p.full_name,
                 p.alias,
                 p.squad_number,
+                p.is_organiser,
                 r.status,
                 r.backup_type,
+                r.is_comped,
                 r.position_preference as positions,
                 r.position_preference as position_preference,
                 r.tournament_team_preference,
@@ -2303,7 +2305,8 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status IN ('confirmed', 'backup')
             GROUP BY r.id, r.registered_by_player_id, reg_by.alias, reg_by.full_name,
-                     p.id, p.full_name, p.alias, p.squad_number, r.status, r.backup_type,
+                     p.id, p.full_name, p.alias, p.squad_number, p.is_organiser,
+                     r.status, r.backup_type, r.is_comped,
                      r.position_preference, r.tournament_team_preference, t.team_name
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY 
@@ -2481,6 +2484,24 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             }
         }
         
+        // COMP-001: Check if player is an organiser eligible for a free comp slot
+        const organiserCheck = await client.query(
+            'SELECT is_organiser FROM players WHERE id = $1',
+            [req.user.playerId]
+        );
+        const isOrganiser = organiserCheck.rows[0]?.is_organiser || false;
+
+        let isComped = false;
+        if (isOrganiser) {
+            const compCount = await client.query(
+                "SELECT COUNT(*) as cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
+                [gameId]
+            );
+            if (parseInt(compCount.rows[0].cnt) < 6) {
+                isComped = true;
+            }
+        }
+
         // Determine registration status
         let status, regBackupType = null;
         
@@ -2507,9 +2528,9 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             status = 'backup';
             regBackupType = backupType;
             
-            // For confirmed backup, deduct credits immediately
+            // For confirmed backup, deduct credits immediately (unless comped organiser)
             if (backupType === 'confirmed_backup') {
-                if (parseFloat(game.cost_per_player) > 0) {
+                if (!isComped && parseFloat(game.cost_per_player) > 0) {
                     const creditResult = await client.query(
                         'SELECT balance FROM credits WHERE player_id = $1',
                         [req.user.playerId]
@@ -2535,8 +2556,8 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             // Game has space - confirm registration
             status = 'confirmed';
             
-            // Deduct credits (skip entirely for free games)
-            if (parseFloat(game.cost_per_player) > 0) {
+            // Deduct credits (skip for comped organisers and free games)
+            if (!isComped && parseFloat(game.cost_per_player) > 0) {
                 const creditResult = await client.query(
                     'SELECT balance FROM credits WHERE player_id = $1',
                     [req.user.playerId]
@@ -2561,11 +2582,12 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, amount_paid)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, amount_paid, is_comped)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
-             status === 'confirmed' ? game.cost_per_player : 0]
+             isComped ? 0 : (status === 'confirmed' ? game.cost_per_player : 0),
+             isComped]
         );
         
         const registrationId = regResult.rows[0].id;
