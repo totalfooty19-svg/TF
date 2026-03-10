@@ -171,6 +171,33 @@ async function auditLog(pool, adminId, action, targetId, detail = '') {
     }
 }
 
+// ── Tier update helper ────────────────────────────────────────────────────────
+// Centralised function — always use this instead of bare UPDATE reliability_tier.
+// Sets banned_until automatically based on tier:
+//   white → banned for 7 days then auto-lifted by scheduler
+//   black → permanent ban (banned_until = NULL)
+//   anything else → clears banned_until
+async function applyTierUpdate(client, playerId, newTier) {
+    if (newTier === 'white') {
+        await client.query(
+            `UPDATE players SET reliability_tier = $1, banned_until = NOW() + INTERVAL '7 days' WHERE id = $2`,
+            [newTier, playerId]
+        );
+        console.log(`⚠️ Player ${playerId} moved to WHITE — ban expires in 7 days`);
+    } else if (newTier === 'black') {
+        await client.query(
+            `UPDATE players SET reliability_tier = $1, banned_until = NULL WHERE id = $2`,
+            [newTier, playerId]
+        );
+        console.log(`⛔ Player ${playerId} moved to BLACK — permanent ban`);
+    } else {
+        await client.query(
+            `UPDATE players SET reliability_tier = $1, banned_until = NULL WHERE id = $2`,
+            [newTier, playerId]
+        );
+    }
+}
+
 // SEC-009: Rate limiter for DM sends — prevents spam/flooding
 const dmSendLimiter = rateLimit({
     windowMs: 60 * 1000,   // 1 minute
@@ -423,10 +450,16 @@ app.post('/api/auth/register', async (req, res) => {
         // Create player - simple insert with just the fields we know exist
         const playerResult = await pool.query(
             `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver') RETURNING id`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold') RETURNING id`,
             [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield']
         );
         const playerId = playerResult.rows[0].id;
+
+        // New players start with 1 discipline point (keeps them on Gold tier, 0-1 = Gold)
+        await pool.query(
+            `INSERT INTO discipline_records (player_id, offense_type, points, warning_level) VALUES ($1, 'Starting Point', 1, 0)`,
+            [playerId]
+        );
 
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
@@ -1866,7 +1899,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         // Tier-based visibility (exact requirements)
         let hoursAhead = 72; // silver default (72 hours = 3 days)
-        if (tier === 'gold') hoursAhead = 28 * 24; // 28 days
+        if (tier === 'gold') hoursAhead = 7 * 24; // 7 days
         if (tier === 'bronze') hoursAhead = 24; // 24 hours
         if (tier === 'white' || tier === 'black') hoursAhead = 0; // banned - no games visible
         
@@ -2944,7 +2977,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         // Tier timing window — apply the FRIEND's tier, as if they registered themselves
         const friendTier = friend.reliability_tier || 'silver';
         let hoursAhead = 72;
-        if (friendTier === 'gold') hoursAhead = 28 * 24;
+        if (friendTier === 'gold') hoursAhead = 7 * 24;
         if (friendTier === 'bronze') hoursAhead = 24;
 
         const windowCheck = await client.query(
@@ -4985,14 +5018,11 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                     
                     // Award discipline points if late dropout
                     if (isLateDropout) {
-                        const formatLower = (game.format || '').toLowerCase().replace(/\s+/g, '');
-                        const is11aSide = formatLower.includes('11') &&
-                            (formatLower.includes('side') || formatLower.includes('v') || formatLower.includes('x'));
-                        const disciplinePoints = is11aSide ? 3 : 2;
+                        const disciplinePoints = 10; // Late Drop Out = 10 pts (all formats)
                         
                         await client.query(
                             `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
-                             VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
+                             VALUES ($1, $2, 'Late Drop Out', $3, 1)`,
                             [playerId, gameId, disciplinePoints]
                         );
                         
@@ -5003,10 +5033,15 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                             );
                             const newTier = tierResult.rows[0]?.new_tier;
                             if (newTier) {
-                                await client.query(
-                                    'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-                                    [newTier, playerId]
-                                );
+                                await applyTierUpdate(client, playerId, newTier);
+                                if (newTier === 'white' || newTier === 'black') {
+                                    await client.query(
+                                        `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_banned', $2)`,
+                                        [playerId, newTier === 'white'
+                                            ? '⚠️ Your account has been suspended for 7 days due to a late drop out.'
+                                            : '⛔ Your account has been permanently banned.']
+                                    );
+                                }
                             }
                         } catch (tierError) {
                             console.error('Failed to recalculate tier after late dropout:', tierError.message);
@@ -5200,10 +5235,15 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 );
                 const newTier = tierResult.rows[0]?.new_tier;
                 if (newTier) {
-                    await client.query(
-                        'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-                        [newTier, dpId]
-                    );
+                    await applyTierUpdate(client, dpId, newTier);
+                    if (newTier === 'white' || newTier === 'black') {
+                        await client.query(
+                            `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_banned', $2)`,
+                            [dpId, newTier === 'white'
+                                ? '⚠️ Your account has been suspended for 7 days due to discipline points.'
+                                : '⛔ Your account has been permanently banned.']
+                        );
+                    }
                 }
             } catch (tierError) {
                 console.error('Failed to recalculate tier for player:', dpId, tierError.message);
@@ -7394,7 +7434,15 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
                 // Recalculate tier after discipline
                 const tierResult = await client.query('SELECT calculate_player_tier($1) as new_tier', [record.playerId]);
                 if (tierResult.rows.length > 0) {
-                    await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [tierResult.rows[0].new_tier, record.playerId]);
+                    await applyTierUpdate(client, record.playerId, tierResult.rows[0].new_tier);
+                    if (tierResult.rows[0].new_tier === 'white' || tierResult.rows[0].new_tier === 'black') {
+                        await client.query(
+                            `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_banned', $2)`,
+                            [record.playerId, tierResult.rows[0].new_tier === 'white'
+                                ? '⚠️ Your account has been suspended for 7 days due to discipline points.'
+                                : '⛔ Your account has been permanently banned.']
+                        );
+                    }
                 }
             }
         }
@@ -7570,8 +7618,16 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
         const tierResult = await client.query(
             'SELECT calculate_player_tier($1) AS new_tier', [id]
         );
-        const newTier = tierResult.rows[0]?.new_tier || 'silver';
-        await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, id]);
+        const newTier = tierResult.rows[0]?.new_tier || 'gold';
+        await applyTierUpdate(client, id, newTier);
+        if (newTier === 'white' || newTier === 'black') {
+            await client.query(
+                `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_banned', $2)`,
+                [id, newTier === 'white'
+                    ? '⚠️ Your account has been suspended for 7 days due to discipline points.'
+                    : '⛔ Your account has been permanently banned.']
+            );
+        }
 
         await client.query('COMMIT');
         res.json({ success: true, newTier, pointsAdded: pts });
@@ -7601,16 +7657,13 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireAdmin, async 
             VALUES ($1, NULL, 1, 'Reinstated after ban', $2)
         `, [id, req.user.playerId]);
 
-        // Recalculate tier (1 point with sufficient appearances = silver)
+        // Recalculate tier (1 point = gold under new thresholds)
         const tierResult = await client.query(`
             SELECT calculate_player_tier($1) AS new_tier
         `, [id]);
-        const newTier = tierResult.rows[0]?.new_tier || 'silver';
+        const newTier = tierResult.rows[0]?.new_tier || 'gold';
 
-        await client.query(
-            'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-            [newTier, id]
-        );
+        await applyTierUpdate(client, id, newTier);
 
         // Insert reinstatement notification for the player
         await client.query(`
@@ -8337,6 +8390,60 @@ app.listen(PORT, () => {
             reminderRunning = false;
         }
     }, 5 * 60 * 1000); // Check every 5 minutes
+
+    // Auto-unban white-tier players whose 7-day ban has expired
+    setInterval(async () => {
+        try {
+            const expired = await pool.query(`
+                SELECT id FROM players
+                WHERE reliability_tier = 'white'
+                  AND banned_until IS NOT NULL
+                  AND banned_until <= NOW()
+            `);
+
+            if (expired.rows.length === 0) return;
+
+            console.log(`⏰ Auto-unbanning ${expired.rows.length} player(s) whose white-tier ban has expired...`);
+
+            for (const row of expired.rows) {
+                const client = await pool.connect();
+                try {
+                    await client.query('BEGIN');
+
+                    // Clear discipline records and insert fresh 1-point starting entry
+                    await client.query('DELETE FROM discipline_records WHERE player_id = $1', [row.id]);
+                    await client.query(
+                        `INSERT INTO discipline_records (player_id, offense_type, points, warning_level) VALUES ($1, 'Ban Expired', 1, 0)`,
+                        [row.id]
+                    );
+
+                    // Recalculate tier — 1 pt = gold
+                    const tierResult = await client.query('SELECT calculate_player_tier($1) AS new_tier', [row.id]);
+                    const newTier = tierResult.rows[0]?.new_tier || 'gold';
+                    await applyTierUpdate(client, row.id, newTier);
+
+                    // Notify the player
+                    await client.query(
+                        `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_reinstated', '✅ Your 7-day suspension has ended. Your account has been reinstated.')`,
+                        [row.id]
+                    );
+
+                    await client.query('COMMIT');
+                    console.log(`✅ Auto-unbanned player ${row.id} → ${newTier}`);
+
+                    // Fire push notification (non-blocking)
+                    sendPushNotification(row.id, 'account_reinstated', '✅ Your 7-day suspension has ended. Your account has been reinstated.').catch(() => {});
+                } catch (err) {
+                    await client.query('ROLLBACK');
+                    console.error(`✗ Auto-unban failed for player ${row.id}:`, err.message);
+                } finally {
+                    client.release();
+                }
+            }
+        } catch (error) {
+            console.error('✗ Auto-unban scheduler error:', error.message);
+        }
+    }, 60 * 60 * 1000); // Check every hour
 
     // Auto-finalize expired MOTM voting every 10 minutes
     setInterval(async () => {
