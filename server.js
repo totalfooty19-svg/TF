@@ -2633,9 +2633,13 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         // Build response
         let message;
         if (status === 'confirmed') {
-            message = fixedTeam
-                ? `Registered successfully! You've been placed in the ${fixedTeam.charAt(0).toUpperCase() + fixedTeam.slice(1)} team based on previous games.`
-                : 'Registered successfully';
+            if (isComped) {
+                message = "Thank you for signing up, this game is covered by the GAFFA — appreciate everything you guys do to make TF great!";
+            } else {
+                message = fixedTeam
+                    ? `Registered successfully! You've been placed in the ${fixedTeam.charAt(0).toUpperCase() + fixedTeam.slice(1)} team based on previous games.`
+                    : 'Registered successfully';
+            }
         } else if (regBackupType === 'confirmed_backup') {
             message = `You're on the confirmed backup list. £${parseFloat(game.cost_per_player).toFixed(2)} has been deducted and you'll be first in line if a spot opens. If you don't get on, you'll be refunded after the game.`;
         } else if (regBackupType === 'gk_backup') {
@@ -2644,7 +2648,7 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             message = "You're on the backup list. You'll be notified if a space becomes available.";
         }
         
-        res.json({ message, status, backupType: regBackupType, fixedTeam });
+        res.json({ message, status, backupType: regBackupType, fixedTeam, isComped });
 
         // Non-critical: fire notifications after response is sent
         setImmediate(async () => {
@@ -3679,7 +3683,14 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             ORDER BY p.overall_rating DESC
         `, [gameId]);
         
-        const players = playersResult.rows;
+        const players = playersResult.rows.map(p => ({
+            ...p,
+            // For GK-only players, use goalkeeper_rating as their effective overall throughout
+            // the algorithm, display, and fine-tuning. Outfield or dual-position players keep overall_rating.
+            overall_rating: p.position_preference?.trim().toLowerCase() === 'gk'
+                ? (p.goalkeeper_rating || p.overall_rating || 0)
+                : (p.overall_rating || 0)
+        }));
         
         // Also fetch +N guests for this game (multi-guest)
         const guestsResult = await pool.query(`
@@ -3753,8 +3764,9 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         const blueTeam = [];
         
         // PRIORITY 1: Assign 1 GK to each team
-        const goalkeepers = players.filter(p => p.position_preference?.toLowerCase().includes('gk'));
-        const outfield = players.filter(p => !p.position_preference?.toLowerCase().includes('gk'));
+        // Only treat as GK if they selected GK exclusively (not GK + outfield)
+        const goalkeepers = players.filter(p => p.position_preference?.trim().toLowerCase() === 'gk');
+        const outfield = players.filter(p => p.position_preference?.trim().toLowerCase() !== 'gk');
         
         if (goalkeepers.length >= 1) redTeam.push(goalkeepers[0]);
         if (goalkeepers.length >= 2) blueTeam.push(goalkeepers[1]);
@@ -4085,25 +4097,28 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             shooting:  blueTeam.reduce((sum, p) => sum + (p.shooting_rating  || 0), 0)
         };
         
-        const mapPlayer = p => ({
-            id:           p.player_id,
-            name:         p.alias || p.full_name,
-            full_name:    p.full_name,
-            alias:        p.alias,
-            squad_number: p.squad_number,
-            overall:      p.overall_rating    || 0,
-            defense:      p.defending_rating  || 0,
-            strength:     p.strength_rating   || 0,
-            fitness:      p.fitness_rating    || 0,
-            pace:         p.pace_rating       || 0,
-            decisions:    p.decisions_rating  || 0,
-            assisting:    p.assisting_rating  || 0,
-            shooting:     p.shooting_rating   || 0,
-            gk:           p.goalkeeper_rating || 0,
-            isGK:         p.position_preference?.toLowerCase().includes('gk') || false,
-            position_preference: p.position_preference || 'outfield',
-            is_guest:     p.is_guest || false
-        });
+        const mapPlayer = p => {
+            const isGKOnly = p.position_preference?.trim().toLowerCase() === 'gk';
+            return {
+                id:           p.player_id,
+                name:         p.alias || p.full_name,
+                full_name:    p.full_name,
+                alias:        p.alias,
+                squad_number: p.squad_number,
+                overall:      isGKOnly ? (p.goalkeeper_rating || 0) : (p.overall_rating || 0),
+                defense:      p.defending_rating  || 0,
+                strength:     p.strength_rating   || 0,
+                fitness:      p.fitness_rating    || 0,
+                pace:         p.pace_rating       || 0,
+                decisions:    p.decisions_rating  || 0,
+                assisting:    p.assisting_rating  || 0,
+                shooting:     p.shooting_rating   || 0,
+                gk:           p.goalkeeper_rating || 0,
+                isGK:         isGKOnly,
+                position_preference: p.position_preference || 'outfield',
+                is_guest:     p.is_guest || false
+            };
+        };
         
         res.json({
             message: 'Teams generated successfully',
@@ -4823,16 +4838,20 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
                     .filter(g => g.team_name === team.team_name)
                     .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall: g.overall_rating || 0, defense: 0, strength: 0, fitness: 0, pace: 0, decisions: 0, assisting: 0, shooting: 0, gk: 0, isGK: false, is_guest: true }));
                 
-                teams[team.team_name] = [...playersResult.rows.map(p => ({
-                    id: p.id, full_name: p.full_name, alias: p.alias, squad_number: p.squad_number,
-                    overall: p.overall_rating || 0, defense: p.defending_rating || 0,
-                    strength: p.strength_rating || 0, fitness: p.fitness_rating || 0,
-                    pace: p.pace_rating || 0, decisions: p.decisions_rating || 0,
-                    assisting: p.assisting_rating || 0, shooting: p.shooting_rating || 0,
-                    gk: p.goalkeeper_rating || 0,
-                    isGK: p.position_preference?.toLowerCase().includes('gk') || false,
-                    position_preference: p.position_preference || 'outfield'
-                })), ...teamGuests];
+                teams[team.team_name] = [...playersResult.rows.map(p => {
+                    const isGKOnly = p.position_preference?.trim().toLowerCase() === 'gk';
+                    return {
+                        id: p.id, full_name: p.full_name, alias: p.alias, squad_number: p.squad_number,
+                        overall: isGKOnly ? (p.goalkeeper_rating || 0) : (p.overall_rating || 0),
+                        defense: p.defending_rating || 0,
+                        strength: p.strength_rating || 0, fitness: p.fitness_rating || 0,
+                        pace: p.pace_rating || 0, decisions: p.decisions_rating || 0,
+                        assisting: p.assisting_rating || 0, shooting: p.shooting_rating || 0,
+                        gk: p.goalkeeper_rating || 0,
+                        isGK: isGKOnly,
+                        position_preference: p.position_preference || 'outfield'
+                    };
+                }), ...teamGuests];
             }
             res.json({ teams, isTournament: true });
         } else {
@@ -4867,23 +4886,26 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
                 `, [blueTeamId, gameId])
             ]);
             
-            const mapTeamPlayer = p => ({
-                id:           p.id,
-                full_name:    p.full_name,
-                alias:        p.alias,
-                squad_number: p.squad_number,
-                overall:      p.overall_rating    || 0,
-                defense:      p.defending_rating  || 0,
-                strength:     p.strength_rating   || 0,
-                fitness:      p.fitness_rating    || 0,
-                pace:         p.pace_rating       || 0,
-                decisions:    p.decisions_rating  || 0,
-                assisting:    p.assisting_rating  || 0,
-                shooting:     p.shooting_rating   || 0,
-                gk:           p.goalkeeper_rating || 0,
-                isGK:         p.position_preference?.toLowerCase().includes('gk') || false,
-                position_preference: p.position_preference || 'outfield'
-            });
+            const mapTeamPlayer = p => {
+                const isGKOnly = p.position_preference?.trim().toLowerCase() === 'gk';
+                return {
+                    id:           p.id,
+                    full_name:    p.full_name,
+                    alias:        p.alias,
+                    squad_number: p.squad_number,
+                    overall:      isGKOnly ? (p.goalkeeper_rating || 0) : (p.overall_rating || 0),
+                    defense:      p.defending_rating  || 0,
+                    strength:     p.strength_rating   || 0,
+                    fitness:      p.fitness_rating    || 0,
+                    pace:         p.pace_rating       || 0,
+                    decisions:    p.decisions_rating  || 0,
+                    assisting:    p.assisting_rating  || 0,
+                    shooting:     p.shooting_rating   || 0,
+                    gk:           p.goalkeeper_rating || 0,
+                    isGK:         isGKOnly,
+                    position_preference: p.position_preference || 'outfield'
+                };
+            };
 
             const redGuests = guestsResult.rows
                 .filter(g => g.team_name === 'Red')
