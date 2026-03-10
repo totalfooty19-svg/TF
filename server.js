@@ -166,8 +166,50 @@ async function auditLog(pool, adminId, action, targetId, detail = '') {
             [adminId, action, targetId, detail]
         );
     } catch (e) {
-        // Audit log table may not exist yet — non-critical but logged
         console.warn('audit_log insert failed (non-critical):', e.message);
+    }
+}
+
+async function gameAuditLog(pool, gameId, adminId, action, detail = '') {
+    try {
+        await pool.query(
+            `INSERT INTO game_audit_log (game_id, admin_id, action, detail, created_at)
+             VALUES ($1, $2, $3, $4, NOW())`,
+            [gameId, adminId || null, action, detail]
+        );
+    } catch (e) {
+        console.warn('game_audit_log insert failed (non-critical):', e.message);
+    }
+}
+
+async function registrationEvent(pool, gameId, playerId, eventType, detail = '') {
+    try {
+        await pool.query(
+            `INSERT INTO registration_events (game_id, player_id, event_type, detail, created_at)
+             VALUES ($1, $2, $3, $4, NOW())`,
+            [gameId, playerId, eventType, detail]
+        );
+    } catch (e) {
+        console.warn('registration_event insert failed (non-critical):', e.message);
+    }
+}
+
+async function statHistory(pool, playerId, changedBy, stats, tier = null) {
+    try {
+        await pool.query(
+            `INSERT INTO player_stat_history 
+             (player_id, changed_by, overall_rating, defending_rating, strength_rating,
+              fitness_rating, pace_rating, decisions_rating, assisting_rating, shooting_rating,
+              goalkeeper_rating, reliability_tier, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())`,
+            [playerId, changedBy || null,
+             stats.overall || null, stats.defending || null, stats.strength || null,
+             stats.fitness || null, stats.pace || null, stats.decisions || null,
+             stats.assisting || null, stats.shooting || null, stats.goalkeeper || null,
+             tier || null]
+        );
+    } catch (e) {
+        console.warn('stat_history insert failed (non-critical):', e.message);
     }
 }
 
@@ -534,6 +576,9 @@ app.post('/api/auth/register', async (req, res) => {
             } catch (e) {
                 console.error('Signup notification failed (non-critical):', e.message);
             }
+            try {
+                await auditLog(pool, playerId, 'player_created', playerId, `email:${email} name:${fullName}`);
+            } catch (e) { /* non-critical */ }
             // #14: Notify admin of new signup
             try {
                 await emailTransporter.sendMail({
@@ -1319,6 +1364,11 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
 
         await client.query('COMMIT');
         res.json({ message: 'Profile updated successfully' });
+
+        setImmediate(async () => {
+            await auditLog(pool, req.user.playerId, 'account_updated', req.user.playerId,
+                `name:${fullName?.trim()} alias:${alias?.trim() || '-'} email:${email || '-'} phone:${phone ? 'updated' : '-'}`);
+        });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Update profile error:', error);
@@ -1390,6 +1440,13 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, as
         );
         
         res.json({ message: 'Stats updated' });
+
+        setImmediate(async () => {
+            await statHistory(pool, req.params.id, req.user.playerId,
+                { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper });
+            await auditLog(pool, req.user.playerId, 'stats_updated', req.params.id,
+                `OVR:${overall} DEF:${defending} STR:${strength} FIT:${fitness} PAC:${pace} DEC:${decisions} AST:${assisting} SHT:${shooting} GK:${goalkeeper}`);
+        });
     } catch (error) {
         console.error('Update stats error:', error);
         res.status(500).json({ error: 'Update failed' });
@@ -1506,13 +1563,20 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         }
         
         res.json({ message: 'Player updated successfully' });
+
+        setImmediate(async () => {
+            await statHistory(pool, playerId, req.user.playerId,
+                { overall: overall_rating, defending: defending_rating, strength: strength_rating,
+                  fitness: fitness_rating, pace: pace_rating, decisions: decisions_rating,
+                  assisting: assisting_rating, shooting: shooting_rating, goalkeeper: goalkeeper_rating });
+            await auditLog(pool, req.user.playerId, 'player_updated', playerId,
+                `OVR:${overall_rating} squad:${squad_number ?? '-'} alias:${alias ?? '-'}`);
+        });
     } catch (error) {
         console.error('Update player error:', error);
         res.status(500).json({ error: 'Failed to update player' });
     }
 });
-
-// Delete player (admin only)
 app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -2229,6 +2293,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     seriesId: seriesIdValue,
                     games: createdGames 
                 });
+                setImmediate(() => createdGames.forEach(g => 
+                    gameAuditLog(pool, g.id, req.user.playerId, 'game_created',
+                        `format:${format} type:normal cost:£${costPerPlayer} max:${maxPlayers} series:${seriesIdValue}`)
+                ));
             } catch (e) {
                 await wClient.query('ROLLBACK').catch(() => {});
                 throw e;
@@ -2272,6 +2340,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             );
             
             res.json({ id: result.rows[0].id, gameUrl });
+            setImmediate(() => gameAuditLog(pool, result.rows[0].id, req.user.playerId, 'game_created',
+                `format:${format} type:${selType} cost:£${costPerPlayer} max:${maxPlayers}`));
         }
     } catch (error) {
         console.error('Create game error:', error);
@@ -2670,8 +2740,19 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         res.json({ message, status, backupType: regBackupType, fixedTeam, isComped });
 
-        // Non-critical: fire notifications after response is sent
+        // Non-critical: fire notifications + audit after response is sent
         setImmediate(async () => {
+            try {
+                const evtType = status === 'backup'
+                    ? (regBackupType === 'confirmed_backup' ? 'confirmed_backup_joined'
+                        : regBackupType === 'gk_backup' ? 'gk_backup_joined' : 'backup_joined')
+                    : 'signed_up';
+                const evtDetail = `Position: ${positionValue}${regBackupType ? ' | Backup type: ' + regBackupType : ''}${isComped ? ' | Comped' : ''}`;
+                await registrationEvent(pool, gameId, req.user.playerId, evtType, evtDetail);
+                await gameAuditLog(pool, gameId, null,
+                    status === 'backup' ? 'player_backup_joined' : 'player_signed_up',
+                    `Player ID ${req.user.playerId} — ${evtDetail}`);
+            } catch (e) { /* non-critical */ }
             try {
                 const gameData = await getGameDataForNotification(gameId);
                 const notifType = status === 'confirmed' ? 'game_registered' : 'backup_added';
@@ -2837,7 +2918,8 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             referralLink: referralCode ? `https://totalfooty.co.uk/vibecoding/?ref=${referralCode}` : null,
             referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
         });
-    } catch (error) {
+        setImmediate(() => gameAuditLog(pool, req.params.id, null, 'guest_added',
+            `Guest: ${guestName.trim()} | Host: Player ${req.user.playerId} | OVR: ${guestRating}`));
         await client.query('ROLLBACK').catch(() => {});
         console.error('Add guest error:', error);
         res.status(500).json({ error: 'Failed to add guest' });
@@ -2925,6 +3007,8 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
         res.json({
             message: `${guest.guest_name} removed. £${refundAmt.toFixed(2)} refunded to your balance.`
         });
+        setImmediate(() => gameAuditLog(pool, req.body.gameId || req.params.id, null, 'guest_removed',
+            `Guest: ${guest.guest_name} | Host: Player ${req.user.playerId} | Refunded: £${refundAmt.toFixed(2)}`));
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Remove guest error:', error);
@@ -3579,6 +3663,13 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
             } catch (e) {
                 console.error('Dropout notification failed (non-critical):', e.message);
             }
+            try {
+                const evtType = wasConfirmed ? 'dropped_out' : 'backup_removed';
+                const evtDetail = wasConfirmedBackup ? 'Was confirmed backup' : wasConfirmed ? `Refunded £${cost.toFixed(2)}` : 'No charge';
+                await registrationEvent(pool, gameId, req.user.playerId, evtType, evtDetail);
+                await gameAuditLog(pool, gameId, null, evtType,
+                    `Player ID ${req.user.playerId}${promotedPlayer ? ` | Promoted: ${promotedPlayer.alias || promotedPlayer.full_name}` : ''}`);
+            } catch (e) { /* non-critical */ }
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -4158,6 +4249,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 }))
             )
         });
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'teams_generated', 'Teams generated by algorithm'));
     } catch (error) {
         console.error('Generate teams error:', error);
         res.status(500).json({ error: 'Failed to generate teams' });
@@ -4457,7 +4549,8 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
             message: 'Game settings updated successfully',
             updated: { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count }
         });
-        
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'settings_updated',
+            `venue:${venue_id} max:${max_players} cost:£${cost_per_player}${game_date ? ' date:' + game_date : ''}${oldCost !== parseFloat(cost_per_player) ? ` (cost was £${oldCost})` : ''}`));
     } catch (error) {
         console.error('Update game settings error:', error);
         res.status(500).json({ error: 'Failed to update game settings' });
@@ -4689,6 +4782,7 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             message: 'Teams saved successfully',
             game: fullGameResult.rows[0]
         });
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed', 'Teams manually confirmed'));
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Save manual teams error:', error);
@@ -4709,6 +4803,7 @@ app.post('/api/admin/games/:gameId/confirm-game', authenticateToken, requireGame
         );
         
         res.json({ message: 'Game confirmed' });
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_confirmed', 'Status set to confirmed'));
     } catch (error) {
         console.error('Confirm game error:', error);
         res.status(500).json({ error: 'Failed to confirm game' });
@@ -5004,6 +5099,7 @@ app.post('/api/admin/games/:gameId/start-motm', authenticateToken, requireGameMa
         );
         
         res.json({ message: 'MOTM voting started', votingEndsAt: votingEnds });
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'motm_voting_started', `Voting ends: ${votingEnds}`));
 
         // Non-critical: notify all nominees that voting is open
         setImmediate(async () => {
@@ -5448,7 +5544,8 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             motmNominees: nomineesInserted,
             motmVotingEnds: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
         });
-        
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_completed',
+            `Winner: ${winningTeam || 'N/A'} | MOTM nominees: ${nomineesInserted}`));
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Complete game error:', error);
@@ -6232,7 +6329,7 @@ app.post('/api/admin/games/:gameId/lock', authenticateToken, requireCLMAdmin, as
         }
         
         res.json({ message: 'Game locked for editing' });
-        
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_locked', 'Player editing locked'));
     } catch (error) {
         console.error('Lock game error:', error);
         res.status(500).json({ error: 'Failed to lock game' });
@@ -6261,7 +6358,7 @@ app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireCLMAdmin, 
         );
         
         res.json({ message: 'Game unlocked' });
-        
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_unlocked', 'Player editing unlocked'));
     } catch (error) {
         console.error('Unlock game error:', error);
         res.status(500).json({ error: 'Failed to unlock game' });
@@ -6425,7 +6522,10 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         }
         
         res.json({ message: 'Player added successfully' });
-        
+        setImmediate(() => {
+            registrationEvent(pool, gameId, playerId, 'admin_added', `Added by admin ${req.user.playerId}`);
+            gameAuditLog(pool, gameId, req.user.playerId, 'admin_player_added', `Player ID: ${playerId} | Position: ${position}`);
+        });
     } catch (error) {
         console.error('Add player error:', error);
         res.status(500).json({ error: 'Failed to add player' });
@@ -6681,7 +6781,10 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             : 'Player removed successfully';
         
         res.json({ message: msg, promotedPlayer: promotedPlayer ? { name: promotedPlayer.alias || promotedPlayer.full_name } : null });
-        
+        setImmediate(() => {
+            registrationEvent(pool, gameId, playerId, 'admin_removed', `Removed by admin ${req.user.playerId}${promotedPlayer ? ' | ' + (promotedPlayer.alias || promotedPlayer.full_name) + ' promoted' : ''}`);
+            gameAuditLog(pool, gameId, req.user.playerId, 'admin_player_removed', `Player ID: ${playerId}${promotedPlayer ? ' | Promoted: ' + (promotedPlayer.alias || promotedPlayer.full_name) : ''}`);
+        });
     } catch (error) {
         console.error('Remove player error:', error);
         res.status(500).json({ error: 'Failed to remove player' });
@@ -6782,6 +6885,8 @@ app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireGam
             return res.status(400).json({ error: 'MOTM already finalized' });
         }
         res.json({ message: 'MOTM voting finalized', winners: result.winners });
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'motm_finalized',
+            `Winner(s): ${result.winners?.map(w => w.alias || w.full_name).join(', ') || 'none'}`));
     } catch (error) {
         console.error('Finalize MOTM error:', error);
         res.status(500).json({ error: error.message || 'Failed to finalize MOTM voting' });
@@ -7616,6 +7721,141 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
 });
 
 // ==========================================
+// AUDIT ENDPOINTS
+// ==========================================
+
+// GET /api/admin/audit/player/:id — full audit history for a player
+app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // 1. Balance history
+        const balance = await pool.query(`
+            SELECT ct.created_at, ct.amount, ct.type, ct.description,
+                   p.alias as admin_alias, p.full_name as admin_name
+            FROM credit_transactions ct
+            LEFT JOIN users u ON u.id = ct.admin_id
+            LEFT JOIN players p ON p.user_id = u.id
+            WHERE ct.player_id = $1
+            ORDER BY ct.created_at DESC
+        `, [id]);
+
+        // 2. Stat history
+        const stats = await pool.query(`
+            SELECT psh.created_at, psh.overall_rating, psh.defending_rating, psh.strength_rating,
+                   psh.fitness_rating, psh.pace_rating, psh.decisions_rating,
+                   psh.assisting_rating, psh.shooting_rating, psh.goalkeeper_rating,
+                   psh.reliability_tier, p.alias as changed_by_alias, p.full_name as changed_by_name
+            FROM player_stat_history psh
+            LEFT JOIN players p ON p.id = psh.changed_by
+            WHERE psh.player_id = $1
+            ORDER BY psh.created_at DESC
+        `, [id]);
+
+        // 3. Registration events (sign up / drop out)
+        const regEvents = await pool.query(`
+            SELECT re.created_at, re.event_type, re.detail,
+                   g.game_date, g.format, g.game_url, v.name as venue_name
+            FROM registration_events re
+            JOIN games g ON g.id = re.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE re.player_id = $1
+            ORDER BY re.created_at DESC
+        `, [id]);
+
+        // 4. MOTM received
+        const motmReceived = await pool.query(`
+            SELECT g.game_date, g.format, g.game_url, v.name as venue_name,
+                   g.motm_winner_id
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.motm_winner_id = $1 AND g.game_status = 'completed'
+            ORDER BY g.game_date DESC
+        `, [id]);
+
+        // 5. MOTM votes cast
+        const motmVotes = await pool.query(`
+            SELECT mv.created_at, g.game_date, g.format, g.game_url, v.name as venue_name,
+                   p.alias as voted_for_alias, p.full_name as voted_for_name
+            FROM motm_votes mv
+            JOIN games g ON g.id = mv.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            JOIN players p ON p.id = mv.voted_for_id
+            WHERE mv.voter_id = $1
+            ORDER BY mv.created_at DESC
+        `, [id]);
+
+        // 6. Admin actions (audit_logs targeting this player)
+        const adminActions = await pool.query(`
+            SELECT al.created_at, al.action, al.detail,
+                   p.alias as admin_alias, p.full_name as admin_name
+            FROM audit_logs al
+            LEFT JOIN players p ON p.id = al.admin_id
+            WHERE al.target_id = $1
+            ORDER BY al.created_at DESC
+        `, [id]);
+
+        res.json({
+            balance: balance.rows,
+            stats: stats.rows,
+            registrations: regEvents.rows,
+            motmReceived: motmReceived.rows,
+            motmVotesCast: motmVotes.rows,
+            adminActions: adminActions.rows
+        });
+    } catch (error) {
+        console.error('Player audit error:', error);
+        res.status(500).json({ error: 'Failed to load player audit' });
+    }
+});
+
+// GET /api/admin/audit/game/:id — full audit history for a game
+app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // 1. Game audit log (admin actions)
+        const gameLogs = await pool.query(`
+            SELECT gal.created_at, gal.action, gal.detail,
+                   p.alias as admin_alias, p.full_name as admin_name
+            FROM game_audit_log gal
+            LEFT JOIN players p ON p.id = gal.admin_id
+            WHERE gal.game_id = $1
+            ORDER BY gal.created_at DESC
+        `, [id]);
+
+        // 2. Registration events for this game
+        const regEvents = await pool.query(`
+            SELECT re.created_at, re.event_type, re.detail,
+                   p.alias as player_alias, p.full_name as player_name, p.squad_number
+            FROM registration_events re
+            JOIN players p ON p.id = re.player_id
+            WHERE re.game_id = $1
+            ORDER BY re.created_at DESC
+        `, [id]);
+
+        // 3. Registrations (signed up currently)
+        const currentRegs = await pool.query(`
+            SELECT r.registered_at, r.status, r.backup_type, r.position_preference,
+                   p.alias, p.full_name, p.squad_number
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1
+            ORDER BY r.registered_at ASC
+        `, [id]);
+
+        res.json({
+            gameLogs: gameLogs.rows,
+            registrationEvents: regEvents.rows,
+            currentRegistrations: currentRegs.rows
+        });
+    } catch (error) {
+        console.error('Game audit error:', error);
+        res.status(500).json({ error: 'Failed to load game audit' });
+    }
+});
+
+// ==========================================
 // PUSH NOTIFICATION TOKEN MANAGEMENT
 // ==========================================
 
@@ -7753,10 +7993,13 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
 
         await client.query('COMMIT');
         res.json({ success: true, newTier, pointsAdded: pts });
+        setImmediate(async () => {
+            await auditLog(pool, req.user.playerId, 'discipline_added', id,
+                `${pts} point(s) added manually | new tier: ${newTier}`);
+        });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Add discipline points error:', error);
-        res.status(500).json({ error: 'Failed to add discipline points' });
     } finally {
         client.release();
     }
@@ -7802,10 +8045,13 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireAdmin, async 
         sendPushNotification(id, 'account_reinstated', '✅ Your account has been reinstated. Welcome back.').catch(() => {});
 
         res.json({ message: 'Player unbanned successfully', newTier });
+        setImmediate(async () => {
+            await auditLog(pool, req.user.playerId, 'player_unbanned', id,
+                `Discipline cleared | new tier: ${newTier}`);
+        });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Unban error:', error);
-        res.status(500).json({ error: 'Failed to unban player' });
     } finally {
         client.release();
     }
