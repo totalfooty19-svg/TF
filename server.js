@@ -171,33 +171,6 @@ async function auditLog(pool, adminId, action, targetId, detail = '') {
     }
 }
 
-// ── Tier update helper ────────────────────────────────────────────────────────
-// Centralised function — always use this instead of bare UPDATE reliability_tier.
-// Sets banned_until automatically based on tier:
-//   white → banned for 7 days then auto-lifted by scheduler
-//   black → permanent ban (banned_until = NULL)
-//   anything else → clears banned_until
-async function applyTierUpdate(client, playerId, newTier) {
-    if (newTier === 'white') {
-        await client.query(
-            `UPDATE players SET reliability_tier = $1, banned_until = NOW() + INTERVAL '7 days' WHERE id = $2`,
-            [newTier, playerId]
-        );
-        console.log(`⚠️ Player ${playerId} moved to WHITE — ban expires in 7 days`);
-    } else if (newTier === 'black') {
-        await client.query(
-            `UPDATE players SET reliability_tier = $1, banned_until = NULL WHERE id = $2`,
-            [newTier, playerId]
-        );
-        console.log(`⛔ Player ${playerId} moved to BLACK — permanent ban`);
-    } else {
-        await client.query(
-            `UPDATE players SET reliability_tier = $1, banned_until = NULL WHERE id = $2`,
-            [newTier, playerId]
-        );
-    }
-}
-
 // SEC-009: Rate limiter for DM sends — prevents spam/flooding
 const dmSendLimiter = rateLimit({
     windowMs: 60 * 1000,   // 1 minute
@@ -450,16 +423,10 @@ app.post('/api/auth/register', async (req, res) => {
         // Create player - simple insert with just the fields we know exist
         const playerResult = await pool.query(
             `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold') RETURNING id`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver') RETURNING id`,
             [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield']
         );
         const playerId = playerResult.rows[0].id;
-
-        // New players start with 1 discipline point (keeps them on Gold tier, 0-1 = Gold)
-        await pool.query(
-            `INSERT INTO discipline_records (player_id, offense_type, points, warning_level) VALUES ($1, 'Starting Point', 1, 0)`,
-            [playerId]
-        );
 
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
@@ -1899,7 +1866,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         // Tier-based visibility (exact requirements)
         let hoursAhead = 72; // silver default (72 hours = 3 days)
-        if (tier === 'gold') hoursAhead = 7 * 24; // 7 days
+        if (tier === 'gold') hoursAhead = 28 * 24; // 28 days
         if (tier === 'bronze') hoursAhead = 24; // 24 hours
         if (tier === 'white' || tier === 'black') hoursAhead = 0; // banned - no games visible
         
@@ -2351,7 +2318,34 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             ? result.rows
             : result.rows.map(({ pairs, avoids, ...safe }) => safe);
 
-        res.json(players);
+        // Append guests as pseudo-players so they appear in the confirmed player list
+        const guestResult = await pool.query(`
+            SELECT 
+                NULL::integer as registration_id,
+                NULL::integer as registered_by_player_id,
+                NULL::text as registered_by_alias,
+                NULL::text as registered_by_full_name,
+                ('guest_' || gg.id::text) as player_id,
+                ('guest_' || gg.id::text) as id,
+                gg.guest_name as full_name,
+                (gg.guest_name || ' (Guest)') as alias,
+                NULL::integer as squad_number,
+                'confirmed' as status,
+                NULL::text as backup_type,
+                'outfield' as positions,
+                'outfield' as position_preference,
+                NULL::text as tournament_team_preference,
+                gg.team_name,
+                NULL::text as fixed_team,
+                NULL::integer[] as pairs,
+                NULL::integer[] as avoids,
+                TRUE as is_guest
+            FROM game_guests gg
+            WHERE gg.game_id = $1
+            ORDER BY gg.guest_number
+        `, [req.params.id]);
+
+        res.json([...players, ...guestResult.rows]);
     } catch (error) {
         console.error('Get game players error:', error);
         res.status(500).json({ error: 'Failed to fetch players' });
@@ -2515,6 +2509,34 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
             
             // For confirmed backup, deduct credits immediately
             if (backupType === 'confirmed_backup') {
+                if (parseFloat(game.cost_per_player) > 0) {
+                    const creditResult = await client.query(
+                        'SELECT balance FROM credits WHERE player_id = $1',
+                        [req.user.playerId]
+                    );
+                    
+                    if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
+                        await client.query('ROLLBACK');
+                        return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
+                    }
+                    
+                    await client.query(
+                        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+                        [game.cost_per_player, req.user.playerId]
+                    );
+                    
+                    await client.query(
+                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                        [req.user.playerId, -game.cost_per_player, 'game_fee', `Confirmed backup for game ${gameId}`]
+                    );
+                }
+            }
+        } else {
+            // Game has space - confirm registration
+            status = 'confirmed';
+            
+            // Deduct credits (skip entirely for free games)
+            if (parseFloat(game.cost_per_player) > 0) {
                 const creditResult = await client.query(
                     'SELECT balance FROM credits WHERE player_id = $1',
                     [req.user.playerId]
@@ -2522,7 +2544,7 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
                 
                 if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
                     await client.query('ROLLBACK');
-                    return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
+                    return res.status(400).json({ error: 'Insufficient credits' });
                 }
                 
                 await client.query(
@@ -2532,33 +2554,9 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
                 
                 await client.query(
                     'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [req.user.playerId, -game.cost_per_player, 'game_fee', `Confirmed backup for game ${gameId}`]
+                    [req.user.playerId, -game.cost_per_player, 'game_fee', `Registration for game ${gameId}`]
                 );
             }
-        } else {
-            // Game has space - confirm registration
-            status = 'confirmed';
-            
-            // Deduct credits
-            const creditResult = await client.query(
-                'SELECT balance FROM credits WHERE player_id = $1',
-                [req.user.playerId]
-            );
-            
-            if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: 'Insufficient credits' });
-            }
-            
-            await client.query(
-                'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                [game.cost_per_player, req.user.playerId]
-            );
-            
-            await client.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [req.user.playerId, -game.cost_per_player, 'game_fee', `Registration for game ${gameId}`]
-            );
         }
         
         // Register player
@@ -2977,7 +2975,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         // Tier timing window — apply the FRIEND's tier, as if they registered themselves
         const friendTier = friend.reliability_tier || 'silver';
         let hoursAhead = 72;
-        if (friendTier === 'gold') hoursAhead = 7 * 24;
+        if (friendTier === 'gold') hoursAhead = 28 * 24;
         if (friendTier === 'bronze') hoursAhead = 24;
 
         const windowCheck = await client.query(
@@ -3641,7 +3639,12 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 p.overall_rating,
                 p.goalkeeper_rating,
                 p.defending_rating,
+                p.strength_rating,
                 p.fitness_rating,
+                p.pace_rating,
+                p.decisions_rating,
+                p.assisting_rating,
+                p.shooting_rating,
                 r.position_preference,
                 array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
@@ -3650,7 +3653,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status = 'confirmed'
-            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.fitness_rating, r.position_preference
+            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.strength_rating, p.fitness_rating, p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating, r.position_preference
             ORDER BY p.overall_rating DESC
         `, [gameId]);
         
@@ -3679,7 +3682,12 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 overall_rating: guest.overall_rating || 0,
                 goalkeeper_rating: 0,
                 defending_rating: 0,
+                strength_rating: 0,
                 fitness_rating: 0,
+                pace_rating: 0,
+                decisions_rating: 0,
+                assisting_rating: 0,
+                shooting_rating: 0,
                 position_preference: 'outfield',
                 pairs: [guest.invited_by],
                 avoids: [],
@@ -4034,37 +4042,51 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         
         // Calculate stats
         const redStats = {
-            overall: redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0),
-            defense: redTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
-            fitness: redTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
+            overall:   redTeam.reduce((sum, p) => sum + (p.overall_rating    || 0), 0),
+            defense:   redTeam.reduce((sum, p) => sum + (p.defending_rating  || 0), 0),
+            strength:  redTeam.reduce((sum, p) => sum + (p.strength_rating   || 0), 0),
+            fitness:   redTeam.reduce((sum, p) => sum + (p.fitness_rating    || 0), 0),
+            pace:      redTeam.reduce((sum, p) => sum + (p.pace_rating       || 0), 0),
+            decisions: redTeam.reduce((sum, p) => sum + (p.decisions_rating  || 0), 0),
+            assisting: redTeam.reduce((sum, p) => sum + (p.assisting_rating  || 0), 0),
+            shooting:  redTeam.reduce((sum, p) => sum + (p.shooting_rating   || 0), 0)
         };
         
         const blueStats = {
-            overall: blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0),
-            defense: blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
-            fitness: blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0)
+            overall:   blueTeam.reduce((sum, p) => sum + (p.overall_rating   || 0), 0),
+            defense:   blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0),
+            strength:  blueTeam.reduce((sum, p) => sum + (p.strength_rating  || 0), 0),
+            fitness:   blueTeam.reduce((sum, p) => sum + (p.fitness_rating   || 0), 0),
+            pace:      blueTeam.reduce((sum, p) => sum + (p.pace_rating      || 0), 0),
+            decisions: blueTeam.reduce((sum, p) => sum + (p.decisions_rating || 0), 0),
+            assisting: blueTeam.reduce((sum, p) => sum + (p.assisting_rating || 0), 0),
+            shooting:  blueTeam.reduce((sum, p) => sum + (p.shooting_rating  || 0), 0)
         };
+        
+        const mapPlayer = p => ({
+            id:           p.player_id,
+            name:         p.alias || p.full_name,
+            full_name:    p.full_name,
+            alias:        p.alias,
+            squad_number: p.squad_number,
+            overall:      p.overall_rating    || 0,
+            defense:      p.defending_rating  || 0,
+            strength:     p.strength_rating   || 0,
+            fitness:      p.fitness_rating    || 0,
+            pace:         p.pace_rating       || 0,
+            decisions:    p.decisions_rating  || 0,
+            assisting:    p.assisting_rating  || 0,
+            shooting:     p.shooting_rating   || 0,
+            gk:           p.goalkeeper_rating || 0,
+            isGK:         p.position_preference?.toLowerCase().includes('gk') || false,
+            position_preference: p.position_preference || 'outfield',
+            is_guest:     p.is_guest || false
+        });
         
         res.json({
             message: 'Teams generated successfully',
-            redTeam: redTeam.map(p => ({
-                id: p.player_id,
-                name: p.alias || p.full_name,
-                squadNumber: p.squad_number,
-                overall: p.overall_rating,
-                defense: p.defending_rating || 0,
-                fitness: p.fitness_rating || 0,
-                isGK: p.position_preference?.toLowerCase().includes('gk')
-            })),
-            blueTeam: blueTeam.map(p => ({
-                id: p.player_id,
-                name: p.alias || p.full_name,
-                squadNumber: p.squad_number,
-                overall: p.overall_rating,
-                defense: p.defending_rating || 0,
-                fitness: p.fitness_rating || 0,
-                isGK: p.position_preference?.toLowerCase().includes('gk')
-            })),
+            redTeam:   redTeam.map(mapPlayer),
+            blueTeam:  blueTeam.map(mapPlayer),
             redStats,
             blueStats,
             beefs: Array.from(highBeefs.entries()).map(([playerId, targets]) => ({
@@ -4763,18 +4785,32 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             const teams = {};
             for (const team of teamsResult.rows) {
                 const playersResult = await pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number, p.overall_rating
+                    SELECT p.id, p.full_name, p.alias, p.squad_number,
+                           p.overall_rating, p.defending_rating, p.strength_rating,
+                           p.fitness_rating, p.pace_rating, p.decisions_rating,
+                           p.assisting_rating, p.shooting_rating, p.goalkeeper_rating,
+                           r.position_preference
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
+                    JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [team.id]);
+                `, [team.id, gameId]);
                 
                 const teamGuests = guestsResult.rows
                     .filter(g => g.team_name === team.team_name)
-                    .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall_rating: g.overall_rating, isGuest: true }));
+                    .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall: g.overall_rating || 0, defense: 0, strength: 0, fitness: 0, pace: 0, decisions: 0, assisting: 0, shooting: 0, gk: 0, isGK: false, is_guest: true }));
                 
-                teams[team.team_name] = [...playersResult.rows, ...teamGuests];
+                teams[team.team_name] = [...playersResult.rows.map(p => ({
+                    id: p.id, full_name: p.full_name, alias: p.alias, squad_number: p.squad_number,
+                    overall: p.overall_rating || 0, defense: p.defending_rating || 0,
+                    strength: p.strength_rating || 0, fitness: p.fitness_rating || 0,
+                    pace: p.pace_rating || 0, decisions: p.decisions_rating || 0,
+                    assisting: p.assisting_rating || 0, shooting: p.shooting_rating || 0,
+                    gk: p.goalkeeper_rating || 0,
+                    isGK: p.position_preference?.toLowerCase().includes('gk') || false,
+                    position_preference: p.position_preference || 'outfield'
+                })), ...teamGuests];
             }
             res.json({ teams, isTournament: true });
         } else {
@@ -4784,31 +4820,76 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             
             const [redTeamResult, blueTeamResult] = await Promise.all([
                 pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number
+                    SELECT p.id, p.full_name, p.alias, p.squad_number,
+                           p.overall_rating, p.defending_rating, p.strength_rating,
+                           p.fitness_rating, p.pace_rating, p.decisions_rating,
+                           p.assisting_rating, p.shooting_rating, p.goalkeeper_rating,
+                           r.position_preference
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
+                    JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [redTeamId]),
+                `, [redTeamId, gameId]),
                 pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number
+                    SELECT p.id, p.full_name, p.alias, p.squad_number,
+                           p.overall_rating, p.defending_rating, p.strength_rating,
+                           p.fitness_rating, p.pace_rating, p.decisions_rating,
+                           p.assisting_rating, p.shooting_rating, p.goalkeeper_rating,
+                           r.position_preference
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
+                    JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [blueTeamId])
+                `, [blueTeamId, gameId])
             ]);
             
+            const mapTeamPlayer = p => ({
+                id:           p.id,
+                full_name:    p.full_name,
+                alias:        p.alias,
+                squad_number: p.squad_number,
+                overall:      p.overall_rating    || 0,
+                defense:      p.defending_rating  || 0,
+                strength:     p.strength_rating   || 0,
+                fitness:      p.fitness_rating    || 0,
+                pace:         p.pace_rating       || 0,
+                decisions:    p.decisions_rating  || 0,
+                assisting:    p.assisting_rating  || 0,
+                shooting:     p.shooting_rating   || 0,
+                gk:           p.goalkeeper_rating || 0,
+                isGK:         p.position_preference?.toLowerCase().includes('gk') || false,
+                position_preference: p.position_preference || 'outfield'
+            });
+
             const redGuests = guestsResult.rows
                 .filter(g => g.team_name === 'Red')
-                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
+                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall: g.overall_rating || 0, defense: 0, strength: 0, fitness: 0, pace: 0, decisions: 0, assisting: 0, shooting: 0, gk: 0, isGK: false, is_guest: true }));
             const blueGuests = guestsResult.rows
                 .filter(g => g.team_name === 'Blue')
-                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, isGuest: true }));
-            
+                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall: g.overall_rating || 0, defense: 0, strength: 0, fitness: 0, pace: 0, decisions: 0, assisting: 0, shooting: 0, gk: 0, isGK: false, is_guest: true }));
+
+            const redMapped  = [...redTeamResult.rows.map(mapTeamPlayer),  ...redGuests];
+            const blueMapped = [...blueTeamResult.rows.map(mapTeamPlayer), ...blueGuests];
+
+            // Compute team stats for display
+            const calcStats = team => ({
+                overall:   team.reduce((s, p) => s + (p.overall   || 0), 0),
+                defense:   team.reduce((s, p) => s + (p.defense   || 0), 0),
+                strength:  team.reduce((s, p) => s + (p.strength  || 0), 0),
+                fitness:   team.reduce((s, p) => s + (p.fitness   || 0), 0),
+                pace:      team.reduce((s, p) => s + (p.pace      || 0), 0),
+                decisions: team.reduce((s, p) => s + (p.decisions || 0), 0),
+                assisting: team.reduce((s, p) => s + (p.assisting || 0), 0),
+                shooting:  team.reduce((s, p) => s + (p.shooting  || 0), 0)
+            });
+
             res.json({
-                redTeam: [...redTeamResult.rows, ...redGuests],
-                blueTeam: [...blueTeamResult.rows, ...blueGuests]
+                redTeam:   redMapped,
+                blueTeam:  blueMapped,
+                redStats:  calcStats(redMapped),
+                blueStats: calcStats(blueMapped)
             });
         }
         
@@ -5018,11 +5099,14 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                     
                     // Award discipline points if late dropout
                     if (isLateDropout) {
-                        const disciplinePoints = 10; // Late Drop Out = 10 pts (all formats)
+                        const formatLower = (game.format || '').toLowerCase().replace(/\s+/g, '');
+                        const is11aSide = formatLower.includes('11') &&
+                            (formatLower.includes('side') || formatLower.includes('v') || formatLower.includes('x'));
+                        const disciplinePoints = is11aSide ? 3 : 2;
                         
                         await client.query(
                             `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
-                             VALUES ($1, $2, 'Late Drop Out', $3, 1)`,
+                             VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
                             [playerId, gameId, disciplinePoints]
                         );
                         
@@ -5033,15 +5117,10 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                             );
                             const newTier = tierResult.rows[0]?.new_tier;
                             if (newTier) {
-                                await applyTierUpdate(client, playerId, newTier);
-                                if (newTier === 'white' || newTier === 'black') {
-                                    await client.query(
-                                        `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_banned', $2)`,
-                                        [playerId, newTier === 'white'
-                                            ? '⚠️ Your account has been suspended for 7 days due to a late drop out.'
-                                            : '⛔ Your account has been permanently banned.']
-                                    );
-                                }
+                                await client.query(
+                                    'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                                    [newTier, playerId]
+                                );
                             }
                         } catch (tierError) {
                             console.error('Failed to recalculate tier after late dropout:', tierError.message);
@@ -5235,15 +5314,10 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 );
                 const newTier = tierResult.rows[0]?.new_tier;
                 if (newTier) {
-                    await applyTierUpdate(client, dpId, newTier);
-                    if (newTier === 'white' || newTier === 'black') {
-                        await client.query(
-                            `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_banned', $2)`,
-                            [dpId, newTier === 'white'
-                                ? '⚠️ Your account has been suspended for 7 days due to discipline points.'
-                                : '⛔ Your account has been permanently banned.']
-                        );
-                    }
+                    await client.query(
+                        'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                        [newTier, dpId]
+                    );
                 }
             } catch (tierError) {
                 console.error('Failed to recalculate tier for player:', dpId, tierError.message);
@@ -7434,15 +7508,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
                 // Recalculate tier after discipline
                 const tierResult = await client.query('SELECT calculate_player_tier($1) as new_tier', [record.playerId]);
                 if (tierResult.rows.length > 0) {
-                    await applyTierUpdate(client, record.playerId, tierResult.rows[0].new_tier);
-                    if (tierResult.rows[0].new_tier === 'white' || tierResult.rows[0].new_tier === 'black') {
-                        await client.query(
-                            `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_banned', $2)`,
-                            [record.playerId, tierResult.rows[0].new_tier === 'white'
-                                ? '⚠️ Your account has been suspended for 7 days due to discipline points.'
-                                : '⛔ Your account has been permanently banned.']
-                        );
-                    }
+                    await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [tierResult.rows[0].new_tier, record.playerId]);
                 }
             }
         }
@@ -7618,16 +7684,8 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
         const tierResult = await client.query(
             'SELECT calculate_player_tier($1) AS new_tier', [id]
         );
-        const newTier = tierResult.rows[0]?.new_tier || 'gold';
-        await applyTierUpdate(client, id, newTier);
-        if (newTier === 'white' || newTier === 'black') {
-            await client.query(
-                `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_banned', $2)`,
-                [id, newTier === 'white'
-                    ? '⚠️ Your account has been suspended for 7 days due to discipline points.'
-                    : '⛔ Your account has been permanently banned.']
-            );
-        }
+        const newTier = tierResult.rows[0]?.new_tier || 'silver';
+        await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, id]);
 
         await client.query('COMMIT');
         res.json({ success: true, newTier, pointsAdded: pts });
@@ -7657,13 +7715,16 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireAdmin, async 
             VALUES ($1, NULL, 1, 'Reinstated after ban', $2)
         `, [id, req.user.playerId]);
 
-        // Recalculate tier (1 point = gold under new thresholds)
+        // Recalculate tier (1 point with sufficient appearances = silver)
         const tierResult = await client.query(`
             SELECT calculate_player_tier($1) AS new_tier
         `, [id]);
-        const newTier = tierResult.rows[0]?.new_tier || 'gold';
+        const newTier = tierResult.rows[0]?.new_tier || 'silver';
 
-        await applyTierUpdate(client, id, newTier);
+        await client.query(
+            'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+            [newTier, id]
+        );
 
         // Insert reinstatement notification for the player
         await client.query(`
@@ -8390,60 +8451,6 @@ app.listen(PORT, () => {
             reminderRunning = false;
         }
     }, 5 * 60 * 1000); // Check every 5 minutes
-
-    // Auto-unban white-tier players whose 7-day ban has expired
-    setInterval(async () => {
-        try {
-            const expired = await pool.query(`
-                SELECT id FROM players
-                WHERE reliability_tier = 'white'
-                  AND banned_until IS NOT NULL
-                  AND banned_until <= NOW()
-            `);
-
-            if (expired.rows.length === 0) return;
-
-            console.log(`⏰ Auto-unbanning ${expired.rows.length} player(s) whose white-tier ban has expired...`);
-
-            for (const row of expired.rows) {
-                const client = await pool.connect();
-                try {
-                    await client.query('BEGIN');
-
-                    // Clear discipline records and insert fresh 1-point starting entry
-                    await client.query('DELETE FROM discipline_records WHERE player_id = $1', [row.id]);
-                    await client.query(
-                        `INSERT INTO discipline_records (player_id, offense_type, points, warning_level) VALUES ($1, 'Ban Expired', 1, 0)`,
-                        [row.id]
-                    );
-
-                    // Recalculate tier — 1 pt = gold
-                    const tierResult = await client.query('SELECT calculate_player_tier($1) AS new_tier', [row.id]);
-                    const newTier = tierResult.rows[0]?.new_tier || 'gold';
-                    await applyTierUpdate(client, row.id, newTier);
-
-                    // Notify the player
-                    await client.query(
-                        `INSERT INTO notifications (player_id, type, message) VALUES ($1, 'account_reinstated', '✅ Your 7-day suspension has ended. Your account has been reinstated.')`,
-                        [row.id]
-                    );
-
-                    await client.query('COMMIT');
-                    console.log(`✅ Auto-unbanned player ${row.id} → ${newTier}`);
-
-                    // Fire push notification (non-blocking)
-                    sendPushNotification(row.id, 'account_reinstated', '✅ Your 7-day suspension has ended. Your account has been reinstated.').catch(() => {});
-                } catch (err) {
-                    await client.query('ROLLBACK');
-                    console.error(`✗ Auto-unban failed for player ${row.id}:`, err.message);
-                } finally {
-                    client.release();
-                }
-            }
-        } catch (error) {
-            console.error('✗ Auto-unban scheduler error:', error.message);
-        }
-    }, 60 * 60 * 1000); // Check every hour
 
     // Auto-finalize expired MOTM voting every 10 minutes
     setInterval(async () => {
