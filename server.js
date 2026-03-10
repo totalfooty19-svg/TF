@@ -2108,6 +2108,26 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             }
         }
         
+        // For tournament games, add per-team signup counts so UI can show slots remaining
+        if (game.team_selection_type === 'tournament' && game.tournament_team_count) {
+            try {
+                const teamCountsResult = await pool.query(`
+                    SELECT tournament_team_preference, COUNT(*) as count
+                    FROM registrations
+                    WHERE game_id = $1 AND status = 'confirmed' AND tournament_team_preference IS NOT NULL
+                    GROUP BY tournament_team_preference
+                `, [req.params.id]);
+                game.tournament_team_counts = {};
+                teamCountsResult.rows.forEach(r => {
+                    game.tournament_team_counts[r.tournament_team_preference] = parseInt(r.count);
+                });
+                game.tournament_team_max = Math.floor(parseInt(game.max_players) / parseInt(game.tournament_team_count));
+            } catch (e) {
+                game.tournament_team_counts = {};
+                game.tournament_team_max = null;
+            }
+        }
+        
         res.json(game);
     } catch (error) {
         console.error('Error fetching game:', error);
