@@ -1889,6 +1889,22 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
 
 
 // ==========================================
+// VENUES API
+// ==========================================
+
+app.get('/api/venues', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT id, name, address FROM venues ORDER BY name ASC'
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching venues:', error);
+        res.status(500).json({ error: 'Failed to fetch venues' });
+    }
+});
+
+// ==========================================
 // GAMES API
 // ==========================================
 
@@ -2204,7 +2220,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         const { 
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
             exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor,
-            tournamentTeamCount, tournamentName, starRating
+            tournamentTeamCount, tournamentName, starRating,
+            isVenueClash, venueClashTeam1Name, venueClashTeam2Name
         } = req.body;
 
         // FIX-023: Validate required game creation inputs
@@ -2234,6 +2251,20 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             }
             if (regularity === 'weekly') {
                 return res.status(400).json({ error: 'Tournaments can only be created as one-off events' });
+            }
+        }
+
+        // Venue Clash validation — MISFITS-exclusive, both team names required
+        const vcEnabled = isVenueClash === true || isVenueClash === 'true';
+        if (vcEnabled) {
+            if (gameExclusivity !== 'misfits') {
+                return res.status(400).json({ error: 'Venue Clash games must be set to Misfits Only exclusivity' });
+            }
+            if (!venueClashTeam1Name || !venueClashTeam1Name.trim()) {
+                return res.status(400).json({ error: 'Team 1 name is required for Venue Clash games' });
+            }
+            if (!venueClashTeam2Name || !venueClashTeam2Name.trim()) {
+                return res.status(400).json({ error: 'Team 2 name is required for Venue Clash games' });
             }
         }
         
@@ -2273,14 +2304,18 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                         `INSERT INTO games (
                             venue_id, game_date, max_players, cost_per_player, format, regularity, 
                             exclusivity, position_type, game_url, series_id, 
-                            team_selection_type, external_opponent, tf_kit_color, opp_kit_color, star_rating
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                            team_selection_type, external_opponent, tf_kit_color, opp_kit_color, star_rating,
+                            is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
                             gameExclusivity, positionType || 'outfield_gk', gameUrl, 
                             seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
-                            starRating || null
+                            starRating || null,
+                            vcEnabled || false,
+                            vcEnabled ? venueClashTeam1Name.trim() : null,
+                            vcEnabled ? venueClashTeam2Name.trim() : null
                         ]
                     );
                     
@@ -2326,8 +2361,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     venue_id, game_date, max_players, cost_per_player, format, regularity, 
                     exclusivity, position_type, game_url, series_id,
                     team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
-                    tournament_team_count, tournament_name, star_rating
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                    tournament_team_count, tournament_name, star_rating,
+                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -2335,7 +2371,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
                     selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                     selType === 'tournament' ? (tournamentName || null) : null,
-                    starRating || null
+                    starRating || null,
+                    vcEnabled || false,
+                    vcEnabled ? venueClashTeam1Name.trim() : null,
+                    vcEnabled ? venueClashTeam2Name.trim() : null
                 ]
             );
             
@@ -2448,7 +2487,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
 app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
-        const { position, positions, pairs, avoids, backupType, tournamentTeamPreference } = req.body;
+        const { position, positions, pairs, avoids, backupType, tournamentTeamPreference, venueClashTeamPreference } = req.body;
         const gameId = req.params.id;
         const positionValue = positions || position || 'outfield';
         
@@ -2458,7 +2497,8 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         const gameLock = await client.query(`
             SELECT max_players, cost_per_player, exclusivity, 
                    player_editing_locked, team_selection_type, position_type, tournament_team_count,
-                   series_id, game_status, game_date
+                   series_id, game_status, game_date,
+                   is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
             FROM games
             WHERE id = $1
             FOR UPDATE
@@ -2672,10 +2712,11 @@ app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
         
         // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, amount_paid, is_comped)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, venue_clash_team_preference, amount_paid, is_comped)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
+             game.is_venue_clash ? (venueClashTeamPreference || null) : null,
              isComped ? 0 : (status === 'confirmed' ? game.cost_per_player : 0),
              isComped]
         );
@@ -7723,6 +7764,225 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
 // ==========================================
 // AUDIT ENDPOINTS
 // ==========================================
+
+// ==========================================
+// GAME TYPE CONVERSION
+// ==========================================
+
+// PUT /api/admin/games/:gameId/convert-type — convert a game between types
+app.put('/api/admin/games/:gameId/convert-type', authenticateToken, requireCLMAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { newType } = req.body;
+
+        const validTypes = ['normal', 'vs_external', 'tournament', 'draft_memory'];
+        if (!validTypes.includes(newType)) {
+            return res.status(400).json({ error: `Invalid game type. Must be one of: ${validTypes.join(', ')}` });
+        }
+
+        const gameResult = await pool.query(
+            'SELECT game_status, team_selection_type, teams_confirmed FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+
+        const game = gameResult.rows[0];
+        const oldType = game.team_selection_type;
+
+        if (['completed', 'cancelled'].includes(game.game_status)) {
+            return res.status(400).json({ error: 'Cannot change the type of a completed or cancelled game' });
+        }
+
+        if (game.game_status === 'confirmed' || game.teams_confirmed) {
+            return res.status(400).json({
+                error: 'Game is confirmed. Unconfirm it first before changing the type.',
+                requiresUnconfirm: true
+            });
+        }
+
+        if (oldType === newType) {
+            return res.status(400).json({ error: 'Game is already that type' });
+        }
+
+        // Clear fields that no longer apply when switching types
+        const clearFields = {};
+        if (newType === 'normal' || newType === 'draft_memory') {
+            clearFields.external_opponent = null;
+            clearFields.tf_kit_color = null;
+            clearFields.opp_kit_color = null;
+            clearFields.tournament_team_count = null;
+            clearFields.tournament_name = null;
+        }
+        if (newType === 'vs_external') {
+            clearFields.tournament_team_count = null;
+            clearFields.tournament_name = null;
+        }
+        if (newType === 'tournament') {
+            clearFields.external_opponent = null;
+            clearFields.tf_kit_color = null;
+            clearFields.opp_kit_color = null;
+        }
+
+        // Build targeted UPDATE — only nulls out fields that don't apply to new type
+        const setClauses = ['team_selection_type = $1'];
+        const params = [newType];
+        let idx = 2;
+        for (const col of Object.keys(clearFields)) {
+            setClauses.push(`${col} = $${idx}`);
+            params.push(null);
+            idx++;
+        }
+        params.push(gameId);
+        await pool.query(
+            `UPDATE games SET ${setClauses.join(', ')} WHERE id = $${idx}`,
+            params
+        );
+
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'type_converted',
+            `Changed from ${oldType} to ${newType}`));
+
+        res.json({ message: `Game type changed from ${oldType} to ${newType}. Existing registrations preserved.` });
+    } catch (error) {
+        console.error('Convert game type error:', error);
+        res.status(500).json({ error: 'Failed to convert game type' });
+    }
+});
+
+// ==========================================
+// PLAYER WIN RATE ANALYSIS
+// ==========================================
+
+// GET /api/admin/players/stats-list — player list for dropdown (id, alias, full_name only)
+app.get('/api/admin/players/stats-list', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT p.id, p.alias, p.full_name, p.squad_number
+            FROM players p
+            WHERE p.is_active = true OR p.is_active IS NULL
+            ORDER BY COALESCE(p.alias, p.full_name)
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to load players' });
+    }
+});
+
+// GET /api/admin/players/:id/stats-graph
+// Returns per-overall-rating data points: for each distinct overall rating the player
+// held, calculate Win% and MOTM% across all completed games played at that rating.
+app.get('/api/admin/players/:id/stats-graph', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // 1. Build rating timeline: each period = (overall_rating, from_date, to_date)
+        //    player_stat_history records each time rating changed
+        const historyResult = await pool.query(`
+            SELECT overall_rating, created_at
+            FROM player_stat_history
+            WHERE player_id = $1 AND overall_rating IS NOT NULL
+            ORDER BY created_at ASC
+        `, [id]);
+
+        // Also get the player's current overall rating as the latest period
+        const currentResult = await pool.query(
+            'SELECT overall_rating, created_at FROM players WHERE id = $1',
+            [id]
+        );
+        const current = currentResult.rows[0];
+
+        // Build periods array
+        const historyRows = historyResult.rows;
+        const periods = [];
+
+        // Add a synthetic "before first history entry" period using current rating if no history
+        if (historyRows.length === 0) {
+            if (current && current.overall_rating) {
+                periods.push({
+                    rating: parseFloat(current.overall_rating),
+                    from: new Date('2020-01-01'),
+                    to: new Date('2099-01-01')
+                });
+            }
+        } else {
+            // First period: from beginning of time to first history entry
+            // (player had this rating before the first recorded change)
+            periods.push({
+                rating: parseFloat(historyRows[0].overall_rating),
+                from: new Date('2020-01-01'),
+                to: new Date(historyRows[0].created_at)
+            });
+            // Middle periods
+            for (let i = 1; i < historyRows.length; i++) {
+                periods.push({
+                    rating: parseFloat(historyRows[i].overall_rating),
+                    from: new Date(historyRows[i - 1].created_at),
+                    to: new Date(historyRows[i].created_at)
+                });
+            }
+            // Final period: last change to now
+            periods.push({
+                rating: parseFloat(current?.overall_rating || historyRows[historyRows.length - 1].overall_rating),
+                from: new Date(historyRows[historyRows.length - 1].created_at),
+                to: new Date('2099-01-01')
+            });
+        }
+
+        // 2. For each period, get completed games the player appeared in and calculate stats
+        const grouped = {}; // keyed by rating
+
+        for (const period of periods) {
+            const gamesResult = await pool.query(`
+                SELECT
+                    g.id,
+                    g.game_date,
+                    g.motm_winner_id,
+                    g.winning_team,
+                    t.team_name
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                LEFT JOIN team_players tp ON tp.player_id = r.player_id
+                LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                WHERE r.player_id = $1
+                  AND r.status = 'confirmed'
+                  AND g.game_status = 'completed'
+                  AND g.game_date >= $2
+                  AND g.game_date < $3
+            `, [id, period.from.toISOString(), period.to.toISOString()]);
+
+            const rKey = period.rating;
+            if (!grouped[rKey]) grouped[rKey] = { appearances: 0, wins: 0, motms: 0 };
+
+            for (const g of gamesResult.rows) {
+                grouped[rKey].appearances++;
+                if (g.winning_team && g.team_name &&
+                    g.winning_team.toLowerCase() === g.team_name.toLowerCase()) {
+                    grouped[rKey].wins++;
+                }
+                if (parseInt(g.motm_winner_id) === parseInt(id)) {
+                    grouped[rKey].motms++;
+                }
+            }
+        }
+
+        // 3. Build output — only include rating bands with at least 1 appearance
+        const dataPoints = Object.entries(grouped)
+            .filter(([, v]) => v.appearances > 0)
+            .map(([rating, v]) => ({
+                rating: parseFloat(rating),
+                appearances: v.appearances,
+                wins: v.wins,
+                motms: v.motms,
+                win_pct: v.appearances > 0 ? Math.round((v.wins / v.appearances) * 1000) / 10 : 0,
+                motm_pct: v.appearances > 0 ? Math.round((v.motms / v.appearances) * 1000) / 10 : 0
+            }))
+            .sort((a, b) => a.rating - b.rating);
+
+        res.json(dataPoints);
+    } catch (error) {
+        console.error('Stats graph error:', error);
+        res.status(500).json({ error: 'Failed to load stats graph' });
+    }
+});
 
 // GET /api/admin/audit/player/:id — full audit history for a player
 app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (req, res) => {
