@@ -501,6 +501,7 @@ app.post('/api/auth/register', async (req, res) => {
                             [playerId, clmBadge.rows[0].id]
                         );
                         console.log('CLM badge assigned via direct link to player ' + playerId);
+                        await auditLog(pool, null, 'badge_auto_awarded', playerId, 'badge: CLM (registration via CLM link)');
                     }
                 } else if (ref.toLowerCase() === 'misfits') {
                     // Direct Misfits link - just assign Misfits badge
@@ -511,6 +512,7 @@ app.post('/api/auth/register', async (req, res) => {
                             [playerId, misfitsBadge.rows[0].id]
                         );
                         console.log('Misfits badge assigned via direct link to player ' + playerId);
+                        await auditLog(pool, null, 'badge_auto_awarded', playerId, 'badge: Misfits (registration via Misfits link)');
                     }
                 } else {
                     let referrerId = null;
@@ -549,6 +551,7 @@ app.post('/api/auth/register', async (req, res) => {
                                             'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
                                             [playerId, misfitsBadge.rows[0].id]
                                         );
+                                        await auditLog(pool, null, 'badge_auto_awarded', playerId, `badge: Misfits (inherited via referral from player ${referrerId})`);
                                     }
                                 }
                             }
@@ -1653,19 +1656,45 @@ app.put('/api/admin/players/:playerId/badges', authenticateToken, requireAdmin, 
         const { badgeIds } = req.body;
         
         await client.query('BEGIN');
+
+        // Capture before state for audit
+        const beforeResult = await client.query(
+            'SELECT b.name FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = $1 ORDER BY b.name',
+            [playerId]
+        );
+        const beforeNames = beforeResult.rows.map(r => r.name);
         
         // Remove all existing badges
         await client.query('DELETE FROM player_badges WHERE player_id = $1', [playerId]);
         
         // Add new badges
+        let afterNames = [];
         for (const badgeId of badgeIds) {
             await client.query(
                 'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2)',
                 [playerId, badgeId]
             );
         }
+
+        // Capture after state for audit
+        if (badgeIds.length > 0) {
+            const afterResult = await client.query(
+                'SELECT b.name FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = $1 ORDER BY b.name',
+                [playerId]
+            );
+            afterNames = afterResult.rows.map(r => r.name);
+        }
         
         await client.query('COMMIT');
+
+        // Audit: log what changed
+        const added = afterNames.filter(n => !beforeNames.includes(n));
+        const removed = beforeNames.filter(n => !afterNames.includes(n));
+        const detail = [
+            added.length   ? 'added: ' + added.join(', ')   : '',
+            removed.length ? 'removed: ' + removed.join(', ') : ''
+        ].filter(Boolean).join(' | ') || 'no change';
+        await auditLog(pool, req.user.playerId, 'badges_updated', playerId, detail);
         
         res.json({ message: 'Badges updated successfully' });
 
@@ -1688,6 +1717,7 @@ app.put('/api/admin/players/:playerId/badges', authenticateToken, requireAdmin, 
 
 
 // Auto-allocate badges based on player stats
+
 async function autoAllocateBadges(playerId) {
     try {
         // Get player stats
@@ -1736,6 +1766,8 @@ async function autoAllocateBadges(playerId) {
                 'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
                 [playerId, badgeId]
             );
+            const badgeName = badgesResult.rows.find(b => b.id === badgeId)?.name || badgeId;
+            await auditLog(pool, null, 'badge_auto_awarded', playerId, `badge: ${badgeName} (auto)`);
         }
         
         // Remove "New" badge if no longer applicable
@@ -1744,6 +1776,8 @@ async function autoAllocateBadges(playerId) {
                 'DELETE FROM player_badges WHERE player_id = $1 AND badge_id = $2',
                 [playerId, badgeId]
             );
+            const badgeName = badgesResult.rows.find(b => b.id === badgeId)?.name || badgeId;
+            await auditLog(pool, null, 'badge_auto_removed', playerId, `badge: ${badgeName} (auto-expired)`);
         }
         
         return { awarded: badgesToAward.length, removed: badgesToRemove.length };
@@ -2293,8 +2327,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             
                 // Create 26 weeks of games (6 months)
                 for (let week = 0; week < 26; week++) {
-                    const weekDate = new Date(gameDate);
-                    weekDate.setDate(weekDate.getDate() + (week * 7));
+                    // FIX-DST: Use London-timezone-aware date to preserve local clock time
+                    // across DST boundaries (clocks change in March/October)
+                    const weekDate = addWeeksLondon(gameDate, week);
                     
                     const gameUrl = crypto.randomBytes(6).toString('hex');
                     const gameNumber = String(week + 1).padStart(2, '0');
@@ -3060,6 +3095,93 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
         await client.query('ROLLBACK').catch(() => {});
         console.error('Remove guest error:', error);
         res.status(500).json({ error: 'Failed to remove guest' });
+    } finally {
+        client.release();
+    }
+});
+
+// DELETE /api/games/:gameId/remove-my-registration/:registrationId
+// Allows the player who signed up a friend to remove them (without game lock).
+// Only works if the calling player is the registered_by_player_id on the registration.
+app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { gameId, registrationId } = req.params;
+        const playerId = req.user.playerId;
+
+        await client.query('BEGIN');
+
+        // Fetch the registration — must belong to this game and be registered by this player
+        const regResult = await client.query(
+            `SELECT r.id, r.player_id, r.status, r.amount_paid, r.registered_by_player_id,
+                    p.alias, p.full_name,
+                    g.game_status, g.teams_generated, g.player_editing_locked
+             FROM registrations r
+             JOIN players p ON p.id = r.player_id
+             JOIN games g ON g.id = $1
+             WHERE r.id = $2 AND r.game_id = $1`,
+            [gameId, registrationId]
+        );
+
+        if (regResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(404).json({ error: 'Registration not found' });
+        }
+
+        const reg = regResult.rows[0];
+
+        // Ensure the calling player was the one who registered this person
+        if (reg.registered_by_player_id !== playerId) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(403).json({ error: 'You can only remove players you personally signed up' });
+        }
+
+        // Block if game is past completion
+        if (!['available', 'confirmed'].includes(reg.game_status)) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: 'Cannot remove player from a completed or cancelled game' });
+        }
+
+        // Block if teams generated (same rule as admin endpoint for safety)
+        if (reg.teams_generated) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: 'Cannot remove a player after teams have been generated. Ask an admin.' });
+        }
+
+        const playerName = reg.alias || reg.full_name;
+        const refundAmt = parseFloat(reg.amount_paid || 0);
+
+        // Delete the registration
+        await client.query('DELETE FROM registrations WHERE id = $1', [registrationId]);
+
+        // Refund whoever paid (the registering player)
+        if (refundAmt > 0) {
+            await client.query(
+                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                [refundAmt, playerId]
+            );
+            await client.query(
+                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
+                [playerId, refundAmt, 'refund', `Removed ${playerName} from game`]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: `${playerName} has been removed.${refundAmt > 0 ? ` £${refundAmt.toFixed(2)} refunded to your balance.` : ''}`
+        });
+        setImmediate(() => gameAuditLog(pool, gameId, null, 'player_removed',
+            `Player: ${playerName} removed by registering player ${playerId} | Refunded: £${refundAmt.toFixed(2)}`));
+
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Remove my registration error:', error);
+        res.status(500).json({ error: 'Failed to remove player' });
     } finally {
         client.release();
     }
@@ -6002,6 +6124,9 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             venue_name: game.venue_name,
             venue_address: game.venue_address,
             venue_photo: venue_photo,
+            venue_pitch_location: game.venue_pitch_location || null,
+            venue_facilities: game.venue_facilities || null,
+            venue_notes: game.venue_notes || null,
             format: game.format,
             max_players: game.max_players,
             current_players: game.current_players,
@@ -7199,8 +7324,12 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
         let query, params;
         if (isFullAdmin) {
             query = `SELECT g.*, v.name as venue_name,
-                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
-                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players, motm_p.alias as motm_winner_alias
+                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
+                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                motm_p.alias as motm_winner_alias,
+                COALESCE((SELECT SUM(r.amount_paid) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
+                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 ORDER BY g.game_date DESC`;
             params = [];
@@ -7217,8 +7346,12 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 )`);
             }
             query = `SELECT g.*, v.name as venue_name,
-                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
-                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players, motm_p.alias as motm_winner_alias
+                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
+                 (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                motm_p.alias as motm_winner_alias,
+                COALESCE((SELECT SUM(r.amount_paid) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
+                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
@@ -7312,6 +7445,7 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
                     'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
                     [playerId, cb.rows[0].id]
                 );
+                await auditLog(pool, req.user.playerId, 'badge_auto_awarded', playerId, 'badge: CLM (granted with CLM admin role)');
             }
         }
         
@@ -7323,6 +7457,7 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
                     'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
                     [playerId, ob.rows[0].id]
                 );
+                await auditLog(pool, req.user.playerId, 'badge_auto_awarded', playerId, 'badge: Organiser (granted with organiser role)');
             }
         }
         
@@ -9074,6 +9209,41 @@ app.listen(PORT, () => {
             reminderRunning = false;
         }
     }, 5 * 60 * 1000); // Check every 5 minutes
+
+    // Daily sweep: remove expired 'New' (baby) badge from players > 30 days old
+    // This catches players who registered but never played (autoAllocateBadges never ran for them)
+    setInterval(async () => {
+        try {
+            // Get affected players before deleting so we can audit each one
+            const affected = await pool.query(`
+                SELECT pb.player_id
+                FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                JOIN players p ON p.id = pb.player_id
+                WHERE b.name = 'New'
+                  AND p.created_at < NOW() - INTERVAL '30 days'
+            `);
+            if (affected.rows.length === 0) return;
+
+            const result = await pool.query(`
+                DELETE FROM player_badges pb
+                USING badges b, players p
+                WHERE pb.badge_id = b.id
+                  AND pb.player_id = p.id
+                  AND b.name = 'New'
+                  AND p.created_at < NOW() - INTERVAL '30 days'
+            `);
+
+            if (result.rowCount > 0) {
+                console.log(`⏰ Baby badge sweep: removed New badge from ${result.rowCount} player(s)`);
+                for (const row of affected.rows) {
+                    await auditLog(pool, null, 'badge_auto_removed', row.player_id, 'badge: New (30-day sweep)');
+                }
+            }
+        } catch (error) {
+            console.error('✗ Baby badge sweep error:', error.message);
+        }
+    }, 24 * 60 * 60 * 1000); // Once every 24 hours
 
     // Auto-finalize expired MOTM voting every 10 minutes
     setInterval(async () => {
