@@ -3503,7 +3503,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         
         // Get the dropping player's registration — also fetch who paid (registered_by_player_id)
         const regResult = await client.query(
-            'SELECT id, status, backup_type, position_preference, registered_by_player_id FROM registrations WHERE game_id = $1 AND player_id = $2',
+            'SELECT id, status, backup_type, position_preference, registered_by_player_id, is_comped FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
         
@@ -3516,11 +3516,12 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         const wasConfirmed = droppingReg.status === 'confirmed';
         const wasConfirmedBackup = droppingReg.backup_type === 'confirmed_backup';
         const wasGKOnly = droppingReg.position_preference?.trim().toUpperCase() === 'GK';
+        const wasComped = !!droppingReg.is_comped;
         // If someone else paid for this registration, refund them — not the dropping player
         const refundTargetId = droppingReg.registered_by_player_id || req.user.playerId;
         
-        // Refund if they paid (confirmed players or confirmed backups)
-        if (wasConfirmed || wasConfirmedBackup) {
+        // Refund if they paid (confirmed players or confirmed backups) — skip if comped (£0 was taken)
+        if (!wasComped && (wasConfirmed || wasConfirmedBackup)) {
             await client.query(
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                 [cost, refundTargetId]
@@ -3684,7 +3685,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
         
         let message;
         if (wasConfirmed || wasConfirmedBackup) {
-            if (refundTargetId !== req.user.playerId) {
+            if (wasComped) {
+                message = 'Successfully dropped out.';
+            } else if (refundTargetId !== req.user.playerId) {
                 message = `Successfully dropped out. £${cost.toFixed(2)} refunded to the player who signed you up.`;
             } else {
                 message = `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.`;
@@ -6030,23 +6033,36 @@ app.get('/api/public/game/:gameUrl/series', async (req, res) => {
 
         // Get the current game's series_id
         const gameResult = await pool.query(
-            'SELECT id, series_id, game_date FROM games WHERE game_url = $1',
+            'SELECT id, series_id, venue_id, regularity, game_date FROM games WHERE game_url = $1',
             [gameUrl]
         );
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-        const { id: gameId, series_id } = gameResult.rows[0];
+        const { id: gameId, series_id, venue_id, regularity } = gameResult.rows[0];
 
-        if (!series_id) return res.json({ series: null });
-
-        // Get all games in the series ordered by date
-        const seriesResult = await pool.query(`
-            SELECT g.id, g.game_url, g.game_date, g.game_status, g.max_players,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
-                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
-            FROM games g
-            WHERE g.series_id = $1
-            ORDER BY g.game_date ASC
-        `, [series_id]);
+        // If no series_id but game is weekly recurring, group by venue + regularity as a fallback
+        let seriesResult;
+        if (series_id) {
+            seriesResult = await pool.query(`
+                SELECT g.id, g.game_url, g.game_date, g.game_status, g.max_players,
+                       ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                        + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+                FROM games g
+                WHERE g.series_id = $1
+                ORDER BY g.game_date ASC
+            `, [series_id]);
+        } else if (regularity === 'weekly' && venue_id) {
+            // Legacy weekly games without a series_id — group by venue
+            seriesResult = await pool.query(`
+                SELECT g.id, g.game_url, g.game_date, g.game_status, g.max_players,
+                       ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                        + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+                FROM games g
+                WHERE g.venue_id = $1 AND g.regularity = 'weekly' AND g.series_id IS NULL
+                ORDER BY g.game_date ASC
+            `, [venue_id]);
+        } else {
+            return res.json({ series: null });
+        }
 
         const games = seriesResult.rows;
         const currentIndex = games.findIndex(g => g.id === gameId);
@@ -6231,7 +6247,29 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
             LIMIT 50
         `, isDraftMemory ? [gameId, series_id] : [gameId]);
         
-        res.json(playersResult.rows);
+        // Append guests so they appear on the public game page
+        const guestsResult = await pool.query(`
+            SELECT
+                ('guest_' || gg.id::text) as id,
+                gg.guest_name as full_name,
+                (gg.guest_name || ' (Guest)') as alias,
+                NULL::integer as squad_number,
+                NULL::text as photo_url,
+                NULL::integer as total_appearances,
+                NULL::integer as motm_wins,
+                NULL::integer as total_wins,
+                NULL::text as reliability_tier,
+                'outfield' as position_preference,
+                gg.overall_rating,
+                NULL::text as fixed_team,
+                NULL::json as badges,
+                TRUE as is_guest
+            FROM game_guests gg
+            WHERE gg.game_id = $1
+            ORDER BY gg.guest_number
+        `, [gameId]);
+
+        res.json([...playersResult.rows, ...guestsResult.rows]);
         
     } catch (error) {
         console.error('Get public game players error:', error);
@@ -7159,7 +7197,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + 
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players, motm_p.alias as motm_winner_alias
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
-                ORDER BY g.game_date DESC LIMIT 50`;
+                ORDER BY g.game_date DESC`;
             params = [];
         } else {
             // Build OR conditions for each role the player has
