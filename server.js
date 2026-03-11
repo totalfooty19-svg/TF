@@ -272,18 +272,22 @@ const authenticateToken = async (req, res, next) => {
         // FIX-075: Verify player still exists (deleted players should lose access immediately)
         try {
             const playerExists = await pool.query(
-                'SELECT p.id, u.token_version FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+                'SELECT p.id, p.is_clm_admin, p.is_organiser, u.token_version, u.role FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
                 [user.playerId]
             );
             if (playerExists.rows.length === 0) {
                 return res.status(401).json({ error: 'Account no longer exists' });
             }
-            // SEC-016: JWT revocation via token_version — if user's version incremented, token is invalid
+            // SEC-016: JWT revocation via token_version
             const dbVersion = playerExists.rows[0].token_version || 0;
             const tokenVersion = user.tokenVersion || 0;
             if (tokenVersion < dbVersion) {
                 return res.status(401).json({ error: 'Session expired. Please log in again.' });
             }
+            // SEC-ROLE: Always use role from DB, not JWT — prevents stale elevated roles
+            user.role = playerExists.rows[0].role;
+            user.isCLMAdmin = playerExists.rows[0].is_clm_admin || false;
+            user.isOrganiser = playerExists.rows[0].is_organiser || false;
         } catch (e) {
             return res.status(500).json({ error: 'Authentication error' });
         }
@@ -741,7 +745,6 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 
 app.get('/api/players/me', authenticateToken, async (req, res) => {
     try {
-        console.log('Fetching player data for playerId:', req.user.playerId);
         
         // Start with absolute basics
         const result = await pool.query(`
@@ -750,7 +753,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
             WHERE p.id = $1
         `, [req.user.playerId]);
         
-        console.log('Query result:', result.rows);
         
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Player not found' });
@@ -832,7 +834,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
         if (player.isAdmin === undefined) player.isAdmin = false;
         if (player.isSuperAdmin === undefined) player.isSuperAdmin = false;
         
-        console.log('Returning player profile for:', player.id);
         res.json(player);
     } catch (error) {
         console.error('Error fetching player data:', error);
@@ -1895,7 +1896,7 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
 app.get('/api/venues', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT id, name, address FROM venues ORDER BY name ASC'
+            'SELECT id, name, address, pitch_location, facilities, notes FROM venues ORDER BY name ASC'
         );
         res.json(result.rows);
     } catch (error) {
@@ -2231,8 +2232,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         if (!parsedMax || parsedMax < 2 || parsedMax > 100) return res.status(400).json({ error: 'Max players must be between 2 and 100' });
         const parsedCost = parseFloat(costPerPlayer);
         if (isNaN(parsedCost) || parsedCost < 0 || parsedCost > 1000) return res.status(400).json({ error: 'Cost per player must be between £0 and £1000' });
-        const validFormats = ['5-a-side', '6-a-side', '7-a-side', '8-a-side', '9-a-side', '11-a-side'];
-        if (!validFormats.includes(format)) return res.status(400).json({ error: 'Invalid game format' });
+        if (!format || format.trim().length < 2 || format.trim().length > 30) return res.status(400).json({ error: 'Format must be between 2 and 30 characters (e.g. 9v9, 11v11)' });
         if (!['weekly', 'one-off'].includes(regularity)) return res.status(400).json({ error: 'Regularity must be weekly or one-off' });
 
         // FIX-084: Validate venue exists before creating games (prevents FK violation 500 error)
@@ -2962,7 +2962,8 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
         });
         setImmediate(() => gameAuditLog(pool, req.params.id, null, 'guest_added',
-            `Guest: ${guestName.trim()} | Host: Player ${req.user.playerId} | OVR: ${guestRating}`));
+            `Guest: ${guestName.trim()} | Host: Player ${req.user.playerId} | OVR: ${guestRating} | Paid: £${cost.toFixed(2)}`));
+    } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Add guest error:', error);
         res.status(500).json({ error: 'Failed to add guest' });
@@ -2996,6 +2997,9 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
             client.release();
             return res.status(400).json({ error: 'Cannot remove guest - teams already generated.' });
         }
+
+        // Lock credits row to prevent concurrent exploits
+        await client.query('SELECT id FROM credits WHERE player_id = $1 FOR UPDATE', [playerId]);
 
         // Find and delete the specific guest (or the most recent one if no guestId given)
         let guestResult;
@@ -5944,6 +5948,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.tournament_team_count, g.tournament_results_finalised, g.series_id,
                    g.regularity,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
+                   v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -7907,7 +7912,6 @@ app.get('/api/admin/players/stats-list', authenticateToken, requireAdmin, async 
         const result = await pool.query(`
             SELECT p.id, p.alias, p.full_name, p.squad_number
             FROM players p
-            WHERE p.is_active = true OR p.is_active IS NULL
             ORDER BY COALESCE(p.alias, p.full_name)
         `);
         res.json(result.rows);
