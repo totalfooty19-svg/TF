@@ -5655,29 +5655,11 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             }
         }
         
-        // 3b. Explicitly recalculate tiers for disciplined players
-        const disciplinedPlayerIds = (disciplineRecords || [])
-            .filter(d => d.points > 0)
-            .map(d => d.playerId);
-        
-        const uniqueDisciplinedIds = [...new Set(disciplinedPlayerIds)];
-        
-        for (const dpId of uniqueDisciplinedIds) {
-            try {
-                const tierResult = await client.query(
-                    'SELECT calculate_player_tier($1) as new_tier', [dpId]
-                );
-                const newTier = tierResult.rows[0]?.new_tier;
-                if (newTier) {
-                    await client.query(
-                        'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-                        [newTier, dpId]
-                    );
-                }
-            } catch (tierError) {
-                console.error('Failed to recalculate tier for player:', dpId, tierError.message);
-            }
-        }
+        // 3b. Collect disciplined player IDs for tier recalc AFTER commit
+        // (same pattern as unconfirm — never call calculate_player_tier inside a transaction)
+        const uniqueDisciplinedIds = [...new Set(
+            (disciplineRecords || []).filter(d => d.points > 0).map(d => d.playerId)
+        )];
         
         // 4. Save beef entries (bidirectional)
         for (const beef of beefEntries || []) {
@@ -5733,6 +5715,29 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 }
             }
         });
+
+        // Recalculate reliability tiers for disciplined players AFTER commit, using pool
+        // (not client) with ::uuid cast so the overloaded DB function resolves correctly
+        if (uniqueDisciplinedIds.length > 0) {
+            setImmediate(async () => {
+                for (const dpId of uniqueDisciplinedIds) {
+                    try {
+                        const tierResult = await pool.query(
+                            'SELECT calculate_player_tier($1::uuid) as new_tier', [dpId]
+                        );
+                        const newTier = tierResult.rows[0]?.new_tier;
+                        if (newTier) {
+                            await pool.query(
+                                'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                                [newTier, dpId]
+                            );
+                        }
+                    } catch (tierError) {
+                        console.error('Tier recalc failed for player', dpId, ':', tierError.message);
+                    }
+                }
+            });
+        }
         
         res.json({ 
             message: 'Game completed successfully',
@@ -7910,6 +7915,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             '10_late': '10+ Minutes Late',
             'no_show': 'No Show'
         };
+        const tournamentDisciplinedIds = [];
         for (const record of disciplineRecords || []) {
             if (record.points > 0) {
                 await client.query(
@@ -7917,12 +7923,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
                      VALUES ($1, $2, $3, $4, $5)`,
                     [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
                 );
-                
-                // Recalculate tier after discipline
-                const tierResult = await client.query('SELECT calculate_player_tier($1) as new_tier', [record.playerId]);
-                if (tierResult.rows.length > 0) {
-                    await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [tierResult.rows[0].new_tier, record.playerId]);
-                }
+                tournamentDisciplinedIds.push(record.playerId);
             }
         }
         
@@ -7945,6 +7946,29 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             } catch (badgeError) {
                 console.error(`Badge allocation failed for ${playerId}:`, badgeError.message);
             }
+        }
+
+        // Tier recalculation for disciplined players — after commit, pool not client, ::uuid cast
+        const uniqueTournamentDisciplinedIds = [...new Set(tournamentDisciplinedIds)];
+        if (uniqueTournamentDisciplinedIds.length > 0) {
+            setImmediate(async () => {
+                for (const dpId of uniqueTournamentDisciplinedIds) {
+                    try {
+                        const tierResult = await pool.query(
+                            'SELECT calculate_player_tier($1::uuid) as new_tier', [dpId]
+                        );
+                        const newTier = tierResult.rows[0]?.new_tier;
+                        if (newTier) {
+                            await pool.query(
+                                'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                                [newTier, dpId]
+                            );
+                        }
+                    } catch (tierError) {
+                        console.error('Tier recalc failed for player', dpId, ':', tierError.message);
+                    }
+                }
+            });
         }
         
         res.json({
@@ -8448,7 +8472,7 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
 
         // Immediately recalculate tier
         const tierResult = await client.query(
-            'SELECT calculate_player_tier($1) AS new_tier', [id]
+            'SELECT calculate_player_tier($1::uuid) AS new_tier', [id]
         );
         const newTier = tierResult.rows[0]?.new_tier || 'silver';
         await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, id]);
@@ -8486,7 +8510,7 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireAdmin, async 
 
         // Recalculate tier (1 point with sufficient appearances = silver)
         const tierResult = await client.query(`
-            SELECT calculate_player_tier($1) AS new_tier
+            SELECT calculate_player_tier($1::uuid) AS new_tier
         `, [id]);
         const newTier = tierResult.rows[0]?.new_tier || 'silver';
 
