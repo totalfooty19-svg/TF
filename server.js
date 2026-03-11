@@ -2454,9 +2454,9 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
         const guestResult = await pool.query(`
             SELECT 
                 NULL::integer as registration_id,
-                NULL::integer as registered_by_player_id,
-                NULL::text as registered_by_alias,
-                NULL::text as registered_by_full_name,
+                gg.invited_by as registered_by_player_id,
+                host.alias as registered_by_alias,
+                host.full_name as registered_by_full_name,
                 ('guest_' || gg.id::text) as player_id,
                 ('guest_' || gg.id::text) as id,
                 gg.guest_name as full_name,
@@ -2471,8 +2471,10 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 NULL::text as fixed_team,
                 NULL::integer[] as pairs,
                 NULL::integer[] as avoids,
-                TRUE as is_guest
+                TRUE as is_guest,
+                gg.overall_rating
             FROM game_guests gg
+            LEFT JOIN players host ON host.id = gg.invited_by
             WHERE gg.game_id = $1
             ORDER BY gg.guest_number
         `, [req.params.id]);
@@ -3496,12 +3498,8 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
             });
         }
         
-        if (gameCheck.rows[0]?.teams_generated) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Cannot drop out - teams already generated' });
-        }
-        
         const cost = parseFloat(gameCheck.rows[0].cost_per_player);
+        const teamsWereGenerated = !!gameCheck.rows[0].teams_generated;
         
         // Get the dropping player's registration — also fetch who paid (registered_by_player_id)
         const regResult = await client.query(
@@ -3672,6 +3670,16 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
             }
         }
         
+        // If teams were already generated, clear them so admin must re-generate
+        if (teamsWereGenerated && wasConfirmed) {
+            await client.query(
+                'UPDATE games SET teams_generated = FALSE, teams_confirmed = FALSE WHERE id = $1',
+                [gameId]
+            );
+            await client.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)', [gameId]);
+            await client.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+        }
+
         await client.query('COMMIT');
         
         let message;
@@ -3680,6 +3688,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
                 message = `Successfully dropped out. £${cost.toFixed(2)} refunded to the player who signed you up.`;
             } else {
                 message = `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.`;
+            }
+            if (teamsWereGenerated) {
+                message += ' Note: teams have been reset and will need to be regenerated.';
             }
         } else {
             message = 'Successfully removed from backup list.';
