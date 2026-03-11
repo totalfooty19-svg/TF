@@ -5410,6 +5410,9 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
         const gameCost = parseFloat(game.cost_per_player);
         
         await client.query('BEGIN');
+            // Collect late-dropout player IDs for tier recalc AFTER commit (not inside transaction)
+            const lateDropoutPlayerIds = [];
+
             // Handle player removals if reason is player_dropout
             if (reason === 'player_dropout' && removedPlayers && removedPlayers.length > 0) {
                 for (const removal of removedPlayers) {
@@ -5450,22 +5453,9 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                              VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
                             [playerId, gameId, disciplinePoints]
                         );
-                        
-                        // Explicitly recalculate tier after late dropout
-                        try {
-                            const tierResult = await client.query(
-                                'SELECT calculate_player_tier($1) as new_tier', [playerId]
-                            );
-                            const newTier = tierResult.rows[0]?.new_tier;
-                            if (newTier) {
-                                await client.query(
-                                    'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-                                    [newTier, playerId]
-                                );
-                            }
-                        } catch (tierError) {
-                            console.error('Failed to recalculate tier after late dropout:', tierError.message);
-                        }
+                        // NOTE: Tier recalculation runs AFTER commit (see below) — never inside
+                        // the transaction, to prevent a DB function error from aborting everything
+                        lateDropoutPlayerIds.push(playerId);
                     }
                 }
             }
@@ -5498,6 +5488,30 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                 message: 'Game unconfirmed successfully',
                 playersRemoved: removedPlayers?.length || 0
             });
+
+            // Recalculate tiers for late dropouts AFTER commit and response,
+            // using pool (not client) so any failure is fully isolated.
+            // Cast to ::uuid so Postgres resolves the overloaded function correctly.
+            if (lateDropoutPlayerIds.length > 0) {
+                setImmediate(async () => {
+                    for (const pid of lateDropoutPlayerIds) {
+                        try {
+                            const tierResult = await pool.query(
+                                'SELECT calculate_player_tier($1::uuid) as new_tier', [pid]
+                            );
+                            const newTier = tierResult.rows[0]?.new_tier;
+                            if (newTier) {
+                                await pool.query(
+                                    'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+                                    [newTier, pid]
+                                );
+                            }
+                        } catch (tierError) {
+                            console.error('Tier recalc failed for player', pid, ':', tierError.message);
+                        }
+                    }
+                });
+            }
         
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
