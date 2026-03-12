@@ -4915,6 +4915,37 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
             `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, gameId]);
         }
 
+        // If tournament_team_count changed, wipe existing team assignments and
+        // clear any player team preferences that are now out of range (e.g. player
+        // picked "Team 6" but we're now running 4 teams).
+        if (tournament_team_count) {
+            const existingCount = await pool.query(
+                'SELECT tournament_team_count FROM games WHERE id = $1', [gameId]
+            );
+            const prevCount = existingCount.rows[0]?.tournament_team_count;
+            if (prevCount && parseInt(prevCount) !== parseInt(tournament_team_count)) {
+                // Delete generated teams (team_players first due to FK)
+                await pool.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)', [gameId]);
+                await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+                // Clear any player preferences that named a team slot that no longer exists
+                // Team names are stored as e.g. 'Team 5', 'Team 6' — clear if number > new count
+                await pool.query(`
+                    UPDATE registrations
+                    SET tournament_team_preference = NULL
+                    WHERE game_id = $1
+                      AND tournament_team_preference IS NOT NULL
+                      AND CAST(REGEXP_REPLACE(tournament_team_preference, '[^0-9]', '', 'g') AS INTEGER) > $2
+                `, [gameId, parseInt(tournament_team_count)]);
+                await pool.query(`
+                    UPDATE game_guests
+                    SET tournament_team_preference = NULL
+                    WHERE game_id = $1
+                      AND tournament_team_preference IS NOT NULL
+                      AND CAST(REGEXP_REPLACE(tournament_team_preference, '[^0-9]', '', 'g') AS INTEGER) > $2
+                `, [gameId, parseInt(tournament_team_count)]);
+            }
+        }
+
         // FIX-098: Notify confirmed players if cost changed
         const newCost = parseFloat(cost_per_player);
         if (oldCost !== newCost) {
