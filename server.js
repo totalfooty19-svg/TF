@@ -7,6 +7,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const cookieParser = require('cookie-parser');
 require('dotenv').config();
 
 // Nodemailer Gmail setup for password reset emails
@@ -57,6 +58,7 @@ app.use(helmet({
     referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
 }));
 app.disable('x-powered-by');
+app.use(cookieParser()); // CRIT-2: Parse httpOnly cookies on every request
 
 // SEC-005: Enforce JSON Content-Type on all API responses
 app.use('/api', (req, res, next) => {
@@ -139,6 +141,26 @@ function validateSocialUrl(url) {
     const trimmed = String(url).trim();
     if (!trimmed.startsWith('https://')) return null;
     return trimmed;
+}
+
+// CRIT-8/10/15/N8: htmlEncode for user-supplied values inside HTML email bodies
+function htmlEncode(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// wrapEmailHtml: consistent dark-theme email wrapper used by signup + topup emails
+function wrapEmailHtml(inner) {
+    return `<div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
+        <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
+        ${inner}
+        <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
+    </div>`;
 }
 
 function addWeeksLondon(isoDateStr, weeks) {
@@ -324,8 +346,8 @@ if (!SUPERADMIN_EMAIL) console.warn('WARNING: SUPERADMIN_EMAIL not set — auto-
 // ==========================================
 
 const authenticateToken = async (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+    // CRIT-2: Read JWT from httpOnly cookie — not Authorization header
+    const token = req.cookies?.tf_token;
     if (!token) return res.status(401).json({ error: 'Access denied' });
     
     jwt.verify(token, JWT_SECRET, async (err, user) => {
@@ -367,19 +389,22 @@ const requireAdmin = (req, res, next) => {
 // SEC-026: Optional auth — attaches user if token present but never blocks unauthenticated requests.
 // Used for endpoints where general content is public but personalised content requires auth.
 const optionalAuth = async (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return next(); // No token — continue as guest
+    // CRIT-2: Read JWT from httpOnly cookie — not Authorization header
+    const token = req.cookies?.tf_token;
+    if (!token) return next();
     jwt.verify(token, JWT_SECRET, async (err, user) => {
         if (!err) {
             try {
                 const row = await pool.query(
-                    'SELECT p.id, u.token_version FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+                    'SELECT p.id, u.token_version, u.role FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
                     [user.playerId]
                 );
                 if (row.rows.length > 0) {
                     const dbVer = row.rows[0].token_version || 0;
-                    if ((user.tokenVersion || 0) >= dbVer) req.user = user;
+                    if ((user.tokenVersion || 0) >= dbVer) {
+                        user.role = row.rows[0].role; // SEC-ROLE: always use role from DB
+                        req.user = user;
+                    }
                 }
             } catch (_) { /* ignore — treat as guest */ }
         }
@@ -509,10 +534,9 @@ app.post('/api/auth/register', async (req, res) => {
 
         // Hash password
         const passwordHash = await bcrypt.hash(password, 12); // SEC-014: bcrypt cost 12 (was 10)
-        
-        // Determine role
-        let role = 'player';
-        if (email.toLowerCase() === SUPERADMIN_EMAIL) role = 'superadmin';
+
+        // MED-2: All new accounts start as 'player' — superadmin must be set directly in DB
+        const role = 'player';
 
         // Create user
         const userResult = await pool.query(
@@ -655,11 +679,11 @@ app.post('/api/auth/register', async (req, res) => {
                     html: wrapEmailHtml(`
                         <p style="color:#888;font-size:14px;margin:0 0 16px">New account created</p>
                         <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
-                            <tr><td style="padding:6px 0;color:#888;width:120px;">Full Name</td><td style="font-weight:900;">${fullName.trim()}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Alias</td><td>${playerAlias}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Email</td><td>${email}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Mobile</td><td>${phone.trim()}</td></tr>
-                            ${ref ? `<tr><td style="padding:6px 0;color:#888;">Referral</td><td>${ref}</td></tr>` : ''}
+                            <tr><td style="padding:6px 0;color:#888;width:120px;">Full Name</td><td style="font-weight:900;">${htmlEncode(fullName.trim())}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Alias</td><td>${htmlEncode(playerAlias)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Email</td><td>${htmlEncode(email)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Mobile</td><td>${htmlEncode(phone.trim())}</td></tr>
+                            ${ref ? `<tr><td style="padding:6px 0;color:#888;">Referral</td><td>${htmlEncode(ref)}</td></tr>` : ''}
                         </table>
                     `)
                 });
@@ -685,12 +709,43 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         const user = userResult.rows[0];
+
+        // MED-4: Check if account is currently locked out
+        const failureRecord = await pool.query(
+            'SELECT failed_count, locked_until FROM login_failures WHERE user_id = $1',
+            [user.id]
+        );
+        if (failureRecord.rows.length > 0) {
+            const { locked_until } = failureRecord.rows[0];
+            if (locked_until && new Date(locked_until) > new Date()) {
+                const minutesLeft = Math.ceil((new Date(locked_until) - new Date()) / 60000);
+                return res.status(429).json({
+                    error: `Account temporarily locked due to too many failed attempts. Try again in ${minutesLeft} minute${minutesLeft !== 1 ? 's' : ''}.`
+                });
+            }
+        }
+
         const validPassword = await bcrypt.compare(password, user.password_hash);
         if (!validPassword) {
-            // FIX-056: Log failed attempt (email only, never password)
+            // MED-4: Record failed attempt — lock after 10 failures for 15 minutes
+            await pool.query(`
+                INSERT INTO login_failures (user_id, failed_count, last_failed_at)
+                VALUES ($1, 1, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET failed_count = login_failures.failed_count + 1,
+                    last_failed_at = NOW(),
+                    locked_until = CASE
+                        WHEN login_failures.failed_count + 1 >= 10
+                        THEN NOW() + INTERVAL '15 minutes'
+                        ELSE NULL
+                    END
+            `, [user.id]);
             console.warn(`Failed login: ${email.toLowerCase()} at ${new Date().toISOString()}`);
             return res.status(401).json({ error: 'Invalid credentials' });
         }
+
+        // MED-4: Successful login — clear failure record
+        await pool.query('DELETE FROM login_failures WHERE user_id = $1', [user.id]);
 
         const playerResult = await pool.query(
             `SELECT p.*, c.balance as credits,
@@ -722,8 +777,16 @@ app.post('/api/auth/login', async (req, res) => {
             { expiresIn: '7d' }
         );
 
+        // CRIT-2: Set JWT as httpOnly cookie — not in response body
+        // SameSite=None required for cross-origin (totalfooty.co.uk → totalfooty-api.onrender.com)
+        res.cookie('tf_token', token, {
+            httpOnly: true,
+            secure: true,
+            sameSite: 'none',
+            maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in ms
+        });
+
         res.json({
-            token,
             user: {
                 id: player.id,
                 userId: user.id,
@@ -762,6 +825,16 @@ app.post('/api/auth/login', async (req, res) => {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed' });
     }
+});
+
+// CRIT-2: Logout — clear the httpOnly cookie
+app.post('/api/auth/logout', (req, res) => {
+    res.clearCookie('tf_token', {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'none'
+    });
+    res.json({ message: 'Logged out' });
 });
 
 // Get current user info (for game.html auth check)
@@ -1332,7 +1405,12 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
 app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
     try {
         const { playerId } = req.params;
-        
+
+        // CRIT-9: Prevent IDOR — only the player themselves or an admin can view game history
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!isAdmin && req.user.playerId !== playerId) {
+            return res.status(403).json({ error: 'You can only view your own game history' });
+        }
         // Get upcoming games (registered and not completed)
         const upcomingResult = await pool.query(`
             SELECT g.id, g.game_date, g.cost_per_player, g.max_players, g.format, g.game_url,
@@ -1405,12 +1483,16 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
             if (!currentPassword) {
                 return res.status(400).json({ error: 'Current password is required to change your email address' });
             }
-            const userResult = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.userId]);
+            const userResult = await pool.query('SELECT password_hash, email FROM users WHERE id = $1', [req.user.userId]);
             const valid = await bcrypt.compare(currentPassword, userResult.rows[0].password_hash);
             if (!valid) {
                 return res.status(403).json({ error: 'Current password is incorrect' });
             }
         }
+
+        // N10: Fetch old email before update so we can alert it afterwards
+        const oldEmailRow = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
+        const oldEmail = oldEmailRow.rows[0]?.email || null;
 
         // FIX-091: Wrap both UPDATEs in a transaction — prevents partial profile update
         await client.query('BEGIN');
@@ -1442,6 +1524,32 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
         setImmediate(async () => {
             await auditLog(pool, req.user.playerId, 'account_updated', req.user.playerId,
                 `name:${fullName?.trim()} alias:${alias?.trim() || '-'} email:${email || '-'} phone:${phone ? 'updated' : '-'}`);
+
+            // N10: Alert old email address when email is changed — lets player spot unauthorised takeover
+            if (email && oldEmail && email.toLowerCase() !== oldEmail.toLowerCase()) {
+                try {
+                    await emailTransporter.sendMail({
+                        from: '"TotalFooty" <totalfooty19@gmail.com>',
+                        to: oldEmail,
+                        subject: '⚠️ Your TotalFooty email address was changed',
+                        html: wrapEmailHtml(`
+                            <p style="color:#ccc;font-size:15px;margin:0 0 16px;">
+                                The email address on your TotalFooty account was just changed to
+                                <strong>${htmlEncode(email)}</strong>.
+                            </p>
+                            <p style="color:#ccc;font-size:15px;margin:0 0 16px;">
+                                If you made this change, you can ignore this message.
+                            </p>
+                            <p style="color:#ff4444;font-size:15px;margin:0;">
+                                If you did <strong>not</strong> make this change, contact us immediately at
+                                <a href="mailto:totalfooty19@gmail.com" style="color:#ff4444;">totalfooty19@gmail.com</a>.
+                            </p>
+                        `)
+                    });
+                } catch (e) {
+                    console.error('Email change alert failed (non-critical):', e.message);
+                }
+            }
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -2338,6 +2446,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         const parsedCost = parseFloat(costPerPlayer);
         if (isNaN(parsedCost) || parsedCost < 0 || parsedCost > 1000) return res.status(400).json({ error: 'Cost per player must be between £0 and £1000' });
         if (!format || format.trim().length < 2 || format.trim().length > 30) return res.status(400).json({ error: 'Format must be between 2 and 30 characters (e.g. 9v9, 11v11)' });
+        // CRIT-35: Reject HTML characters in free-text game fields — these appear in emails and rendered HTML
+        if (/[<>"'&]/.test(format)) return res.status(400).json({ error: 'Format contains invalid characters' });
+        if (externalOpponent && /[<>"'&]/.test(externalOpponent)) return res.status(400).json({ error: 'Opponent name contains invalid characters' });
+        if (externalOpponent && externalOpponent.trim().length > 60) return res.status(400).json({ error: 'Opponent name: max 60 characters' });
         if (!['weekly', 'one-off'].includes(regularity)) return res.status(400).json({ error: 'Regularity must be weekly or one-off' });
 
         // FIX-084: Validate venue exists before creating games (prevents FK violation 500 error)
@@ -2402,7 +2514,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     // across DST boundaries (clocks change in March/October)
                     const weekDate = addWeeksLondon(gameDate, week);
                     
-                    const gameUrl = crypto.randomBytes(6).toString('hex');
+                    const gameUrl = crypto.randomBytes(8).toString('hex');
                     const gameNumber = String(week + 1).padStart(2, '0');
                     const fullSeriesId = `${seriesIdValue}-${gameNumber}`;
                     
@@ -2446,7 +2558,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             }
         } else {
             // Create single one-off game
-            const gameUrl = crypto.randomBytes(6).toString('hex');
+            const gameUrl = crypto.randomBytes(8).toString('hex');
             const selType = teamSelectionType || 'normal';
             
             // Create series record for one-off draft_memory or vs_external (for scoreline tracking)
@@ -6606,13 +6718,17 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
         if (isNaN(playerId)) {
             // UUID
             playerResult = await pool.query(
-                'SELECT * FROM players WHERE id = $1',
+                `SELECT id, full_name, alias, squad_number, photo_url, reliability_tier,
+                        total_appearances, total_wins, motm_wins
+                 FROM players WHERE id = $1`,
                 [playerId]
             );
         } else {
             // Squad number
             playerResult = await pool.query(
-                'SELECT * FROM players WHERE squad_number = $1',
+                `SELECT id, full_name, alias, squad_number, photo_url, reliability_tier,
+                        total_appearances, total_wins, motm_wins
+                 FROM players WHERE squad_number = $1`,
                 [parseInt(playerId)]
             );
         }
@@ -7326,10 +7442,10 @@ app.post('/api/players/me/topup-request', authenticateToken, topupLimiter, async
                     html: wrapEmailHtml(`
                         <p style="color:#888;font-size:14px;margin:0 0 16px">Player has requested a credit top-up</p>
                         <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
-                            <tr><td style="padding:6px 0;color:#888;width:120px;">Player</td><td style="font-weight:900;">${displayName}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Email</td><td>${player.email}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Player ID</td><td style="font-family:monospace;">${playerId}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Requested</td><td style="font-weight:900;color:#00cc66;">${amountStr}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;width:120px;">Player</td><td style="font-weight:900;">${htmlEncode(displayName)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Email</td><td>${htmlEncode(player.email)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Player ID</td><td style="font-family:monospace;">${htmlEncode(playerId)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Requested</td><td style="font-weight:900;color:#00cc66;">${htmlEncode(amountStr)}</td></tr>
                         </table>
                         <p style="color:#888;font-size:13px;margin-top:16px;">Once you receive their bank transfer, use the admin panel to add the credits.</p>
                     `)
@@ -9264,7 +9380,7 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
         const valid = await bcrypt.compare(currentPassword, userResult.rows[0].password_hash);
         if (!valid) return res.status(403).json({ error: 'Current password is incorrect' });
 
-        const hash = await bcrypt.hash(newPassword, 10);
+        const hash = await bcrypt.hash(newPassword, 12); // SEC-035: consistent cost 12 across all password hashing
         // HIGH-2: Bump token_version — all previously issued JWTs are now invalid
         await pool.query(
             'UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2',
