@@ -466,10 +466,12 @@ app.post('/api/auth/register', async (req, res) => {
         const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : firstName;
         const playerAlias = alias?.trim() || firstName;
 
-        // Create player - simple insert with just the fields we know exist
+        // Create player with default stats (GK=84, all outfield stats=12, overall=84)
         const playerResult = await pool.query(
-            `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver') RETURNING id`,
+            `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
+                goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+                pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver', 84, 12, 12, 12, 12, 12, 12, 12, 84) RETURNING id`,
             [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield']
         );
         const playerId = playerResult.rows[0].id;
@@ -2964,12 +2966,21 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             [playerId, -cost, 'game_fee', `+1 guest (${guestName.trim()}) for game`]
         );
 
-        // Get player's overall rating, guest gets -2
+        // Get player's overall rating (compute from individual stats if overall_rating is NULL)
         const playerRating = await client.query(
-            'SELECT overall_rating FROM players WHERE id = $1',
+            `SELECT overall_rating, defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating
+             FROM players WHERE id = $1`,
             [playerId]
         );
-        const guestRating = Math.max(0, (playerRating.rows[0]?.overall_rating || 0) - 2);
+        const pr = playerRating.rows[0] || {};
+        const computedOverall = (pr.overall_rating != null)
+            ? parseInt(pr.overall_rating)
+            : (parseInt(pr.defending_rating || 0) + parseInt(pr.strength_rating || 0) +
+               parseInt(pr.fitness_rating || 0) + parseInt(pr.pace_rating || 0) +
+               parseInt(pr.decisions_rating || 0) + parseInt(pr.assisting_rating || 0) +
+               parseInt(pr.shooting_rating || 0));
+        const guestRating = Math.max(0, computedOverall - 2);
 
         // Insert guest record
         await client.query(
