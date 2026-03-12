@@ -113,16 +113,21 @@ app.use('/api', (req, res, next) => {
 });
 
 // SEC-007: CSRF — reject state-changing requests from unexpected origins
+// CRIT-33: Use URL().origin for exact match — startsWith() was spoofable via https://totalfooty.co.uk.evil.com
 const ALLOWED_ORIGINS = ['https://totalfooty.co.uk', 'https://www.totalfooty.co.uk'];
 const csrfProtect = (req, res, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-    const origin = req.headers['origin'] || req.headers['referer'] || '';
-    if (!ALLOWED_ORIGINS.some(o => origin.startsWith(o))) {
+    const raw = req.headers['origin'] || req.headers['referer'] || '';
+    let originToCheck = raw;
+    try { originToCheck = new URL(raw).origin; } catch (_) { /* not a valid URL — block it */ }
+    if (!ALLOWED_ORIGINS.includes(originToCheck)) {
         return res.status(403).json({ error: 'Request origin not permitted' });
     }
     next();
 };
 app.use('/api', csrfProtect);
+// CRIT-30: One-line rate limit covers all 8+ /api/public/* routes
+app.use('/api/public/', publicEndpointLimiter);
 
 // SEC-008: Audit log — tamper-evident record of privileged actions
 
@@ -130,6 +135,14 @@ app.use('/api', csrfProtect);
 // Standard Date.setDate() operates in UTC, so crossing a DST boundary shifts the stored hour by 1.
 // This function extracts the London local hour/minute from the original date, adds weeks to the
 // calendar date, then returns the UTC instant that gives the same wall-clock time in London.
+// N2: Reject any social URL that doesn't start with https:// — prevents javascript: URI stored XSS
+function validateSocialUrl(url) {
+    if (!url) return null;
+    const trimmed = String(url).trim();
+    if (!trimmed.startsWith('https://')) return null;
+    return trimmed;
+}
+
 function addWeeksLondon(isoDateStr, weeks) {
     const orig = new Date(isoDateStr);
     const fmt = new Intl.DateTimeFormat('en-CA', {
@@ -228,6 +241,53 @@ const fairnessLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 10,
     message: { error: 'Too many votes. Please slow down.' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// CRIT-30: Rate limit all /api/public/* routes — game_url is brute-forceable without this
+const publicEndpointLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    message: { error: 'Too many requests. Please slow down.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// CRIT-21: Rate limit public player profile — prevents full squad enumeration in 99 requests
+const publicPlayerLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: { error: 'Too many requests. Please slow down.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// CRIT-13: Rate limit player lookup/search endpoints
+const playerLookupLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: { error: 'Too many requests. Please slow down.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// CRIT-32: Rate limit game registration and dropout — prevents slot-camping scripts
+const registrationLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000,
+    max: 10,
+    message: { error: 'Too many registration attempts. Please wait and try again.' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// CRIT-34: Rate limit top-up requests — prevents admin inbox flood
+const topupLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 3,
+    message: { error: 'Too many top-up requests. Please wait before requesting again.' },
     keyGenerator: (req) => req.user?.playerId || req.ip,
     standardHeaders: true,
     legacyHeaders: false,
@@ -848,7 +908,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
     }
 });
 
-app.get('/api/players', authenticateToken, async (req, res) => {
+app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res) => {
     try {
         const result = await pool.query(`
             WITH player_stats AS (
@@ -1170,7 +1230,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
     }
 });
 
-app.get('/api/players/:id', authenticateToken, async (req, res) => {
+app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT p.*, c.balance as credits, u.email,
@@ -1547,7 +1607,8 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
             overall_rating, total_wins, squad_number, phone, alias || null,
             is_featured !== undefined ? is_featured : null,
-            social_tiktok || null, social_instagram || null, social_youtube || null, social_facebook || null,
+            validateSocialUrl(social_tiktok), validateSocialUrl(social_instagram),
+            validateSocialUrl(social_youtube), validateSocialUrl(social_facebook),
             playerId]);
         
         // FIX-053: Update balance with audit trail if changed
@@ -2523,7 +2584,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
     }
 });
 
-app.post('/api/games/:id/register', authenticateToken, async (req, res) => {
+app.post('/api/games/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
     const client = await pool.connect();
     try {
         const { position, positions, pairs, avoids, backupType, tournamentTeamPreference, venueClashTeamPreference } = req.body;
@@ -3518,7 +3579,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     await emailTransporter.sendMail({
                         from: '"TotalFooty" <totalfooty19@gmail.com>',
                         to: friendEmail,
-                        subject: `⚽ ${regName} signed you up — TotalFooty`,
+                        subject: `⚽ ${(regName || '').replace(/[\r\n]/g, '')} signed you up — TotalFooty`,
                         html: `<div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
                             <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
                             <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:20px;">YOU'VE BEEN SIGNED UP</h2>
@@ -3533,7 +3594,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     await emailTransporter.sendMail({
                         from: '"TotalFooty" <totalfooty19@gmail.com>',
                         to: regEmail,
-                        subject: `✅ You signed up ${friendName} — TotalFooty`,
+                        subject: `✅ You signed up ${(friendName || '').replace(/[\r\n]/g, '')} — TotalFooty`,
                         html: `<div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
                             <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
                             <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:20px;">FRIEND REGISTERED</h2>
@@ -3624,7 +3685,7 @@ app.get('/api/games/:id/backups', authenticateToken, async (req, res) => {
 });
 
 // Drop out of game with refund + backup promotion
-app.post('/api/games/:id/drop-out', authenticateToken, async (req, res) => {
+app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, async (req, res) => {
     const client = await pool.connect();
     try {
         const gameId = req.params.id;
@@ -6479,6 +6540,15 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
             return res.status(400).json({ error: 'Voting has closed' });
         }
         
+        // CRIT-28: Verify nomineeId is an actual nominee for this game
+        const nomineeCheck = await pool.query(
+            'SELECT 1 FROM motm_nominees WHERE game_id = $1 AND player_id = $2',
+            [gameId, nomineeId]
+        );
+        if (nomineeCheck.rows.length === 0) {
+            return res.status(400).json({ error: 'That player is not a nominee for this game' });
+        }
+
         // Cast vote (upsert)
         await pool.query(
             `INSERT INTO motm_votes (game_id, voter_id, voted_for_id)
@@ -6497,7 +6567,7 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
 });
 
 // Get player profile (public)
-app.get('/api/public/player/:playerId', async (req, res) => {
+app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) => {
     try {
         const { playerId } = req.params;
         
@@ -7204,7 +7274,7 @@ app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
 });
 
 // #15: Player top-up request — emails admin and logs the request
-app.post('/api/players/me/topup-request', authenticateToken, async (req, res) => {
+app.post('/api/players/me/topup-request', authenticateToken, topupLimiter, async (req, res) => {
     try {
         const { amount } = req.body;
         const playerId = req.user.playerId;
@@ -7222,7 +7292,7 @@ app.post('/api/players/me/topup-request', authenticateToken, async (req, res) =>
                 await emailTransporter.sendMail({
                     from: '"TotalFooty" <totalfooty19@gmail.com>',
                     to: 'totalfooty19@gmail.com',
-                    subject: `💰 Top-Up Request — ${displayName}`,
+                    subject: `💰 Top-Up Request — ${(displayName || '').replace(/[\r\n]/g, '')}`,
                     html: wrapEmailHtml(`
                         <p style="color:#888;font-size:14px;margin:0 0 16px">Player has requested a credit top-up</p>
                         <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
@@ -8512,7 +8582,8 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
 });
 
 // POST /api/admin/players/:id/unban — superadmin only, clears discipline and adds 1 warning point
-app.post('/api/admin/players/:id/unban', authenticateToken, requireAdmin, async (req, res) => {
+// CRIT-14: requireSuperAdmin — admins must not be able to unban players the superadmin deliberately banned
+app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, async (req, res) => {
     const { id } = req.params;
     const client = await pool.connect();
     try {
@@ -9016,6 +9087,11 @@ app.get('/api/public/game/:gameUrl/messages', async (req, res) => {
         if (gameRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
         const gameId = gameRes.rows[0].id;
 
+        // CRIT-12: Validate since is a valid ISO date before using in query
+        if (since && isNaN(Date.parse(since))) {
+            return res.status(400).json({ error: 'Invalid since parameter' });
+        }
+
         const sinceClause = since ? 'AND gm.created_at > $2' : '';
         const params = since ? [gameId, since] : [gameId];
 
@@ -9145,7 +9221,11 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
         if (!valid) return res.status(403).json({ error: 'Current password is incorrect' });
 
         const hash = await bcrypt.hash(newPassword, 10);
-        await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.user.userId]);
+        // HIGH-2: Bump token_version — all previously issued JWTs are now invalid
+        await pool.query(
+            'UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2',
+            [hash, req.user.userId]
+        );
 
         res.json({ message: 'Password updated successfully' });
     } catch (error) {
@@ -9163,7 +9243,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     try {
         const result = await pool.query(
-            `SELECT prt.id, prt.player_id, prt.expires_at, prt.used_at
+            `SELECT prt.id, prt.token AS stored_token, prt.player_id, prt.expires_at, prt.used_at
              FROM password_reset_tokens prt
              WHERE prt.token = $1`,
             [token]
@@ -9172,6 +9252,13 @@ app.post('/api/auth/reset-password', async (req, res) => {
         if (result.rows.length === 0) return res.status(400).json({ error: 'Invalid or expired reset link' });
 
         const resetToken = result.rows[0];
+
+        // MED-1: Timing-safe comparison to prevent brute-force enumeration via timing side-channel
+        let tokenMatch = false;
+        try {
+            tokenMatch = crypto.timingSafeEqual(Buffer.from(token, 'hex'), Buffer.from(resetToken.stored_token, 'hex'));
+        } catch (_) { tokenMatch = false; }
+        if (!tokenMatch) return res.status(400).json({ error: 'Invalid or expired reset link' });
 
         if (resetToken.used_at) return res.status(400).json({ error: 'This reset link has already been used' });
         if (new Date() > new Date(resetToken.expires_at)) return res.status(400).json({ error: 'This reset link has expired' });
