@@ -246,6 +246,117 @@ async function statHistory(pool, playerId, changedBy, stats, tier = null) {
     }
 }
 
+
+
+// ── PUSH NOTIFICATIONS ───────────────────────────────────────────────────────
+// getGameDataForNotification: fetch minimal game info for push payloads
+async function getGameDataForNotification(gameId) {
+    const result = await pool.query(
+        `SELECT g.game_date, g.game_url, g.format, g.cost_per_player,
+                v.name as venue_name
+         FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+         WHERE g.id = $1`,
+        [gameId]
+    );
+    if (result.rows.length === 0) return {};
+    const row = result.rows[0];
+    const d = new Date(row.game_date);
+    return {
+        gameId,
+        game_url: row.game_url,
+        day:      d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'Europe/London' }),
+        time:     d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London' }),
+        venue:    row.venue_name || 'TBC',
+        format:   row.format || '',
+        cost:     parseFloat(row.cost_per_player || 0),
+    };
+}
+
+// Push notification title/body templates per type
+const NOTIF_TEMPLATES = {
+    game_registered:   d => ({ title: 'Signed Up! ⚽',          body: `You're in for ${d.day} at ${d.venue}. £${(d.cost||0).toFixed(2)} deducted.` }),
+    backup_added:      d => ({ title: 'On the Backup List ⏳',  body: `You're on backup for ${d.day} at ${d.venue}.` }),
+    dropout_confirmed: d => ({ title: 'Dropped Out ✅',          body: `You've been removed from ${d.day} at ${d.venue}.` }),
+    backup_promoted:   d => ({ title: "You're In! 🟢",           body: `A spot opened — you're confirmed for ${d.day} at ${d.venue}!` }),
+    teams_created:     d => ({ title: 'Teams Are Live! 🏟️',     body: `Teams set for ${d.day} at ${d.venue}. Check the app!` }),
+    game_cancelled:    d => ({ title: 'Game Cancelled ❌',       body: `The game on ${d.day} at ${d.venue} has been cancelled. Refund issued.` }),
+    cost_changed:      d => ({ title: 'Price Updated 💰',        body: `Game cost changed: was £${d.oldCost}, now £${d.newCost}.` }),
+    game_reminder:     d => ({ title: 'Game Tomorrow! ⚽',       body: `You're playing ${d.day} at ${d.time}, ${d.venue}.` }),
+    motm_voting_open:  d => ({ title: 'Vote for MOTM 🏆',       body: `Voting is open for ${d.day}. Cast your vote now!` }),
+    motm_winner:       d => ({ title: 'MOTM Winner 🌟',          body: `${d.winnerName} has won Man of the Match for ${d.day}!` }),
+    signup:            _d => ({ title: 'Welcome to TotalFooty! ⚽', body: "Your account is ready. Find a game and sign up!" }),
+    badge_awarded:     _d => ({ title: 'New Badge! 🏅',          body: "You've earned a new badge. Check your profile!" }),
+    balance_updated:   _d => ({ title: 'Balance Updated 💳',    body: 'Your TotalFooty credit balance has been updated.' }),
+};
+
+// sendNotification: send an Expo push notification to a player's registered devices.
+// Silently no-ops if the player has no tokens. Never throws.
+async function sendNotification(type, playerId, data = {}) {
+    try {
+        const tokenResult = await pool.query(
+            'SELECT fcm_token FROM fcm_tokens WHERE player_id = $1 ORDER BY last_used_at DESC LIMIT 5',
+            [playerId]
+        );
+        if (tokenResult.rows.length === 0) return;
+
+        const tmpl = NOTIF_TEMPLATES[type];
+        if (!tmpl) { console.warn('sendNotification: unknown type ' + type); return; }
+        const { title, body } = tmpl(data);
+
+        const messages = tokenResult.rows.map(row => ({
+            to: row.fcm_token, sound: 'default', title, body,
+            data: { type, gameId: data.gameId || null },
+        }));
+
+        const response = await fetch('https://exp.host/--/api/v2/push/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify(messages),
+        });
+
+        if (!response.ok) {
+            console.warn('Expo push API error: ' + response.status);
+            return;
+        }
+        // Prune DeviceNotRegistered tokens
+        const json = await response.json();
+        const tickets = Array.isArray(json.data) ? json.data : [];
+        for (let i = 0; i < tickets.length; i++) {
+            if (tickets[i]?.details?.error === 'DeviceNotRegistered') {
+                const stale = tokenResult.rows[i]?.fcm_token;
+                if (stale) pool.query('DELETE FROM fcm_tokens WHERE fcm_token = $1', [stale]).catch(() => {});
+            }
+        }
+    } catch (e) {
+        console.warn('sendNotification(' + type + ', ' + playerId + ') failed (non-critical):', e.message);
+    }
+}
+
+// ── SUPERADMIN EMAIL ALERTS ──────────────────────────────────────────────────
+// notifyAdmin: fire-and-forget email to SUPERADMIN_EMAIL. Never throws.
+// rows: array of [label, value] pairs to render as a table.
+async function notifyAdmin(subject, rows) {
+    if (!SUPERADMIN_EMAIL) return;
+    try {
+        const tableRows = rows.map(([label, value]) =>
+            `<tr><td style="padding:6px 0;color:#888;width:140px;vertical-align:top;">${htmlEncode(String(label))}</td>` +
+            `<td style="font-weight:700;color:#fff;">${htmlEncode(String(value))}</td></tr>`
+        ).join('');
+        await emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to:   SUPERADMIN_EMAIL,
+            subject,
+            html: wrapEmailHtml(
+                `<p style="color:#888;font-size:14px;margin:0 0 16px">${htmlEncode(subject)}</p>` +
+                `<table style="width:100%;border-collapse:collapse;font-size:14px;">${tableRows}</table>`
+            ),
+        });
+    } catch (e) {
+        console.warn('notifyAdmin email failed (non-critical):', e.message);
+    }
+}
+
+
 // SEC-009: Rate limiter for DM sends — prevents spam/flooding
 const dmSendLimiter = rateLimit({
     windowMs: 60 * 1000,   // 1 minute
@@ -674,7 +785,7 @@ app.post('/api/auth/register', async (req, res) => {
             try {
                 await emailTransporter.sendMail({
                     from: '"TotalFooty" <totalfooty19@gmail.com>',
-                    to: 'totalfooty19@gmail.com',
+                    to: SUPERADMIN_EMAIL || 'totalfooty19@gmail.com',
                     subject: '🆕 New Player Signup — TotalFooty',
                     html: wrapEmailHtml(`
                         <p style="color:#888;font-size:14px;margin:0 0 16px">New account created</p>
@@ -821,6 +932,10 @@ app.post('/api/auth/login', async (req, res) => {
                 }
             }
         });
+
+        // Audit login event (non-critical, after response)
+        setImmediate(() => auditLog(pool, player.id, 'login', player.id,
+            `email:${user.email} role:${user.role}`).catch(() => {}));
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed' });
@@ -3026,6 +3141,26 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 const gameData = await getGameDataForNotification(gameId);
                 const notifType = status === 'confirmed' ? 'game_registered' : 'backup_added';
                 await sendNotification(notifType, req.user.playerId, gameData);
+                // Superadmin: notify on game/tournament registration
+                const playerRow = await pool.query(
+                    'SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+                    [req.user.playerId]
+                );
+                const pName = playerRow.rows[0]?.alias || playerRow.rows[0]?.full_name || req.user.playerId;
+                const pEmail = playerRow.rows[0]?.email || '';
+                const isTournament = (await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId])).rows[0]?.team_selection_type === 'tournament';
+                const regType = status === 'confirmed' ? 'Confirmed' : `Backup (${regBackupType || 'standard'})`;
+                await notifyAdmin(
+                    `${isTournament ? '🏆 Tournament' : '⚽ Game'} Registration — ${pName}`,
+                    [
+                        ['Player', pName],
+                        ['Email', pEmail],
+                        ['Game', `${gameData.day} ${gameData.time}`],
+                        ['Venue', gameData.venue],
+                        ['Status', regType],
+                        ['Position', positionValue],
+                    ]
+                );
             } catch (e) {
                 console.error('Registration notification failed (non-critical):', e.message);
             }
@@ -3204,8 +3339,25 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             referralLink: referralCode ? `https://totalfooty.co.uk/vibecoding/?ref=${referralCode}` : null,
             referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
         });
-        setImmediate(() => gameAuditLog(pool, req.params.id, null, 'guest_added',
-            `Guest: ${guestName.trim()} | Host: Player ${req.user.playerId} | OVR: ${guestRating} | Paid: £${cost.toFixed(2)}`));
+        setImmediate(async () => {
+            await gameAuditLog(pool, req.params.id, null, 'guest_added',
+                `Guest: ${guestName.trim()} | Host: Player ${req.user.playerId} | OVR: ${guestRating} | Paid: £${cost.toFixed(2)}`);
+            try {
+                const hostRow = await pool.query(
+                    'SELECT p.full_name, p.alias FROM players p WHERE p.id = $1', [req.user.playerId]
+                );
+                const hostName = hostRow.rows[0]?.alias || hostRow.rows[0]?.full_name || req.user.playerId;
+                const gameData = await getGameDataForNotification(req.params.id);
+                await notifyAdmin('👤 Guest Added — ' + guestName.trim(), [
+                    ['Guest', guestName.trim()],
+                    ['Host', hostName],
+                    ['Rating', String(guestRating)],
+                    ['Cost', '£' + cost.toFixed(2)],
+                    ['Game', gameData.day + ' ' + gameData.time],
+                    ['Venue', gameData.venue],
+                ]);
+            } catch (e) { /* non-critical */ }
+        });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Add guest error:', error);
@@ -3739,6 +3891,21 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     }).catch(e => console.error('Friend registration email to registering player failed (non-critical):', e.message));
                 }
 
+                // Superadmin notify: player added another player
+                try {
+                    const isTournament = (await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId])).rows[0]?.team_selection_type === 'tournament';
+                    await notifyAdmin(
+                        `👥 Player Added by ${regName}`,
+                        [
+                            ['Added by', regName],
+                            ['Added player', friendFullName],
+                            ['Status', status === 'confirmed' ? 'Confirmed' : 'Backup'],
+                            ['Game', (gameData.day || '') + ' ' + (gameData.time || '')],
+                            ['Venue', gameData.venue || ''],
+                            ['Tournament', isTournament ? 'Yes' : 'No'],
+                        ]
+                    );
+                } catch (e) { /* non-critical */ }
             } catch (e) {
                 console.error('Friend registration notification failed (non-critical):', e.message);
             }
@@ -4056,6 +4223,11 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             try {
                 const evtType = wasConfirmed ? 'dropped_out' : 'backup_removed';
                 const evtDetail = wasConfirmedBackup ? 'Was confirmed backup' : wasConfirmed ? `Refunded £${cost.toFixed(2)}` : 'No charge';
+                // Enrich audit with player full name for easier cross-reference
+                const _playerNameRow = await pool.query(
+                    'SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]
+                ).catch(() => ({ rows: [] }));
+                const _pName = _playerNameRow.rows[0]?.alias || _playerNameRow.rows[0]?.full_name || req.user.playerId;
                 await registrationEvent(pool, gameId, req.user.playerId, evtType, evtDetail);
                 await gameAuditLog(pool, gameId, null, evtType,
                     `Player ID ${req.user.playerId}${promotedPlayer ? ` | Promoted: ${promotedPlayer.alias || promotedPlayer.full_name}` : ''}`);
@@ -4639,7 +4811,21 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 }))
             )
         });
-        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'teams_generated', 'Teams generated by algorithm'));
+        setImmediate(async () => {
+            const redAvg = redTeam.length ? (redStats.overall / redTeam.length).toFixed(1) : '0';
+            const blueAvg = blueTeam.length ? (blueStats.overall / blueTeam.length).toFixed(1) : '0';
+            await gameAuditLog(pool, gameId, req.user.playerId, 'teams_generated',
+                `Teams generated | Red avg OVR: ${redAvg} (${redTeam.length}p) | Blue avg OVR: ${blueAvg} (${blueTeam.length}p)`);
+            try {
+                const gameData = await getGameDataForNotification(gameId);
+                await notifyAdmin('🔀 Teams Generated', [
+                    ['Game', (gameData.day || '') + ' ' + (gameData.time || '')],
+                    ['Venue', gameData.venue || ''],
+                    ['Red team', redTeam.length + ' players | avg OVR ' + redAvg],
+                    ['Blue team', blueTeam.length + ' players | avg OVR ' + blueAvg],
+                ]);
+            } catch (e) { /* non-critical */ }
+        });
     } catch (error) {
         console.error('Generate teams error:', error);
         res.status(500).json({ error: 'Failed to generate teams' });
@@ -5203,7 +5389,28 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             message: 'Teams saved successfully',
             game: fullGameResult.rows[0]
         });
-        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed', 'Teams manually confirmed'));
+        setImmediate(async () => {
+            // Record avg overall rating per team at confirmation time
+            try {
+                const teamStats = await pool.query(`
+                    SELECT t.team_name,
+                           COUNT(tp.player_id) as player_count,
+                           ROUND(AVG(p.overall_rating)::numeric, 1) as avg_ovr
+                    FROM teams t
+                    JOIN team_players tp ON tp.team_id = t.id
+                    JOIN players p ON p.id = tp.player_id
+                    WHERE t.game_id = $1
+                    GROUP BY t.team_name ORDER BY t.team_name
+                `, [gameId]);
+                const teamSummary = teamStats.rows.map(r =>
+                    r.team_name + ': ' + r.player_count + 'p avg ' + r.avg_ovr
+                ).join(' | ');
+                await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed',
+                    'Teams confirmed | ' + (teamSummary || 'no team stats'));
+            } catch (e) {
+                await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed', 'Teams manually confirmed');
+            }
+        });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Save manual teams error:', error);
@@ -5592,6 +5799,20 @@ app.post('/api/games/:gameId/vote-motm', authenticateToken, async (req, res) => 
         );
         
         res.json({ message: 'Vote recorded' });
+
+        // Audit: record who voted for whom with full names
+        setImmediate(async () => {
+            try {
+                const [voterRow, nomineeRow] = await Promise.all([
+                    pool.query('SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]),
+                    pool.query('SELECT full_name, alias FROM players WHERE id = $1', [votedForId]),
+                ]);
+                const voterName = voterRow.rows[0]?.alias || voterRow.rows[0]?.full_name || req.user.playerId;
+                const nomineeName = nomineeRow.rows[0]?.alias || nomineeRow.rows[0]?.full_name || votedForId;
+                await gameAuditLog(pool, gameId, null, 'motm_vote',
+                    `Voter: ${voterName} (${req.user.playerId}) voted for ${nomineeName} (${votedForId})`);
+            } catch (e) { /* non-critical */ }
+        });
     } catch (error) {
         console.error('Vote MOTM error:', error);
         res.status(500).json({ error: 'Failed to record vote' });
@@ -5998,8 +6219,19 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             motmNominees: nomineesInserted,
             motmVotingEnds: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
         });
-        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_completed',
-            `Winner: ${winningTeam || 'N/A'} | MOTM nominees: ${nomineesInserted}`));
+        setImmediate(async () => {
+            await gameAuditLog(pool, gameId, req.user.playerId, 'game_completed',
+                `Winner: ${winningTeam || 'N/A'} | MOTM nominees: ${nomineesInserted}`);
+            try {
+                const gameData = await getGameDataForNotification(gameId);
+                await notifyAdmin('✅ Game Completed', [
+                    ['Game', (gameData.day || '') + ' ' + (gameData.time || '')],
+                    ['Venue', gameData.venue || ''],
+                    ['Winner', winningTeam || 'N/A'],
+                    ['MOTM nominees', String(nomineesInserted)],
+                ]);
+            } catch (e) { /* non-critical */ }
+        });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Complete game error:', error);
@@ -6732,6 +6964,20 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
         );
         
         res.json({ message: 'Vote recorded' });
+
+        // Audit: record who voted for whom with full names
+        setImmediate(async () => {
+            try {
+                const [voterRow, nomineeRow] = await Promise.all([
+                    pool.query('SELECT full_name, alias FROM players WHERE id = $1', [voterId]),
+                    pool.query('SELECT full_name, alias FROM players WHERE id = $1', [nomineeId]),
+                ]);
+                const voterName = voterRow.rows[0]?.alias || voterRow.rows[0]?.full_name || voterId;
+                const nomineeName = nomineeRow.rows[0]?.alias || nomineeRow.rows[0]?.full_name || nomineeId;
+                await gameAuditLog(pool, gameId, null, 'motm_vote',
+                    `Voter: ${voterName} (${voterId}) voted for ${nomineeName} (${nomineeId})`);
+            } catch (e) { /* non-critical */ }
+        });
         
     } catch (error) {
         console.error('MOTM vote error:', error);
@@ -7468,7 +7714,7 @@ app.post('/api/players/me/topup-request', authenticateToken, topupLimiter, async
             try {
                 await emailTransporter.sendMail({
                     from: '"TotalFooty" <totalfooty19@gmail.com>',
-                    to: 'totalfooty19@gmail.com',
+                    to: SUPERADMIN_EMAIL || 'totalfooty19@gmail.com',
                     subject: `💰 Top-Up Request — ${(displayName || '').replace(/[\r\n]/g, '')}`,
                     html: wrapEmailHtml(`
                         <p style="color:#888;font-size:14px;margin:0 0 16px">Player has requested a credit top-up</p>
@@ -9476,6 +9722,59 @@ app.post('/api/auth/reset-password', async (req, res) => {
     } catch (error) {
         console.error('Reset password error'); // SEC-037: No error details in log — no token/email leak
         res.status(500).json({ error: 'Failed to reset password' });
+    }
+});
+
+
+// ── CONTACT FORM ──────────────────────────────────────────────────────────────
+// POST /api/public/contact — anyone can submit (covered by publicEndpointLimiter)
+app.post('/api/public/contact', async (req, res) => {
+    try {
+        const { name, mobile, message } = req.body || {};
+
+        // Validate
+        if (!name || typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 80) {
+            return res.status(400).json({ error: 'Please provide your name (2–80 characters).' });
+        }
+        if (!mobile || typeof mobile !== 'string' || mobile.trim().length < 7 || mobile.trim().length > 20) {
+            return res.status(400).json({ error: 'Please provide a valid mobile number.' });
+        }
+        const dangerousChars = /[<>"'`]/;
+        if (dangerousChars.test(name) || dangerousChars.test(mobile)) {
+            return res.status(400).json({ error: 'Invalid characters in submission.' });
+        }
+        if (message && (typeof message !== 'string' || message.length > 500)) {
+            return res.status(400).json({ error: 'Message must be 500 characters or less.' });
+        }
+        if (message && dangerousChars.test(message)) {
+            return res.status(400).json({ error: 'Invalid characters in message.' });
+        }
+
+        res.json({ message: "Thanks! We'll be in touch soon." });
+
+        // Send email to admin (non-critical, after response)
+        setImmediate(async () => {
+            try {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to:   SUPERADMIN_EMAIL || 'totalfooty19@gmail.com',
+                    subject: '📬 Contact Form Submission — TotalFooty',
+                    html: wrapEmailHtml(
+                        '<p style="color:#888;font-size:14px;margin:0 0 16px">New contact form submission</p>' +
+                        '<table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">' +
+                        `<tr><td style="padding:6px 0;color:#888;width:100px;">Name</td><td style="font-weight:900;">${htmlEncode(name.trim())}</td></tr>` +
+                        `<tr><td style="padding:6px 0;color:#888;">Mobile</td><td>${htmlEncode(mobile.trim())}</td></tr>` +
+                        `<tr><td style="padding:6px 0;color:#888;">Message</td><td>${htmlEncode(message ? message.trim() : '(none)')}</td></tr>` +
+                        '</table>'
+                    ),
+                });
+            } catch (e) {
+                console.error('Contact form email failed (non-critical):', e.message);
+            }
+        });
+    } catch (error) {
+        console.error('Contact form error:', error);
+        res.status(500).json({ error: 'Failed to submit contact form.' });
     }
 });
 
