@@ -2317,6 +2317,8 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const venuePhotoMap = {
             'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
             'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
             'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
             'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
             'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
@@ -2386,6 +2388,8 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
         const venuePhotoMap = {
             'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
             'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
             'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
             'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
             'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
@@ -2490,6 +2494,8 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         const venuePhotoMap = {
             'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
             'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
             'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
             'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
             'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
@@ -6715,7 +6721,8 @@ app.get('/g/:gameUrl', async (req, res) => {
             WHERE g.game_url = $1
         `, [gameUrl]);
 
-        const gameUrl_ = `https://totalfooty.co.uk/vibecoding/game.html?url=${gameUrl}`;
+        const refParam = req.query.ref ? `&ref=${encodeURIComponent(req.query.ref)}` : '';
+        const gameUrl_ = `https://totalfooty.co.uk/vibecoding/game.html?url=${gameUrl}${refParam}`;
 
         if (result.rows.length === 0) {
             return res.redirect(gameUrl_);
@@ -6788,6 +6795,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
         const venuePhotoMap = {
             'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
             'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
             'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
             'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
             'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
