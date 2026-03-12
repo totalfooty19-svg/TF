@@ -2301,7 +2301,9 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             WHERE (
                 (g.game_status = 'available' AND g.game_date >= CURRENT_TIMESTAMP)
                 OR (g.game_status = 'confirmed')
-                ${isAdmin ? "OR (g.game_status = 'completed')" : ''}
+                OR (g.game_status = 'completed' AND (
+                    ${isAdmin ? 'TRUE' : 'EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1)'}
+                ))
             )
             ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
             AND g.game_status != 'cancelled'
