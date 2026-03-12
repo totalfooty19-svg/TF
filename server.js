@@ -4948,24 +4948,47 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
         
         const game = gameResult.rows[0];
         
-        if (!game.series_id) {
-            client.release();
-            return res.status(400).json({ error: 'This is not part of a weekly series' });
+        let seriesName = 'Unknown';
+        let seriesGames;
+
+        if (game.series_id) {
+            // Modern path: series_id UUID exists — use it directly
+            const seriesNameResult = await client.query(
+                'SELECT series_name FROM game_series WHERE id = $1',
+                [game.series_id]
+            );
+            seriesName = seriesNameResult.rows[0]?.series_name || 'Unknown';
+
+            seriesGames = await client.query(`
+                SELECT id FROM games
+                WHERE series_id = $1
+                AND game_date > CURRENT_TIMESTAMP
+            `, [game.series_id]);
+        } else {
+            // Legacy path: game was created before series_id was added.
+            // Match future games with same venue + format + day-of-week + weekly regularity.
+            const anchorResult = await client.query(
+                'SELECT venue_id, format, game_date FROM games WHERE id = $1',
+                [gameId]
+            );
+            if (anchorResult.rows.length === 0) {
+                client.release();
+                return res.status(404).json({ error: 'Game not found' });
+            }
+            const anchor = anchorResult.rows[0];
+            seriesName = anchor.format || 'Legacy series';
+
+            seriesGames = await client.query(`
+                SELECT id FROM games
+                WHERE venue_id     = $1
+                AND   format       = $2
+                AND   regularity   = 'weekly'
+                AND   series_id    IS NULL
+                AND   EXTRACT(DOW FROM game_date AT TIME ZONE 'Europe/London')
+                      = EXTRACT(DOW FROM $3::timestamptz AT TIME ZONE 'Europe/London')
+                AND   game_date    > CURRENT_TIMESTAMP
+            `, [anchor.venue_id, anchor.format, anchor.game_date]);
         }
-        
-        // Get series name for response
-        const seriesNameResult = await client.query(
-            'SELECT series_name FROM game_series WHERE id = $1',
-            [game.series_id]
-        );
-        const seriesName = seriesNameResult.rows[0]?.series_name || 'Unknown';
-        
-        // Find all FUTURE games in this series (same UUID, not LIKE)
-        const seriesGames = await client.query(`
-            SELECT id FROM games 
-            WHERE series_id = $1
-            AND game_date > CURRENT_TIMESTAMP
-        `, [game.series_id]);
         
         const gameIds = seriesGames.rows.map(g => g.id);
         
@@ -8902,7 +8925,7 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
                    p.alias as admin_alias, p.full_name as admin_name
             FROM audit_logs al
             LEFT JOIN players p ON p.id = al.admin_id
-            WHERE al.target_id = $1
+            WHERE al.target_id = $1 AND al.action != 'login'
             ORDER BY al.created_at DESC
         `, [id]);
 
