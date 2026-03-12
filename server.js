@@ -126,8 +126,6 @@ const csrfProtect = (req, res, next) => {
     next();
 };
 app.use('/api', csrfProtect);
-// CRIT-30: One-line rate limit covers all 8+ /api/public/* routes
-app.use('/api/public/', publicEndpointLimiter);
 
 // SEC-008: Audit log — tamper-evident record of privileged actions
 
@@ -292,6 +290,9 @@ const topupLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
 });
+
+// CRIT-30: One-line rate limit covers all 8+ /api/public/* routes — must be after limiter definitions
+app.use('/api/public/', publicEndpointLimiter);
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
