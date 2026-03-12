@@ -36,7 +36,7 @@ app.set('trust proxy', 1);
 // CORS MUST be first — before rate limiters, before helmet, before everything.
 // If CORS comes after rate limiters, any 429 response has no CORS headers and
 // the browser treats it as a CORS failure, blocking ALL subsequent requests.
-const CORS_ORIGINS = ['https://totalfooty.co.uk', 'https://www.totalfooty.co.uk'];
+const CORS_ORIGINS = ['https://totalfooty.co.uk', 'https://www.totalfooty.co.uk', 'https://api.totalfooty.co.uk'];
 app.use(cors({
     origin: CORS_ORIGINS,
     credentials: true,
@@ -116,7 +116,7 @@ app.use('/api', (req, res, next) => {
 
 // SEC-007: CSRF — reject state-changing requests from unexpected origins
 // CRIT-33: Use URL().origin for exact match — startsWith() was spoofable via https://totalfooty.co.uk.evil.com
-const ALLOWED_ORIGINS = ['https://totalfooty.co.uk', 'https://www.totalfooty.co.uk'];
+const ALLOWED_ORIGINS = ['https://totalfooty.co.uk', 'https://www.totalfooty.co.uk', 'https://api.totalfooty.co.uk'];
 const csrfProtect = (req, res, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
     const raw = req.headers['origin'] || req.headers['referer'] || '';
@@ -893,7 +893,8 @@ app.post('/api/auth/login', async (req, res) => {
         res.cookie('tf_token', token, {
             httpOnly: true,
             secure: true,
-            sameSite: 'none',
+            sameSite: 'lax',   // 'none' blocked by Samsung/DuckDuckGo/Firefox strict.
+                               // 'lax' works because api.totalfooty.co.uk is same-site as totalfooty.co.uk
             maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in ms
         });
 
@@ -947,7 +948,7 @@ app.post('/api/auth/logout', (req, res) => {
     res.clearCookie('tf_token', {
         httpOnly: true,
         secure: true,
-        sameSite: 'none'
+        sameSite: 'lax'
     });
     res.json({ message: 'Logged out' });
 });
@@ -2612,16 +2613,14 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                 const seqResult = await wClient.query("SELECT nextval('game_series_name_seq') as n");
                 const seriesIdValue = `TF${String(seqResult.rows[0].n).padStart(4, '0')}`;
             
-                // Create series record for draft_memory and vs_external games
-                let seriesUuid = null;
+                // Create series record for ALL weekly games (not just draft_memory/vs_external)
+                // This UUID is what delete-series uses to find and delete all games in the series
                 const selType = teamSelectionType || 'normal';
-                if (selType === 'draft_memory' || selType === 'vs_external') {
-                    const seriesResult = await wClient.query(
-                        'INSERT INTO game_series (series_name, series_type) VALUES ($1, $2) RETURNING id',
-                        [seriesIdValue, selType]
-                    );
-                    seriesUuid = seriesResult.rows[0].id;
-                }
+                const seriesResult = await wClient.query(
+                    'INSERT INTO game_series (series_name, series_type) VALUES ($1, $2) RETURNING id',
+                    [seriesIdValue, selType]
+                );
+                let seriesUuid = seriesResult.rows[0].id;
             
                 // Create 26 weeks of games (6 months)
                 for (let week = 0; week < 26; week++) {
@@ -3131,11 +3130,17 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     ? (regBackupType === 'confirmed_backup' ? 'confirmed_backup_joined'
                         : regBackupType === 'gk_backup' ? 'gk_backup_joined' : 'backup_joined')
                     : 'signed_up';
+                const regType = status === 'backup'
+                    ? (regBackupType === 'confirmed_backup' ? 'confirmed backup' : regBackupType === 'gk_backup' ? 'GK backup' : 'backup')
+                    : 'standard';
                 const evtDetail = `Position: ${positionValue}${regBackupType ? ' | Backup type: ' + regBackupType : ''}${isComped ? ' | Comped' : ''}`;
+                // Fetch player name for readable audit trail
+                const _snRow = await pool.query('SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]).catch(() => ({ rows: [] }));
+                const _snName = _snRow.rows[0]?.alias || _snRow.rows[0]?.full_name || req.user.playerId;
                 await registrationEvent(pool, gameId, req.user.playerId, evtType, evtDetail);
                 await gameAuditLog(pool, gameId, null,
                     status === 'backup' ? 'player_backup_joined' : 'player_signed_up',
-                    `Player ID ${req.user.playerId} — ${evtDetail}`);
+                    `${_snName} (${req.user.playerId}) | ${regType} | Position: ${positionValue}${isComped ? ' | Comped' : ''}`);
             } catch (e) { /* non-critical */ }
             try {
                 const gameData = await getGameDataForNotification(gameId);
@@ -3340,8 +3345,10 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
         });
         setImmediate(async () => {
+            const _hostRow = await pool.query('SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]).catch(() => ({ rows: [] }));
+            const _hostName = _hostRow.rows[0]?.alias || _hostRow.rows[0]?.full_name || req.user.playerId;
             await gameAuditLog(pool, req.params.id, null, 'guest_added',
-                `Guest: ${guestName.trim()} | Host: Player ${req.user.playerId} | OVR: ${guestRating} | Paid: £${cost.toFixed(2)}`);
+                `Guest: ${guestName.trim()} | Host: ${_hostName} (${req.user.playerId}) | OVR: ${guestRating} | Paid: £${cost.toFixed(2)}`);
             try {
                 const hostRow = await pool.query(
                     'SELECT p.full_name, p.alias FROM players p WHERE p.id = $1', [req.user.playerId]
@@ -3891,6 +3898,19 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     }).catch(e => console.error('Friend registration email to registering player failed (non-critical):', e.message));
                 }
 
+                // Audit: add-friend registration
+                try {
+                    const friendRegType = status === 'backup'
+                        ? (regBackupType === 'confirmed_backup' ? 'confirmed backup' : regBackupType === 'gk_backup' ? 'GK backup' : 'backup')
+                        : 'standard';
+                    await registrationEvent(pool, gameId, friendPlayerId,
+                        status === 'backup' ? 'backup_joined' : 'signed_up',
+                        `Signed up by ${regName} | ${friendRegType}`);
+                    await gameAuditLog(pool, gameId, null,
+                        status === 'backup' ? 'player_backup_joined' : 'player_signed_up',
+                        `${friendFullName} (${friendPlayerId}) | ${friendRegType} | Added by ${regName} (${registeringPlayerId})`);
+                } catch (e) { /* non-critical */ }
+
                 // Superadmin notify: player added another player
                 try {
                     const isTournament = (await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId])).rows[0]?.team_selection_type === 'tournament';
@@ -4230,7 +4250,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 const _pName = _playerNameRow.rows[0]?.alias || _playerNameRow.rows[0]?.full_name || req.user.playerId;
                 await registrationEvent(pool, gameId, req.user.playerId, evtType, evtDetail);
                 await gameAuditLog(pool, gameId, null, evtType,
-                    `Player ID ${req.user.playerId}${promotedPlayer ? ` | Promoted: ${promotedPlayer.alias || promotedPlayer.full_name}` : ''}`);
+                    `${_pName} (${req.user.playerId}) | ${evtDetail}${promotedPlayer ? ` | Promoted: ${promotedPlayer.alias || promotedPlayer.full_name}` : ''}`);
             } catch (e) { /* non-critical */ }
         });
     } catch (error) {
@@ -5727,7 +5747,8 @@ app.post('/api/admin/games/:gameId/start-motm', authenticateToken, requireGameMa
         );
         
         res.json({ message: 'MOTM voting started', votingEndsAt: votingEnds });
-        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'motm_voting_started', `Voting ends: ${votingEnds}`));
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'motm_voting_started',
+            `Nominees: ${nominees.length} players | Voting ends: ${votingEnds.toISOString()}`));
 
         // Non-critical: notify all nominees that voting is open
         setImmediate(async () => {
@@ -7729,7 +7750,7 @@ app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireGam
         }
         res.json({ message: 'MOTM voting finalized', winners: result.winners });
         setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'motm_finalized',
-            `Winner(s): ${result.winners?.map(w => w.alias || w.full_name).join(', ') || 'none'}`));
+            `Winner(s): ${result.winners?.map(w => `${w.name} (${w.playerId}) — ${w.votes} votes`).join(' | ') || 'none'}`));
     } catch (error) {
         console.error('Finalize MOTM error:', error);
         res.status(500).json({ error: error.message || 'Failed to finalize MOTM voting' });
@@ -8885,13 +8906,23 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             ORDER BY al.created_at DESC
         `, [id]);
 
+        // 7. Login events (from audit_logs where action = 'login' and target = this player)
+        const loginEvents = await pool.query(`
+            SELECT al.created_at, al.detail
+            FROM audit_logs al
+            WHERE al.target_id = $1 AND al.action = 'login'
+            ORDER BY al.created_at DESC
+            LIMIT 100
+        `, [id]);
+
         res.json({
             balance: balance.rows,
             stats: stats.rows,
             registrations: regEvents.rows,
             motmReceived: motmReceived.rows,
             motmVotesCast: motmVotes.rows,
-            adminActions: adminActions.rows
+            adminActions: adminActions.rows,
+            loginEvents: loginEvents.rows
         });
     } catch (error) {
         console.error('Player audit error:', error);
@@ -8934,10 +8965,23 @@ app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req
             ORDER BY r.registered_at ASC
         `, [id]);
 
+        // 4. URL views for this game (who viewed the game page and when)
+        const urlViews = await pool.query(`
+            SELECT gv.viewed_at,
+                   p.alias, p.full_name, p.squad_number,
+                   CASE WHEN p.id IS NULL THEN 'Guest (not logged in)' ELSE NULL END as guest_label
+            FROM game_url_views gv
+            LEFT JOIN players p ON p.id = gv.player_id
+            WHERE gv.game_id = $1
+            ORDER BY gv.viewed_at DESC
+            LIMIT 200
+        `, [id]).catch(() => ({ rows: [] })); // graceful if table doesn't exist yet
+
         res.json({
             gameLogs: gameLogs.rows,
             registrationEvents: regEvents.rows,
-            currentRegistrations: currentRegs.rows
+            currentRegistrations: currentRegs.rows,
+            urlViews: urlViews.rows
         });
     } catch (error) {
         console.error('Game audit error:', error);
@@ -9992,6 +10036,9 @@ app.listen(PORT, () => {
                     if (!result.alreadyFinalized) {
                         const names = result.winners.map(w => w.name).join(' & ');
                         console.log(`✅ MOTM auto-finalized game ${row.id}: ${names}`);
+                        // Audit the auto-finalization (no admin actor — null)
+                        await gameAuditLog(pool, row.id, null, 'motm_finalized',
+                            `Auto-finalized | Winner(s): ${names} | Votes: ${result.winners[0]?.votes ?? '?'}`).catch(() => {});
                     }
                 } catch (e) {
                     console.error(`✗ MOTM auto-finalize failed for game ${row.id}:`, e.message);
