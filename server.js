@@ -2989,12 +2989,20 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             [gameId, playerId, guestName.trim(), guestRating, cost, nextGuestNumber]
         );
 
-        // Get player's referral code for the refer-a-friend prompt
+        // Get player's referral code — generate one on the fly if missing (legacy accounts)
         const refResult = await client.query(
             'SELECT referral_code FROM players WHERE id = $1',
             [playerId]
         );
-        const referralCode = refResult.rows[0]?.referral_code;
+        let referralCode = refResult.rows[0]?.referral_code;
+        if (!referralCode) {
+            referralCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
+            await client.query('UPDATE players SET referral_code = $1 WHERE id = $2', [referralCode, playerId]);
+            await pool.query(
+                'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                [playerId, referralCode]
+            );
+        }
 
         await client.query('COMMIT');
 
@@ -3205,7 +3213,7 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
 app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
-        const { friendPlayerId, position, backupType } = req.body;
+        const { friendPlayerId, position, backupType, tournamentTeamPreference } = req.body;
         const gameId = req.params.id;
         const registeringPlayerId = req.user.playerId;
         const positionValue = position || 'outfield';
@@ -3422,12 +3430,13 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
 
         // Insert registration under friend's player_id, recording who paid
         await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid, registered_by_player_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid, registered_by_player_id, tournament_team_preference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
             [
                 gameId, friendPlayerId, status, positionValue, regBackupType,
                 (status === 'confirmed' || regBackupType === 'confirmed_backup') ? game.cost_per_player : 0,
-                registeringPlayerId
+                registeringPlayerId,
+                tournamentTeamPreference || null
             ]
         );
 
