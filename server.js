@@ -6779,6 +6779,9 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.regularity,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
+                   v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
+                   v.pitch_pin as venue_pitch_pin, v.boot_type as venue_boot_type,
+                   v.pitch_name as venue_pitch_name, v.special_instructions as venue_special_instructions,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
