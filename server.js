@@ -552,31 +552,14 @@ app.post('/api/auth/register', async (req, res) => {
             console.error('Referrals table insert (non-critical):', refErr.message);
         }
         
-        // Handle referral: look up referrer by code or direct CLM link
+        // Handle referral: look up referrer by code
+        // N6: ref=clm and ref=misfits badge auto-assignment REMOVED — exclusive badges must be admin-granted only.
+        // Any user who reads the source could self-assign restricted badges via ?ref=clm on the register URL.
         if (ref) {
             try {
-                if (ref.toLowerCase() === 'clm') {
-                    // Direct CLM link - just assign CLM badge
-                    const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
-                    if (clmBadge.rows.length > 0) {
-                        await pool.query(
-                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                            [playerId, clmBadge.rows[0].id]
-                        );
-                        console.log('CLM badge assigned via direct link to player ' + playerId);
-                        await auditLog(pool, null, 'badge_auto_awarded', playerId, 'badge: CLM (registration via CLM link)');
-                    }
-                } else if (ref.toLowerCase() === 'misfits') {
-                    // Direct Misfits link - just assign Misfits badge
-                    const misfitsBadge = await pool.query("SELECT id FROM badges WHERE name = 'Misfits'");
-                    if (misfitsBadge.rows.length > 0) {
-                        await pool.query(
-                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                            [playerId, misfitsBadge.rows[0].id]
-                        );
-                        console.log('Misfits badge assigned via direct link to player ' + playerId);
-                        await auditLog(pool, null, 'badge_auto_awarded', playerId, 'badge: Misfits (registration via Misfits link)');
-                    }
+                if (ref.toLowerCase() === 'clm' || ref.toLowerCase() === 'misfits') {
+                    // Silently ignore — no longer auto-assigns badges from URL param
+                    console.log(`N6: ref=${ref} badge auto-assign blocked for player ${playerId}`);
                 } else {
                     let referrerId = null;
                     const pRef = await pool.query('SELECT id FROM players WHERE referral_code = $1', [ref.toUpperCase()]);
@@ -600,7 +583,21 @@ app.post('/api/auth/register', async (req, res) => {
                                 // Set referred_by on new player
                                 await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referrerId, playerId]);
 
-                                // FIX-066: CLM badge auto-inheritance REMOVED — CLM access must be admin-granted only
+                                // CLM badge inheritance via referral chain
+                                const referrerCLM = await pool.query(
+                                    "SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'CLM'",
+                                    [referrerId]
+                                );
+                                if (referrerCLM.rows.length > 0) {
+                                    const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
+                                    if (clmBadge.rows.length > 0) {
+                                        await pool.query(
+                                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                                            [playerId, clmBadge.rows[0].id]
+                                        );
+                                        await auditLog(pool, null, 'badge_auto_awarded', playerId, `badge: CLM (inherited via referral from player ${referrerId})`);
+                                    }
+                                }
 
                                 // Misfits badge inheritance (social group, kept intentionally)
                                 const referrerMisfits = await pool.query(
@@ -1379,7 +1376,7 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
 app.put('/api/players/me', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
-        const { fullName, alias, email, phone } = req.body;
+        const { fullName, alias, email, phone, currentPassword } = req.body;
 
         // FIX-078: Guard against undefined/null fullName (was crashing with TypeError)
         if (!fullName?.trim()) return res.status(400).json({ error: 'Full name is required' });
@@ -1402,6 +1399,16 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
             );
             if (emailCheck.rows.length > 0) {
                 return res.status(400).json({ error: 'Email already in use by another account' });
+            }
+
+            // N5: Require current password to change email — prevents account takeover via stolen session
+            if (!currentPassword) {
+                return res.status(400).json({ error: 'Current password is required to change your email address' });
+            }
+            const userResult = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.userId]);
+            const valid = await bcrypt.compare(currentPassword, userResult.rows[0].password_hash);
+            if (!valid) {
+                return res.status(403).json({ error: 'Current password is incorrect' });
             }
         }
 
@@ -2656,29 +2663,37 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 JOIN badges b ON b.id = pb.badge_id
                 WHERE pb.player_id = $1 AND b.name = 'CLM'
             `, [req.user.playerId]);
-            
+
             if (badgeCheck.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return res.status(403).json({ 
-                    error: 'This is a CLM exclusive game. You need the CLM badge to register.',
-                    requiresBadge: 'CLM'
-                });
+                // N6: Auto-grant CLM badge when player accesses a CLM game via shared URL
+                const clmBadge = await client.query("SELECT id FROM badges WHERE name = 'CLM'");
+                if (clmBadge.rows.length > 0) {
+                    await client.query(
+                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                        [req.user.playerId, clmBadge.rows[0].id]
+                    );
+                    await auditLog(pool, req.user.playerId, 'badge_auto_awarded', req.user.playerId, 'badge: CLM (auto-granted via CLM game registration)');
+                }
             }
         }
-        
+
         if (game.exclusivity === 'misfits') {
             const badgeCheck = await client.query(`
                 SELECT 1 FROM player_badges pb
                 JOIN badges b ON b.id = pb.badge_id
                 WHERE pb.player_id = $1 AND b.name = 'Misfits'
             `, [req.user.playerId]);
-            
+
             if (badgeCheck.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return res.status(403).json({ 
-                    error: 'This is a Misfits game. You need the Misfits badge to register.',
-                    requiresBadge: 'Misfits'
-                });
+                // N6: Auto-grant Misfits badge when player accesses a Misfits game via shared URL
+                const misfitsBadge = await client.query("SELECT id FROM badges WHERE name = 'Misfits'");
+                if (misfitsBadge.rows.length > 0) {
+                    await client.query(
+                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                        [req.user.playerId, misfitsBadge.rows[0].id]
+                    );
+                    await auditLog(pool, req.user.playerId, 'badge_auto_awarded', req.user.playerId, 'badge: Misfits (auto-granted via Misfits game registration)');
+                }
             }
         }
         
@@ -5662,6 +5677,20 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             [gameId]
         );
         const allPlayerIds = playersResult.rows.map(r => r.player_id);
+        const confirmedSet = new Set(allPlayerIds);
+
+        // CRIT-29: Validate motmNominees and beefEntries contain only confirmed participants.
+        // Without this, an admin could inflate stats for any player in the DB.
+        const invalidNominees = (motmNominees || []).filter(id => !confirmedSet.has(id));
+        if (invalidNominees.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'motmNominees contains players not confirmed for this game' });
+        }
+        const invalidBeef = (beefEntries || []).filter(b => !confirmedSet.has(b.player1) || !confirmedSet.has(b.player2));
+        if (invalidBeef.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'beefEntries contains players not confirmed for this game' });
+        }
         
         // Get players with no-show discipline
         const noShowPlayerIds = (disciplineRecords || [])
@@ -8972,7 +9001,8 @@ app.get('/api/games/:gameId/messages', optionalAuth, async (req, res) => {
         const gameCheck = await pool.query('SELECT id, game_status FROM games WHERE id = $1', [gameId]);
         if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
-        // Resolve team for authenticated players only
+        // N7: Anyone can read general (scope='chat') messages — no auth required.
+        // Team messages are filtered server-side to the requesting player's team only.
         let myTeamId = null;
         if (req.user?.playerId) {
             const teamRes = await pool.query(`
@@ -9041,6 +9071,19 @@ app.post('/api/games/:gameId/messages', authenticateToken, async (req, res) => {
         if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
         if (gameCheck.rows[0].game_status === 'cancelled') {
             return res.status(403).json({ error: 'Chat is disabled for cancelled games' });
+        }
+
+        // CRIT-7/N7: Must be registered in the game (any status) to post to general chat.
+        // Team chat is further restricted to team members only (handled below via team_id resolution).
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!isAdmin) {
+            const regCheck = await pool.query(
+                `SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2`,
+                [gameId, req.user.playerId]
+            );
+            if (regCheck.rows.length === 0) {
+                return res.status(403).json({ error: 'You must be registered for this game to post in chat' });
+            }
         }
 
         // Resolve team_id server-side — never trust client to send their own team_id
