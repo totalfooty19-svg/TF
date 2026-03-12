@@ -2557,7 +2557,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         if (!venueId) return res.status(400).json({ error: 'Venue is required' });
         if (!gameDate || isNaN(Date.parse(gameDate))) return res.status(400).json({ error: 'Valid game date is required' });
         const parsedMax = parseInt(maxPlayers);
-        if (!parsedMax || parsedMax < 2 || parsedMax > 100) return res.status(400).json({ error: 'Max players must be between 2 and 100' });
+        if (!parsedMax || parsedMax < 2 || parsedMax > 999) return res.status(400).json({ error: 'Max players must be between 2 and 999' });
         const parsedCost = parseFloat(costPerPlayer);
         if (isNaN(parsedCost) || parsedCost < 0 || parsedCost > 1000) return res.status(400).json({ error: 'Cost per player must be between £0 and £1000' });
         if (!format || format.trim().length < 2 || format.trim().length > 30) return res.status(400).json({ error: 'Format must be between 2 and 30 characters (e.g. 9v9, 11v11)' });
@@ -5950,6 +5950,21 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                 playersRemoved: removedPlayers?.length || 0
             });
 
+            // Audit + superadmin notification
+            setImmediate(async () => {
+                try {
+                    const gameData = await getGameDataForNotification(gameId);
+                    await gameAuditLog(pool, gameId, req.user.playerId, 'teams_deleted',
+                        `Teams deleted | reason: ${reason || 'other'} | players removed: ${removedPlayers?.length || 0}`);
+                    await notifyAdmin('🗑️ Teams Deleted', [
+                        ['Game', (gameData.day || '') + ' ' + (gameData.time || '')],
+                        ['Venue', gameData.venue || ''],
+                        ['Reason', reason || 'other'],
+                        ['Players removed', String(removedPlayers?.length || 0)],
+                    ]);
+                } catch (e) { /* non-critical */ }
+            });
+
             // Recalculate tiers for late dropouts AFTER commit and response,
             // using pool (not client) so any failure is fully isolated.
             // Cast to ::uuid so Postgres resolves the overloaded function correctly.
@@ -6560,6 +6575,82 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         res.status(500).json({ error: 'Failed to get team sheet' });
     }
 });
+
+// ── GAME URL VIEW TRACKING ───────────────────────────────────────────────────
+// POST /api/public/game/:gameUrl/view — called by game.html on load.
+// Records which player viewed which game URL and when.
+// Uses optionalAuth: logged-in players are identified; guests recorded anonymously.
+// Table: game_url_views (game_id, player_id nullable, viewed_at, ip_hash)
+// Created with: CREATE TABLE IF NOT EXISTS game_url_views (
+//   id BIGSERIAL PRIMARY KEY,
+//   game_id UUID REFERENCES games(id) ON DELETE CASCADE,
+//   player_id UUID REFERENCES players(id) ON DELETE SET NULL,
+//   viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//   ip_hash TEXT
+// );
+app.post('/api/public/game/:gameUrl/view', optionalAuth, async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+
+        // Resolve game_id from game_url
+        const gameResult = await pool.query(
+            'SELECT id FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        if (gameResult.rows.length === 0) return res.json({ recorded: false });
+
+        const gameId = gameResult.rows[0].id;
+        const playerId = req.user?.playerId || null;
+
+        // Hash IP for privacy (not stored raw)
+        const crypto = require('crypto');
+        const rawIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || '';
+        const ipHash = crypto.createHash('sha256').update(rawIp).digest('hex').slice(0, 16);
+
+        await pool.query(
+            `INSERT INTO game_url_views (game_id, player_id, viewed_at, ip_hash)
+             VALUES ($1, $2, NOW(), $3)`,
+            [gameId, playerId, ipHash]
+        );
+
+        res.json({ recorded: true });
+    } catch (error) {
+        // If table doesn't exist yet, silently ignore rather than erroring on game page
+        if (error.code === '42P01') {
+            console.warn('game_url_views table does not exist yet — run the CREATE TABLE migration');
+            return res.json({ recorded: false, hint: 'table_missing' });
+        }
+        console.error('Game view tracking error:', error);
+        res.json({ recorded: false });
+    }
+});
+
+// GET /api/admin/games/:gameId/views — admin: who has viewed this game URL
+app.get('/api/admin/games/:gameId/views', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const result = await pool.query(
+            `SELECT
+                gv.viewed_at,
+                p.full_name,
+                p.alias,
+                p.squad_number,
+                CASE WHEN p.id IS NULL THEN 'Guest (not logged in)' ELSE NULL END as guest_label
+             FROM game_url_views gv
+             LEFT JOIN players p ON p.id = gv.player_id
+             WHERE gv.game_id = $1
+             ORDER BY gv.viewed_at DESC
+             LIMIT 200`,
+            [gameId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        if (error.code === '42P01') return res.json([]);
+        console.error('Get game views error:', error);
+        res.status(500).json({ error: 'Failed to fetch views' });
+    }
+});
+
 
 // PUBLIC endpoint - Get game details for registration/sharing (no auth required)
 app.get('/api/public/game/:gameUrl/details', async (req, res) => {
