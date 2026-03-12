@@ -2861,7 +2861,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
         const gameId = req.params.id;
-        const { guestName } = req.body;
+        const { guestName, tournamentTeamPreference } = req.body;
         const playerId = req.user.playerId;
 
         if (!guestName || guestName.trim().length < 2) {
@@ -2984,9 +2984,9 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
 
         // Insert guest record
         await client.query(
-            `INSERT INTO game_guests (game_id, invited_by, guest_name, overall_rating, amount_paid, guest_number)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [gameId, playerId, guestName.trim(), guestRating, cost, nextGuestNumber]
+            `INSERT INTO game_guests (game_id, invited_by, guest_name, overall_rating, amount_paid, guest_number, tournament_team_preference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [gameId, playerId, guestName.trim(), guestRating, cost, nextGuestNumber, tournamentTeamPreference || null]
         );
 
         // Get player's referral code — generate one on the fly if missing (legacy accounts)
