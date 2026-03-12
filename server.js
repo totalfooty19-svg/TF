@@ -9452,6 +9452,59 @@ app.post('/api/auth/reset-password', async (req, res) => {
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 // FIX-037: Global handlers — SEC-012: uncaughtException now exits to prevent undefined server state
+// POST /api/public/contact — contact form, no auth required
+// publicEndpointLimiter already applied via app.use('/api/public/', ...)
+app.post('/api/public/contact', async (req, res) => {
+    try {
+        const { name, mobile, message } = req.body;
+
+        // Validation
+        if (!name || typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 80) {
+            return res.status(400).json({ error: 'Please enter your name (2-80 characters)' });
+        }
+        if (!mobile || typeof mobile !== 'string' || mobile.trim().length < 7 || mobile.trim().length > 20) {
+            return res.status(400).json({ error: 'Please enter a valid mobile number' });
+        }
+        if (/[<>"'`]/.test(name) || /[<>"'`]/.test(mobile)) {
+            return res.status(400).json({ error: 'Invalid characters in submission' });
+        }
+        const cleanName    = name.trim();
+        const cleanMobile  = mobile.trim();
+        const cleanMessage = message && typeof message === 'string'
+            ? message.trim().slice(0, 500)
+            : '';
+
+        if (cleanMessage && /[<>"'`]/.test(cleanMessage)) {
+            return res.status(400).json({ error: 'Invalid characters in message' });
+        }
+
+        // Send email to admin
+        const transporter = nodemailer.createTransport({
+            service: 'gmail',
+            auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+        });
+
+        await transporter.sendMail({
+            from: `"TotalFooty Contact" <${process.env.EMAIL_USER}>`,
+            to: process.env.EMAIL_USER,
+            subject: `TotalFooty Contact Form - ${htmlEncode(cleanName)}`,
+            html: wrapEmailHtml(`
+                <h2 style="margin-bottom:16px;">New Contact Form Submission</h2>
+                <table style="width:100%;border-collapse:collapse;">
+                    <tr><td style="padding:10px 0;color:#999;font-weight:700;width:120px;">Name</td><td style="padding:10px 0;font-weight:900;">${htmlEncode(cleanName)}</td></tr>
+                    <tr><td style="padding:10px 0;color:#999;font-weight:700;">Mobile</td><td style="padding:10px 0;font-weight:900;">${htmlEncode(cleanMobile)}</td></tr>
+                    ${cleanMessage ? `<tr><td style="padding:10px 0;color:#999;font-weight:700;vertical-align:top;">Message</td><td style="padding:10px 0;">${htmlEncode(cleanMessage)}</td></tr>` : ''}
+                </table>
+            `)
+        });
+
+        res.json({ message: 'Message sent successfully' });
+    } catch (error) {
+        console.error('Contact form error:', error);
+        res.status(500).json({ error: 'Failed to send message. Please try again.' });
+    }
+});
+
 process.on('unhandledRejection', (reason) => {
     console.error('Unhandled Promise Rejection:', reason);
 });
