@@ -3162,7 +3162,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 const pName = playerRow.rows[0]?.alias || playerRow.rows[0]?.full_name || req.user.playerId;
                 const pEmail = playerRow.rows[0]?.email || '';
                 const isTournament = (await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId])).rows[0]?.team_selection_type === 'tournament';
-                const regType = status === 'confirmed' ? 'Confirmed' : `Backup (${regBackupType || 'standard'})`;
+                const adminRegType = status === 'confirmed' ? 'Confirmed' : `Backup (${regBackupType || 'standard'})`;
                 await notifyAdmin(
                     `${isTournament ? '🏆 Tournament' : '⚽ Game'} Registration — ${pName}`,
                     [
@@ -3170,7 +3170,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                         ['Email', pEmail],
                         ['Game', `${gameData.day} ${gameData.time}`],
                         ['Venue', gameData.venue],
-                        ['Status', regType],
+                        ['Status', adminRegType],
                         ['Position', positionValue],
                     ]
                 );
@@ -9092,195 +9092,6 @@ app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req
 });
 
 // ==========================================
-// REPORTING ENDPOINTS
-// ==========================================
-
-// GET /api/reports/games — all completed games with revenue/player counts
-app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT
-                g.id, g.game_date, g.format, g.exclusivity, g.max_players,
-                g.winning_team, g.game_status, g.game_url,
-                v.name AS venue_name,
-                COALESCE(motm_p.alias, motm_p.full_name) AS motm_winner,
-                -- Confirmed signups (excluding guests)
-                (SELECT COUNT(*) FROM registrations r
-                 WHERE r.game_id = g.id AND r.status = 'confirmed') AS signups,
-                -- Guests
-                (SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id) AS guest_count,
-                -- Total players on pitch
-                (SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed') +
-                (SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id) AS total_players,
-                -- Backups
-                (SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'backup') AS backup_count,
-                -- MOTM votes cast
-                (SELECT COUNT(*) FROM motm_votes mv WHERE mv.game_id = g.id) AS motm_votes_total,
-                -- Revenue (NULL-safe: fall back to cost_per_player for old rows)
-                COALESCE(
-                    (SELECT SUM(COALESCE(r.amount_paid, CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
-                     FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0
-                ) +
-                COALESCE(
-                    (SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0
-                ) AS revenue
-            FROM games g
-            LEFT JOIN venues v ON v.id = g.venue_id
-            LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
-            WHERE g.game_status = 'completed'
-            ORDER BY g.game_date DESC
-        `);
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Reports/games error:', error);
-        res.status(500).json({ error: 'Failed to load games report' });
-    }
-});
-
-// GET /api/reports/players — all players with aggregated stats
-app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT
-                p.id, p.squad_number, p.full_name, p.alias,
-                COALESCE(p.alias, p.full_name) AS name,
-                p.reliability_tier AS tier,
-                p.total_appearances AS appearances,
-                p.motm_wins, p.total_wins,
-                p.overall_rating, p.defending_rating, p.strength_rating,
-                p.fitness_rating, p.pace_rating, p.decisions_rating,
-                p.assisting_rating, p.shooting_rating, p.goalkeeper_rating,
-                -- Tournament wins
-                (SELECT COUNT(*) FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 JOIN team_players tp ON tp.player_id = r.player_id
-                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
-                 WHERE r.player_id = p.id AND r.status = 'confirmed'
-                   AND g.game_status = 'completed' AND g.team_selection_type = 'tournament'
-                   AND LOWER(g.winning_team) = LOWER(t.team_name)) AS tournament_wins,
-                -- External wins
-                (SELECT COUNT(*) FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 JOIN team_players tp ON tp.player_id = r.player_id
-                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
-                 WHERE r.player_id = p.id AND r.status = 'confirmed'
-                   AND g.game_status = 'completed' AND g.team_selection_type = 'vs_external'
-                   AND LOWER(g.winning_team) = LOWER(t.team_name)) AS external_wins,
-                -- Badges
-                (SELECT COUNT(*) FROM player_badges pb WHERE pb.player_id = p.id) AS badge_count,
-                (SELECT ARRAY_AGG(b.name ORDER BY b.name)
-                 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
-                 WHERE pb.player_id = p.id) AS badge_names,
-                -- Late dropouts (recorded as discipline_records with offense_type='Late Drop Out')
-                (SELECT COUNT(*) FROM discipline_records dr
-                 WHERE dr.player_id = p.id AND dr.offense_type = 'Late Drop Out') AS dropouts,
-                COALESCE((SELECT SUM(dr.points) FROM discipline_records dr WHERE dr.player_id = p.id), 0) AS disc_points,
-                -- Referrals
-                (SELECT COUNT(*) FROM players p2 WHERE p2.referred_by = p.id) AS referrals_count,
-                -- Revenue from referrals (CLM guests brought in)
-                0::numeric AS referral_revenue,
-                -- Guests added
-                (SELECT COUNT(*) FROM game_guests gg WHERE gg.invited_by = p.id) AS guests_added,
-                -- Total credits spent on games
-                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
-                 WHERE ct.player_id = p.id AND ct.type = 'game_fee'), 0) AS revenue_spent
-            FROM players p
-            ORDER BY p.squad_number ASC NULLS LAST
-        `);
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Reports/players error:', error);
-        res.status(500).json({ error: 'Failed to load players report' });
-    }
-});
-
-// GET /api/reports/players/list — minimal list for the player selector dropdown
-app.get('/api/reports/players/list', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT p.id, p.squad_number,
-                   COALESCE(p.alias, p.full_name) AS name
-            FROM players p
-            ORDER BY p.squad_number ASC NULLS LAST, p.full_name ASC
-        `);
-        res.json(result.rows);
-    } catch (error) {
-        console.error('Reports/players/list error:', error);
-        res.status(500).json({ error: 'Failed to load players list' });
-    }
-});
-
-// GET /api/reports/player/:id/games — per-player game history
-app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const { id } = req.params;
-        // Validate UUID
-        if (!/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid player ID' });
-
-        // Player info
-        const playerResult = await pool.query(`
-            SELECT p.id, p.squad_number, COALESCE(p.alias, p.full_name) AS name,
-                   p.reliability_tier AS tier, p.total_appearances AS appearances,
-                   p.motm_wins, p.total_wins, p.overall_rating
-            FROM players p WHERE p.id = $1
-        `, [id]);
-        if (playerResult.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
-        const player = playerResult.rows[0];
-
-        // Game history
-        const gamesResult = await pool.query(`
-            SELECT
-                g.game_date, g.format, g.exclusivity, g.game_url,
-                v.name AS venue_name,
-                g.winning_team,
-                r.status AS player_status,
-                r.amount_paid,
-                -- Which team was this player on
-                (SELECT t.team_name FROM team_players tp
-                 JOIN teams t ON t.id = tp.team_id
-                 WHERE tp.player_id = $1 AND t.game_id = g.id
-                 LIMIT 1) AS player_team,
-                -- Win/Loss/Draw result
-                CASE
-                    WHEN g.winning_team IS NULL THEN 'D'
-                    WHEN (SELECT t.team_name FROM team_players tp
-                          JOIN teams t ON t.id = tp.team_id
-                          WHERE tp.player_id = $1 AND t.game_id = g.id LIMIT 1) = g.winning_team THEN 'W'
-                    ELSE 'L'
-                END AS result,
-                -- Guests this player brought
-                (SELECT COUNT(*) FROM game_guests gg
-                 WHERE gg.game_id = g.id AND gg.invited_by = $1) AS guest_count,
-                -- MOTM votes received by this player in this game
-                (SELECT COUNT(*) FROM motm_votes mv
-                 WHERE mv.game_id = g.id AND mv.voted_for_id = $1) AS motm_votes_received,
-                -- MOTM winner name
-                COALESCE(motm_p.alias, motm_p.full_name) AS motm_winner,
-                -- Did this player vote in MOTM?
-                EXISTS (SELECT 1 FROM motm_votes mv
-                        WHERE mv.game_id = g.id AND mv.voter_id = $1) AS did_vote_motm,
-                -- Who did this player vote for?
-                (SELECT COALESCE(vp.alias, vp.full_name)
-                 FROM motm_votes mv JOIN players vp ON vp.id = mv.voted_for_id
-                 WHERE mv.game_id = g.id AND mv.voter_id = $1 LIMIT 1) AS voted_for_name
-            FROM registrations r
-            JOIN games g ON g.id = r.game_id
-            LEFT JOIN venues v ON v.id = g.venue_id
-            LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
-            WHERE r.player_id = $1
-              AND r.status = 'confirmed'
-              AND g.game_status = 'completed'
-            ORDER BY g.game_date DESC
-        `, [id]);
-
-        res.json({ player, games: gamesResult.rows });
-    } catch (error) {
-        console.error('Reports/player/games error:', error);
-        res.status(500).json({ error: 'Failed to load player game history' });
-    }
-});
-
-// ==========================================
 // PUSH NOTIFICATION TOKEN MANAGEMENT
 // ==========================================
 
@@ -9438,21 +9249,14 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, a
     try {
         await client.query('BEGIN');
 
-        // Clear all existing discipline records for this player
+        // Clear all existing discipline records — player returns to 0 disc points
         await client.query('DELETE FROM discipline_records WHERE player_id = $1', [id]);
 
-        // Add a single warning-level discipline point (clean slate but flagged)
-        // SEC-038: game_id explicitly NULL — unban is not tied to a specific game
-        await client.query(`
-            INSERT INTO discipline_records (player_id, game_id, points, reason, recorded_by)
-            VALUES ($1, NULL, 1, 'Reinstated after ban', $2)
-        `, [id, req.user.playerId]);
-
-        // Recalculate tier (1 point with sufficient appearances = silver)
+        // Recalculate tier — 0 points = gold
         const tierResult = await client.query(`
             SELECT calculate_player_tier($1::uuid) AS new_tier
         `, [id]);
-        const newTier = tierResult.rows[0]?.new_tier || 'silver';
+        const newTier = tierResult.rows[0]?.new_tier || 'gold';
 
         await client.query(
             'UPDATE players SET reliability_tier = $1 WHERE id = $2',
