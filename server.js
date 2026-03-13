@@ -667,7 +667,7 @@ app.post('/api/auth/register', async (req, res) => {
             `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
                 goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
                 pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver', 84, 12, 12, 12, 12, 12, 12, 12, 84) RETURNING id`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold', 84, 12, 12, 12, 12, 12, 12, 12, 84) RETURNING id`,
             [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield']
         );
         const playerId = playerResult.rows[0].id;
@@ -5574,33 +5574,10 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.id = $1
         `, [gameId]);
-
+        
         res.json({ 
             message: 'Teams confirmed',
             game: fullGameResult.rows[0]
-        });
-
-        // Audit log with per-team avg ratings (non-critical, after response)
-        setImmediate(async () => {
-            try {
-                const teamStats = await pool.query(`
-                    SELECT t.team_name, COUNT(tp.player_id) AS player_count,
-                           ROUND(AVG(p.overall_rating)::numeric, 1) AS avg_ovr
-                    FROM teams t
-                    JOIN team_players tp ON tp.team_id = t.id
-                    JOIN players p ON p.id = tp.player_id
-                    WHERE t.game_id = $1
-                    GROUP BY t.team_name ORDER BY t.team_name
-                `, [gameId]);
-                const teamSummary = teamStats.rows.map(r =>
-                    `${r.team_name}: ${r.player_count}p avg ${r.avg_ovr}`
-                ).join(' | ');
-                await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed',
-                    'Teams confirmed | ' + (teamSummary || 'no team stats'));
-            } catch (e) {
-                await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed',
-                    'Teams confirmed').catch(() => {});
-            }
         });
     } catch (error) {
         console.error('Confirm teams error:', error);
@@ -7861,11 +7838,6 @@ async function runMotmFinalize(gameId) {
             name:     w.alias || w.full_name,
             votes:    maxVotes,
             motmIncrement
-        })),
-        // Full tally for audit log
-        allVotes: votesResult.rows.map(r => ({
-            name:  r.alias || r.full_name,
-            votes: parseInt(r.votes)
         }))
     };
 }
@@ -7879,12 +7851,8 @@ app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireGam
             return res.status(400).json({ error: 'MOTM already finalized' });
         }
         res.json({ message: 'MOTM voting finalized', winners: result.winners });
-        setImmediate(() => {
-            const tally = result.allVotes?.map(v => `${v.name}: ${v.votes}`).join(', ') || 'none';
-            const winnerStr = result.winners?.map(w => w.name).join(' & ') || 'none';
-            gameAuditLog(pool, gameId, req.user.playerId, 'motm_finalized',
-                `Winner: ${winnerStr} | Tally: ${tally}`);
-        });
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'motm_finalized',
+            `Winner(s): ${result.winners?.map(w => `${w.name} (${w.playerId}) — ${w.votes} votes`).join(' | ') || 'none'}`));
     } catch (error) {
         console.error('Finalize MOTM error:', error);
         res.status(500).json({ error: error.message || 'Failed to finalize MOTM voting' });
@@ -8977,7 +8945,6 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
         // 1. Balance history
         const balance = await pool.query(`
             SELECT ct.created_at, ct.amount, ct.type, ct.description,
-                   ct.balance_before, ct.balance_after,
                    p.alias as admin_alias, p.full_name as admin_name
             FROM credit_transactions ct
             LEFT JOIN users u ON u.id = ct.admin_id
@@ -9033,12 +9000,10 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
 
         // 6. Admin actions (audit_logs targeting this player)
         const adminActions = await pool.query(`
-            SELECT al.created_at, al.action, al.detail, al.target_id,
-                   p.alias as admin_alias, p.full_name as admin_name,
-                   ptgt.alias as target_alias, ptgt.full_name as target_name
+            SELECT al.created_at, al.action, al.detail,
+                   p.alias as admin_alias, p.full_name as admin_name
             FROM audit_logs al
             LEFT JOIN players p ON p.id = al.admin_id
-            LEFT JOIN players ptgt ON ptgt.id = al.target_id
             WHERE al.target_id = $1 AND al.action != 'login'
             ORDER BY al.created_at DESC
         `, [id]);
@@ -9123,129 +9088,6 @@ app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req
     } catch (error) {
         console.error('Game audit error:', error);
         res.status(500).json({ error: 'Failed to load game audit' });
-    }
-});
-
-// GET /api/admin/audit/feed — global paginated all-actions feed
-// Query params: before (ISO timestamp cursor), limit (max 100), group (optional filter)
-// Groups: Account, Registrations, Removals, Balance, Stats, Discipline, Badges, MOTM, URL Views, Game Lifecycle, Teams
-const AUDIT_GROUP_ACTIONS = {
-    'Account':        ['player_created', 'login', 'account_updated', 'player_updated', 'player_deleted'],
-    'Registrations':  ['player_signed_up', 'player_backup_joined', 'admin_player_added', 'guest_added',
-                       'signed_up', 'backup_joined', 'signed_up_another', 'signed_up_guest', 'confirmed_backup_refund'],
-    'Removals':       ['player_removed', 'admin_player_removed', 'guest_removed', 'dropped_out'],
-    'Balance':        ['balance_adjustment', 'credit_transaction'],
-    'Stats':          ['stats_updated'],
-    'Discipline':     ['discipline_added', 'player_unbanned'],
-    'Badges':         ['badges_updated', 'badge_auto_awarded', 'badge_auto_removed'],
-    'MOTM':           ['motm_voting_started', 'motm_vote', 'motm_finalized', 'motm_vote_tally', 'motm_received', 'motm_vote_cast'],
-    'URL Views':      ['url_view', 'game_url_viewed'],
-    'Game Lifecycle': ['game_created', 'game_confirmed', 'game_completed', 'settings_updated', 'type_converted', 'game_locked', 'game_unlocked'],
-    'Teams':          ['teams_generated', 'teams_confirmed', 'teams_deleted', 'avg_team_ratings'],
-};
-
-app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const rawBefore = req.query.before;
-        const rawLimit  = parseInt(req.query.limit) || 100;
-        const group     = req.query.group || null;
-        const limit     = Math.min(rawLimit, 100);
-
-        // Validate before cursor
-        let before = null;
-        if (rawBefore) {
-            const ts = Date.parse(rawBefore);
-            if (isNaN(ts)) return res.status(400).json({ error: 'Invalid before timestamp' });
-            before = new Date(ts).toISOString();
-        }
-
-        // Build optional action filter
-        let actionFilter = null;
-        if (group && AUDIT_GROUP_ACTIONS[group]) {
-            actionFilter = AUDIT_GROUP_ACTIONS[group];
-        }
-
-        const beforeClause = before ? `AND created_at < $2` : '';
-        const actionParam  = actionFilter ? actionFilter : null;
-
-        // Pull from audit_logs (player actions)
-        const playerParams = actionParam
-            ? (before ? [actionParam, before, limit] : [actionParam, limit])
-            : (before ? [before, limit] : [limit]);
-
-        const playerActionSQL = actionParam
-            ? `SELECT 'player' AS source, al.id::text, al.created_at, al.action, al.detail,
-                      p.alias as admin_alias, p.full_name as admin_name,
-                      ptgt.alias as target_alias, ptgt.full_name as target_name,
-                      al.target_id, NULL::uuid as game_id
-               FROM audit_logs al
-               LEFT JOIN players p ON p.id = al.admin_id
-               LEFT JOIN players ptgt ON ptgt.id = al.target_id
-               WHERE al.action = ANY($1)
-               ${before ? 'AND al.created_at < $2' : ''}
-               ORDER BY al.created_at DESC
-               LIMIT ${before ? '$3' : '$2'}`
-            : `SELECT 'player' AS source, al.id::text, al.created_at, al.action, al.detail,
-                      p.alias as admin_alias, p.full_name as admin_name,
-                      ptgt.alias as target_alias, ptgt.full_name as target_name,
-                      al.target_id, NULL::uuid as game_id
-               FROM audit_logs al
-               LEFT JOIN players p ON p.id = al.admin_id
-               LEFT JOIN players ptgt ON ptgt.id = al.target_id
-               ${before ? 'WHERE al.created_at < $1' : ''}
-               ORDER BY al.created_at DESC
-               LIMIT ${before ? '$2' : '$1'}`;
-
-        // Pull from game_audit_log (game actions)
-        const gameParams = actionParam
-            ? (before ? [actionParam, before, limit] : [actionParam, limit])
-            : (before ? [before, limit] : [limit]);
-
-        const gameActionSQL = actionParam
-            ? `SELECT 'game' AS source, gal.id::text, gal.created_at, gal.action, gal.detail,
-                      p.alias as admin_alias, p.full_name as admin_name,
-                      NULL as target_alias, NULL as target_name,
-                      NULL::uuid as target_id, gal.game_id,
-                      v.name as venue_name, g.game_date
-               FROM game_audit_log gal
-               LEFT JOIN players p ON p.id = gal.admin_id
-               LEFT JOIN games g ON g.id = gal.game_id
-               LEFT JOIN venues v ON v.id = g.venue_id
-               WHERE gal.action = ANY($1)
-               ${before ? 'AND gal.created_at < $2' : ''}
-               ORDER BY gal.created_at DESC
-               LIMIT ${before ? '$3' : '$2'}`
-            : `SELECT 'game' AS source, gal.id::text, gal.created_at, gal.action, gal.detail,
-                      p.alias as admin_alias, p.full_name as admin_name,
-                      NULL as target_alias, NULL as target_name,
-                      NULL::uuid as target_id, gal.game_id,
-                      v.name as venue_name, g.game_date
-               FROM game_audit_log gal
-               LEFT JOIN players p ON p.id = gal.admin_id
-               LEFT JOIN games g ON g.id = gal.game_id
-               LEFT JOIN venues v ON v.id = g.venue_id
-               ${before ? 'WHERE gal.created_at < $1' : ''}
-               ORDER BY gal.created_at DESC
-               LIMIT ${before ? '$2' : '$1'}`;
-
-        const [playerRows, gameRows] = await Promise.all([
-            pool.query(playerActionSQL, playerParams).then(r => r.rows),
-            pool.query(gameActionSQL,  gameParams).then(r => r.rows),
-        ]);
-
-        // Merge and sort by created_at desc, take top `limit`
-        const merged = [...playerRows, ...gameRows]
-            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-            .slice(0, limit);
-
-        res.json({
-            records: merged,
-            nextCursor: merged.length === limit ? merged[merged.length - 1].created_at : null,
-            groups: Object.keys(AUDIT_GROUP_ACTIONS),
-        });
-    } catch (error) {
-        console.error('Audit feed error:', error);
-        res.status(500).json({ error: 'Failed to load audit feed' });
     }
 });
 
@@ -10297,9 +10139,8 @@ app.listen(PORT, () => {
                         const names = result.winners.map(w => w.name).join(' & ');
                         console.log(`✅ MOTM auto-finalized game ${row.id}: ${names}`);
                         // Audit the auto-finalization (no admin actor — null)
-                        const tally = result.allVotes?.map(v => `${v.name}: ${v.votes}`).join(', ') || 'none';
                         await gameAuditLog(pool, row.id, null, 'motm_finalized',
-                            `Auto-finalized | Winner: ${names} | Tally: ${tally}`).catch(() => {});
+                            `Auto-finalized | Winner(s): ${names} | Votes: ${result.winners[0]?.votes ?? '?'}`).catch(() => {});
                     }
                 } catch (e) {
                     console.error(`✗ MOTM auto-finalize failed for game ${row.id}:`, e.message);
