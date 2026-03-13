@@ -9205,9 +9205,12 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
             ? `SELECT 'game' AS source, gal.id::text, gal.created_at, gal.action, gal.detail,
                       p.alias as admin_alias, p.full_name as admin_name,
                       NULL as target_alias, NULL as target_name,
-                      NULL::uuid as target_id, gal.game_id
+                      NULL::uuid as target_id, gal.game_id,
+                      v.name as venue_name, g.game_date
                FROM game_audit_log gal
                LEFT JOIN players p ON p.id = gal.admin_id
+               LEFT JOIN games g ON g.id = gal.game_id
+               LEFT JOIN venues v ON v.id = g.venue_id
                WHERE gal.action = ANY($1)
                ${before ? 'AND gal.created_at < $2' : ''}
                ORDER BY gal.created_at DESC
@@ -9215,9 +9218,12 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
             : `SELECT 'game' AS source, gal.id::text, gal.created_at, gal.action, gal.detail,
                       p.alias as admin_alias, p.full_name as admin_name,
                       NULL as target_alias, NULL as target_name,
-                      NULL::uuid as target_id, gal.game_id
+                      NULL::uuid as target_id, gal.game_id,
+                      v.name as venue_name, g.game_date
                FROM game_audit_log gal
                LEFT JOIN players p ON p.id = gal.admin_id
+               LEFT JOIN games g ON g.id = gal.game_id
+               LEFT JOIN venues v ON v.id = g.venue_id
                ${before ? 'WHERE gal.created_at < $1' : ''}
                ORDER BY gal.created_at DESC
                LIMIT ${before ? '$2' : '$1'}`;
