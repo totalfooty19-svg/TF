@@ -667,7 +667,7 @@ app.post('/api/auth/register', async (req, res) => {
             `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
                 goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
                 pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold', 84, 12, 12, 12, 12, 12, 12, 12, 84) RETURNING id`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver', 84, 12, 12, 12, 12, 12, 12, 12, 84) RETURNING id`,
             [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield']
         );
         const playerId = playerResult.rows[0].id;
@@ -8073,9 +8073,12 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 motm_p.alias as motm_winner_alias,
-                COALESCE((SELECT SUM(r.amount_paid) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
+                COALESCE((SELECT SUM(
+                    COALESCE(r.amount_paid, CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END)
+                ) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
-                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count,
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_player_count
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 ORDER BY g.game_date DESC`;
             params = [];
@@ -8095,9 +8098,12 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 motm_p.alias as motm_winner_alias,
-                COALESCE((SELECT SUM(r.amount_paid) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
+                COALESCE((SELECT SUM(
+                    COALESCE(r.amount_paid, CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END)
+                ) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
-                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count,
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_player_count
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
