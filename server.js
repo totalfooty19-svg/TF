@@ -10015,14 +10015,6 @@ app.post('/api/public/contact', async (req, res) => {
     }
 });
 
-// FIX-043: Catch-all 404 handler (must be after all routes)
-app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
-
-// FIX-037: Global handlers — SEC-012: uncaughtException now exits to prevent undefined server state
-process.on('unhandledRejection', (reason) => {
-    console.error('Unhandled Promise Rejection:', reason);
-});
-
 // ── REPORTING ENDPOINTS ───────────────────────────────────────────────────────
 
 // GET /api/reports/games — completed games with revenue, signups, guests, backups, MOTM
@@ -10186,6 +10178,20 @@ process.on('uncaughtException', (err) => {
     console.error('Uncaught Exception — exiting:', err.message);
     process.exit(1);
 });
+
+// FIX-043: Catch-all 404 handler (must be after all routes)
+app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
+
+// FIX-037: Global handlers — SEC-012: uncaughtException now exits to prevent undefined server state
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled Promise Rejection:', reason);
+});
+
+// FIX-037: Global handlers — SEC-012: uncaughtException now exits to prevent undefined server state
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled Promise Rejection:', reason);
+});
+
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
