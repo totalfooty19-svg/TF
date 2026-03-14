@@ -2559,8 +2559,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
             exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor,
             tournamentTeamCount, tournamentName, starRating,
-            isVenueClash, venueClashTeam1Name, venueClashTeam2Name,
-            requiresOrganiser
+            isVenueClash, venueClashTeam1Name, venueClashTeam2Name
         } = req.body;
 
         // FIX-023: Validate required game creation inputs
@@ -2646,9 +2645,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             venue_id, game_date, max_players, cost_per_player, format, regularity, 
                             exclusivity, position_type, game_url, series_id, 
                             team_selection_type, external_opponent, tf_kit_color, opp_kit_color, star_rating,
-                            is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                            requires_organiser
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                            is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -2657,8 +2655,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             starRating || null,
                             vcEnabled || false,
                             vcEnabled ? venueClashTeam1Name.trim() : null,
-                            vcEnabled ? venueClashTeam2Name.trim() : null,
-                            requiresOrganiser === true || requiresOrganiser === 'true'
+                            vcEnabled ? venueClashTeam2Name.trim() : null
                         ]
                     );
                     
@@ -2705,9 +2702,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     exclusivity, position_type, game_url, series_id,
                     team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
                     tournament_team_count, tournament_name, star_rating,
-                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                    requires_organiser
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -2718,8 +2714,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     starRating || null,
                     vcEnabled || false,
                     vcEnabled ? venueClashTeam1Name.trim() : null,
-                    vcEnabled ? venueClashTeam2Name.trim() : null,
-                    requiresOrganiser === true || requiresOrganiser === 'true'
+                    vcEnabled ? venueClashTeam2Name.trim() : null
                 ]
             );
             
@@ -2845,8 +2840,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             SELECT max_players, cost_per_player, exclusivity, 
                    player_editing_locked, team_selection_type, position_type, tournament_team_count,
                    series_id, game_status, game_date,
-                   is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                   requires_organiser
+                   is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
             FROM games
             WHERE id = $1
             FOR UPDATE
@@ -2949,20 +2943,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         }
         
         const isFull = parseInt(game.current_players) >= parseInt(game.max_players);
-
-        // ORGANISER-001: Check if organiser slot is reserved
-        const confirmedOrganiserCount = await client.query(
-            `SELECT COUNT(*) as cnt FROM registrations r
-             JOIN players p ON p.id = r.player_id
-             WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = TRUE`,
-            [gameId]
-        );
-        const organiserSlotReserved = (
-            !!game.requires_organiser &&
-            parseInt(game.current_players) === parseInt(game.max_players) - 1 &&
-            parseInt(confirmedOrganiserCount.rows[0].cnt) === 0
-        );
-
+        
         // GK slot check for confirmed registrations
         const isGKOnly = positionValue.trim().toUpperCase() === 'GK';
         if (!isFull && isGKOnly) {
@@ -3003,29 +2984,8 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
 
         // Determine registration status
         let status, regBackupType = null;
-
-        // ORGANISER-001: Allow organiser to claim reserved slot
-        const isOrganiserClaimingSlot = organiserSlotReserved && isOrganiser;
-
-        // If slot is reserved and this player is NOT an organiser, block or route to backup
-        if (organiserSlotReserved && !isOrganiser) {
-            if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({
-                    error: 'organiser_slot_reserved',
-                    message: 'The last spot is reserved for an organiser. Please join the backup list.',
-                    currentPlayers: parseInt(game.current_players),
-                    maxPlayers: parseInt(game.max_players)
-                });
-            }
-            // Valid backup type provided — treat exactly like a full game backup
-            // Fall through to the isFull block below by temporarily marking as full
-        }
-
-        // Treat reserved-slot as full for non-organisers so the backup logic runs correctly
-        const effectivelyFull = isFull || (organiserSlotReserved && !isOrganiser);
-
-        if (effectivelyFull && !isOrganiserClaimingSlot) {
+        
+        if (isFull) {
             // Game is full - must be a backup registration
             if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
                 await client.query('ROLLBACK');
@@ -3275,7 +3235,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
 
         // Lock game row and check capacity
         const gameLock = await client.query(
-            'SELECT max_players, cost_per_player, player_editing_locked, teams_generated, game_status, requires_organiser FROM games WHERE id = $1 FOR UPDATE',
+            'SELECT max_players, cost_per_player, player_editing_locked, teams_generated, game_status FROM games WHERE id = $1 FOR UPDATE',
             [gameId]
         );
         if (gameLock.rows.length === 0) {
@@ -3319,21 +3279,6 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             await client.query('ROLLBACK');
             client.release();
             return res.status(400).json({ error: 'Game is full - no space for another guest' });
-        }
-
-        // ORGANISER-001: Block guest filling the reserved organiser slot
-        if (game.requires_organiser && totalPlayers === parseInt(game.max_players) - 1) {
-            const orgCheck = await client.query(
-                `SELECT COUNT(*) as cnt FROM registrations r
-                 JOIN players p ON p.id = r.player_id
-                 WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = TRUE`,
-                [gameId]
-            );
-            if (parseInt(orgCheck.rows[0].cnt) === 0) {
-                await client.query('ROLLBACK');
-                client.release();
-                return res.status(400).json({ error: 'The last spot is reserved for an organiser — guests cannot fill it' });
-            }
         }
 
         // Check player has enough credits to pay for guest
@@ -3642,7 +3587,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         const gameLock = await client.query(`
             SELECT max_players, cost_per_player, exclusivity,
                    player_editing_locked, team_selection_type, position_type, tournament_team_count,
-                   series_id, game_status, game_date, requires_organiser
+                   series_id, game_status, game_date
             FROM games WHERE id = $1 FOR UPDATE
         `, [gameId]);
 
@@ -3779,25 +3724,9 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         const currentPlayers = parseInt(countResult.rows[0].current_players);
         const isFull = currentPlayers >= parseInt(game.max_players);
 
-        // ORGANISER-001: Check organiser slot for friend-registration path
-        const friendOrgCheck = await client.query(
-            `SELECT COUNT(*) as cnt FROM registrations r
-             JOIN players p ON p.id = r.player_id
-             WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = TRUE`,
-            [gameId]
-        );
-        const friendOrgSlotReserved = (
-            !!game.requires_organiser &&
-            currentPlayers === parseInt(game.max_players) - 1 &&
-            parseInt(friendOrgCheck.rows[0].cnt) === 0
-        );
-        const friendOrgRow = await client.query('SELECT is_organiser FROM players WHERE id = $1', [friendPlayerId]);
-        const friendIsOrganiser = friendOrgRow.rows[0]?.is_organiser || false;
-        const friendClaimingSlot = friendOrgSlotReserved && friendIsOrganiser;
-
         // GK slot check
         const isGKOnly = positionValue.trim().toUpperCase() === 'GK';
-        if (!isFull && !friendClaimingSlot && isGKOnly) {
+        if (!isFull && isGKOnly) {
             const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4) : 2;
             const gkCount = await client.query(`
                 SELECT COUNT(*) as gk_count FROM registrations
@@ -3812,24 +3741,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         // Determine status and handle credit deduction from REGISTERING PLAYER
         let status, regBackupType = null;
 
-        // ORGANISER-001: Block non-organiser friend from filling reserved slot
-        if (friendOrgSlotReserved && !friendIsOrganiser) {
-            if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({
-                    error: 'organiser_slot_reserved',
-                    message: `The last spot is reserved for an organiser. ${friendName} cannot fill it — please join the backup list.`,
-                    currentPlayers,
-                    maxPlayers: parseInt(game.max_players)
-                });
-            }
-            // Valid backup type — fall through to backup handling below
-        }
-
-        // Treat reserved-slot as full for non-organiser friends
-        const friendEffectivelyFull = isFull || (friendOrgSlotReserved && !friendIsOrganiser);
-
-        if (friendEffectivelyFull && !friendClaimingSlot) {
+        if (isFull) {
             if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
                 await client.query('ROLLBACK');
                 return res.status(400).json({
@@ -5178,7 +5090,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, requires_organiser } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -5225,10 +5137,9 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $3, 
                     cost_per_player = $4,
                     star_rating = $5,
-                    tournament_team_count = COALESCE($6, tournament_team_count),
-                    requires_organiser = COALESCE($7, requires_organiser)
-                WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, requires_organiser ?? null, gameId]);
+                    tournament_team_count = COALESCE($6, tournament_team_count)
+                WHERE id = $7
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, gameId]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -5236,10 +5147,9 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $2, 
                     cost_per_player = $3,
                     star_rating = $4,
-                    tournament_team_count = COALESCE($5, tournament_team_count),
-                    requires_organiser = COALESCE($6, requires_organiser)
-                WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, requires_organiser ?? null, gameId]);
+                    tournament_team_count = COALESCE($5, tournament_team_count)
+                WHERE id = $6
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, gameId]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
@@ -6872,11 +6782,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
                    v.pitch_pin as venue_pitch_pin, v.boot_type as venue_boot_type,
                    v.pitch_name as venue_pitch_name, v.special_instructions as venue_special_instructions,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
-                   g.requires_organiser,
-                   (SELECT COUNT(*) FROM registrations r
-                    JOIN players p ON p.id = r.player_id
-                    WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = TRUE) as confirmed_organiser_count
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.game_url = $1
@@ -6943,12 +6849,6 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             format: game.format,
             max_players: game.max_players,
             current_players: game.current_players,
-            requires_organiser: game.requires_organiser || false,
-            organiser_slot_reserved: (
-                !!game.requires_organiser &&
-                parseInt(game.current_players) === parseInt(game.max_players) - 1 &&
-                parseInt(game.confirmed_organiser_count) === 0
-            ),
             cost_per_player: game.cost_per_player,
             game_status: game.game_status,
             exclusivity: game.exclusivity,
@@ -7511,7 +7411,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         
         // Get game details for capacity + GK checks
         const gameResult = await pool.query(
-            'SELECT cost_per_player, max_players, team_selection_type, tournament_team_count, requires_organiser FROM games WHERE id = $1',
+            'SELECT cost_per_player, max_players, team_selection_type, tournament_team_count FROM games WHERE id = $1',
             [gameId]
         );
         const game = gameResult.rows[0];
@@ -7523,28 +7423,10 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
                     (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS total`,
             [gameId]
         );
-        const totalNow = parseInt(countResult.rows[0].total);
-        if (totalNow >= parseInt(game.max_players)) {
+        if (parseInt(countResult.rows[0].total) >= parseInt(game.max_players)) {
             return res.status(400).json({
                 error: `Game is full (${game.max_players}/${game.max_players}). Remove a player first.`
             });
-        }
-
-        // ORGANISER-001: Admin adding a non-organiser cannot fill the reserved organiser slot
-        if (game.requires_organiser && totalNow === parseInt(game.max_players) - 1) {
-            const orgCheck = await pool.query(
-                `SELECT COUNT(*) as cnt FROM registrations r
-                 JOIN players p ON p.id = r.player_id
-                 WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = TRUE`,
-                [gameId]
-            );
-            const addingPlayerOrg = await pool.query('SELECT is_organiser FROM players WHERE id = $1', [playerId]);
-            const addingIsOrganiser = addingPlayerOrg.rows[0]?.is_organiser || false;
-            if (parseInt(orgCheck.rows[0].cnt) === 0 && !addingIsOrganiser) {
-                return res.status(400).json({
-                    error: 'The last spot is reserved for an organiser. Add an organiser-flagged player to fill it.'
-                });
-            }
         }
         
         // Check GK slot limits if adding as GK
@@ -8191,7 +8073,8 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 motm_p.alias as motm_winner_alias,
-                COALESCE((SELECT SUM(r.amount_paid) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
+                COALESCE((SELECT SUM(COALESCE(r.amount_paid, CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
+                 FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
@@ -8213,7 +8096,8 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 motm_p.alias as motm_winner_alias,
-                COALESCE((SELECT SUM(r.amount_paid) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
+                COALESCE((SELECT SUM(COALESCE(r.amount_paid, CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
+                 FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
@@ -9367,14 +9251,21 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, a
     try {
         await client.query('BEGIN');
 
-        // Clear all existing discipline records — player returns to 0 disc points
+        // Clear all existing discipline records for this player
         await client.query('DELETE FROM discipline_records WHERE player_id = $1', [id]);
 
-        // Recalculate tier — 0 points = gold
+        // Add a single warning-level discipline point (clean slate but flagged)
+        // SEC-038: game_id explicitly NULL — unban is not tied to a specific game
+        await client.query(`
+            INSERT INTO discipline_records (player_id, game_id, points, reason, recorded_by)
+            VALUES ($1, NULL, 1, 'Reinstated after ban', $2)
+        `, [id, req.user.playerId]);
+
+        // Recalculate tier (1 point with sufficient appearances = silver)
         const tierResult = await client.query(`
             SELECT calculate_player_tier($1::uuid) AS new_tier
         `, [id]);
-        const newTier = tierResult.rows[0]?.new_tier || 'gold';
+        const newTier = tierResult.rows[0]?.new_tier || 'silver';
 
         await client.query(
             'UPDATE players SET reliability_tier = $1 WHERE id = $2',
