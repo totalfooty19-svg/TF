@@ -10023,10 +10023,8 @@ app.post('/api/public/contact', async (req, res) => {
 app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT
-                g.id, g.game_date, g.format, g.exclusivity, g.max_players, g.cost_per_player,
-                g.game_status, g.winning_team, g.game_url,
-                v.name as venue_name,
+            SELECT g.id, g.game_date, g.format, g.exclusivity, g.max_players, g.cost_per_player,
+                g.game_status, g.winning_team, g.game_url, v.name as venue_name,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as signups,
                 COALESCE((SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_count,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'backup'), 0) as backup_count,
@@ -10037,99 +10035,64 @@ app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) 
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as revenue,
                 COALESCE((SELECT COUNT(*) FROM motm_votes mv WHERE mv.game_id = g.id), 0) as motm_votes_total,
                 p.alias as motm_winner
-            FROM games g
-            LEFT JOIN venues v ON v.id = g.venue_id
-            LEFT JOIN players p ON p.id = g.motm_winner_id
+            FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players p ON p.id = g.motm_winner_id
             ORDER BY g.game_date DESC
         `);
         res.json(result.rows);
-    } catch (error) {
-        console.error('Reports games error:', error);
-        res.status(500).json({ error: 'Failed to load games report' });
-    }
+    } catch (error) { console.error('Reports games error:', error); res.status(500).json({ error: 'Failed to load games report' }); }
 });
 
 app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT
-                p.id, p.squad_number, p.alias, p.full_name as name,
-                p.reliability_tier as tier, p.total_appearances as appearances,
-                p.motm_wins, p.overall_rating,
+            SELECT p.id, p.squad_number, p.alias, p.full_name as name, p.reliability_tier as tier,
+                p.total_appearances as appearances, p.motm_wins, p.overall_rating,
                 COALESCE(c.balance, 0) as credit_balance,
-                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
-                    WHERE ct.player_id = p.id AND ct.type = 'game_fee'), 0) as revenue_spent,
-                COALESCE((SELECT COUNT(*) FROM registrations r
-                    WHERE r.player_id = p.id AND r.status = 'confirmed'), 0) as confirmed_games,
-                COALESCE((SELECT COUNT(*) FROM discipline_records dr
-                    WHERE dr.player_id = p.id AND dr.offense_type = 'Late Drop Out'), 0) as late_dropouts,
+                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct WHERE ct.player_id = p.id AND ct.type = 'game_fee'), 0) as revenue_spent,
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.player_id = p.id AND r.status = 'confirmed'), 0) as confirmed_games,
+                COALESCE((SELECT COUNT(*) FROM discipline_records dr WHERE dr.player_id = p.id AND dr.offense_type = 'Late Drop Out'), 0) as late_dropouts,
                 COALESCE((SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id), 0) as referrals,
                 COALESCE((SELECT COUNT(*) FROM game_guests gg WHERE gg.invited_by = p.id), 0) as guests_added,
-                COALESCE((SELECT json_agg(b.name ORDER BY b.name)
-                    FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
-                    WHERE pb.player_id = p.id), '[]'::json) as badge_names,
+                COALESCE((SELECT json_agg(b.name ORDER BY b.name) FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = p.id), '[]'::json) as badge_names,
                 u.email
-            FROM players p
-            LEFT JOIN credits c ON c.player_id = p.id
-            LEFT JOIN users u ON u.id = p.user_id
+            FROM players p LEFT JOIN credits c ON c.player_id = p.id LEFT JOIN users u ON u.id = p.user_id
             ORDER BY p.squad_number ASC NULLS LAST
         `);
         res.json(result.rows);
-    } catch (error) {
-        console.error('Reports players error:', error);
-        res.status(500).json({ error: 'Failed to load players report' });
-    }
+    } catch (error) { console.error('Reports players error:', error); res.status(500).json({ error: 'Failed to load players report' }); }
 });
 
 app.get('/api/reports/players/list', authenticateToken, requireAdmin, async (req, res) => {
     try {
-        const result = await pool.query(
-            `SELECT id, COALESCE(alias, full_name) as name, squad_number
-             FROM players ORDER BY squad_number ASC NULLS LAST`
-        );
+        const result = await pool.query(`SELECT id, COALESCE(alias, full_name) as name, squad_number FROM players ORDER BY squad_number ASC NULLS LAST`);
         res.json(result.rows);
-    } catch (error) {
-        console.error('Reports players list error:', error);
-        res.status(500).json({ error: 'Failed to load players list' });
-    }
+    } catch (error) { res.status(500).json({ error: 'Failed to load players list' }); }
 });
 
 app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         const result = await pool.query(`
-            SELECT
-                g.id, g.game_date, g.format, g.game_url,
-                v.name as venue_name,
+            SELECT g.id, g.game_date, g.format, g.game_url, v.name as venue_name,
                 r.status, r.position_preference, r.tournament_team_preference,
                 COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END) as amount_paid,
                 r.is_comped,
                 CASE WHEN g.winning_team IS NOT NULL AND t.team_name = g.winning_team THEN 'W'
                      WHEN g.winning_team IS NOT NULL AND t.team_name IS NOT NULL THEN 'L'
-                     WHEN g.winning_team = 'Draw' THEN 'D'
                      ELSE NULL END as result,
                 t.team_name,
-                COALESCE((SELECT COUNT(*) FROM motm_votes mv
-                    WHERE mv.game_id = g.id AND mv.voted_for_player_id = p.id), 0) as motm_votes_received,
-                COALESCE((SELECT COUNT(*) FROM motm_votes mv2
-                    WHERE mv2.game_id = g.id AND mv2.voter_player_id = p.id), 0) as voted,
-                COALESCE((SELECT COUNT(*) FROM game_guests gg
-                    WHERE gg.game_id = g.id AND gg.invited_by = p.id), 0) as guests_brought,
+                COALESCE((SELECT COUNT(*) FROM motm_votes mv WHERE mv.game_id = g.id AND mv.voted_for_player_id = p.id), 0) as motm_votes_received,
+                COALESCE((SELECT COUNT(*) FROM motm_votes mv2 WHERE mv2.game_id = g.id AND mv2.voter_player_id = p.id), 0) as voted,
+                COALESCE((SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id AND gg.invited_by = p.id), 0) as guests_brought,
                 (g.motm_winner_id = p.id) as won_motm
-            FROM registrations r
-            JOIN games g ON g.id = r.game_id
-            JOIN players p ON p.id = r.player_id
+            FROM registrations r JOIN games g ON g.id = r.game_id JOIN players p ON p.id = r.player_id
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN team_players tp ON tp.player_id = p.id
             LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
-            WHERE r.player_id = $1 AND r.status = 'confirmed'
-            ORDER BY g.game_date DESC
+            WHERE r.player_id = $1 AND r.status = 'confirmed' ORDER BY g.game_date DESC
         `, [id]);
         res.json(result.rows);
-    } catch (error) {
-        console.error('Reports player games error:', error);
-        res.status(500).json({ error: 'Failed to load player game history' });
-    }
+    } catch (error) { console.error('Reports player games error:', error); res.status(500).json({ error: 'Failed to load player game history' }); }
 });
 
 // FIX-043: Catch-all 404 handler (must be after all routes)
