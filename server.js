@@ -3162,7 +3162,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 const pName = playerRow.rows[0]?.alias || playerRow.rows[0]?.full_name || req.user.playerId;
                 const pEmail = playerRow.rows[0]?.email || '';
                 const isTournament = (await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId])).rows[0]?.team_selection_type === 'tournament';
-                const adminRegType = status === 'confirmed' ? 'Confirmed' : `Backup (${regBackupType || 'standard'})`;
+                const regType = status === 'confirmed' ? 'Confirmed' : `Backup (${regBackupType || 'standard'})`;
                 await notifyAdmin(
                     `${isTournament ? '🏆 Tournament' : '⚽ Game'} Registration — ${pName}`,
                     [
@@ -3170,7 +3170,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                         ['Email', pEmail],
                         ['Game', `${gameData.day} ${gameData.time}`],
                         ['Venue', gameData.venue],
-                        ['Status', adminRegType],
+                        ['Status', regType],
                         ['Position', positionValue],
                     ]
                 );
@@ -8073,8 +8073,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 motm_p.alias as motm_winner_alias,
-                COALESCE((SELECT SUM(COALESCE(r.amount_paid, CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
-                 FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
+                COALESCE((SELECT SUM(r.amount_paid) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
@@ -8096,8 +8095,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 motm_p.alias as motm_winner_alias,
-                COALESCE((SELECT SUM(COALESCE(r.amount_paid, CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
-                 FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
+                COALESCE((SELECT SUM(r.amount_paid) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
@@ -10024,6 +10022,166 @@ app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 process.on('unhandledRejection', (reason) => {
     console.error('Unhandled Promise Rejection:', reason);
 });
+
+// ── REPORTING ENDPOINTS ───────────────────────────────────────────────────────
+
+// GET /api/reports/games — completed games with revenue, signups, guests, backups, MOTM
+app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                g.id, g.game_date, g.format, g.exclusivity, g.max_players, g.cost_per_player,
+                g.game_status, g.winning_team, g.game_url,
+                v.name as venue_name,
+                COALESCE((
+                    SELECT COUNT(*) FROM registrations r
+                    WHERE r.game_id = g.id AND r.status = 'confirmed'
+                ), 0) as signups,
+                COALESCE((
+                    SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id
+                ), 0) as guest_count,
+                COALESCE((
+                    SELECT COUNT(*) FROM registrations r
+                    WHERE r.game_id = g.id AND r.status = 'backup'
+                ), 0) as backup_count,
+                COALESCE((
+                    SELECT COUNT(*) FROM registrations r
+                    WHERE r.game_id = g.id AND r.status = 'confirmed'
+                ), 0) + COALESCE((
+                    SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id
+                ), 0) as total_players,
+                COALESCE((
+                    SELECT SUM(COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
+                    FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'
+                ), 0) + COALESCE((
+                    SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id
+                ), 0) as revenue,
+                COALESCE((
+                    SELECT COUNT(*) FROM motm_votes mv WHERE mv.game_id = g.id
+                ), 0) as motm_votes_total,
+                p.alias as motm_winner
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN players p ON p.id = g.motm_winner_id
+            ORDER BY g.game_date DESC
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Reports games error:', error);
+        res.status(500).json({ error: 'Failed to load games report' });
+    }
+});
+
+// GET /api/reports/players — all players with stats, badges, dropouts, referrals
+app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                p.id, p.squad_number, p.alias, p.full_name as name,
+                p.reliability_tier as tier,
+                p.total_appearances as appearances,
+                p.motm_wins,
+                p.overall_rating,
+                COALESCE(c.balance, 0) as credit_balance,
+                COALESCE((
+                    SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct
+                    WHERE ct.player_id = p.id AND ct.type = 'game_fee'
+                ), 0) as revenue_spent,
+                COALESCE((
+                    SELECT COUNT(*) FROM registrations r
+                    WHERE r.player_id = p.id AND r.status = 'confirmed'
+                ), 0) as confirmed_games,
+                COALESCE((
+                    SELECT COUNT(*) FROM discipline_records dr
+                    WHERE dr.player_id = p.id AND dr.offense_type = 'Late Drop Out'
+                ), 0) as late_dropouts,
+                COALESCE((
+                    SELECT COUNT(*) FROM players ref
+                    WHERE ref.referred_by = p.id
+                ), 0) as referrals,
+                COALESCE((
+                    SELECT COUNT(*) FROM game_guests gg WHERE gg.invited_by = p.id
+                ), 0) as guests_added,
+                COALESCE((
+                    SELECT json_agg(b.name ORDER BY b.name)
+                    FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                    WHERE pb.player_id = p.id
+                ), '[]'::json) as badge_names,
+                u.email
+            FROM players p
+            LEFT JOIN credits c ON c.player_id = p.id
+            LEFT JOIN users u ON u.id = p.user_id
+            ORDER BY p.squad_number ASC NULLS LAST
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Reports players error:', error);
+        res.status(500).json({ error: 'Failed to load players report' });
+    }
+});
+
+// GET /api/reports/players/list — minimal id/name/squad for dropdown
+app.get('/api/reports/players/list', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT id, COALESCE(alias, full_name) as name, squad_number
+            FROM players ORDER BY squad_number ASC NULLS LAST
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Reports players list error:', error);
+        res.status(500).json({ error: 'Failed to load players list' });
+    }
+});
+
+// GET /api/reports/player/:id/games — per-player game history
+app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query(`
+            SELECT
+                g.id, g.game_date, g.format, g.game_url,
+                v.name as venue_name,
+                r.status, r.position_preference,
+                r.tournament_team_preference,
+                COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END) as amount_paid,
+                r.is_comped,
+                CASE
+                    WHEN g.winning_team IS NOT NULL AND t.team_name = g.winning_team THEN 'W'
+                    WHEN g.winning_team IS NOT NULL AND t.team_name IS NOT NULL THEN 'L'
+                    WHEN g.winning_team = 'Draw' THEN 'D'
+                    ELSE NULL
+                END as result,
+                t.team_name,
+                COALESCE((
+                    SELECT COUNT(*) FROM motm_votes mv
+                    WHERE mv.game_id = g.id AND mv.voted_for_player_id = p.id
+                ), 0) as motm_votes_received,
+                COALESCE((
+                    SELECT COUNT(*) FROM motm_votes mv2
+                    WHERE mv2.game_id = g.id AND mv2.voter_player_id = p.id
+                ), 0) as voted,
+                COALESCE((
+                    SELECT COUNT(*) FROM game_guests gg
+                    WHERE gg.game_id = g.id AND gg.invited_by = p.id
+                ), 0) as guests_brought,
+                (g.motm_winner_id = p.id) as won_motm
+            FROM registrations r
+            JOIN games g ON g.id = r.game_id
+            JOIN players p ON p.id = r.player_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN team_players tp ON tp.player_id = p.id
+            LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+            WHERE r.player_id = $1 AND r.status = 'confirmed'
+            ORDER BY g.game_date DESC
+        `, [id]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Reports player games error:', error);
+        res.status(500).json({ error: 'Failed to load player game history' });
+    }
+});
+
 process.on('uncaughtException', (err) => {
     console.error('Uncaught Exception — exiting:', err.message);
     process.exit(1);
