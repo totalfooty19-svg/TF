@@ -9279,6 +9279,66 @@ app.get('/api/admin/players/:playerId/dm-conversations', authenticateToken, requ
     }
 });
 
+// GET /api/admin/dm/all-conversations
+// Platform-wide admin view — all unique DM conversation pairs, most recent first
+app.get('/api/admin/dm/all-conversations', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                sub.player_a_id,
+                sub.player_b_id,
+                COALESCE(pa.alias, pa.full_name) AS player_a_name,
+                COALESCE(pb.alias, pb.full_name) AS player_b_name,
+                pa.reliability_tier              AS player_a_tier,
+                pb.reliability_tier              AS player_b_tier,
+                sub.last_message_at,
+                sub.total_messages,
+                sub.last_message,
+                sub.last_sender_id
+            FROM (
+                SELECT
+                    LEAST(dm.sender_id, dm.recipient_id)    AS player_a_id,
+                    GREATEST(dm.sender_id, dm.recipient_id) AS player_b_id,
+                    MAX(dm.created_at)                      AS last_message_at,
+                    COUNT(*)                                AS total_messages,
+                    (
+                        SELECT dm2.message
+                        FROM direct_messages dm2
+                        WHERE LEAST(dm2.sender_id, dm2.recipient_id)
+                                = LEAST(dm.sender_id, dm.recipient_id)
+                          AND GREATEST(dm2.sender_id, dm2.recipient_id)
+                                = GREATEST(dm.sender_id, dm.recipient_id)
+                          AND dm2.deleted_at IS NULL
+                        ORDER BY dm2.created_at DESC LIMIT 1
+                    ) AS last_message,
+                    (
+                        SELECT dm2.sender_id
+                        FROM direct_messages dm2
+                        WHERE LEAST(dm2.sender_id, dm2.recipient_id)
+                                = LEAST(dm.sender_id, dm.recipient_id)
+                          AND GREATEST(dm2.sender_id, dm2.recipient_id)
+                                = GREATEST(dm.sender_id, dm.recipient_id)
+                          AND dm2.deleted_at IS NULL
+                        ORDER BY dm2.created_at DESC LIMIT 1
+                    ) AS last_sender_id
+                FROM direct_messages dm
+                WHERE dm.deleted_at IS NULL
+                GROUP BY
+                    LEAST(dm.sender_id, dm.recipient_id),
+                    GREATEST(dm.sender_id, dm.recipient_id)
+            ) sub
+            JOIN players pa ON pa.id = sub.player_a_id
+            JOIN players pb ON pb.id = sub.player_b_id
+            ORDER BY sub.last_message_at DESC
+            LIMIT 200
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Admin all-conversations error:', error);
+        res.status(500).json({ error: 'Failed to load conversations' });
+    }
+});
+
 // GET /api/admin/dm-thread/:subjectId/:otherId
 // Full thread view between two players — read-only admin view
 app.get('/api/admin/dm-thread/:subjectId/:otherId', authenticateToken, requireAdmin, async (req, res) => {
