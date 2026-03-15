@@ -10676,12 +10676,20 @@ app.get('/api/games/:gameId/my-team', authenticateToken, async (req, res) => {
         // 3. Check venue_clash team preference (pre-confirmed)
         if (g.is_venue_clash) {
             const vcResult = await pool.query(
-                'SELECT venue_clash_team_preference FROM registrations WHERE player_id = $1 AND game_id = $2 AND status = $3',
-                [req.user.playerId, gameId, 'confirmed']
+                `SELECT r.venue_clash_team_preference,
+                        g2.venue_clash_team1_name, g2.venue_clash_team2_name
+                 FROM registrations r
+                 JOIN games g2 ON g2.id = r.game_id
+                 WHERE r.player_id = $1 AND r.game_id = $2 AND r.status = 'confirmed'`,
+                [req.user.playerId, gameId]
             );
-            if (vcResult.rows.length > 0 && vcResult.rows[0].venue_clash_team_preference) {
-                const name = vcResult.rows[0].venue_clash_team_preference;
-                return res.json({ teamId: `vc-${name}`, teamName: name });
+            if (vcResult.rows.length > 0) {
+                const pref  = vcResult.rows[0].venue_clash_team_preference; // 'team1','team2','both'
+                const name1 = vcResult.rows[0].venue_clash_team1_name || 'Team 1';
+                const name2 = vcResult.rows[0].venue_clash_team2_name || 'Team 2';
+                // 'both' = no preference, skip toggle
+                if (pref === 'team1') return res.json({ teamId: `vc-team1`, teamName: name1 });
+                if (pref === 'team2') return res.json({ teamId: `vc-team2`, teamName: name2 });
             }
         }
 
@@ -10711,10 +10719,18 @@ async function resolvePreDraftTeam(playerId, gameId) {
     }
     if (g.is_venue_clash) {
         const vc = await pool.query(
-            "SELECT venue_clash_team_preference FROM registrations WHERE player_id = $1 AND game_id = $2 AND status = 'confirmed'",
+            `SELECT r.venue_clash_team_preference,
+                    g2.venue_clash_team1_name, g2.venue_clash_team2_name
+             FROM registrations r
+             JOIN games g2 ON g2.id = r.game_id
+             WHERE r.player_id = $1 AND r.game_id = $2 AND r.status = 'confirmed'`,
             [playerId, gameId]
         );
-        if (vc.rows[0]?.venue_clash_team_preference) return vc.rows[0].venue_clash_team_preference;
+        if (vc.rows.length > 0) {
+            const pref = vc.rows[0].venue_clash_team_preference;
+            if (pref === 'team1') return vc.rows[0].venue_clash_team1_name || 'Team 1';
+            if (pref === 'team2') return vc.rows[0].venue_clash_team2_name || 'Team 2';
+        }
     }
     return null;
 }
