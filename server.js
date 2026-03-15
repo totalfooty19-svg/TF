@@ -2011,7 +2011,7 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         const {
             goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            total_wins, squad_number, phone, balance, alias,
+            total_wins, squad_number, phone, balance, alias, position,
             is_featured, social_tiktok, social_instagram, social_youtube, social_facebook
         } = req.body;
         
@@ -2050,7 +2050,8 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 social_tiktok = $15,
                 social_instagram = $16,
                 social_youtube = $17,
-                social_facebook = $18
+                social_facebook = $18,
+                position = $20
             WHERE id = $19
         `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
@@ -2058,7 +2059,8 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
             is_featured !== undefined ? is_featured : null,
             validateSocialUrl(social_tiktok), validateSocialUrl(social_instagram),
             validateSocialUrl(social_youtube), validateSocialUrl(social_facebook),
-            playerId]);
+            playerId,
+            ['goalkeeper','outfield'].includes(position) ? position : 'outfield']);
         
         // FIX-053: Update balance with audit trail if changed
         if (balance !== undefined) {
