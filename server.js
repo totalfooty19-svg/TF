@@ -2051,16 +2051,16 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 social_instagram = $16,
                 social_youtube = $17,
                 social_facebook = $18,
-                position = $20
-            WHERE id = $19
+                position = $19
+            WHERE id = $20
         `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
             overall_rating, total_wins, squad_number, phone, alias || null,
             is_featured !== undefined ? is_featured : null,
             validateSocialUrl(social_tiktok), validateSocialUrl(social_instagram),
             validateSocialUrl(social_youtube), validateSocialUrl(social_facebook),
-            playerId,
-            ['goalkeeper','outfield'].includes(position) ? position : 'outfield']);
+            ['goalkeeper','outfield'].includes(position) ? position : 'outfield',
+            playerId]);
         
         // FIX-053: Update balance with audit trail if changed
         if (balance !== undefined) {
