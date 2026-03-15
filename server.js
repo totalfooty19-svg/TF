@@ -250,18 +250,27 @@ async function statHistory(pool, playerId, changedBy, stats, tier = null) {
 
 // ── MIN RATING HELPER ────────────────────────────────────────────────────────
 // Single source of truth for the effective minimum OVR at any moment.
-// Called by visibility filter, registration gate, friend gate, guest gate.
+// Visibility-only rating filter — determines which games appear on a player's list.
+// A player passes if overall_rating >= minOvr OR goalkeeper_rating >= minGk.
+// Registration is never blocked by this filter — shared URLs always allow sign-up.
 const MIN_OVR_BY_STARS = { 1: 0, 2: 75, 3: 82, 4: 84, 5: 85 };
-function effectiveMinOvr(game) {
+const MIN_GK_BY_STARS  = { 1: 0, 2:  0, 3: 82, 4: 84, 5: 86 };
+function effectiveMinRating(game) {
     const stars = parseInt(game.star_rating);
-    if (!stars || stars < 1) return 0;          // no rating = no minimum
-    const base = MIN_OVR_BY_STARS[stars] ?? 0;
-    if (!game.min_rating_enabled) return base;  // toggle off = full minimum enforced
+    if (!stars || stars < 1) return { minOvr: 0, minGk: 0 };
+    const baseOvr = MIN_OVR_BY_STARS[stars] ?? 0;
+    const baseGk  = MIN_GK_BY_STARS[stars]  ?? 0;
+    if (!game.min_rating_enabled) return { minOvr: baseOvr, minGk: baseGk };
     const hoursToKickoff = (new Date(game.game_date) - Date.now()) / 36e5;
     const drop = hoursToKickoff <= 24 ? 2 : hoursToKickoff <= 48 ? 1 : 0;
     const effectiveStar = Math.max(1, stars - drop);
-    return MIN_OVR_BY_STARS[effectiveStar] ?? 0;
+    return {
+        minOvr: MIN_OVR_BY_STARS[effectiveStar] ?? 0,
+        minGk:  MIN_GK_BY_STARS[effectiveStar]  ?? 0,
+    };
 }
+// Backwards-compatible alias used by scheduler logging — returns overall threshold only
+function effectiveMinOvr(game) { return effectiveMinRating(game).minOvr; }
 
 // ── PUSH NOTIFICATIONS ───────────────────────────────────────────────────────
 // getGameDataForNotification: fetch minimal game info for push payloads
@@ -2317,12 +2326,13 @@ app.get('/api/venues', authenticateToken, async (req, res) => {
 app.get('/api/games', authenticateToken, async (req, res) => {
     try {
         const playerResult = await pool.query(
-            'SELECT reliability_tier, overall_rating FROM players WHERE id = $1',
+            'SELECT reliability_tier, overall_rating, goalkeeper_rating FROM players WHERE id = $1',
             [req.user.playerId]
         );
         
-        const tier = playerResult.rows[0]?.reliability_tier || 'silver';
-        const playerOvr = parseInt(playerResult.rows[0]?.overall_rating ?? 0);
+        const tier      = playerResult.rows[0]?.reliability_tier || 'silver';
+        const playerOvr = parseInt(playerResult.rows[0]?.overall_rating    ?? 0);
+        const playerGk  = parseInt(playerResult.rows[0]?.goalkeeper_rating ?? 0);
         
         // Check if player has TF All Star badge
         const allStarBadgeResult = await pool.query(`
@@ -2425,13 +2435,17 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             });
         }
 
-        // Min-rating visibility filter — admins see all games regardless.
-        // Completed games are always shown (player already played them — history must never disappear).
+        // Visibility-only filter — admins see all games regardless.
+        // Completed games always shown (history must never disappear).
+        // Player passes if: overall_rating >= minOvr OR goalkeeper_rating >= minGk.
+        // Registration is never blocked — only visibility is affected.
         const visibleGames = isAdmin
             ? gamesWithPhotos
-            : gamesWithPhotos.filter(game =>
-                game.game_status === 'completed' || playerOvr >= effectiveMinOvr(game)
-            );
+            : gamesWithPhotos.filter(game => {
+                if (game.game_status === 'completed') return true;
+                const { minOvr, minGk } = effectiveMinRating(game);
+                return playerOvr >= minOvr || (minGk > 0 && playerGk >= minGk);
+            });
 
         res.json(visibleGames);
     } catch (error) {
@@ -3027,25 +3041,8 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             return res.status(400).json({ error: 'Already registered' });
         }
 
-        // Min-rating gate — admins bypass
-        const isAdminReg = req.user.role === 'admin' || req.user.role === 'superadmin';
-        if (!isAdminReg && game.star_rating) {
-            const pRating = await client.query(
-                'SELECT overall_rating FROM players WHERE id = $1',
-                [req.user.playerId]
-            );
-            const ovr = parseInt(pRating.rows[0]?.overall_rating ?? 0);
-            const minOvr = effectiveMinOvr(game);
-            if (ovr < minOvr) {
-                await client.query('ROLLBACK');
-                return res.status(403).json({
-                    error: 'Your rating is too low for this game.',
-                    minRating: minOvr,
-                    yourRating: ovr
-                });
-            }
-        }
-        
+        // Min-rating is visibility-only — registration is never blocked by rating.
+        // Players can always sign up if they have the game URL or find it via games list.
         const isFull = parseInt(game.current_players) >= parseInt(game.max_players);
         
         // GK slot check for confirmed registrations
@@ -3766,19 +3763,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             return res.status(403).json({ error: `This game isn't open for ${friendName}'s tier (${tierLabel}) yet` });
         }
 
-        // Min-rating gate — uses friend's OVR, not the registering player's
-        if (game.star_rating) {
-            const friendOvr = parseInt(friend.overall_rating ?? 0);
-            const minOvr = effectiveMinOvr(game);
-            if (friendOvr < minOvr) {
-                await client.query('ROLLBACK');
-                return res.status(403).json({
-                    error: `${friendName}'s rating is too low for this game.`,
-                    minRating: minOvr,
-                    yourRating: friendOvr
-                });
-            }
-        }
+        // Min-rating is visibility-only — friend registration is never blocked by rating.
 
         // Exclusivity badge checks:
         // If the REGISTERING player holds the badge, the friend is exempt — they are vouching for them.
@@ -9281,8 +9266,22 @@ app.get('/api/admin/players/:playerId/dm-conversations', authenticateToken, requ
 
 // GET /api/admin/dm/all-conversations
 // Platform-wide admin view — all unique DM conversation pairs, most recent first
+// GET /api/admin/dm/all-conversations?offset=0&limit=100
+// Paginated: returns { conversations, total, hasMore }
 app.get('/api/admin/dm/all-conversations', authenticateToken, requireAdmin, async (req, res) => {
+    const limit  = Math.min(parseInt(req.query.limit)  || 100, 200);
+    const offset = Math.max(parseInt(req.query.offset) || 0,   0);
     try {
+        // Count total unique conversations for hasMore
+        const countRes = await pool.query(`
+            SELECT COUNT(DISTINCT
+                LEAST(sender_id, recipient_id)::text || '_' ||
+                GREATEST(sender_id, recipient_id)::text
+            ) AS total
+            FROM direct_messages WHERE deleted_at IS NULL
+        `);
+        const total = parseInt(countRes.rows[0].total);
+
         const result = await pool.query(`
             SELECT
                 sub.player_a_id,
@@ -9330,9 +9329,13 @@ app.get('/api/admin/dm/all-conversations', authenticateToken, requireAdmin, asyn
             JOIN players pa ON pa.id = sub.player_a_id
             JOIN players pb ON pb.id = sub.player_b_id
             ORDER BY sub.last_message_at DESC
-            LIMIT 200
-        `);
-        res.json(result.rows);
+            LIMIT $1 OFFSET $2
+        `, [limit, offset]);
+        res.json({
+            conversations: result.rows,
+            total,
+            hasMore: offset + result.rows.length < total,
+        });
     } catch (error) {
         console.error('Admin all-conversations error:', error);
         res.status(500).json({ error: 'Failed to load conversations' });
