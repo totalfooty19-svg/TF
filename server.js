@@ -311,6 +311,11 @@ const NOTIF_TEMPLATES = {
     signup:            _d => ({ title: 'Welcome to TotalFooty! ⚽', body: "Your account is ready. Find a game and sign up!" }),
     badge_awarded:     _d => ({ title: 'New Badge! 🏅',          body: "You've earned a new badge. Check your profile!" }),
     balance_updated:   _d => ({ title: 'Balance Updated 💳',    body: 'Your TotalFooty credit balance has been updated.' }),
+    // Referee system
+    referee_confirmed: d => ({ title: "You're confirmed to ref! 👮", body: `You're officiating on ${d.day} at ${d.venue}.` }),
+    ref_review_open:   d => ({ title: 'Rate the referee 🌟',       body: `How was the ref on ${d.day}? Leave your rating.` }),
+    account_reinstated: _d => ({ title: 'Account Reinstated ✅',   body: 'Your account has been reinstated. Welcome back.' }),
+    new_dm:            d => ({ title: 'New message 💬',            body: d.preview || 'You have a new message.' }),
 };
 
 // sendNotification: send an Expo push notification to a player's registered devices.
@@ -650,7 +655,7 @@ const requireGameManager = async (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone, ref, skillLevel } = req.body;
+        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam } = req.body;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -756,6 +761,77 @@ app.post('/api/auth/register', async (req, res) => {
             console.error('Referrals table insert (non-critical):', refErr.message);
         }
         
+        // Handle ?referee_invite=CODE — one-time invite that grants Referee badge
+        const referee_invite = req.body.referee_invite;
+        if (referee_invite) {
+            try {
+                const inviteResult = await pool.query(
+                    `SELECT id FROM referee_invites
+                     WHERE code = $1 AND used_at IS NULL AND expires_at > NOW()`,
+                    [referee_invite.toUpperCase()]
+                );
+                if (inviteResult.rows.length > 0) {
+                    const refBadge = await pool.query("SELECT id FROM badges WHERE name = 'Referee'");
+                    if (refBadge.rows.length > 0) {
+                        await pool.query(
+                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                            [playerId, refBadge.rows[0].id]
+                        );
+                        await auditLog(pool, null, 'badge_auto_awarded', playerId,
+                            `badge: Referee (via invite ${referee_invite})`);
+                    }
+                    await pool.query(
+                        `UPDATE referee_invites SET used_by = $1, used_at = NOW() WHERE id = $2`,
+                        [playerId, inviteResult.rows[0].id]
+                    );
+                    // Notify superadmin
+                    setImmediate(async () => {
+                        try {
+                            const adminEmail = SUPERADMIN_EMAIL || 'totalfooty19@gmail.com';
+                            const pName = alias || fullName;
+                            await emailTransporter.sendMail({
+                                from: '"TotalFooty" <totalfooty19@gmail.com>',
+                                to: adminEmail,
+                                subject: `👮 Referee Joined via Invite — ${pName.replace(/[\r\n]/g, '')}`,
+                                html: wrapEmailHtml(`
+                                    <p style="font-weight:700;font-size:16px;">New Referee Registration</p>
+                                    <table style="width:100%;border-collapse:collapse;">
+                                        <tr><td style="padding:6px 0;color:#888;width:120px;">Name</td>
+                                            <td style="font-weight:700;color:#fff;">${htmlEncode(pName)}</td></tr>
+                                        <tr><td style="padding:6px 0;color:#888;">Email</td>
+                                            <td style="font-weight:700;color:#fff;">${htmlEncode(email)}</td></tr>
+                                        <tr><td style="padding:6px 0;color:#888;">Invite code</td>
+                                            <td style="font-weight:700;color:#fff;">${htmlEncode(referee_invite)}</td></tr>
+                                    </table>`)
+                            });
+                        } catch (e) {
+                            console.error('Referee invite email failed:', e.message);
+                        }
+                    });
+                }
+                // Invalid/expired: silently proceed — never block registration
+            } catch (inviteErr) {
+                console.error('Referee invite processing (non-critical):', inviteErr.message);
+            }
+        }
+
+        // Handle ?role=referee — grants Referee badge to new user, no referral chain
+        if (roleParam === 'referee') {
+            try {
+                const refBadge = await pool.query("SELECT id FROM badges WHERE name = 'Referee'");
+                if (refBadge.rows.length > 0) {
+                    await pool.query(
+                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                        [playerId, refBadge.rows[0].id]
+                    );
+                    setImmediate(() => auditLog(pool, null, 'badge_auto_awarded', playerId,
+                        'badge: Referee (via referee referral link)'));
+                }
+            } catch (roleErr) {
+                console.error('Referee badge assign error (non-critical):', roleErr.message);
+            }
+        }
+
         // Handle referral: look up referrer by code
         // N6: ref=clm and ref=misfits badge auto-assignment REMOVED — exclusive badges must be admin-granted only.
         // Any user who reads the source could self-assign restricted badges via ?ref=clm on the register URL.
@@ -1502,6 +1578,51 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
     }
 });
 
+// GET /api/players/:playerId/ref-stats — public referee profile stats
+app.get('/api/players/:playerId/ref-stats', async (req, res) => {
+    const { playerId } = req.params;
+    try {
+        // Total confirmed ref appearances
+        const apps = await pool.query(
+            `SELECT COUNT(*) AS appearances
+             FROM game_referees WHERE player_id = $1 AND status = 'confirmed'`,
+            [playerId]
+        );
+
+        // All-time average across all games
+        const allTime = await pool.query(
+            `SELECT ROUND(AVG(rating), 1) AS avg_rating, COUNT(*) AS total_reviews
+             FROM referee_reviews WHERE referee_player_id = $1`,
+            [playerId]
+        );
+
+        // Last 5 game averages (one avg per game, then average those)
+        const last5 = await pool.query(
+            `SELECT ROUND(AVG(avg_per_game), 1) AS last5_avg
+             FROM (
+                 SELECT game_id, AVG(rating) AS avg_per_game
+                 FROM referee_reviews
+                 WHERE referee_player_id = $1
+                 GROUP BY game_id
+                 ORDER BY MAX(created_at) DESC
+                 LIMIT 5
+             ) sub`,
+            [playerId]
+        );
+
+        res.json({
+            appearances:   parseInt(apps.rows[0].appearances),
+            avg_rating:    allTime.rows[0].avg_rating,
+            total_reviews: parseInt(allTime.rows[0].total_reviews),
+            last5_avg:     last5.rows[0].last5_avg
+        });
+    } catch (error) {
+        console.error('Ref stats error:', error);
+        res.status(500).json({ error: 'Failed to fetch referee stats' });
+    }
+});
+
+
 app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -2037,6 +2158,16 @@ app.put('/api/admin/players/:playerId/badges', authenticateToken, requireAdmin, 
         
         await client.query('BEGIN');
 
+        // SEC: Referee badge can only be assigned by superadmin
+        if (req.user.role !== 'superadmin' && badgeIds && badgeIds.length > 0) {
+            const refBadgeRow = await client.query("SELECT id FROM badges WHERE name = 'Referee'");
+            const refBadgeId = refBadgeRow.rows[0]?.id;
+            if (refBadgeId && badgeIds.includes(refBadgeId)) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({ error: 'Only superadmin can assign the Referee badge' });
+            }
+        }
+
         // Capture before state for audit
         const beforeResult = await client.query(
             'SELECT b.name FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = $1 ORDER BY b.name',
@@ -2516,6 +2647,48 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
     }
 });
 
+// GET /api/games/needing-refs — games with refs_required > 0 and unfilled slots
+// Used by referee badge holders in "Ref mode"
+app.get('/api/games/needing-refs', authenticateToken, async (req, res) => {
+    try {
+        // Verify player has Referee badge
+        const badgeCheck = await pool.query(
+            `SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+             WHERE pb.player_id = $1 AND b.name = 'Referee'`,
+            [req.user.playerId]
+        );
+        if (!badgeCheck.rows.length) {
+            return res.status(403).json({ error: 'Referee badge required' });
+        }
+
+        const result = await pool.query(`
+            SELECT g.id, g.game_url, g.game_date, g.format, g.refs_required,
+                   g.ref_pay, g.game_status,
+                   v.name AS venue_name,
+                   (SELECT COUNT(*) FROM game_referees gr
+                    WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_refs,
+                   (SELECT COUNT(*) FROM game_referees gr
+                    WHERE gr.game_id = g.id AND gr.player_id = $1) AS my_application,
+                   (SELECT status FROM game_referees gr
+                    WHERE gr.game_id = g.id AND gr.player_id = $1 LIMIT 1) AS my_status,
+                   EXISTS(SELECT 1 FROM registrations r
+                          WHERE r.game_id = g.id AND r.player_id = $1
+                          AND r.status = 'confirmed') AS also_playing
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.refs_required > 0
+              AND g.game_status IN ('available','confirmed')
+              AND g.game_date >= NOW()
+            ORDER BY g.game_date ASC
+        `, [req.user.playerId]);
+
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Needing refs error:', error);
+        res.status(500).json({ error: 'Failed to fetch games needing referees' });
+    }
+});
+
 app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         const gameResult = await pool.query(`
@@ -2658,7 +2831,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
             exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor,
             tournamentTeamCount, tournamentName, starRating,
-            isVenueClash, venueClashTeam1Name, venueClashTeam2Name
+            isVenueClash, venueClashTeam1Name, venueClashTeam2Name,
+            maxReferees, refereeFee
         } = req.body;
 
         // FIX-023: Validate required game creation inputs
@@ -2744,8 +2918,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             venue_id, game_date, max_players, cost_per_player, format, regularity, 
                             exclusivity, position_type, game_url, series_id, 
                             team_selection_type, external_opponent, tf_kit_color, opp_kit_color, star_rating,
-                            is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                            is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
+                            refs_required, ref_pay
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -2754,7 +2929,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             starRating || null,
                             vcEnabled || false,
                             vcEnabled ? venueClashTeam1Name.trim() : null,
-                            vcEnabled ? venueClashTeam2Name.trim() : null
+                            vcEnabled ? venueClashTeam2Name.trim() : null,
+                            parseInt(maxReferees) || 0,
+                            parseFloat(refereeFee) || 0.00
                         ]
                     );
                     
@@ -2801,8 +2978,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     exclusivity, position_type, game_url, series_id,
                     team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
                     tournament_team_count, tournament_name, star_rating,
-                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
+                    refs_required, ref_pay
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -2813,7 +2991,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     starRating || null,
                     vcEnabled || false,
                     vcEnabled ? venueClashTeam1Name.trim() : null,
-                    vcEnabled ? venueClashTeam2Name.trim() : null
+                    vcEnabled ? venueClashTeam2Name.trim() : null,
+                    parseInt(maxReferees) || 0,
+                    parseFloat(refereeFee) || 0.00
                 ]
             );
             
@@ -3161,6 +3341,16 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             }
         }
         
+        // SEC: Block registration if player is already a confirmed referee for this game
+        const refConflict = await client.query(
+            `SELECT 1 FROM game_referees WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [gameId, req.user.playerId]
+        );
+        if (refConflict.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'You are already confirmed as a referee for this game' });
+        }
+
         // Register player
         const regResult = await client.query(
             `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, venue_clash_team_preference, amount_paid, is_comped)
@@ -3683,6 +3873,16 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         }
 
         await client.query('BEGIN');
+
+        // Block if friend is already a confirmed referee for this game
+        const friendRefConflict = await client.query(
+            `SELECT 1 FROM game_referees WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [req.params.id, friendPlayerId]
+        );
+        if (friendRefConflict.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This player is already confirmed as a referee for this game' });
+        }
 
         // Lock game row to prevent race conditions
         const gameLock = await client.query(`
@@ -4994,6 +5194,14 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
             gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${cancelGameRow.game_url}`
         };
         const cancelledPlayerIds = registrations.rows.map(r => r.player_id);
+
+        // Capture confirmed referee IDs before CASCADE deletes them
+        const confirmedRefRows = await client.query(
+            `SELECT player_id FROM game_referees WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        const cancelledRefIds = confirmedRefRows.rows.map(r => r.player_id);
+
         let totalRefunded = 0;
         for (const reg of registrations.rows) {
             const refundAmt = parseFloat(reg.amount_paid || fallbackCost);
@@ -5033,6 +5241,10 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
                 } catch (e) {
                     console.error(`game_cancelled notification failed player ${pid}:`, e.message);
                 }
+            }
+            // Notify confirmed referees of cancellation
+            for (const pid of cancelledRefIds) {
+                await sendNotification('game_cancelled', pid, cancelGameData).catch(() => {});
             }
         });
     } catch (error) {
@@ -5196,7 +5408,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -5245,12 +5457,14 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     star_rating = $5,
                     tournament_team_count = COALESCE($6, tournament_team_count),
                     min_rating_enabled = COALESCE($7, min_rating_enabled),
+                    refs_required = COALESCE($9, refs_required),
+                    ref_pay = COALESCE($10, ref_pay),
                     min_rating_drop_sent = CASE
                         WHEN $1::timestamptz > NOW() + INTERVAL '48 hours' THEN 0
                         ELSE min_rating_drop_sent
                     END
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId]);
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -5259,9 +5473,11 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     cost_per_player = $3,
                     star_rating = $4,
                     tournament_team_count = COALESCE($5, tournament_team_count),
-                    min_rating_enabled = COALESCE($6, min_rating_enabled)
+                    min_rating_enabled = COALESCE($6, min_rating_enabled),
+                    refs_required = COALESCE($8, refs_required),
+                    ref_pay = COALESCE($9, ref_pay)
                 WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId]);
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
@@ -6126,6 +6342,14 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                         ['Reason', reason || 'other'],
                         ['Players removed', String(removedPlayers?.length || 0)],
                     ]);
+                    // Notify confirmed referees that the game has been unconfirmed
+                    const confirmedRefs = await pool.query(
+                        `SELECT player_id FROM game_referees WHERE game_id = $1 AND status = 'confirmed'`,
+                        [gameId]
+                    );
+                    for (const r of confirmedRefs.rows) {
+                        await sendNotification('game_cancelled', r.player_id, gameData).catch(() => {});
+                    }
                 } catch (e) { /* non-critical */ }
             });
 
@@ -6208,7 +6432,8 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             `UPDATE games 
              SET winning_team = $1, 
                  game_status = 'completed',
-                 motm_voting_ends = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'}
+                 motm_voting_ends = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'},
+                 ref_review_ends = NOW() + INTERVAL '24 hours'
              WHERE id = $2`,
             [winningTeam, gameId]
         );
@@ -6767,7 +6992,6 @@ app.post('/api/public/game/:gameUrl/view', optionalAuth, async (req, res) => {
         const playerId = req.user?.playerId || null;
 
         // Hash IP for privacy (not stored raw)
-        const crypto = require('crypto');
         const rawIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || '';
         const ipHash = crypto.createHash('sha256').update(rawIp).digest('hex').slice(0, 16);
 
@@ -6889,6 +7113,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.winning_team, g.motm_voting_ends, g.motm_winner_id, g.tournament_name,
                    g.tournament_team_count, g.tournament_results_finalised, g.series_id,
                    g.regularity, g.star_rating, g.min_rating_enabled,
+                   g.refs_required, g.ref_pay, g.ref_review_ends,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
@@ -6978,7 +7203,10 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             series_id: game.series_id || null,
             regularity: game.regularity || null,
             star_rating: game.star_rating || null,
-            min_rating_enabled: game.min_rating_enabled || false,
+            min_rating_enabled:   game.min_rating_enabled || false,
+            refs_required:         game.refs_required || 0,
+            ref_pay:          parseFloat(game.ref_pay) || 0,
+            ref_review_ends: game.ref_review_ends || null,
             seriesScoreline
         });
         
@@ -7522,6 +7750,15 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         if (existingReg.rows.length > 0) {
             return res.status(400).json({ error: 'Player already registered' });
         }
+
+        // Block if player is a confirmed referee for this game
+        const addPlayerRefConflict = await pool.query(
+            `SELECT 1 FROM game_referees WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [gameId, playerId]
+        );
+        if (addPlayerRefConflict.rows.length > 0) {
+            return res.status(400).json({ error: 'This player is already confirmed as a referee for this game' });
+        }
         
         // Get game details for capacity + GK checks
         const gameResult = await pool.query(
@@ -7957,6 +8194,102 @@ async function runMotmFinalize(gameId) {
 }
 
 // Admin endpoint — manual finalize (still available as fallback)
+// Idempotent: computes final avg from referee_reviews, writes to game_referees.final_rating
+// Called by: game completion, MOTM scheduler, and ref_review_ends scheduler
+async function finaliseRefereeReviews(gameId) {
+    try {
+        // Fetch all confirmed refs for this game (idempotent — safe to re-run)
+        const refs = await pool.query(
+            `SELECT player_id FROM game_referees
+             WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        if (refs.rows.length === 0) return;
+
+        const gameData = await pool.query(
+            `SELECT g.game_date, v.name AS venue_name
+             FROM games g LEFT JOIN venues v ON v.id = g.venue_id WHERE g.id = $1`,
+            [gameId]
+        );
+        const gd = gameData.rows[0] || {};
+        const day = gd.game_date
+            ? new Date(gd.game_date).toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long' })
+            : '';
+        const venue = gd.venue_name || 'TBC';
+
+        for (const ref of refs.rows) {
+            // Check existing final_rating to avoid re-emailing on subsequent scheduler runs
+            const existingRow = await pool.query(
+                'SELECT final_rating FROM game_referees WHERE game_id = $1 AND player_id = $2',
+                [gameId, ref.player_id]
+            );
+            const alreadyFinalised = existingRow.rows[0]?.final_rating !== null &&
+                                     existingRow.rows[0]?.final_rating !== undefined;
+
+            const agg = await pool.query(
+                `SELECT ROUND(AVG(rating)::numeric, 2) AS avg_rating,
+                        COUNT(*)                       AS cnt
+                 FROM referee_reviews
+                 WHERE game_id = $1 AND referee_player_id = $2`,
+                [gameId, ref.player_id]
+            );
+            const avgRating  = agg.rows[0]?.avg_rating || null;
+            const cnt        = parseInt(agg.rows[0]?.cnt || 0);
+
+            await pool.query(
+                `UPDATE game_referees
+                 SET final_rating = $1, review_count = $2
+                 WHERE game_id = $3 AND player_id = $4`,
+                [avgRating, cnt, gameId, ref.player_id]
+            );
+
+            setImmediate(() => {
+                gameAuditLog(pool, gameId, null, 'ref_score_finalised',
+                    `Referee ${ref.player_id} final avg: ${avgRating} (${cnt} reviews)`).catch(() => {});
+                auditLog(pool, null, 'ref_score_finalised', ref.player_id,
+                    `Final referee rating game ${gameId}: ${avgRating} (${cnt} reviews)`).catch(() => {});
+            });
+
+            // Email the referee their rating on first finalisation only
+            if (cnt > 0 && avgRating && !alreadyFinalised) {
+                setImmediate(async () => {
+                    try {
+                        const pRow = await pool.query(
+                            `SELECT p.alias, p.full_name, u.email
+                             FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
+                            [ref.player_id]
+                        );
+                        if (!pRow.rows[0]?.email) return;
+                        const name      = pRow.rows[0].alias || pRow.rows[0].full_name;
+                        const starsHtml = '&#9733;'.repeat(Math.round(avgRating)) +
+                                          '&#9734;'.repeat(5 - Math.round(avgRating));
+                        await emailTransporter.sendMail({
+                            from: '"TotalFooty" <totalfooty19@gmail.com>',
+                            to:   pRow.rows[0].email,
+                            subject: `⭐ Your referee rating — ${day}`,
+                            html: wrapEmailHtml(`
+                                <p style="font-size:16px;font-weight:700;">Hi ${htmlEncode(name)},</p>
+                                <p style="color:#888;">The review period has closed for your game on ${htmlEncode(day)} at ${htmlEncode(venue)}.</p>
+                                <div style="text-align:center;padding:28px 0;">
+                                    <div style="font-size:38px;color:#ffd700;letter-spacing:4px;">${starsHtml}</div>
+                                    <div style="font-size:52px;font-weight:900;margin:8px 0;">${htmlEncode(String(avgRating))}</div>
+                                    <div style="color:#888;">average from ${cnt} review${cnt > 1 ? 's' : ''}</div>
+                                </div>
+                                <p style="text-align:center;color:#666;font-size:13px;">Thanks for officiating. See you on the pitch! ⚽</p>
+                            `)
+                        });
+                    } catch (e) {
+                        console.error('Referee rating email failed:', e.message);
+                    }
+                });
+            }
+        }
+    } catch (e) {
+        console.error('finaliseRefereeReviews error:', e.message);
+    }
+}
+
+
 app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
@@ -8190,7 +8523,9 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 COALESCE((SELECT SUM(COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
                  FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
-                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count,
+                (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'pending')   AS pending_referee_applications,
+                (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_referees
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 ORDER BY g.game_date DESC`;
             params = [];
@@ -8213,7 +8548,9 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 COALESCE((SELECT SUM(COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
                  FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
-                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count
+                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count,
+                (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'pending')   AS pending_referee_applications,
+                (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_referees
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
@@ -8704,7 +9041,8 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
              SET winning_team = $1, 
                  game_status = 'completed',
                  tournament_results_finalised = TRUE,
-                 motm_voting_ends = NOW() + INTERVAL '24 hours'
+                 motm_voting_ends = NOW() + INTERVAL '24 hours',
+                 ref_review_ends = NOW() + INTERVAL '24 hours'
              WHERE id = $2`,
             [winningTeam, gameId]
         );
@@ -9760,6 +10098,403 @@ app.post('/api/dm/:playerId/mark-read', authenticateToken, async (req, res) => {
     }
 });
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REFEREE SYSTEM
+// ══════════════════════════════════════════════════════════════════════════════
+
+// POST /api/games/:gameId/apply-ref — referee applies to officiate a game
+app.post('/api/games/:gameId/apply-ref', authenticateToken, registrationLimiter, async (req, res) => {
+    const { gameId } = req.params;
+    try {
+        // Must have Referee badge
+        const badgeCheck = await pool.query(
+            `SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+             WHERE pb.player_id = $1 AND b.name = 'Referee'`,
+            [req.user.playerId]
+        );
+        if (!badgeCheck.rows.length) return res.status(403).json({ error: 'Referee badge required' });
+
+        // Game must exist and require refs
+        const game = await pool.query(
+            'SELECT id, refs_required, game_status FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (!game.rows.length) return res.status(404).json({ error: 'Game not found' });
+        if (game.rows[0].refs_required === 0) return res.status(400).json({ error: 'This game does not require a referee' });
+        if (!['available','confirmed'].includes(game.rows[0].game_status)) {
+            return res.status(400).json({ error: 'Cannot apply to referee a completed or cancelled game' });
+        }
+
+        await pool.query(
+            `INSERT INTO game_referees (game_id, player_id, status, applied_at)
+             VALUES ($1, $2, 'pending', NOW())
+             ON CONFLICT (game_id, player_id)
+             DO UPDATE SET status = 'pending', applied_at = NOW()
+             WHERE game_referees.status = 'declined'`,
+            [gameId, req.user.playerId]
+        );
+
+        setImmediate(() => {
+            gameAuditLog(pool, gameId, req.user.playerId, 'ref_applied',
+                `Player ${req.user.playerId} applied to referee`);
+            auditLog(pool, req.user.playerId, 'ref_applied', gameId,
+                `Applied to referee game ${gameId}`);
+        });
+
+        res.json({ ok: true, message: 'Application submitted — awaiting organiser confirmation' });
+    } catch (error) {
+        console.error('Apply ref error:', error);
+        res.status(500).json({ error: 'Failed to apply' });
+    }
+});
+
+// DELETE /api/games/:gameId/apply-ref — referee withdraws their application
+app.delete('/api/games/:gameId/apply-ref', authenticateToken, registrationLimiter, async (req, res) => {
+    const { gameId } = req.params;
+    try {
+        await pool.query(
+            'DELETE FROM game_referees WHERE game_id = $1 AND player_id = $2',
+            [gameId, req.user.playerId]
+        );
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'ref_withdrawn',
+            `Referee ${req.user.playerId} withdrew application`));
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to withdraw application' });
+    }
+});
+
+// GET /api/admin/games/:gameId/referees — list all referee applications for a game
+// Accessible to game managers (organisers, CLM admins, admins)
+app.get('/api/admin/games/:gameId/referees', authenticateToken, requireGameManager, async (req, res) => {
+    const { gameId } = req.params;
+    try {
+        const result = await pool.query(`
+            SELECT gr.id, gr.player_id, gr.status, gr.applied_at, gr.confirmed_at,
+                   gr.final_rating, gr.review_count,
+                   COALESCE(p.alias, p.full_name) AS player_name,
+                   p.photo_url,
+                   p.squad_number,
+                   g.refs_required,
+                   g.ref_pay,
+                   g.game_status,
+                   g.ref_review_ends,
+                   (SELECT COUNT(*) FROM game_referees WHERE game_id = $1 AND status = 'confirmed') AS confirmed_count,
+                   (SELECT COUNT(*) FROM referee_reviews WHERE game_id = $1 AND referee_player_id = gr.player_id) AS live_review_count,
+                   (SELECT ROUND(AVG(rating)::numeric,1) FROM referee_reviews WHERE game_id = $1 AND referee_player_id = gr.player_id) AS live_avg_rating
+            FROM game_referees gr
+            JOIN players p ON p.id = gr.player_id
+            JOIN games g ON g.id = gr.game_id
+            WHERE gr.game_id = $1
+            ORDER BY gr.status DESC, gr.applied_at ASC
+        `, [gameId]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get game referees error:', error);
+        res.status(500).json({ error: 'Failed to fetch referees' });
+    }
+});
+
+// POST /api/admin/games/:gameId/referees/:refPlayerId/confirm — confirm a referee
+app.post('/api/admin/games/:gameId/referees/:refPlayerId/confirm', authenticateToken, requireGameManager, async (req, res) => {
+    const { gameId, refPlayerId } = req.params;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        // Lock game row to prevent race condition on slot count
+        const game = await client.query('SELECT refs_required FROM games WHERE id = $1 FOR UPDATE', [gameId]);
+        if (!game.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Game not found' }); }
+
+        const confirmedCount = await client.query(
+            'SELECT COUNT(*) AS cnt FROM game_referees WHERE game_id = $1 AND status = $2',
+            [gameId, 'confirmed']
+        );
+        if (parseInt(confirmedCount.rows[0].cnt) >= game.rows[0].refs_required) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Maximum number of referees already confirmed for this game' });
+        }
+
+        const result = await client.query(
+            `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW()
+             WHERE game_id = $1 AND player_id = $2
+             RETURNING id`,
+            [gameId, refPlayerId]
+        );
+        if (!result.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Application not found' }); }
+        await client.query('COMMIT');
+
+        setImmediate(() => {
+            gameAuditLog(pool, gameId, req.user.playerId, 'ref_confirmed',
+                `Referee ${refPlayerId} confirmed`);
+            auditLog(pool, req.user.playerId, 'ref_confirmed', refPlayerId,
+                `Confirmed as referee for game ${gameId}`);
+            // Notify the referee
+            pool.query(
+                `INSERT INTO notifications (player_id, type, message)
+                 VALUES ($1, 'ref_confirmed', '✅ You have been confirmed as a referee.')`,
+                [refPlayerId]
+            ).catch(() => {});
+        });
+
+        res.json({ ok: true });
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Confirm ref error:', error);
+        res.status(500).json({ error: 'Failed to confirm referee' });
+    } finally {
+        client.release();
+    }
+});
+
+// POST /api/admin/games/:gameId/referees/:refPlayerId/unconfirm — remove confirmation
+app.post('/api/admin/games/:gameId/referees/:refPlayerId/unconfirm', authenticateToken, requireGameManager, async (req, res) => {
+    const { gameId, refPlayerId } = req.params;
+    try {
+        await pool.query(
+            `UPDATE game_referees SET status = 'pending', confirmed_at = NULL
+             WHERE game_id = $1 AND player_id = $2`,
+            [gameId, refPlayerId]
+        );
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'ref_unconfirmed',
+            `Referee ${refPlayerId} unconfirmed`));
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to unconfirm referee' });
+    }
+});
+
+// GET /api/public/game/:gameUrl/referees — public referee list + avg scores for game page
+app.get('/api/public/game/:gameUrl/referees', async (req, res) => {
+    const { gameUrl } = req.params;
+    try {
+        const gameRes = await pool.query(
+            'SELECT id, ref_review_ends FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        if (!gameRes.rows.length) return res.status(404).json({ error: 'Game not found' });
+        const { id: gameId, ref_review_ends } = gameRes.rows[0];
+
+        const result = await pool.query(`
+            SELECT gr.player_id,
+                   COALESCE(p.alias, p.full_name) AS name,
+                   p.photo_url,
+                   p.squad_number,
+                   gr.status,
+                   gr.final_rating                AS avg_rating,
+                   gr.review_count
+            FROM game_referees gr
+            JOIN players p ON p.id = gr.player_id
+            WHERE gr.game_id = $1 AND gr.status = 'confirmed'
+            ORDER BY gr.confirmed_at ASC
+        `, [gameId]);
+
+        res.json({
+            referees: result.rows,
+            review_closes_at: ref_review_ends
+        });
+    } catch (error) {
+        console.error('Public referees error:', error);
+        res.status(500).json({ error: 'Failed to fetch referees' });
+    }
+});
+
+// POST /api/games/:gameId/ref-review/:refPlayerId — submit or update a referee review
+// SEC: only confirmed players for that game can review
+app.post('/api/games/:gameId/ref-review/:refPlayerId', authenticateToken, fairnessLimiter, async (req, res) => {
+    const { gameId, refPlayerId } = req.params;
+    const { rating, comment } = req.body;
+
+    if (!rating || ![1,2,3,4,5].includes(parseInt(rating))) {
+        return res.status(400).json({ error: 'Rating must be 1–5' });
+    }
+    const safeComment = (typeof comment === 'string') ? comment.trim().slice(0, 500) : null;
+
+    try {
+        // Must be confirmed player in that game
+        const playerCheck = await pool.query(
+            `SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [gameId, req.user.playerId]
+        );
+        if (!playerCheck.rows.length) {
+            return res.status(403).json({ error: 'Only confirmed players can review a referee' });
+        }
+
+        // Ref must be confirmed for this game
+        const refCheck = await pool.query(
+            `SELECT 1 FROM game_referees WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [gameId, refPlayerId]
+        );
+        if (!refCheck.rows.length) return res.status(404).json({ error: 'Referee not found for this game' });
+
+        // Review window must be open
+        const gameCheck = await pool.query('SELECT ref_review_ends FROM games WHERE id = $1', [gameId]);
+        const closesAt = gameCheck.rows[0]?.ref_review_ends;
+        if (!closesAt || new Date() > new Date(closesAt)) {
+            return res.status(400).json({ error: 'Referee review window has closed' });
+        }
+
+        // Cannot review yourself
+        if (req.user.playerId === refPlayerId) {
+            return res.status(400).json({ error: 'You cannot review yourself' });
+        }
+
+        const isUpdate = await pool.query(
+            'SELECT id FROM referee_reviews WHERE game_id=$1 AND referee_player_id=$2 AND reviewer_player_id=$3',
+            [gameId, refPlayerId, req.user.playerId]
+        );
+        const isEdit = isUpdate.rows.length > 0;
+
+        await pool.query(
+            `INSERT INTO referee_reviews (game_id, referee_player_id, reviewer_player_id, rating, comment)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (game_id, referee_player_id, reviewer_player_id)
+             DO UPDATE SET rating = $4, comment = $5, updated_at = NOW()`,
+            [gameId, refPlayerId, req.user.playerId, parseInt(rating), safeComment]
+        );
+
+        // Recalculate average and update audit
+        const avgRes = await pool.query(
+            `SELECT ROUND(AVG(rating), 1) AS avg, COUNT(*) AS cnt
+             FROM referee_reviews WHERE game_id = $1 AND referee_player_id = $2`,
+            [gameId, refPlayerId]
+        );
+        const avg = avgRes.rows[0].avg;
+        const cnt = avgRes.rows[0].cnt;
+
+        setImmediate(() => {
+            const action = isEdit ? 'ref_review_updated' : 'ref_review_received';
+            const detail = `rating:${rating}${safeComment ? ' comment:yes' : ''} avg_now:${avg} total_reviews:${cnt}`;
+            gameAuditLog(pool, gameId, req.user.playerId, action,
+                `Reviewer ${req.user.playerId} rated ref ${refPlayerId}: ${rating}★ — ${detail}`);
+            auditLog(pool, req.user.playerId, action, refPlayerId,
+                `Rated referee in game ${gameId}: ${rating}★${safeComment ? ` — "${safeComment}"` : ''}`);
+            // Log comment separately if present
+            if (safeComment) {
+                gameAuditLog(pool, gameId, req.user.playerId, 'ref_review_comment',
+                    `Comment for ref ${refPlayerId}: "${safeComment}"`);
+                auditLog(pool, req.user.playerId, 'ref_review_comment', refPlayerId,
+                    `Comment in game ${gameId}: "${safeComment}"`);
+            }
+            // Update ref_score_finalised flag when enough reviews
+            if (parseInt(cnt) >= 3) {
+                gameAuditLog(pool, gameId, null, 'ref_score_updated',
+                    `Ref ${refPlayerId} current avg: ${avg}★ (${cnt} reviews)`);
+            }
+        });
+
+        res.json({ ok: true, avg_rating: avg, review_count: cnt, is_edit: isEdit });
+    } catch (error) {
+        console.error('Ref review error:', error);
+        res.status(500).json({ error: 'Failed to submit review' });
+    }
+});
+
+// GET /api/games/:gameId/my-ref-review/:refPlayerId — get logged-in player's review for a ref
+app.get('/api/games/:gameId/my-ref-review/:refPlayerId', authenticateToken, async (req, res) => {
+    const { gameId, refPlayerId } = req.params;
+    try {
+        const result = await pool.query(
+            `SELECT rating, comment FROM referee_reviews
+             WHERE game_id = $1 AND referee_player_id = $2 AND reviewer_player_id = $3`,
+            [gameId, refPlayerId, req.user.playerId]
+        );
+        res.json(result.rows[0] || null);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch review' });
+    }
+});
+
+// GET /api/admin/audit/ref-actions — paginated referee audit events from both logs
+app.get('/api/admin/audit/ref-actions', authenticateToken, requireAdmin, async (req, res) => {
+    const limit  = Math.min(parseInt(req.query.limit)  || 100, 200);
+    const offset = Math.max(parseInt(req.query.offset) || 0,   0);
+    const allowedActions = [
+        'ref_applied','ref_confirmed','ref_withdrawn','ref_unconfirmed',
+        'ref_review_received','ref_review_updated','ref_review_comment','ref_score_updated'
+    ];
+    try {
+        // Combine game_audit_log and audit_logs for referee actions
+        const result = await pool.query(`
+            SELECT 'game' AS source, action, detail, game_id::text AS target_id,
+                   admin_id, created_at
+            FROM game_audit_log
+            WHERE action = ANY($1)
+            UNION ALL
+            SELECT 'player', action, detail, target_id::text,
+                   admin_id, created_at
+            FROM audit_logs
+            WHERE action = ANY($1)
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+        `, [allowedActions, limit, offset]);
+
+        const countRes = await pool.query(
+            `SELECT (
+                SELECT COUNT(*) FROM game_audit_log WHERE action = ANY($1)
+             ) + (
+                SELECT COUNT(*) FROM audit_logs WHERE action = ANY($1)
+             ) AS total`,
+            [allowedActions]
+        );
+        const total = parseInt(countRes.rows[0].total);
+
+        res.json({
+            rows:    result.rows,
+            total,
+            hasMore: offset + result.rows.length < total
+        });
+    } catch (error) {
+        console.error('Ref audit error:', error);
+        res.status(500).json({ error: 'Failed to load referee audit log' });
+    }
+});
+
+
+// ── REFEREE INVITE SYSTEM ─────────────────────────────────────────────────────
+
+const refereeInviteLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    message: { error: 'Too many requests' }
+});
+
+// POST /api/admin/referee-invite — admin generates a one-time referee invite link
+app.post('/api/admin/referee-invite', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const code      = 'REF' + crypto.randomBytes(8).toString('hex').toUpperCase();
+        const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+        await pool.query(
+            `INSERT INTO referee_invites (code, created_by, expires_at) VALUES ($1, $2, $3)`,
+            [code, req.user.playerId, expiresAt]
+        );
+        const link = `https://totalfooty.co.uk/vibecoding/?referee_invite=${code}`;
+        setImmediate(() => auditLog(pool, req.user.playerId, 'referee_invite_created',
+            req.user.playerId, `code: ${code}`));
+        res.json({ code, link, expiresAt });
+    } catch (error) {
+        console.error('Generate referee invite error:', error);
+        res.status(500).json({ error: 'Failed to generate invite link' });
+    }
+});
+
+// GET /api/public/referee-invite/:code — validate an invite code (before registration)
+app.get('/api/public/referee-invite/:code', refereeInviteLimiter, async (req, res) => {
+    try {
+        const { code } = req.params;
+        if (!code || !/^[A-Z0-9]+$/.test(code)) return res.json({ valid: false });
+        const result = await pool.query(
+            `SELECT id FROM referee_invites
+             WHERE code = $1 AND used_at IS NULL AND expires_at > NOW()`,
+            [code.toUpperCase()]
+        );
+        res.json({ valid: result.rows.length > 0 });
+    } catch (error) {
+        res.json({ valid: false });
+    }
+});
+
 // ── TEAM FAIRNESS VOTING ─────────────────────────────────────────────────────
 
 // GET /api/games/:gameId/fairness — get vote counts + logged-in player's vote
@@ -10521,10 +11256,12 @@ app.listen(PORT, () => {
                     if (!result.alreadyFinalized) {
                         const names = result.winners.map(w => w.name).join(' & ');
                         console.log(`✅ MOTM auto-finalized game ${row.id}: ${names}`);
-                        // Audit the auto-finalization (no admin actor — null)
                         await gameAuditLog(pool, row.id, null, 'motm_finalized',
                             `Auto-finalized | Winner(s): ${names} | Votes: ${result.winners[0]?.votes ?? '?'}`).catch(() => {});
                     }
+                    // Always run ref finalize — MOTM and refs are independent
+                    await finaliseRefereeReviews(row.id).catch(e =>
+                        console.error(`Ref review finalize failed ${row.id}:`, e.message));
                 } catch (e) {
                     console.error(`✗ MOTM auto-finalize failed for game ${row.id}:`, e.message);
                 }
@@ -10534,7 +11271,30 @@ app.listen(PORT, () => {
         }
     }, 10 * 60 * 1000); // 10 minutes
 
-    // Min-rating auto-drop scheduler — runs every 5 minutes
+    // Ref review window close scheduler — runs every 10 minutes
+    // Handles games that have no MOTM (e.g. external losses) so ref reviews still finalise
+    setInterval(async () => {
+        try {
+            const expiredRefs = await pool.query(`
+                SELECT DISTINCT gr.game_id
+                FROM game_referees gr
+                JOIN games g ON g.id = gr.game_id
+                WHERE g.ref_review_ends < NOW()
+                  AND g.game_status = 'completed'
+                  AND g.refs_required > 0
+                  AND gr.status = 'confirmed'
+                  AND gr.final_rating IS NULL
+            `);
+            for (const row of expiredRefs.rows) {
+                await finaliseRefereeReviews(row.game_id).catch(e =>
+                    console.error(`Scheduled ref review finalize failed ${row.game_id}:`, e.message));
+            }
+        } catch (e) {
+            console.error('Ref review scheduler error:', e.message);
+        }
+    }, 10 * 60 * 1000); // 10 minutes
+
+        // Min-rating auto-drop scheduler — runs every 5 minutes
     // Updates min_rating_drop_sent flag. effectiveMinOvr() uses game_date vs Date.now()
     // so the actual gate drops automatically; this flag just prevents double-firing.
     let minRatingDropRunning = false;
