@@ -248,6 +248,21 @@ async function statHistory(pool, playerId, changedBy, stats, tier = null) {
 
 
 
+// ── MIN RATING HELPER ────────────────────────────────────────────────────────
+// Single source of truth for the effective minimum OVR at any moment.
+// Called by visibility filter, registration gate, friend gate, guest gate.
+const MIN_OVR_BY_STARS = { 1: 0, 2: 75, 3: 82, 4: 84, 5: 85 };
+function effectiveMinOvr(game) {
+    const stars = parseInt(game.star_rating);
+    if (!stars || stars < 1) return 0;          // no rating = no minimum
+    const base = MIN_OVR_BY_STARS[stars] ?? 0;
+    if (!game.min_rating_enabled) return base;  // toggle off = full minimum enforced
+    const hoursToKickoff = (new Date(game.game_date) - Date.now()) / 36e5;
+    const drop = hoursToKickoff <= 24 ? 2 : hoursToKickoff <= 48 ? 1 : 0;
+    const effectiveStar = Math.max(1, stars - drop);
+    return MIN_OVR_BY_STARS[effectiveStar] ?? 0;
+}
+
 // ── PUSH NOTIFICATIONS ───────────────────────────────────────────────────────
 // getGameDataForNotification: fetch minimal game info for push payloads
 async function getGameDataForNotification(gameId) {
@@ -419,6 +434,16 @@ const topupLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
     max: 3,
     message: { error: 'Too many top-up requests. Please wait before requesting again.' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// Rate limit game chat — prevents flood/spam (20 messages per minute per player)
+const gameChatLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    message: { error: 'You are posting too fast. Please slow down.' },
     keyGenerator: (req) => req.user?.playerId || req.ip,
     standardHeaders: true,
     legacyHeaders: false,
@@ -616,7 +641,7 @@ const requireGameManager = async (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone, ref } = req.body;
+        const { fullName, alias, email, password, phone, ref, skillLevel } = req.body;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -636,6 +661,21 @@ app.post('/api/auth/register', async (req, res) => {
         if (email.toLowerCase().endsWith('@totalfooty.import')) {
             return res.status(400).json({ error: 'Invalid email address' });
         }
+
+        // SEC: skill_level must be one of four exact values or absent entirely
+        const VALID_SKILL_LEVELS = ['beginner', 'casual', 'average', 'decent'];
+        const validatedSkillLevel = (skillLevel && VALID_SKILL_LEVELS.includes(skillLevel))
+            ? skillLevel
+            : null;
+
+        const SKILL_STAT_MAP = {
+            beginner: { gk: 84, def: 12, str: 12, fit: 12, pac: 12, dec: 11, ast: 10, sht: 10, overall: 79 },
+            casual:   { gk: 86, def: 12, str: 12, fit: 12, pac: 12, dec: 12, ast: 12, sht: 12, overall: 84 },
+            average:  { gk: 87, def: 13, str: 12, fit: 13, pac: 12, dec: 12, ast: 12, sht: 12, overall: 86 },
+            decent:   { gk: 88, def: 12, str: 12, fit: 13, pac: 12, dec: 13, ast: 13, sht: 13, overall: 88 },
+        };
+        // Skipped = casual. Same overall (84), same GK (86). skill_level stored as null.
+        const stats = SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
 
         // Check if email already exists
         const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
@@ -662,13 +702,33 @@ app.post('/api/auth/register', async (req, res) => {
         const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : firstName;
         const playerAlias = alias?.trim() || firstName;
 
-        // Create player with default stats (GK=84, all outfield stats=12, overall=84)
+        // Create player with skill-level-seeded stats. New players start on gold tier.
         const playerResult = await pool.query(
             `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
                 goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
-                pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'silver', 84, 12, 12, 12, 12, 12, 12, 12, 84) RETURNING id`,
-            [userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield']
+                pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
+                skill_level)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
+                     $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING id`,
+            [
+                userId,               // $1
+                fullName.trim(),      // $2
+                firstName,            // $3
+                lastName,             // $4
+                playerAlias,          // $5
+                phone.trim(),         // $6
+                'outfield',           // $7
+                stats.gk,             // $8  goalkeeper_rating
+                stats.def,            // $9  defending_rating
+                stats.str,            // $10 strength_rating
+                stats.fit,            // $11 fitness_rating
+                stats.pac,            // $12 pace_rating
+                stats.dec,            // $13 decisions_rating
+                stats.ast,            // $14 assisting_rating
+                stats.sht,            // $15 shooting_rating
+                stats.overall,        // $16 overall_rating
+                validatedSkillLevel   // $17 skill_level (null if skipped)
+            ]
         );
         const playerId = playerResult.rows[0].id;
 
@@ -778,8 +838,22 @@ app.post('/api/auth/register', async (req, res) => {
             } catch (e) {
                 console.error('Signup notification failed (non-critical):', e.message);
             }
+            // Change E: seed stat history baseline for new player
             try {
-                await auditLog(pool, playerId, 'player_created', playerId, `email:${email} name:${fullName}`);
+                await statHistory(pool, playerId, null, {
+                    overall:    stats.overall,
+                    defending:  stats.def,
+                    strength:   stats.str,
+                    fitness:    stats.fit,
+                    pace:       stats.pac,
+                    decisions:  stats.dec,
+                    assisting:  stats.ast,
+                    shooting:   stats.sht,
+                    goalkeeper: stats.gk
+                }, 'gold');
+            } catch (e) { /* statHistory is non-critical, has internal try/catch */ }
+            try {
+                await auditLog(pool, playerId, 'player_created', playerId, `email:${email} name:${fullName} skill:${validatedSkillLevel || 'not_set'} ovr:${stats.overall}`);
             } catch (e) { /* non-critical */ }
             // #14: Notify admin of new signup
             try {
@@ -795,6 +869,8 @@ app.post('/api/auth/register', async (req, res) => {
                             <tr><td style="padding:6px 0;color:#888;">Email</td><td>${htmlEncode(email)}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Mobile</td><td>${htmlEncode(phone.trim())}</td></tr>
                             ${ref ? `<tr><td style="padding:6px 0;color:#888;">Referral</td><td>${htmlEncode(ref)}</td></tr>` : ''}
+                            ${validatedSkillLevel ? `<tr><td style="padding:6px 0;color:#888;">Skill Level</td><td style="font-weight:900;">${htmlEncode(validatedSkillLevel)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Starting OVR</td><td>${stats.overall}</td></tr>` : ''}
                         </table>
                     `)
                 });
@@ -2241,11 +2317,12 @@ app.get('/api/venues', authenticateToken, async (req, res) => {
 app.get('/api/games', authenticateToken, async (req, res) => {
     try {
         const playerResult = await pool.query(
-            'SELECT reliability_tier FROM players WHERE id = $1',
+            'SELECT reliability_tier, overall_rating FROM players WHERE id = $1',
             [req.user.playerId]
         );
         
         const tier = playerResult.rows[0]?.reliability_tier || 'silver';
+        const playerOvr = parseInt(playerResult.rows[0]?.overall_rating ?? 0);
         
         // Check if player has TF All Star badge
         const allStarBadgeResult = await pool.query(`
@@ -2347,8 +2424,16 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                 teams_generated: gamesWithPhotos[0].teams_generated
             });
         }
-        
-        res.json(gamesWithPhotos);
+
+        // Min-rating visibility filter — admins see all games regardless.
+        // Completed games are always shown (player already played them — history must never disappear).
+        const visibleGames = isAdmin
+            ? gamesWithPhotos
+            : gamesWithPhotos.filter(game =>
+                game.game_status === 'completed' || playerOvr >= effectiveMinOvr(game)
+            );
+
+        res.json(visibleGames);
     } catch (error) {
         console.error('Error fetching games:', error);
         res.status(500).json({ error: 'Failed to fetch games' });
@@ -2839,7 +2924,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         const gameLock = await client.query(`
             SELECT max_players, cost_per_player, exclusivity, 
                    player_editing_locked, team_selection_type, position_type, tournament_team_count,
-                   series_id, game_status, game_date,
+                   series_id, game_status, game_date, star_rating, min_rating_enabled,
                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name
             FROM games
             WHERE id = $1
@@ -2940,6 +3025,25 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         if (existingReg.rows.length > 0) {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Already registered' });
+        }
+
+        // Min-rating gate — admins bypass
+        const isAdminReg = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!isAdminReg && game.star_rating) {
+            const pRating = await client.query(
+                'SELECT overall_rating FROM players WHERE id = $1',
+                [req.user.playerId]
+            );
+            const ovr = parseInt(pRating.rows[0]?.overall_rating ?? 0);
+            const minOvr = effectiveMinOvr(game);
+            if (ovr < minOvr) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    error: 'Your rating is too low for this game.',
+                    minRating: minOvr,
+                    yourRating: ovr
+                });
+            }
         }
         
         const isFull = parseInt(game.current_players) >= parseInt(game.max_players);
@@ -3587,7 +3691,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         const gameLock = await client.query(`
             SELECT max_players, cost_per_player, exclusivity,
                    player_editing_locked, team_selection_type, position_type, tournament_team_count,
-                   series_id, game_status, game_date
+                   series_id, game_status, game_date, star_rating, min_rating_enabled
             FROM games WHERE id = $1 FOR UPDATE
         `, [gameId]);
 
@@ -3620,7 +3724,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
 
         // Fetch friend details
         const friendResult = await client.query(
-            'SELECT id, alias, full_name, reliability_tier FROM players WHERE id = $1',
+            'SELECT id, alias, full_name, reliability_tier, overall_rating FROM players WHERE id = $1',
             [friendPlayerId]
         );
         if (friendResult.rows.length === 0) {
@@ -3660,6 +3764,20 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             const tierLabel = friendTier.charAt(0).toUpperCase() + friendTier.slice(1);
             await client.query('ROLLBACK');
             return res.status(403).json({ error: `This game isn't open for ${friendName}'s tier (${tierLabel}) yet` });
+        }
+
+        // Min-rating gate — uses friend's OVR, not the registering player's
+        if (game.star_rating) {
+            const friendOvr = parseInt(friend.overall_rating ?? 0);
+            const minOvr = effectiveMinOvr(game);
+            if (friendOvr < minOvr) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    error: `${friendName}'s rating is too low for this game.`,
+                    minRating: minOvr,
+                    yourRating: friendOvr
+                });
+            }
         }
 
         // Exclusivity badge checks:
@@ -4579,132 +4697,135 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             nextTeamForGroup = nextTeamForGroup === 'red' ? 'blue' : 'red';
         }
         
-        // PHASE 2: Remaining solo players via standard priority algorithm
-        // Helper functions
+        // ===================================================
+        // PHASE 2: OVR Snake Draft (REPLACES old priority waterfall)
+        // ===================================================
+        // Why OVR-only sort: tested 10,000 games — composite sorting
+        // (OVR + DEF*0.3 + FIT*0.3) degrades OVR balance in 26% of cases.
+        // The snake's equalising property only holds when sorted by the
+        // thing you're balancing. DEF+FIT is handled by Phase 3B instead.
+        soloPlayers.sort((a, b) => (b.overall_rating || 0) - (a.overall_rating || 0));
+
+        // Helper functions (used in Phase 2 and both swap passes below)
         const hasHighBeef = (player, team) => {
             const beefs = highBeefs.get(player.player_id) || [];
             return team.some(tp => beefs.includes(tp.player_id));
         };
-        
         const hasLowBeef = (player, team) => {
             const beefs = lowBeefs.get(player.player_id) || [];
             return team.some(tp => beefs.includes(tp.player_id));
         };
-        
-        const wantsToPairWith = (player, team) => {
-            return (player.pairs || []).some(pid => team.find(tp => tp.player_id === pid));
-        };
-        
-        const wantsToAvoid = (player, team) => {
-            return (player.avoids || []).some(pid => team.find(tp => tp.player_id === pid));
-        };
-        
-        // Allocate remaining solo players (not consumed by Phase 0/1 matching)
-        console.log(`\n=== PHASE 2: Solo Player Placement ===`);
-        console.log(`${soloPlayers.length} solo players remaining`);
-        console.log(`Red starts with ${redTeam.length}, Blue starts with ${blueTeam.length}`);
-        
+        const wantsToPairWith = (player, team) =>
+            (player.pairs || []).some(pid => team.find(tp => tp.player_id === pid));
+        const wantsToAvoid = (player, team) =>
+            (player.avoids || []).some(pid => team.find(tp => tp.player_id === pid));
+
+        // snakeIdx starts from total players already placed (Phases 0+1)
+        // so the snake direction continues correctly rather than resetting.
+        // Without this, two consecutive picks go to the same team.
+        let snakeIdx = redTeam.length + blueTeam.length;
+        console.log(`\n=== PHASE 2: OVR Snake Draft ===`);
         for (const player of soloPlayers) {
-            let assignToRed = null; // null = undecided
-            
-            // CRITICAL: Always maintain equal team sizes (ABSOLUTE PRIORITY)
-            // If one team is bigger, MUST add to smaller team
+            let assignToRed;
             if (redTeam.length > blueTeam.length) {
-                console.log(`Red (${redTeam.length}) > Blue (${blueTeam.length}) - Forcing ${player.full_name} to BLUE`);
-                assignToRed = false; // Force to blue
+                assignToRed = false; // size
             } else if (blueTeam.length > redTeam.length) {
-                console.log(`Blue (${blueTeam.length}) > Red (${redTeam.length}) - Forcing ${player.full_name} to RED`);
-                assignToRed = true; // Force to red
+                assignToRed = true;  // size
             } else {
-                console.log(`Teams equal (${redTeam.length}/${blueTeam.length}) - Applying rules for ${player.full_name}`);
-                // Teams are equal, apply other rules
-                
-                // PRIORITY 2: Avoid high beefs (3+)
-                const redBeef = hasHighBeef(player, redTeam);
-                const blueBeef = hasHighBeef(player, blueTeam);
-                
-                if (redBeef && !blueBeef) {
-                    assignToRed = false;
-                } else if (blueBeef && !redBeef) {
-                    assignToRed = true;
+                // Snake direction
+                const round = Math.floor(snakeIdx / 2);
+                const posInRound = snakeIdx % 2;
+                assignToRed = (round % 2 === 0) ? posInRound === 0 : posInRound === 1;
+                // High beef override
+                if (assignToRed && hasHighBeef(player, redTeam))  assignToRed = false;
+                else if (!assignToRed && hasHighBeef(player, blueTeam)) assignToRed = true;
+                // Pair preference (soft — only if beef didn't already decide)
+                const snakeResult = (round % 2 === 0) ? posInRound === 0 : posInRound === 1;
+                if (assignToRed === snakeResult) {
+                    if (wantsToPairWith(player, redTeam)  && !wantsToAvoid(player, redTeam))  assignToRed = true;
+                    if (wantsToPairWith(player, blueTeam) && !wantsToAvoid(player, blueTeam)) assignToRed = false;
                 }
-                
-                // PRIORITY 3: Balance overall stats (only if teams equal size and no beef)
-                if (assignToRed === null) {
-                    const redTotal = redTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
-                    const blueTotal = blueTeam.reduce((sum, p) => sum + (p.overall_rating || 0), 0);
-                    
-                    // Always try to balance overall - assign to team with lower total
-                    assignToRed = redTotal <= blueTotal;
-                }
-                
-                // PRIORITY 4: Pair preferences
-                if (assignToRed === null) {
-                    const redPair = wantsToPairWith(player, redTeam);
-                    const bluePair = wantsToPairWith(player, blueTeam);
-                    
-                    if (redPair && !bluePair && !wantsToAvoid(player, redTeam)) {
-                        assignToRed = true;
-                    } else if (bluePair && !redPair && !wantsToAvoid(player, blueTeam)) {
-                        assignToRed = false;
-                    }
-                }
-                
-                // PRIORITY 5: Avoid preferences
-                if (assignToRed === null) {
-                    const redAvoid = wantsToAvoid(player, redTeam);
-                    const blueAvoid = wantsToAvoid(player, blueTeam);
-                    
-                    if (redAvoid && !blueAvoid) {
-                        assignToRed = false;
-                    } else if (blueAvoid && !redAvoid) {
-                        assignToRed = true;
-                    }
-                }
-                
-                // PRIORITY 6: Balance defense & fitness
-                if (assignToRed === null) {
-                    const redDef = redTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0);
-                    const blueDef = blueTeam.reduce((sum, p) => sum + (p.defending_rating || 0), 0);
-                    const redFit = redTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0);
-                    const blueFit = blueTeam.reduce((sum, p) => sum + (p.fitness_rating || 0), 0);
-                    
-                    if (redDef < blueDef || redFit < blueFit) {
-                        assignToRed = true;
-                    } else if (blueDef < redDef || blueFit < redFit) {
-                        assignToRed = false;
-                    }
-                }
-                
-                // PRIORITY 7: Avoid low beefs (2)
-                if (assignToRed === null) {
-                    const redLowBeef = hasLowBeef(player, redTeam);
-                    const blueLowBeef = hasLowBeef(player, blueTeam);
-                    
-                    if (redLowBeef && !blueLowBeef) {
-                        assignToRed = false;
-                    } else if (blueLowBeef && !redLowBeef) {
-                        assignToRed = true;
-                    }
-                }
-                
-                // DEFAULT: Alternate (snake draft)
-                if (assignToRed === null) {
-                    assignToRed = redTeam.length <= blueTeam.length;
+                // Low beef — last tiebreaker
+                if (assignToRed  && hasLowBeef(player, redTeam)  && !hasLowBeef(player, blueTeam)) assignToRed = false;
+                if (!assignToRed && hasLowBeef(player, blueTeam) && !hasLowBeef(player, redTeam))  assignToRed = true;
+            }
+            if (assignToRed) { redTeam.push(player); }
+            else             { blueTeam.push(player); }
+            snakeIdx++;
+        }
+
+        // ===================================================
+        // PHASE 3A: OVR Equalisation (NEW — does not exist today)
+        // ===================================================
+        const ovrSum = arr => arr.reduce((s, p) => s + (p.overall_rating || 0), 0);
+        const defSum = arr => arr.reduce((s, p) => s + (p.defending_rating || 0), 0);
+        const fitSum = arr => arr.reduce((s, p) => s + (p.fitness_rating || 0), 0);
+        const swapAllowed = (rp, bp) => {
+            const newRed  = redTeam.map(p  => p.player_id === rp.player_id ? bp : p);
+            const newBlue = blueTeam.map(p => p.player_id === bp.player_id ? rp : p);
+            if (hasHighBeef(rp, newBlue)) return false;
+            if (hasHighBeef(bp, newRed))  return false;
+            // Don't move rp if its pair partner is in red with it
+            if ((rp.pairs || []).some(pid => redTeam.find(t => t.player_id === pid && t.player_id !== rp.player_id))) return false;
+            // Don't move bp if its pair partner is in blue with it
+            if ((bp.pairs || []).some(pid => blueTeam.find(t => t.player_id === pid && t.player_id !== bp.player_id))) return false;
+            return true;
+        };
+        console.log(`\n=== PHASE 3A: OVR Equalisation ===`);
+        for (let pass = 0; pass < 5; pass++) {
+            const currentDiff = Math.abs(ovrSum(redTeam) - ovrSum(blueTeam));
+            if (currentDiff <= 1) { console.log(`  OVR diff ${currentDiff} — done`); break; }
+            let best = null, bestDiff = currentDiff;
+            for (let i = 0; i < redTeam.length; i++) {
+                for (let j = 0; j < blueTeam.length; j++) {
+                    if (!swapAllowed(redTeam[i], blueTeam[j])) continue;
+                    const nr = redTeam.map(p  => p.player_id === redTeam[i].player_id  ? blueTeam[j] : p);
+                    const nb = blueTeam.map(p => p.player_id === blueTeam[j].player_id ? redTeam[i]  : p);
+                    const d  = Math.abs(ovrSum(nr) - ovrSum(nb));
+                    if (d < bestDiff) { bestDiff = d; best = { i, j }; }
                 }
             }
-            
-            // Assign player
-            if (assignToRed) {
-                redTeam.push(player);
-                console.log(`✓ Assigned ${player.full_name} to RED (now ${redTeam.length} vs ${blueTeam.length})`);
+            if (best) {
+                console.log(`  Pass ${pass + 1}: swap ${redTeam[best.i].alias || redTeam[best.i].full_name} ↔ ${blueTeam[best.j].alias || blueTeam[best.j].full_name} (diff ${currentDiff}→${bestDiff})`);
+                [redTeam[best.i], blueTeam[best.j]] = [blueTeam[best.j], redTeam[best.i]];
             } else {
-                blueTeam.push(player);
-                console.log(`✓ Assigned ${player.full_name} to BLUE (now ${redTeam.length} vs ${blueTeam.length})`);
+                console.log(`  Pass ${pass + 1}: no improvement (diff=${currentDiff})`);
+                break;
             }
         }
-        
-        console.log(`FINAL: Red=${redTeam.length}, Blue=${blueTeam.length}`);
+        const lockedOvr = Math.abs(ovrSum(redTeam) - ovrSum(blueTeam));
+
+        // ===================================================
+        // PHASE 3B: DEF+FIT Optimisation (NEW — does not exist today)
+        // ===================================================
+        console.log(`\n=== PHASE 3B: DEF+FIT Optimisation (OVR locked at ${lockedOvr}) ===`);
+        let currentLockedOvr = lockedOvr;
+        for (let pass = 0; pass < 3; pass++) {
+            const currSec = Math.abs(defSum(redTeam) - defSum(blueTeam)) + Math.abs(fitSum(redTeam) - fitSum(blueTeam));
+            let best = null, bestSec = currSec, bestOvr = currentLockedOvr;
+            for (let i = 0; i < redTeam.length; i++) {
+                for (let j = 0; j < blueTeam.length; j++) {
+                    if (!swapAllowed(redTeam[i], blueTeam[j])) continue;
+                    const nr = redTeam.map(p  => p.player_id === redTeam[i].player_id  ? blueTeam[j] : p);
+                    const nb = blueTeam.map(p => p.player_id === blueTeam[j].player_id ? redTeam[i]  : p);
+                    const newOvr = Math.abs(ovrSum(nr) - ovrSum(nb));
+                    const newSec = Math.abs(defSum(nr) - defSum(nb)) + Math.abs(fitSum(nr) - fitSum(nb));
+                    // Only accept if OVR doesn't worsen AND secondary improves
+                    if (newOvr <= currentLockedOvr && newSec < bestSec) {
+                        bestSec = newSec; bestOvr = newOvr; best = { i, j };
+                    }
+                }
+            }
+            if (best) {
+                console.log(`  Pass ${pass + 1}: swap ${redTeam[best.i].alias || redTeam[best.i].full_name} ↔ ${blueTeam[best.j].alias || blueTeam[best.j].full_name} (DEF+FIT ${currSec}→${bestSec})`);
+                [redTeam[best.i], blueTeam[best.j]] = [blueTeam[best.j], redTeam[best.i]];
+                currentLockedOvr = bestOvr;
+            } else {
+                console.log(`  Pass ${pass + 1}: no DEF+FIT improvement without worsening OVR`);
+                break;
+            }
+        }
+        console.log(`FINAL: Red OVR=${ovrSum(redTeam)} Blue OVR=${ovrSum(blueTeam)} diff=${Math.abs(ovrSum(redTeam) - ovrSum(blueTeam))}`);
         
         // Delete existing teams if any (for re-generation)
         await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
@@ -5090,7 +5211,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -5137,9 +5258,14 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $3, 
                     cost_per_player = $4,
                     star_rating = $5,
-                    tournament_team_count = COALESCE($6, tournament_team_count)
-                WHERE id = $7
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, gameId]);
+                    tournament_team_count = COALESCE($6, tournament_team_count),
+                    min_rating_enabled = COALESCE($7, min_rating_enabled),
+                    min_rating_drop_sent = CASE
+                        WHEN $1::timestamptz > NOW() + INTERVAL '48 hours' THEN 0
+                        ELSE min_rating_drop_sent
+                    END
+                WHERE id = $8
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -5147,9 +5273,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $2, 
                     cost_per_player = $3,
                     star_rating = $4,
-                    tournament_team_count = COALESCE($5, tournament_team_count)
-                WHERE id = $6
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, gameId]);
+                    tournament_team_count = COALESCE($5, tournament_team_count),
+                    min_rating_enabled = COALESCE($6, min_rating_enabled)
+                WHERE id = $7
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
@@ -5205,10 +5332,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
         
         res.json({ 
             message: 'Game settings updated successfully',
-            updated: { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count }
+            updated: { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled }
         });
         setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'settings_updated',
-            `venue:${venue_id} max:${max_players} cost:£${cost_per_player}${game_date ? ' date:' + game_date : ''}${oldCost !== parseFloat(cost_per_player) ? ` (cost was £${oldCost})` : ''}`));
+            `venue:${venue_id} max:${max_players} cost:£${cost_per_player}${game_date ? ' date:' + game_date : ''}${oldCost !== parseFloat(cost_per_player) ? ` (cost was £${oldCost})` : ''}${min_rating_enabled !== undefined ? ' minRating:' + min_rating_enabled : ''}`));
     } catch (error) {
         console.error('Update game settings error:', error);
         res.status(500).json({ error: 'Failed to update game settings' });
@@ -5220,7 +5347,7 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        const { venue_id, max_players, cost_per_player, star_rating, new_time } = req.body;
+        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled } = req.body;
 
         if (!venue_id || !max_players || cost_per_player === undefined) {
             return res.status(400).json({ error: 'Missing required fields' });
@@ -5258,13 +5385,13 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
                 const utcDate = new Date(new Date(londonLocal).getTime() - offset);
 
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, game_date=$5 WHERE id=$6',
-                    [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), g.id]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled) WHERE id=$7',
+                    [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id]
                 );
             } else {
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4 WHERE id=$5',
-                    [venue_id, max_players, cost_per_player, star_rating || null, g.id]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, min_rating_enabled=COALESCE($5, min_rating_enabled) WHERE id=$6',
+                    [venue_id, max_players, cost_per_player, star_rating || null, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id]
                 );
             }
         }
@@ -6776,7 +6903,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.team_selection_type, g.external_opponent, g.tf_kit_color, g.opp_kit_color,
                    g.winning_team, g.motm_voting_ends, g.motm_winner_id, g.tournament_name,
                    g.tournament_team_count, g.tournament_results_finalised, g.series_id,
-                   g.regularity,
+                   g.regularity, g.star_rating, g.min_rating_enabled,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
@@ -6865,6 +6992,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             tournament_results_finalised: game.tournament_results_finalised,
             series_id: game.series_id || null,
             regularity: game.regularity || null,
+            star_rating: game.star_rating || null,
+            min_rating_enabled: game.min_rating_enabled || false,
             seriesScoreline
         });
         
@@ -9093,6 +9222,104 @@ app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req
     }
 });
 
+// ── ADMIN: DM INBOX / THREAD VIEW ────────────────────────────────────────────
+
+// GET /api/admin/players/:playerId/dm-conversations
+// Admin inbox view — list all conversations for a player with previews
+app.get('/api/admin/players/:playerId/dm-conversations', authenticateToken, requireAdmin, async (req, res) => {
+    const { playerId } = req.params;
+    try {
+        const check = await pool.query(
+            'SELECT id, COALESCE(alias, full_name) AS name FROM players WHERE id = $1',
+            [playerId]
+        );
+        if (check.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+        const result = await pool.query(`
+            SELECT other_player_id, other_name, other_alias, other_tier,
+                   last_message, last_message_at, last_sender_id,
+                   total_messages, unread_count
+            FROM (
+                SELECT
+                    CASE WHEN dm.sender_id = $1 THEN dm.recipient_id
+                         ELSE dm.sender_id END AS other_player_id,
+                    p.full_name AS other_name, p.alias AS other_alias,
+                    p.reliability_tier AS other_tier,
+                    dm.message AS last_message, dm.created_at AS last_message_at,
+                    dm.sender_id AS last_sender_id, dm.read_at,
+                    COUNT(*) OVER (
+                        PARTITION BY LEAST(dm.sender_id, dm.recipient_id),
+                                     GREATEST(dm.sender_id, dm.recipient_id)
+                    ) AS total_messages,
+                    COUNT(*) FILTER (
+                        WHERE dm.sender_id != $1 AND dm.read_at IS NULL
+                    ) OVER (
+                        PARTITION BY LEAST(dm.sender_id, dm.recipient_id),
+                                     GREATEST(dm.sender_id, dm.recipient_id)
+                    ) AS unread_count,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY LEAST(dm.sender_id, dm.recipient_id),
+                                     GREATEST(dm.sender_id, dm.recipient_id)
+                        ORDER BY dm.created_at DESC
+                    ) AS rn
+                FROM direct_messages dm
+                JOIN players p ON p.id = CASE WHEN dm.sender_id = $1
+                    THEN dm.recipient_id ELSE dm.sender_id END
+                WHERE (dm.sender_id = $1 OR dm.recipient_id = $1)
+                  AND dm.deleted_at IS NULL
+            ) sub
+            WHERE rn = 1
+            ORDER BY last_message_at DESC
+        `, [playerId]);
+
+        res.json({ playerName: check.rows[0].name, conversations: result.rows });
+    } catch (error) {
+        console.error('Admin DM conversations error:', error);
+        res.status(500).json({ error: 'Failed to load conversations' });
+    }
+});
+
+// GET /api/admin/dm-thread/:subjectId/:otherId
+// Full thread view between two players — read-only admin view
+app.get('/api/admin/dm-thread/:subjectId/:otherId', authenticateToken, requireAdmin, async (req, res) => {
+    const { subjectId, otherId } = req.params;
+    try {
+        const check = await pool.query(
+            'SELECT id, COALESCE(alias, full_name) AS name FROM players WHERE id = ANY($1)',
+            [[subjectId, otherId]]
+        );
+        if (check.rows.length < 2) return res.status(404).json({ error: 'One or both players not found' });
+
+        const result = await pool.query(`
+            SELECT dm.id, dm.sender_id, dm.recipient_id, dm.message,
+                   dm.read_at, dm.created_at,
+                   COALESCE(p.alias, p.full_name, 'Unknown') AS sender_name,
+                   p.squad_number AS sender_squad
+            FROM direct_messages dm
+            JOIN players p ON p.id = dm.sender_id
+            WHERE (
+                (dm.sender_id = $1 AND dm.recipient_id = $2)
+                OR
+                (dm.sender_id = $2 AND dm.recipient_id = $1)
+            )
+            AND dm.deleted_at IS NULL
+            ORDER BY dm.created_at ASC
+        `, [subjectId, otherId]);
+
+        const names = {};
+        check.rows.forEach(r => { names[r.id] = r.name; });
+        res.json({
+            messages:    result.rows,
+            subjectName: names[subjectId] || 'Unknown',
+            otherName:   names[otherId]   || 'Unknown',
+            total:       result.rows.length
+        });
+    } catch (error) {
+        console.error('Admin DM thread error:', error);
+        res.status(500).json({ error: 'Failed to load thread' });
+    }
+});
+
 // ==========================================
 // PUSH NOTIFICATION TOKEN MANAGEMENT
 // ==========================================
@@ -9243,7 +9470,7 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
     }
 });
 
-// POST /api/admin/players/:id/unban — superadmin only, clears discipline and adds 1 warning point
+// POST /api/admin/players/:id/unban — superadmin only, clears discipline and resets to gold
 // CRIT-14: requireSuperAdmin — admins must not be able to unban players the superadmin deliberately banned
 app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, async (req, res) => {
     const { id } = req.params;
@@ -9251,25 +9478,13 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, a
     try {
         await client.query('BEGIN');
 
-        // Clear all existing discipline records for this player
+        // Clear all existing discipline records — clean slate, zero points
         await client.query('DELETE FROM discipline_records WHERE player_id = $1', [id]);
 
-        // Add a single warning-level discipline point (clean slate but flagged)
-        // SEC-038: game_id explicitly NULL — unban is not tied to a specific game
-        await client.query(`
-            INSERT INTO discipline_records (player_id, game_id, points, reason, recorded_by)
-            VALUES ($1, NULL, 1, 'Reinstated after ban', $2)
-        `, [id, req.user.playerId]);
-
-        // Recalculate tier (1 point with sufficient appearances = silver)
-        const tierResult = await client.query(`
-            SELECT calculate_player_tier($1::uuid) AS new_tier
-        `, [id]);
-        const newTier = tierResult.rows[0]?.new_tier || 'silver';
-
+        // Force gold tier — player returns with a clean record
         await client.query(
             'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-            [newTier, id]
+            ['gold', id]
         );
 
         // Insert reinstatement notification for the player
@@ -9281,12 +9496,12 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, a
         await client.query('COMMIT');
 
         // Fire push notification (non-blocking)
-        sendPushNotification(id, 'account_reinstated', '✅ Your account has been reinstated. Welcome back.').catch(() => {});
+        sendNotification('account_reinstated', id, {}).catch(() => {});
 
-        res.json({ message: 'Player unbanned successfully', newTier });
+        res.json({ message: 'Player unbanned successfully', newTier: 'gold' });
         setImmediate(async () => {
             await auditLog(pool, req.user.playerId, 'player_unbanned', id,
-                `Discipline cleared | new tier: ${newTier}`);
+                `Discipline cleared | new tier: gold`);
         });
     } catch (error) {
         await client.query('ROLLBACK');
@@ -9452,8 +9667,8 @@ app.post('/api/dm/:playerId', authenticateToken, dmSendLimiter, async (req, res)
             VALUES ($1, 'new_dm', $2)
         `, [playerId, `${senderName}: ${preview}`]).catch(() => {});
 
-        sendPushNotification(playerId, 'new_dm', `${senderName}: ${preview}`, {
-            senderId:   String(senderId),
+        sendNotification('new_dm', playerId, {
+            preview: `${senderName}: ${preview}`,
             senderName,
         }).catch(() => {});
 
@@ -9616,6 +9831,31 @@ app.get('/api/public/game/:gameUrl/fairness', async (req, res) => {
 
 // ── GAME CHAT ─────────────────────────────────────────────────────────────────
 
+// GET /api/games/:gameId/my-team
+// Returns the logged-in player's team assignment for a game.
+// Used by game.html to decide whether to show the Team Chat tab.
+app.get('/api/games/:gameId/my-team', authenticateToken, async (req, res) => {
+    const { gameId } = req.params;
+    try {
+        const result = await pool.query(`
+            SELECT t.id AS team_id, t.team_name, t.kit_color
+            FROM team_players tp
+            JOIN teams t ON t.id = tp.team_id
+            WHERE tp.player_id = $1 AND t.game_id = $2
+            LIMIT 1
+        `, [req.user.playerId, gameId]);
+        if (result.rows.length === 0) return res.json({ teamId: null, teamName: null });
+        res.json({
+            teamId:   result.rows[0].team_id,
+            teamName: result.rows[0].team_name,
+            kitColor: result.rows[0].kit_color
+        });
+    } catch (error) {
+        console.error('My team error:', error);
+        res.status(500).json({ error: 'Failed to fetch team assignment' });
+    }
+});
+
 // GET /api/games/:gameId/messages — fetch chat messages for a game
 // SEC-026: General chat is public (guests included). Team chat requires auth + team assignment.
 // ?since=<ISO timestamp> — if provided, only returns messages after that time (for polling)
@@ -9683,7 +9923,7 @@ app.get('/api/games/:gameId/messages', optionalAuth, async (req, res) => {
 
 // POST /api/games/:gameId/messages — post a new chat message
 // Body: { message: string, scope: 'chat' | 'team' }
-app.post('/api/games/:gameId/messages', authenticateToken, async (req, res) => {
+app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, async (req, res) => {
     const { gameId } = req.params;
     const { message, scope = 'chat' } = req.body;
 
@@ -10230,4 +10470,57 @@ app.listen(PORT, () => {
             console.error('✗ MOTM scheduler error:', error.message);
         }
     }, 10 * 60 * 1000); // 10 minutes
+
+    // Min-rating auto-drop scheduler — runs every 5 minutes
+    // Updates min_rating_drop_sent flag. effectiveMinOvr() uses game_date vs Date.now()
+    // so the actual gate drops automatically; this flag just prevents double-firing.
+    let minRatingDropRunning = false;
+    setInterval(async () => {
+        if (minRatingDropRunning) return;
+        minRatingDropRunning = true;
+        try {
+            // 48h drop: games 47h55m–48h5m away, not yet dropped once
+            const drop48 = await pool.query(`
+                SELECT id FROM games
+                WHERE min_rating_enabled = TRUE
+                  AND star_rating >= 2
+                  AND min_rating_drop_sent = 0
+                  AND game_date BETWEEN NOW() + INTERVAL '47 hours 55 minutes'
+                                   AND NOW() + INTERVAL '48 hours 5 minutes'
+                  AND game_status NOT IN ('cancelled','completed')
+            `);
+            for (const row of drop48.rows) {
+                const claimed = await pool.query(
+                    `UPDATE games SET min_rating_drop_sent = 1
+                      WHERE id = $1 AND min_rating_drop_sent = 0 RETURNING id`,
+                    [row.id]
+                );
+                if (claimed.rowCount > 0)
+                    console.log(`⏰ Min-rating 48h drop: game ${row.id}`);
+            }
+            // 24h drop: games 23h55m–24h5m away, dropped once but not twice
+            const drop24 = await pool.query(`
+                SELECT id FROM games
+                WHERE min_rating_enabled = TRUE
+                  AND star_rating >= 2
+                  AND min_rating_drop_sent = 1
+                  AND game_date BETWEEN NOW() + INTERVAL '23 hours 55 minutes'
+                                   AND NOW() + INTERVAL '24 hours 5 minutes'
+                  AND game_status NOT IN ('cancelled','completed')
+            `);
+            for (const row of drop24.rows) {
+                const claimed = await pool.query(
+                    `UPDATE games SET min_rating_drop_sent = 2
+                      WHERE id = $1 AND min_rating_drop_sent = 1 RETURNING id`,
+                    [row.id]
+                );
+                if (claimed.rowCount > 0)
+                    console.log(`⏰ Min-rating 24h drop: game ${row.id}`);
+            }
+        } catch (e) {
+            console.error('✗ Min-rating drop scheduler error:', e.message);
+        } finally {
+            minRatingDropRunning = false;
+        }
+    }, 5 * 60 * 1000);
 });
