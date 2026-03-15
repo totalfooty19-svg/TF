@@ -655,7 +655,7 @@ const requireGameManager = async (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam, preferredPosition } = req.body;
+        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam } = req.body;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -690,12 +690,6 @@ app.post('/api/auth/register', async (req, res) => {
         };
         // Skipped = casual. Same overall (84), same GK (86). skill_level stored as null.
         const stats = SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
-
-        // Preferred position: 'goalkeeper', 'outfield', or 'both' (treated as outfield)
-        const VALID_POSITIONS = ['goalkeeper', 'outfield', 'both'];
-        const resolvedPosition = (preferredPosition && VALID_POSITIONS.includes(preferredPosition))
-            ? (preferredPosition === 'both' ? 'outfield' : preferredPosition)
-            : 'outfield';
 
         // Check if email already exists
         const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
@@ -737,7 +731,7 @@ app.post('/api/auth/register', async (req, res) => {
                 lastName,             // $4
                 playerAlias,          // $5
                 phone.trim(),         // $6
-                resolvedPosition,     // $7 position (goalkeeper/outfield)
+                'outfield',           // $7
                 stats.gk,             // $8  goalkeeper_rating
                 stats.def,            // $9  defending_rating
                 stats.str,            // $10 strength_rating
@@ -1087,7 +1081,6 @@ app.post('/api/auth/login', async (req, res) => {
                 wins: player.total_wins || 0,
                 badges: player.badges || [],
                 referralCode: player.referral_code,
-                position: player.position || 'outfield',
                 stats: {
                     overall: player.overall_rating || 0,
                     defending: player.defending_rating || 0,
@@ -1193,7 +1186,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.total_wins,
                     p.is_clm_admin,
                     p.is_organiser,
-                    p.position,
                     p.referred_by,
                     c.balance as credits,
                     u.email,
@@ -1229,7 +1221,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                 player.isSuperAdmin = player.role === 'superadmin';
                 player.isCLMAdmin = player.is_clm_admin || false;
                 player.isOrganiser = player.is_organiser || false;
-                player.position = player.position || 'outfield';
             }
         } catch (detailsError) {
             console.error('Error fetching details:', detailsError.message);
@@ -1312,6 +1303,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 p.goalkeeper_rating,
                 COALESCE(p.is_featured, false) AS is_featured,
                 p.social_tiktok, p.social_instagram, p.social_youtube, p.social_facebook,
+                COALESCE(p.position, 'outfield') AS position,
                 (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
                  FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
                 COALESCE(ps.apps_3m, 0)   AS apps_3m,
@@ -1521,6 +1513,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                 p.social_instagram,
                 p.social_youtube,
                 p.social_facebook,
+                COALESCE(p.position, 'outfield') as position,
 
                 -- DISCIPLINE: all-time total points
                 COALESCE((
@@ -1940,18 +1933,16 @@ app.post('/api/players/me/photo', authenticateToken, async (req, res) => {
 
 app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
-        const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, position } = req.body;
-        const resolvedPos = ['goalkeeper', 'outfield'].includes(position) ? position : 'outfield';
+        const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper } = req.body;
         
         await pool.query(
             `UPDATE players SET 
              overall_rating = $1, defending_rating = $2, strength_rating = $3,
              fitness_rating = $4, pace_rating = $5, decisions_rating = $6,
              assisting_rating = $7, shooting_rating = $8, goalkeeper_rating = $9,
-             position = $10,
              updated_at = CURRENT_TIMESTAMP
-             WHERE id = $11`,
-            [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, resolvedPos, req.params.id]
+             WHERE id = $10`,
+            [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, req.params.id]
         );
         
         res.json({ message: 'Stats updated' });
@@ -10689,20 +10680,12 @@ app.get('/api/games/:gameId/my-team', authenticateToken, async (req, res) => {
         // 3. Check venue_clash team preference (pre-confirmed)
         if (g.is_venue_clash) {
             const vcResult = await pool.query(
-                `SELECT r.venue_clash_team_preference,
-                        g2.venue_clash_team1_name, g2.venue_clash_team2_name
-                 FROM registrations r
-                 JOIN games g2 ON g2.id = r.game_id
-                 WHERE r.player_id = $1 AND r.game_id = $2 AND r.status = 'confirmed'`,
-                [req.user.playerId, gameId]
+                'SELECT venue_clash_team_preference FROM registrations WHERE player_id = $1 AND game_id = $2 AND status = $3',
+                [req.user.playerId, gameId, 'confirmed']
             );
-            if (vcResult.rows.length > 0) {
-                const pref  = vcResult.rows[0].venue_clash_team_preference; // 'team1','team2','both'
-                const name1 = vcResult.rows[0].venue_clash_team1_name || 'Team 1';
-                const name2 = vcResult.rows[0].venue_clash_team2_name || 'Team 2';
-                // 'both' = no preference, skip toggle
-                if (pref === 'team1') return res.json({ teamId: `vc-team1`, teamName: name1 });
-                if (pref === 'team2') return res.json({ teamId: `vc-team2`, teamName: name2 });
+            if (vcResult.rows.length > 0 && vcResult.rows[0].venue_clash_team_preference) {
+                const name = vcResult.rows[0].venue_clash_team_preference;
+                return res.json({ teamId: `vc-${name}`, teamName: name });
             }
         }
 
@@ -10732,18 +10715,10 @@ async function resolvePreDraftTeam(playerId, gameId) {
     }
     if (g.is_venue_clash) {
         const vc = await pool.query(
-            `SELECT r.venue_clash_team_preference,
-                    g2.venue_clash_team1_name, g2.venue_clash_team2_name
-             FROM registrations r
-             JOIN games g2 ON g2.id = r.game_id
-             WHERE r.player_id = $1 AND r.game_id = $2 AND r.status = 'confirmed'`,
+            "SELECT venue_clash_team_preference FROM registrations WHERE player_id = $1 AND game_id = $2 AND status = 'confirmed'",
             [playerId, gameId]
         );
-        if (vc.rows.length > 0) {
-            const pref = vc.rows[0].venue_clash_team_preference;
-            if (pref === 'team1') return vc.rows[0].venue_clash_team1_name || 'Team 1';
-            if (pref === 'team2') return vc.rows[0].venue_clash_team2_name || 'Team 2';
-        }
+        if (vc.rows[0]?.venue_clash_team_preference) return vc.rows[0].venue_clash_team_preference;
     }
     return null;
 }
