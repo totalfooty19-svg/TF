@@ -655,7 +655,7 @@ const requireGameManager = async (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam } = req.body;
+        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam, preferredPosition } = req.body;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -690,6 +690,12 @@ app.post('/api/auth/register', async (req, res) => {
         };
         // Skipped = casual. Same overall (84), same GK (86). skill_level stored as null.
         const stats = SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
+
+        // Preferred position: 'goalkeeper', 'outfield', or 'both' (treated as outfield)
+        const VALID_POSITIONS = ['goalkeeper', 'outfield', 'both'];
+        const resolvedPosition = (preferredPosition && VALID_POSITIONS.includes(preferredPosition))
+            ? (preferredPosition === 'both' ? 'outfield' : preferredPosition)
+            : 'outfield';
 
         // Check if email already exists
         const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
@@ -731,7 +737,7 @@ app.post('/api/auth/register', async (req, res) => {
                 lastName,             // $4
                 playerAlias,          // $5
                 phone.trim(),         // $6
-                'outfield',           // $7
+                resolvedPosition,     // $7 position (goalkeeper/outfield)
                 stats.gk,             // $8  goalkeeper_rating
                 stats.def,            // $9  defending_rating
                 stats.str,            // $10 strength_rating
@@ -1081,6 +1087,7 @@ app.post('/api/auth/login', async (req, res) => {
                 wins: player.total_wins || 0,
                 badges: player.badges || [],
                 referralCode: player.referral_code,
+                position: player.position || 'outfield',
                 stats: {
                     overall: player.overall_rating || 0,
                     defending: player.defending_rating || 0,
@@ -1186,6 +1193,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.total_wins,
                     p.is_clm_admin,
                     p.is_organiser,
+                    p.position,
                     p.referred_by,
                     c.balance as credits,
                     u.email,
@@ -1221,6 +1229,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                 player.isSuperAdmin = player.role === 'superadmin';
                 player.isCLMAdmin = player.is_clm_admin || false;
                 player.isOrganiser = player.is_organiser || false;
+                player.position = player.position || 'outfield';
             }
         } catch (detailsError) {
             console.error('Error fetching details:', detailsError.message);
@@ -1931,16 +1940,18 @@ app.post('/api/players/me/photo', authenticateToken, async (req, res) => {
 
 app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
-        const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper } = req.body;
+        const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, position } = req.body;
+        const resolvedPos = ['goalkeeper', 'outfield'].includes(position) ? position : 'outfield';
         
         await pool.query(
             `UPDATE players SET 
              overall_rating = $1, defending_rating = $2, strength_rating = $3,
              fitness_rating = $4, pace_rating = $5, decisions_rating = $6,
              assisting_rating = $7, shooting_rating = $8, goalkeeper_rating = $9,
+             position = $10,
              updated_at = CURRENT_TIMESTAMP
-             WHERE id = $10`,
-            [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, req.params.id]
+             WHERE id = $11`,
+            [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, resolvedPos, req.params.id]
         );
         
         res.json({ message: 'Stats updated' });
