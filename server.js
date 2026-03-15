@@ -10630,29 +10630,94 @@ app.get('/api/public/game/:gameUrl/fairness', async (req, res) => {
 // ── GAME CHAT ─────────────────────────────────────────────────────────────────
 
 // GET /api/games/:gameId/my-team
-// Returns the logged-in player's team assignment for a game.
-// Used by game.html to decide whether to show the Team Chat tab.
+// Returns the logged-in player's team for a game.
+// Checks in order: confirmed team_players → draft_memory fixed_team → venue_clash preference.
+// This means team chat is available as soon as a player has ANY team assignment,
+// even before teams_confirmed is set — enabling early team chat for draft_memory series
+// and venue clash games.
 app.get('/api/games/:gameId/my-team', authenticateToken, async (req, res) => {
     const { gameId } = req.params;
     try {
-        const result = await pool.query(`
+        // 1. Check confirmed team_players (post-draft or confirmed teams)
+        const teamResult = await pool.query(`
             SELECT t.id AS team_id, t.team_name, t.kit_color
             FROM team_players tp
             JOIN teams t ON t.id = tp.team_id
             WHERE tp.player_id = $1 AND t.game_id = $2
             LIMIT 1
         `, [req.user.playerId, gameId]);
-        if (result.rows.length === 0) return res.json({ teamId: null, teamName: null });
-        res.json({
-            teamId:   result.rows[0].team_id,
-            teamName: result.rows[0].team_name,
-            kitColor: result.rows[0].kit_color
-        });
+        if (teamResult.rows.length > 0) {
+            return res.json({
+                teamId:   teamResult.rows[0].team_id,
+                teamName: teamResult.rows[0].team_name,
+                kitColor: teamResult.rows[0].kit_color
+            });
+        }
+
+        // 2. Check draft_memory fixed assignment (pre-confirmed)
+        const gameInfo = await pool.query(
+            'SELECT team_selection_type, series_id, is_venue_clash FROM games WHERE id = $1',
+            [gameId]
+        );
+        const g = gameInfo.rows[0];
+        if (!g) return res.json({ teamId: null, teamName: null });
+
+        if (g.team_selection_type === 'draft_memory' && g.series_id) {
+            const ftResult = await pool.query(
+                'SELECT fixed_team FROM player_fixed_teams WHERE player_id = $1 AND series_id = $2',
+                [req.user.playerId, g.series_id]
+            );
+            if (ftResult.rows.length > 0 && ftResult.rows[0].fixed_team) {
+                const name = ftResult.rows[0].fixed_team; // 'red' or 'blue'
+                return res.json({ teamId: `draft-${name}`, teamName: name });
+            }
+        }
+
+        // 3. Check venue_clash team preference (pre-confirmed)
+        if (g.is_venue_clash) {
+            const vcResult = await pool.query(
+                'SELECT venue_clash_team_preference FROM registrations WHERE player_id = $1 AND game_id = $2 AND status = $3',
+                [req.user.playerId, gameId, 'confirmed']
+            );
+            if (vcResult.rows.length > 0 && vcResult.rows[0].venue_clash_team_preference) {
+                const name = vcResult.rows[0].venue_clash_team_preference;
+                return res.json({ teamId: `vc-${name}`, teamName: name });
+            }
+        }
+
+        return res.json({ teamId: null, teamName: null });
     } catch (error) {
         console.error('My team error:', error);
         res.status(500).json({ error: 'Failed to fetch team assignment' });
     }
 });
+
+
+// Helper: resolve a player's pre-draft team name (draft_memory or venue_clash)
+// Returns null if not applicable or not assigned.
+async function resolvePreDraftTeam(playerId, gameId) {
+    const gRes = await pool.query(
+        'SELECT team_selection_type, series_id, is_venue_clash FROM games WHERE id = $1',
+        [gameId]
+    );
+    const g = gRes.rows[0];
+    if (!g) return null;
+    if (g.team_selection_type === 'draft_memory' && g.series_id) {
+        const ft = await pool.query(
+            'SELECT fixed_team FROM player_fixed_teams WHERE player_id = $1 AND series_id = $2',
+            [playerId, g.series_id]
+        );
+        if (ft.rows[0]?.fixed_team) return ft.rows[0].fixed_team; // 'red' or 'blue'
+    }
+    if (g.is_venue_clash) {
+        const vc = await pool.query(
+            "SELECT venue_clash_team_preference FROM registrations WHERE player_id = $1 AND game_id = $2 AND status = 'confirmed'",
+            [playerId, gameId]
+        );
+        if (vc.rows[0]?.venue_clash_team_preference) return vc.rows[0].venue_clash_team_preference;
+    }
+    return null;
+}
 
 // GET /api/games/:gameId/messages — fetch chat messages for a game
 // SEC-026: General chat is public (guests included). Team chat requires auth + team assignment.
@@ -10672,8 +10737,9 @@ app.get('/api/games/:gameId/messages', optionalAuth, async (req, res) => {
         if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
         // N7: Anyone can read general (scope='chat') messages — no auth required.
-        // Team messages are filtered server-side to the requesting player's team only.
+        // Team messages filtered server-side: confirmed teams by team_id, pre-draft by scope.
         let myTeamId = null;
+        let myPreDraftTeam = null; // 'red' or 'blue' for pre-confirmed team assignments
         if (req.user?.playerId) {
             const teamRes = await pool.query(`
                 SELECT tp.team_id
@@ -10683,10 +10749,12 @@ app.get('/api/games/:gameId/messages', optionalAuth, async (req, res) => {
                 LIMIT 1
             `, [req.user.playerId, gameId]);
             myTeamId = teamRes.rows[0]?.team_id || null;
+            if (!myTeamId) {
+                myPreDraftTeam = await resolvePreDraftTeam(req.user.playerId, gameId).catch(() => null);
+            }
         }
 
-        // Guests and unauthenticated users see only general (scope='chat') messages.
-        // Authenticated players also see their own team channel if assigned.
+        const preDraftScope = myPreDraftTeam ? `team_${myPreDraftTeam}` : null;
         const sinceClause = since ? 'AND gm.created_at > $3::timestamptz' : '';
         const params = since ? [gameId, myTeamId, since] : [gameId, myTeamId];
 
@@ -10707,6 +10775,7 @@ app.get('/api/games/:gameId/messages', optionalAuth, async (req, res) => {
               AND (
                   gm.scope = 'chat'
                   OR (gm.scope = 'team' AND $2 IS NOT NULL AND gm.team_id = $2)
+                  ${preDraftScope ? `OR gm.scope = '${preDraftScope}'` : ''}
               )
               ${sinceClause}
             ORDER BY gm.created_at ASC
@@ -10731,8 +10800,9 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
     if (message.trim().length > 500) {
         return res.status(400).json({ error: 'Message must be 500 characters or fewer' });
     }
-    if (!['chat', 'team'].includes(scope)) {
-        return res.status(400).json({ error: 'scope must be "chat" or "team"' });
+    const validScopes = ['chat', 'team', 'team_red', 'team_blue'];
+    if (!validScopes.includes(scope)) {
+        return res.status(400).json({ error: 'Invalid scope' });
     }
 
     try {
@@ -10758,7 +10828,9 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
 
         // Resolve team_id server-side — never trust client to send their own team_id
         let teamId = null;
+        let resolvedScope = scope;
         if (scope === 'team') {
+            // Confirmed team assignment
             const teamRes = await pool.query(`
                 SELECT tp.team_id
                 FROM team_players tp
@@ -10766,11 +10838,22 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
                 WHERE tp.player_id = $1 AND t.game_id = $2
                 LIMIT 1
             `, [req.user.playerId, gameId]);
-
-            if (teamRes.rows.length === 0) {
-                return res.status(403).json({ error: 'You are not assigned to a team in this game' });
+            if (teamRes.rows.length > 0) {
+                teamId = teamRes.rows[0].team_id;
+            } else {
+                // Fall back to pre-draft team — auto-resolve scope
+                const preDraft = await resolvePreDraftTeam(req.user.playerId, gameId).catch(() => null);
+                if (!preDraft) return res.status(403).json({ error: 'You are not assigned to a team in this game' });
+                resolvedScope = `team_${preDraft}`;
             }
-            teamId = teamRes.rows[0].team_id;
+        } else if (scope === 'team_red' || scope === 'team_blue') {
+            // Pre-draft scope — verify player is actually on that team
+            const expectedTeam = scope === 'team_red' ? 'red' : 'blue';
+            const preDraft = await resolvePreDraftTeam(req.user.playerId, gameId).catch(() => null);
+            if (preDraft !== expectedTeam) {
+                return res.status(403).json({ error: 'You are not on that team' });
+            }
+            resolvedScope = scope;
         }
 
         const result = await pool.query(`
@@ -10780,7 +10863,7 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
                 id, game_id, player_id, scope, message, created_at,
                 (SELECT COALESCE(alias, full_name, 'Unknown') FROM players WHERE id = $2) AS player_alias,
                 (SELECT full_name FROM players WHERE id = $2) AS player_name
-        `, [gameId, req.user.playerId, teamId, scope, message.trim()]);
+        `, [gameId, req.user.playerId, teamId, resolvedScope, message.trim()]);
 
         res.status(201).json(result.rows[0]);
     } catch (error) {
