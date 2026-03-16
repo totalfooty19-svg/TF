@@ -10920,6 +10920,7 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
         return res.status(400).json({ error: 'Invalid scope' });
     }
 
+    let resolvedScope = scope; // declared outside try so catch can reference it safely
     try {
         // Verify game exists and is not cancelled
         const gameCheck = await pool.query('SELECT id, game_status FROM games WHERE id = $1', [gameId]);
@@ -10943,7 +10944,6 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
 
         // Resolve team_id server-side — never trust client to send their own team_id
         let teamId = null;
-        let resolvedScope = scope;
         if (scope === 'team') {
             // Confirmed team assignment
             const teamRes = await pool.query(`
