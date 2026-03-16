@@ -9871,6 +9871,36 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
     }
 });
 
+// POST /api/admin/players/:id/recalc-tier — force-recalculate a player's tier from their revolving points
+// Fixes stale tiers caused by legacy code or manual corrections.
+// Admin only. Uses same inline logic as the manual discipline endpoint.
+app.post('/api/admin/players/:id/recalc-tier', authenticateToken, requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const revolvingResult = await pool.query(`
+            SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
+            FROM discipline_records dr
+            WHERE dr.player_id = $1
+            AND (dr.game_id IS NULL OR dr.game_id IN (
+                SELECT r.game_id FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                WHERE r.player_id = $1 AND r.status = 'confirmed'
+                AND g.game_status = 'completed'
+                ORDER BY g.game_date DESC LIMIT 10
+            ))
+        `, [id]);
+        const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
+        const newTier = tierFromRevolvingPoints(revolvingPts);
+        await pool.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, id]);
+        res.json({ success: true, newTier, revolvingTotal: revolvingPts });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tier_recalculated', id,
+            `Tier recalculated | revolving pts: ${revolvingPts} | new tier: ${newTier}`));
+    } catch (error) {
+        console.error('Recalc tier error:', error);
+        res.status(500).json({ error: 'Failed to recalculate tier' });
+    }
+});
+
 // POST /api/admin/players/:id/unban — superadmin only, clears discipline and resets to gold
 // CRIT-14: requireSuperAdmin — admins must not be able to unban players the superadmin deliberately banned
 app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, async (req, res) => {
