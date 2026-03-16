@@ -3540,7 +3540,9 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'This game is no longer accepting guests' });
         }
 
-        if (game.player_editing_locked) {
+        // Admins bypass the lock — they shouldn't be blocked by their own edit session
+        const isAdminAddingGuest = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (game.player_editing_locked && !isAdminAddingGuest) {
             await client.query('ROLLBACK');
             client.release();
             return res.status(423).json({ error: 'Game is currently being edited by an admin. Please try again shortly.' });
@@ -3684,7 +3686,9 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
             'SELECT player_editing_locked, teams_generated FROM games WHERE id = $1 FOR UPDATE',
             [gameId]
         );
-        if (gameCheck.rows[0]?.player_editing_locked) {
+        // Admins bypass the lock — they shouldn't be blocked by their own edit session
+        const isAdminRemovingGuest = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (gameCheck.rows[0]?.player_editing_locked && !isAdminRemovingGuest) {
             await client.query('ROLLBACK');
             client.release();
             return res.status(423).json({ error: 'Game is currently being edited by an admin.' });
@@ -3695,20 +3699,26 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
             return res.status(400).json({ error: 'Cannot remove guest - teams already generated.' });
         }
 
-        // Lock credits row to prevent concurrent exploits
-        await client.query('SELECT id FROM credits WHERE player_id = $1 FOR UPDATE', [playerId]);
-
-        // Find and delete the specific guest (or the most recent one if no guestId given)
+        // Find and delete the specific guest.
+        // Admins can remove any guest regardless of who invited them — no invited_by filter.
+        // Non-admins can only remove their own guests.
         let guestResult;
         if (guestId) {
-            guestResult = await client.query(
-                'DELETE FROM game_guests WHERE id = $1 AND game_id = $2 AND invited_by = $3 RETURNING guest_name, amount_paid, guest_number',
-                [guestId, gameId, playerId]
-            );
+            if (isAdminRemovingGuest) {
+                guestResult = await client.query(
+                    'DELETE FROM game_guests WHERE id = $1 AND game_id = $2 RETURNING guest_name, amount_paid, guest_number, invited_by',
+                    [guestId, gameId]
+                );
+            } else {
+                guestResult = await client.query(
+                    'DELETE FROM game_guests WHERE id = $1 AND game_id = $2 AND invited_by = $3 RETURNING guest_name, amount_paid, guest_number, invited_by',
+                    [guestId, gameId, playerId]
+                );
+            }
         } else {
-            // Fallback: remove the last-added guest for this player
+            // Fallback: remove the last-added guest for this player (non-admin only path)
             guestResult = await client.query(
-                'DELETE FROM game_guests WHERE id = (SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2 ORDER BY guest_number DESC LIMIT 1) RETURNING guest_name, amount_paid, guest_number',
+                'DELETE FROM game_guests WHERE id = (SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2 ORDER BY guest_number DESC LIMIT 1) RETURNING guest_name, amount_paid, guest_number, invited_by',
                 [gameId, playerId]
             );
         }
@@ -3721,23 +3731,28 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
 
         const guest = guestResult.rows[0];
         const refundAmt = parseFloat(guest.amount_paid || 0);
+        // Always refund the original inviter, not the admin doing the removal
+        const refundTargetId = guest.invited_by || playerId;
+
+        // Lock the refund target's credits row before updating
+        await client.query('SELECT id FROM credits WHERE player_id = $1 FOR UPDATE', [refundTargetId]);
 
         // Refund the inviting player
         if (refundAmt > 0) {
             await client.query(
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                [refundAmt, playerId]
+                [refundAmt, refundTargetId]
             );
             await client.query(
                 'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [playerId, refundAmt, 'refund', `Guest (${guest.guest_name}) removed - refund`]
+                [refundTargetId, refundAmt, 'refund', `Guest (${guest.guest_name}) removed - refund`]
             );
         }
 
-        // Re-number remaining guests for this player so numbers stay sequential
+        // Re-number remaining guests for the original inviter so numbers stay sequential
         const remaining = await client.query(
             'SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2 ORDER BY guest_number ASC',
-            [gameId, playerId]
+            [gameId, refundTargetId]
         );
         for (let i = 0; i < remaining.rows.length; i++) {
             await client.query(
@@ -4320,7 +4335,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             [gameId]
         );
         
-        if (gameCheck.rows[0]?.player_editing_locked) {
+        // Admins bypass the lock — they shouldn't be blocked from dropping out by their own edit session
+        const isAdminDroppingOut = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (gameCheck.rows[0]?.player_editing_locked && !isAdminDroppingOut) {
             await client.query('ROLLBACK');
             return res.status(423).json({ 
                 error: 'Game is currently being edited by an admin. Please try again in a few minutes.'
