@@ -179,12 +179,14 @@ function addWeeksLondon(isoDateStr, weeks) {
     // Build target date: same wall-clock time but weeks * 7 days later (JS Date handles month overflow)
     const target = new Date(Date.UTC(year, month - 1, day + weeks * 7, hour, minute, second));
 
-    // Check what London hour this UTC instant corresponds to (may differ across DST boundary)
+    // Check what London hour this UTC instant corresponds to (may differ across DST boundary).
+    // FIX-DST2: clamp hourDiff to ±1 to guard against the midnight edge case where a 23h→0h
+    // or 0h→23h wrap produces a spurious diff of ±23 instead of the real ±1 DST shift.
     const checkParts = fmt.formatToParts(target);
     const checkHour = parseInt(checkParts.find(p => p.type === 'hour')?.value || '0');
-
-    // Correct for DST shift (±1 hour at boundary)
-    const hourDiff = checkHour - hour;
+    let hourDiff = checkHour - hour;
+    if (hourDiff > 12)  hourDiff -= 24;   // e.g. 23 - 0 = 23  → clamp to -1 (clocks went back)
+    if (hourDiff < -12) hourDiff += 24;   // e.g. 0  - 23 = -23 → clamp to +1 (clocks went forward)
     if (hourDiff !== 0) {
         return new Date(target.getTime() - hourDiff * 3600 * 1000);
     }
@@ -839,7 +841,6 @@ app.post('/api/auth/register', async (req, res) => {
             try {
                 if (ref.toLowerCase() === 'clm' || ref.toLowerCase() === 'misfits') {
                     // Silently ignore — no longer auto-assigns badges from URL param
-                    console.log(`N6: ref=${ref} badge auto-assign blocked for player ${playerId}`);
                 } else {
                     let referrerId = null;
                     const pRef = await pool.query('SELECT id FROM players WHERE referral_code = $1', [ref.toUpperCase()]);
@@ -853,12 +854,10 @@ app.post('/api/auth/register', async (req, res) => {
                     if (referrerId) {
                         // FIX-065: Block self-referral
                         if (referrerId === playerId) {
-                            console.log('Referral skipped: self-referral detected for player ' + playerId);
                         } else {
                             // FIX-065: Block circular chain (referrer was referred by this new player)
                             const circularCheck = await pool.query('SELECT referred_by FROM players WHERE id = $1', [referrerId]);
                             if (circularCheck.rows[0]?.referred_by === playerId) {
-                                console.log('Referral skipped: circular chain detected');
                             } else {
                                 // Set referred_by on new player
                                 await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referrerId, playerId]);
@@ -975,7 +974,10 @@ app.post('/api/auth/login', async (req, res) => {
         const { email, password } = req.body || {};
         if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
 
-        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+        const userResult = await pool.query(
+            'SELECT id, email, password_hash, role, token_version FROM users WHERE email = $1',
+            [email.toLowerCase()]
+        );
         if (userResult.rows.length === 0) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
@@ -2144,7 +2146,7 @@ app.delete('/api/admin/players/:playerId', authenticateToken, requireAdmin, asyn
 app.get('/api/badges', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT * FROM badges ORDER BY name'
+            'SELECT id, name, icon, description FROM badges ORDER BY name'
         );
         res.json(result.rows);
     } catch (error) {
@@ -2424,7 +2426,6 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
         
         const player = playerCheck.rows[0];
         const referrer = referrerCheck.rows[0];
-        console.log(`Admin manually linked referral: ${player.alias || player.full_name} referred by ${referrer.alias || referrer.full_name}`);
         
         res.json({ 
             message: `${player.alias || player.full_name} is now linked as referred by ${referrer.alias || referrer.full_name}`,
@@ -2560,15 +2561,6 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             return game;
         });
         
-        // Log first game to check teams_generated field
-        if (gamesWithPhotos.length > 0) {
-            console.log('Sample game data:', {
-                id: gamesWithPhotos[0].id,
-                current_players: gamesWithPhotos[0].current_players,
-                max_players: gamesWithPhotos[0].max_players,
-                teams_generated: gamesWithPhotos[0].teams_generated
-            });
-        }
 
         // Visibility-only filter — admins see all games regardless.
         // Completed games always shown (history must never disappear).
@@ -4762,7 +4754,6 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             });
         } catch (beefError) {
             // Beef table doesn't exist yet - that's fine, continue without it
-            console.log('Beef table not found, skipping beef checks');
         }
         
         // ===================================================
@@ -4832,7 +4823,6 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         };
         
         // PHASE 0: Place guests for GKs who brought them
-        console.log(`\n=== PHASE 0: GK Guest Placement ===`);
         for (const gkGroup of gkParentGroups) {
             const targetTeam = gkGroup.team === 'red' ? redTeam : blueTeam;
             const opposingTeam = gkGroup.team === 'red' ? blueTeam : redTeam;
@@ -4841,19 +4831,15 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             
             for (const guest of gkGroup.guests) {
                 targetTeam.push(guest);
-                console.log(`  GK Guest ${guest.full_name} (OVR ${guest.overall_rating}) → ${teamLabel}`);
                 
                 const balancePlayer = findClosestSolo(guest.overall_rating || 0, soloPlayers);
                 if (balancePlayer) {
                     opposingTeam.push(balancePlayer);
-                    console.log(`  Balance ${balancePlayer.full_name} (OVR ${balancePlayer.overall_rating}) → ${oppLabel}`);
                 }
             }
         }
         
         // PHASE 1: Place outfield guest groups with intertwined picking
-        console.log(`\n=== PHASE 1: Guest Group Placement ===`);
-        console.log(`${parentPlayers.length} parent groups, ${soloPlayers.length} solo players available`);
         
         let nextTeamForGroup = 'red';
         
@@ -4864,22 +4850,18 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             const oppLabel = nextTeamForGroup === 'red' ? 'BLUE' : 'RED';
             
             targetTeam.push(group.parent);
-            console.log(`  Parent ${group.parent.full_name} (OVR ${group.parent.overall_rating}) → ${teamLabel}`);
             
             const matchPlayer = findClosestSolo(group.parent.overall_rating || 0, soloPlayers);
             if (matchPlayer) {
                 opposingTeam.push(matchPlayer);
-                console.log(`  Match ${matchPlayer.full_name} (OVR ${matchPlayer.overall_rating}) → ${oppLabel}`);
             }
             
             for (const guest of group.guests) {
                 targetTeam.push(guest);
-                console.log(`  Guest ${guest.full_name} (OVR ${guest.overall_rating}) → ${teamLabel}`);
                 
                 const balancePlayer = findClosestSolo(guest.overall_rating || 0, soloPlayers);
                 if (balancePlayer) {
                     opposingTeam.push(balancePlayer);
-                    console.log(`  Balance ${balancePlayer.full_name} (OVR ${balancePlayer.overall_rating}) → ${oppLabel}`);
                 }
             }
             
@@ -4913,7 +4895,6 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         // so the snake direction continues correctly rather than resetting.
         // Without this, two consecutive picks go to the same team.
         let snakeIdx = redTeam.length + blueTeam.length;
-        console.log(`\n=== PHASE 2: OVR Snake Draft ===`);
         for (const player of soloPlayers) {
             let assignToRed;
             if (redTeam.length > blueTeam.length) {
@@ -4960,10 +4941,9 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             if ((bp.pairs || []).some(pid => blueTeam.find(t => t.player_id === pid && t.player_id !== bp.player_id))) return false;
             return true;
         };
-        console.log(`\n=== PHASE 3A: OVR Equalisation ===`);
         for (let pass = 0; pass < 5; pass++) {
             const currentDiff = Math.abs(ovrSum(redTeam) - ovrSum(blueTeam));
-            if (currentDiff <= 1) { console.log(`  OVR diff ${currentDiff} — done`); break; }
+            if (currentDiff <= 1) { break; }
             let best = null, bestDiff = currentDiff;
             for (let i = 0; i < redTeam.length; i++) {
                 for (let j = 0; j < blueTeam.length; j++) {
@@ -4975,10 +4955,8 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 }
             }
             if (best) {
-                console.log(`  Pass ${pass + 1}: swap ${redTeam[best.i].alias || redTeam[best.i].full_name} ↔ ${blueTeam[best.j].alias || blueTeam[best.j].full_name} (diff ${currentDiff}→${bestDiff})`);
                 [redTeam[best.i], blueTeam[best.j]] = [blueTeam[best.j], redTeam[best.i]];
             } else {
-                console.log(`  Pass ${pass + 1}: no improvement (diff=${currentDiff})`);
                 break;
             }
         }
@@ -4987,7 +4965,6 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         // ===================================================
         // PHASE 3B: DEF+FIT Optimisation (NEW — does not exist today)
         // ===================================================
-        console.log(`\n=== PHASE 3B: DEF+FIT Optimisation (OVR locked at ${lockedOvr}) ===`);
         let currentLockedOvr = lockedOvr;
         for (let pass = 0; pass < 3; pass++) {
             const currSec = Math.abs(defSum(redTeam) - defSum(blueTeam)) + Math.abs(fitSum(redTeam) - fitSum(blueTeam));
@@ -5006,15 +4983,12 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 }
             }
             if (best) {
-                console.log(`  Pass ${pass + 1}: swap ${redTeam[best.i].alias || redTeam[best.i].full_name} ↔ ${blueTeam[best.j].alias || blueTeam[best.j].full_name} (DEF+FIT ${currSec}→${bestSec})`);
                 [redTeam[best.i], blueTeam[best.j]] = [blueTeam[best.j], redTeam[best.i]];
                 currentLockedOvr = bestOvr;
             } else {
-                console.log(`  Pass ${pass + 1}: no DEF+FIT improvement without worsening OVR`);
                 break;
             }
         }
-        console.log(`FINAL: Red OVR=${ovrSum(redTeam)} Blue OVR=${ovrSum(blueTeam)} diff=${Math.abs(ovrSum(redTeam) - ovrSum(blueTeam))}`);
         
         // Delete existing teams if any (for re-generation)
         await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
@@ -5828,9 +5802,6 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
         const { redTeam, blueTeam } = req.body;
         
         // Get game details for response
-        const gameResult = await pool.query('SELECT * FROM games WHERE id = $1', [gameId]);
-        const game = gameResult.rows[0];
-        
         // Update existing teams (they were created by generate-teams)
         await pool.query(`
             UPDATE teams SET team_name = 'Red'
@@ -6510,7 +6481,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                      WHERE id = ANY($1)`,
                     [winningPlayerIds]
                 );
-                console.log(`Updated wins for ${winningPlayerIds.length} winning players`);
             }
         } else if (winningTeam === 'draw') {
         }
@@ -6580,8 +6550,14 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         
         // FIX-086: Series score update moved INSIDE transaction to prevent orphaned scores on crash
         if (seriesUuidFromCheck && (gameType === 'draft_memory' || gameType === 'vs_external')) {
-            const seriesCol = winningTeam === 'red' ? 'red_wins' : winningTeam === 'blue' ? 'blue_wins' : 'draws';
-            await client.query(`UPDATE game_series SET ${seriesCol} = ${seriesCol} + 1 WHERE id = $1`, [seriesUuidFromCheck]);
+            // Use explicit column per winning team — never interpolate user-supplied values into SQL
+            const seriesColMap = { red: 'red_wins', blue: 'blue_wins', draw: 'draws' };
+            const seriesColSql = winningTeam === 'red'
+                ? 'UPDATE game_series SET red_wins = red_wins + 1 WHERE id = $1'
+                : winningTeam === 'blue'
+                    ? 'UPDATE game_series SET blue_wins = blue_wins + 1 WHERE id = $1'
+                    : 'UPDATE game_series SET draws = draws + 1 WHERE id = $1';
+            await client.query(seriesColSql, [seriesUuidFromCheck]);
         }
 
         await client.query('COMMIT');
@@ -6765,7 +6741,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             }
             
             // Get results + league table
-            const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [game.id]);
+            const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [game.id]);
             const teamNames = teamsResult.rows.map(t => t.team_name);
             const leagueTable = calculateLeagueTable(allResults.rows, teamNames);
             
@@ -7322,7 +7298,6 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
     try {
         const { gameUrl } = req.params;
 
-        console.log('Public MOTM request for game URL:', gameUrl);
 
         const gameResult = await pool.query(
             'SELECT id, game_status, motm_voting_ends, motm_winner_id FROM games WHERE game_url = $1',
@@ -7330,15 +7305,12 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
         );
 
         if (gameResult.rows.length === 0) {
-            console.log('MOTM: Game not found for URL:', gameUrl);
             return res.status(404).json({ error: 'Game not found' });
         }
 
         const game = gameResult.rows[0];
-        console.log('MOTM: Game found:', { id: game.id, status: game.game_status, votingEnds: game.motm_voting_ends, winnerId: game.motm_winner_id });
 
         if (game.game_status !== 'completed') {
-            console.log('MOTM: Game not completed, status:', game.game_status);
             return res.status(400).json({ error: 'Game not completed yet' });
         }
 
@@ -7363,7 +7335,6 @@ app.get('/api/public/game/:gameUrl/motm', async (req, res) => {
             ORDER BY vote_count DESC
         `, [game.id]);
 
-        console.log('MOTM: Found', nomineesResult.rows.length, 'nominees for game', game.id);
 
         const votingEnds  = game.motm_voting_ends ? new Date(game.motm_voting_ends) : new Date(0);
         const votingOpen  = votingEnds > new Date();
@@ -8148,7 +8119,6 @@ async function runMotmFinalize(gameId) {
     const winners  = votesResult.rows.filter(r => parseInt(r.votes) === maxVotes);
     const motmIncrement = 1.0 / winners.length;
 
-    console.log(`MOTM finalize game ${gameId}: ${winners.length} winner(s), ${maxVotes} votes, +${motmIncrement} each`);
 
     // Award MOTM wins
     for (const winner of winners) {
@@ -8786,7 +8756,7 @@ app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requir
         );
         
         // Return updated results + league table
-        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
         const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
         
         res.json({
@@ -8829,7 +8799,7 @@ app.put('/api/admin/games/:gameId/tournament-result/:resultId', authenticateToke
         // Return updated results + league table
         const teamsCheck = await pool.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
         const validTeams = teamsCheck.rows.map(t => t.team_name);
-        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
         const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
         
         res.json({ message: 'Result updated', results: allResults.rows, leagueTable });
@@ -8855,7 +8825,7 @@ app.delete('/api/admin/games/:gameId/tournament-result/:resultId', authenticateT
         // Return updated results + league table
         const teamsCheck = await pool.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
         const validTeams = teamsCheck.rows.map(t => t.team_name);
-        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
         const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
         
         res.json({ message: 'Result deleted', results: allResults.rows, leagueTable });
@@ -8872,7 +8842,7 @@ app.get('/api/admin/games/:gameId/tournament-results', authenticateToken, requir
         
         const teamsCheck = await pool.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
         const validTeams = teamsCheck.rows.map(t => t.team_name);
-        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
         const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
         
         res.json({ results: allResults.rows, leagueTable });
@@ -8934,7 +8904,7 @@ app.get('/api/public/game/:gameUrl/tournament', async (req, res) => {
         }
         
         // Get results and league table
-        const allResults = await pool.query('SELECT * FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [game.id]);
+        const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [game.id]);
         const teamNames = teamsResult.rows.map(t => t.team_name);
         const leagueTable = calculateLeagueTable(allResults.rows, teamNames);
         
@@ -9009,7 +8979,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
         // Get results and calculate league table
         const teamsCheck = await client.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
         const teamNames = teamsCheck.rows.map(t => t.team_name);
-        const allResults = await client.query('SELECT * FROM tournament_results WHERE game_id = $1', [gameId]);
+        const allResults = await client.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1', [gameId]);
         
         if (allResults.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -9868,8 +9838,9 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
                 `${pts} point(s) added manually | new tier: ${newTier}`);
         });
     } catch (error) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Add discipline points error:', error);
+        res.status(500).json({ error: 'Failed to add discipline points' });
     } finally {
         client.release();
     }
@@ -10992,7 +10963,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
                     </div>
                 `,
             }).then(() => {
-                console.log(`Password reset email sent to ${email.trim()}`);
             }).catch(emailErr => {
                 // Log the real reason — check Render logs if email not arriving
                 console.error('Password reset email FAILED:', emailErr.message);
