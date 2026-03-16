@@ -10889,7 +10889,7 @@ app.get('/api/games/:gameId/messages', optionalAuth, async (req, res) => {
               AND gm.deleted_at IS NULL
               AND (
                   gm.scope = 'chat'
-                  OR (gm.scope = 'team' AND $2 IS NOT NULL AND gm.team_id = $2)
+                  OR (gm.scope = 'team' AND $2::uuid IS NOT NULL AND gm.team_id = $2::uuid)
                   ${preDraftClause}
               )
               ${sinceClause}
@@ -10972,19 +10972,33 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
             resolvedScope = scope;
         }
 
-        const result = await pool.query(`
+        const insertResult = await pool.query(`
             INSERT INTO game_messages (game_id, player_id, team_id, scope, message)
             VALUES ($1, $2, $3, $4, $5)
-            RETURNING
-                id, game_id, player_id, scope, message, created_at,
-                (SELECT COALESCE(alias, full_name, 'Unknown') FROM players WHERE id = $2) AS player_alias,
-                (SELECT full_name FROM players WHERE id = $2) AS player_name
+            RETURNING id, scope, message, created_at, player_id
         `, [gameId, req.user.playerId, teamId, resolvedScope, message.trim()]);
 
-        res.status(201).json(result.rows[0]);
+        const inserted = insertResult.rows[0];
+        // Fetch player name separately — avoids correlated subqueries in RETURNING
+        const playerRow = await pool.query(
+            "SELECT COALESCE(alias, full_name, 'Unknown') AS player_alias, full_name AS player_name FROM players WHERE id = $1",
+            [req.user.playerId]
+        );
+        const p = playerRow.rows[0] || { player_alias: 'Unknown', player_name: '' };
+
+        res.status(201).json({
+            id:           inserted.id,
+            game_id:      gameId,
+            player_id:    req.user.playerId,
+            scope:        inserted.scope,
+            message:      inserted.message,
+            created_at:   inserted.created_at,
+            player_alias: p.player_alias,
+            player_name:  p.player_name
+        });
     } catch (error) {
-        console.error('Post message error:', error);
-        res.status(500).json({ error: 'Failed to post message' });
+        console.error('Post message error — scope:', resolvedScope, 'gameId:', gameId, 'error:', error.message);
+        res.status(500).json({ error: 'Failed to post message', detail: error.message });
     }
 });
 
