@@ -10788,7 +10788,7 @@ app.get('/api/games/:gameId/my-team', authenticateToken, async (req, res) => {
 // Returns null if not applicable or not assigned.
 async function resolvePreDraftTeam(playerId, gameId) {
     const gRes = await pool.query(
-        'SELECT team_selection_type, series_id, is_venue_clash FROM games WHERE id = $1',
+        'SELECT team_selection_type, series_id, is_venue_clash, venue_clash_team1_name, venue_clash_team2_name FROM games WHERE id = $1',
         [gameId]
     );
     const g = gRes.rows[0];
@@ -10805,7 +10805,12 @@ async function resolvePreDraftTeam(playerId, gameId) {
             "SELECT venue_clash_team_preference FROM registrations WHERE player_id = $1 AND game_id = $2 AND status = 'confirmed'",
             [playerId, gameId]
         );
-        if (vc.rows[0]?.venue_clash_team_preference) return vc.rows[0].venue_clash_team_preference;
+        const pref = vc.rows[0]?.venue_clash_team_preference;
+        if (pref) {
+            // Map team name → 'red'/'blue' so scope stays within valid DB values
+            // team1 → 'red', team2 → 'blue'
+            return pref === g.venue_clash_team1_name ? 'red' : 'blue';
+        }
     }
     return null;
 }
