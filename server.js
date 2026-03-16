@@ -1522,18 +1522,18 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                     SELECT SUM(dr.points) FROM discipline_records dr WHERE dr.player_id = p.id
                 ), 0) as disc_points_total,
 
-                -- DISCIPLINE: revolving — last 10 completed games only (not manual entries)
+                -- DISCIPLINE: revolving — last 10 completed games + all manual (admin) entries
                 COALESCE((
                     SELECT SUM(dr.points)
                     FROM discipline_records dr
                     WHERE dr.player_id = p.id
-                    AND dr.game_id IN (
+                    AND (dr.game_id IS NULL OR dr.game_id IN (
                         SELECT r.game_id FROM registrations r
                         JOIN games g2 ON g2.id = r.game_id
                         WHERE r.player_id = p.id AND r.status = 'confirmed'
                         AND g2.game_status = 'completed'
                         ORDER BY g2.game_date DESC LIMIT 10
-                    )
+                    ))
                 ), 0) as disc_points_revolving,
 
                 -- DISCIPLINE: most recent offense type
@@ -1637,13 +1637,13 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
             COALESCE((
                 SELECT SUM(dr.points) FROM discipline_records dr
                 WHERE dr.player_id = p.id
-                AND dr.game_id IN (
+                AND (dr.game_id IS NULL OR dr.game_id IN (
                     SELECT r.game_id FROM registrations r
                     JOIN games g2 ON g2.id = r.game_id
                     WHERE r.player_id = p.id AND r.status = 'confirmed'
                     AND g2.game_status = 'completed'
                     ORDER BY g2.game_date DESC LIMIT 10
-                )
+                ))
             ), 0) as disc_points_revolving,
             (SELECT dr.offense_type FROM discipline_records dr
              WHERE dr.player_id = p.id AND dr.game_id IS NOT NULL
@@ -9805,6 +9805,19 @@ app.post('/api/players/me/notifications/mark-read', authenticateToken, async (re
 
 // POST /api/admin/players/:id/discipline — manually add discipline points (admin only)
 // Points number only — no reason required. Recalculates tier immediately.
+//
+// IMPORTANT: DISC_TIER_THRESHOLDS below must match your calculate_player_tier DB function.
+// Adjust these constants if tier behaviour doesn't match what you expect.
+// These thresholds apply to the REVOLVING window (last 10 completed games + all manual entries).
+const DISC_TIER_THRESHOLDS = { black: 15, white: 10, bronze: 5, silver: 1 };
+function tierFromRevolvingPoints(pts) {
+    if (pts >= DISC_TIER_THRESHOLDS.black)  return 'black';
+    if (pts >= DISC_TIER_THRESHOLDS.white)  return 'white';
+    if (pts >= DISC_TIER_THRESHOLDS.bronze) return 'bronze';
+    if (pts >= DISC_TIER_THRESHOLDS.silver) return 'silver';
+    return 'gold';
+}
+
 app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, async (req, res) => {
     const { id } = req.params;
     const { points } = req.body;
@@ -9824,18 +9837,30 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
             VALUES ($1, NULL, $2, 'Manual (admin)', $3)
         `, [id, pts, req.user.userId]);
 
-        // Immediately recalculate tier
-        const tierResult = await client.query(
-            'SELECT calculate_player_tier($1::uuid) AS new_tier', [id]
-        );
-        const newTier = tierResult.rows[0]?.new_tier || 'silver';
+        // Compute revolving points inline — includes manual (game_id IS NULL) entries.
+        // calculate_player_tier() is a DB function that filters game_id IS NOT NULL so it
+        // never counts manual entries. We bypass it here and derive tier ourselves.
+        const revolvingResult = await client.query(`
+            SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
+            FROM discipline_records dr
+            WHERE dr.player_id = $1
+            AND (dr.game_id IS NULL OR dr.game_id IN (
+                SELECT r.game_id FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                WHERE r.player_id = $1 AND r.status = 'confirmed'
+                AND g.game_status = 'completed'
+                ORDER BY g.game_date DESC LIMIT 10
+            ))
+        `, [id]);
+        const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
+        const newTier = tierFromRevolvingPoints(revolvingPts);
         await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, id]);
 
         await client.query('COMMIT');
-        res.json({ success: true, newTier, pointsAdded: pts });
+        res.json({ success: true, newTier, pointsAdded: pts, revolvingTotal: revolvingPts });
         setImmediate(async () => {
             await auditLog(pool, req.user.playerId, 'discipline_added', id,
-                `${pts} point(s) added manually | new tier: ${newTier}`);
+                `${pts} point(s) added manually | revolving total: ${revolvingPts} | new tier: ${newTier}`);
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
