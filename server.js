@@ -10910,8 +10910,8 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
     if (message.trim().length > 500) {
         return res.status(400).json({ error: 'Message must be 500 characters or fewer' });
     }
-    const validScopes = ['chat', 'team', 'team_red', 'team_blue'];
-    if (!validScopes.includes(scope)) {
+    // Accept 'chat', 'team', and any 'team_*' pre-draft scope (team_red, team_blue, team_corpus, etc.)
+    if (scope !== 'chat' && scope !== 'team' && !scope.startsWith('team_')) {
         return res.status(400).json({ error: 'Invalid scope' });
     }
 
