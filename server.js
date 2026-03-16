@@ -7098,6 +7098,47 @@ app.get('/g/:gameUrl', async (req, res) => {
     }
 });
 
+// PUT /api/games/:id/my-team-preference — let a confirmed player set their venue clash team side
+// Used when a player was added by admin without a venue_clash_team_preference set
+app.put('/api/games/:id/my-team-preference', authenticateToken, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        const { venueClashTeam } = req.body;
+        if (!venueClashTeam || typeof venueClashTeam !== 'string' || venueClashTeam.length > 50) {
+            return res.status(400).json({ error: 'venueClashTeam is required' });
+        }
+        // Verify game is venue clash
+        const gameCheck = await pool.query(
+            'SELECT is_venue_clash, venue_clash_team1_name, venue_clash_team2_name FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (!gameCheck.rows.length || !gameCheck.rows[0].is_venue_clash) {
+            return res.status(400).json({ error: 'This game is not a Venue Clash game' });
+        }
+        const g = gameCheck.rows[0];
+        const validTeams = [g.venue_clash_team1_name, g.venue_clash_team2_name].filter(Boolean);
+        if (!validTeams.includes(venueClashTeam)) {
+            return res.status(400).json({ error: 'Invalid team name' });
+        }
+        // Player must be confirmed in this game
+        const regCheck = await pool.query(
+            "SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'",
+            [gameId, req.user.playerId]
+        );
+        if (!regCheck.rows.length) {
+            return res.status(403).json({ error: 'You are not confirmed in this game' });
+        }
+        await pool.query(
+            'UPDATE registrations SET venue_clash_team_preference = $1 WHERE game_id = $2 AND player_id = $3',
+            [venueClashTeam, gameId, req.user.playerId]
+        );
+        res.json({ ok: true, venueClashTeam });
+    } catch (error) {
+        console.error('Set team preference error:', error);
+        res.status(500).json({ error: 'Failed to set team preference' });
+    }
+});
+
 app.get('/api/public/game/:gameUrl/details', async (req, res) => {
     try {
         const { gameUrl } = req.params;
@@ -7111,6 +7152,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.tournament_team_count, g.tournament_results_finalised, g.series_id,
                    g.regularity, g.star_rating, g.min_rating_enabled,
                    g.refs_required, g.ref_pay, g.ref_review_ends,
+                   g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
@@ -7204,7 +7246,10 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             refs_required:         game.refs_required || 0,
             ref_pay:          parseFloat(game.ref_pay) || 0,
             ref_review_ends: game.ref_review_ends || null,
-            seriesScoreline
+            seriesScoreline,
+            is_venue_clash: game.is_venue_clash || false,
+            venue_clash_team1_name: game.venue_clash_team1_name || null,
+            venue_clash_team2_name: game.venue_clash_team2_name || null
         });
         
     } catch (error) {
@@ -10893,11 +10938,12 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
                 if (!preDraft) return res.status(403).json({ error: 'You are not assigned to a team in this game' });
                 resolvedScope = `team_${preDraft}`;
             }
-        } else if (scope === 'team_red' || scope === 'team_blue') {
-            // Pre-draft scope — verify player is actually on that team
-            const expectedTeam = scope === 'team_red' ? 'red' : 'blue';
+        } else if (scope.startsWith('team_')) {
+            // Pre-draft scope (team_red, team_blue, team_<venue_clash_name>, etc.)
+            // Verify server-side that player is actually on that team
             const preDraft = await resolvePreDraftTeam(req.user.playerId, gameId).catch(() => null);
-            if (preDraft !== expectedTeam) {
+            const expectedScope = preDraft ? 'team_' + preDraft.toLowerCase() : null;
+            if (!expectedScope || scope !== expectedScope) {
                 return res.status(403).json({ error: 'You are not on that team' });
             }
             resolvedScope = scope;
