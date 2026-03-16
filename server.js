@@ -10732,7 +10732,7 @@ app.get('/api/games/:gameId/my-team', authenticateToken, async (req, res) => {
     try {
         // 1. Check confirmed team_players (post-draft or confirmed teams)
         const teamResult = await pool.query(`
-            SELECT t.id AS team_id, t.team_name, t.kit_color
+            SELECT t.id AS team_id, t.team_name
             FROM team_players tp
             JOIN teams t ON t.id = tp.team_id
             WHERE tp.player_id = $1 AND t.game_id = $2
@@ -10741,8 +10741,7 @@ app.get('/api/games/:gameId/my-team', authenticateToken, async (req, res) => {
         if (teamResult.rows.length > 0) {
             return res.json({
                 teamId:   teamResult.rows[0].team_id,
-                teamName: teamResult.rows[0].team_name,
-                kitColor: teamResult.rows[0].kit_color
+                teamName: teamResult.rows[0].team_name
             });
         }
 
@@ -10846,9 +10845,28 @@ app.get('/api/games/:gameId/messages', optionalAuth, async (req, res) => {
             }
         }
 
-        const preDraftScope = myPreDraftTeam ? `team_${myPreDraftTeam}` : null;
-        const sinceClause = since ? 'AND gm.created_at > $3::timestamptz' : '';
-        const params = since ? [gameId, myTeamId, since] : [gameId, myTeamId];
+        // Normalise pre-draft scope to lowercase so it matches stored message scopes.
+        // Frontend always lowercases (team_corpus not team_Corpus) — this ensures they match.
+        const preDraftScope = myPreDraftTeam ? `team_${myPreDraftTeam.toLowerCase()}` : null;
+        // Build parameterised query — preDraftScope passed as $3/$4 not interpolated (SQL injection fix)
+        let params, sinceClause, preDraftClause;
+        if (preDraftScope && since) {
+            params = [gameId, myTeamId, preDraftScope, since];
+            preDraftClause = 'OR gm.scope = $3';
+            sinceClause = 'AND gm.created_at > $4::timestamptz';
+        } else if (preDraftScope) {
+            params = [gameId, myTeamId, preDraftScope];
+            preDraftClause = 'OR gm.scope = $3';
+            sinceClause = '';
+        } else if (since) {
+            params = [gameId, myTeamId, since];
+            preDraftClause = '';
+            sinceClause = 'AND gm.created_at > $3::timestamptz';
+        } else {
+            params = [gameId, myTeamId];
+            preDraftClause = '';
+            sinceClause = '';
+        }
 
         const result = await pool.query(`
             SELECT
@@ -10867,7 +10885,7 @@ app.get('/api/games/:gameId/messages', optionalAuth, async (req, res) => {
               AND (
                   gm.scope = 'chat'
                   OR (gm.scope = 'team' AND $2 IS NOT NULL AND gm.team_id = $2)
-                  ${preDraftScope ? `OR gm.scope = '${preDraftScope}'` : ''}
+                  ${preDraftClause}
               )
               ${sinceClause}
             ORDER BY gm.created_at ASC
