@@ -9822,7 +9822,7 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
         await client.query(`
             INSERT INTO discipline_records (player_id, game_id, points, offense_type, recorded_by)
             VALUES ($1, NULL, $2, 'Manual (admin)', $3)
-        `, [id, pts, req.user.playerId]);
+        `, [id, pts, req.user.userId]);
 
         // Immediately recalculate tier
         const tierResult = await client.query(
