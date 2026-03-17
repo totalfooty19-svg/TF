@@ -9694,53 +9694,44 @@ app.get('/api/admin/dm/all-conversations', authenticateToken, requireAdmin, asyn
         `);
         const total = parseInt(countRes.rows[0].total);
 
+        // FIX: use a ranked subquery instead of correlated subqueries referencing
+        // ungrouped outer columns — PostgreSQL strict GROUP BY rejects those.
         const result = await pool.query(`
+            WITH ranked AS (
+                SELECT
+                    LEAST(sender_id, recipient_id)    AS player_a_id,
+                    GREATEST(sender_id, recipient_id) AS player_b_id,
+                    message,
+                    sender_id                          AS last_sender_id,
+                    created_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY LEAST(sender_id, recipient_id),
+                                     GREATEST(sender_id, recipient_id)
+                        ORDER BY created_at DESC
+                    ) AS rn,
+                    COUNT(*) OVER (
+                        PARTITION BY LEAST(sender_id, recipient_id),
+                                     GREATEST(sender_id, recipient_id)
+                    ) AS total_messages
+                FROM direct_messages
+                WHERE deleted_at IS NULL
+            )
             SELECT
-                sub.player_a_id,
-                sub.player_b_id,
+                r.player_a_id,
+                r.player_b_id,
                 COALESCE(pa.alias, pa.full_name) AS player_a_name,
                 COALESCE(pb.alias, pb.full_name) AS player_b_name,
                 pa.reliability_tier              AS player_a_tier,
                 pb.reliability_tier              AS player_b_tier,
-                sub.last_message_at,
-                sub.total_messages,
-                sub.last_message,
-                sub.last_sender_id
-            FROM (
-                SELECT
-                    LEAST(dm.sender_id, dm.recipient_id)    AS player_a_id,
-                    GREATEST(dm.sender_id, dm.recipient_id) AS player_b_id,
-                    MAX(dm.created_at)                      AS last_message_at,
-                    COUNT(*)                                AS total_messages,
-                    (
-                        SELECT dm2.message
-                        FROM direct_messages dm2
-                        WHERE LEAST(dm2.sender_id, dm2.recipient_id)
-                                = LEAST(dm.sender_id, dm.recipient_id)
-                          AND GREATEST(dm2.sender_id, dm2.recipient_id)
-                                = GREATEST(dm.sender_id, dm.recipient_id)
-                          AND dm2.deleted_at IS NULL
-                        ORDER BY dm2.created_at DESC LIMIT 1
-                    ) AS last_message,
-                    (
-                        SELECT dm2.sender_id
-                        FROM direct_messages dm2
-                        WHERE LEAST(dm2.sender_id, dm2.recipient_id)
-                                = LEAST(dm.sender_id, dm.recipient_id)
-                          AND GREATEST(dm2.sender_id, dm2.recipient_id)
-                                = GREATEST(dm.sender_id, dm.recipient_id)
-                          AND dm2.deleted_at IS NULL
-                        ORDER BY dm2.created_at DESC LIMIT 1
-                    ) AS last_sender_id
-                FROM direct_messages dm
-                WHERE dm.deleted_at IS NULL
-                GROUP BY
-                    LEAST(dm.sender_id, dm.recipient_id),
-                    GREATEST(dm.sender_id, dm.recipient_id)
-            ) sub
-            JOIN players pa ON pa.id = sub.player_a_id
-            JOIN players pb ON pb.id = sub.player_b_id
-            ORDER BY sub.last_message_at DESC
+                r.created_at                     AS last_message_at,
+                r.total_messages,
+                r.message                        AS last_message,
+                r.last_sender_id
+            FROM ranked r
+            JOIN players pa ON pa.id = r.player_a_id
+            JOIN players pb ON pb.id = r.player_b_id
+            WHERE r.rn = 1
+            ORDER BY r.created_at DESC
             LIMIT $1 OFFSET $2
         `, [limit, offset]);
         res.json({
@@ -9751,6 +9742,45 @@ app.get('/api/admin/dm/all-conversations', authenticateToken, requireAdmin, asyn
     } catch (error) {
         console.error('Admin all-conversations error:', error);
         res.status(500).json({ error: 'Failed to load conversations' });
+    }
+});
+
+// GET /api/admin/dm/recent-messages — latest individual messages platform-wide
+app.get('/api/admin/dm/recent-messages', authenticateToken, requireAdmin, async (req, res) => {
+    const limit  = Math.min(parseInt(req.query.limit)  || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset) || 0,  0);
+    try {
+        const result = await pool.query(`
+            SELECT
+                dm.id,
+                dm.sender_id,
+                dm.recipient_id,
+                dm.message,
+                dm.created_at,
+                dm.read_at,
+                COALESCE(ps.alias, ps.full_name) AS sender_name,
+                COALESCE(pr.alias, pr.full_name) AS receiver_name
+            FROM direct_messages dm
+            JOIN players ps ON ps.id = dm.sender_id
+            JOIN players pr ON pr.id = dm.recipient_id
+            WHERE dm.deleted_at IS NULL
+            ORDER BY dm.created_at DESC
+            LIMIT $1 OFFSET $2
+        `, [limit, offset]);
+
+        const countRes = await pool.query(
+            'SELECT COUNT(*) AS total FROM direct_messages WHERE deleted_at IS NULL'
+        );
+        const total = parseInt(countRes.rows[0].total);
+
+        res.json({
+            messages: result.rows,
+            total,
+            hasMore: offset + result.rows.length < total
+        });
+    } catch (error) {
+        console.error('Recent messages error:', error);
+        res.status(500).json({ error: 'Failed to load recent messages' });
     }
 });
 
@@ -10883,13 +10913,109 @@ app.get('/api/games/:gameId/my-ref-review/:refPlayerId', authenticateToken, asyn
     }
 });
 
+// GET /api/admin/audit/feed — platform-wide chronological feed of all audit events
+// Supports cursor-based pagination (?before=ISO_TIMESTAMP) and group filtering (?group=X)
+app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, res) => {
+    const limit  = Math.min(parseInt(req.query.limit) || 100, 200);
+    const before = req.query.before ? new Date(req.query.before) : null;
+    const group  = req.query.group  || null;
+
+    // Validate before param
+    if (req.query.before && isNaN(before)) {
+        return res.status(400).json({ error: 'Invalid before timestamp' });
+    }
+
+    // Group → action filter map
+    const GROUP_ACTIONS = {
+        players:    ['player_created','player_updated','player_deleted','account_updated','stats_updated','tier_recalculated','badges_updated','badge_auto_awarded','badge_auto_removed'],
+        games:      ['game_created','game_confirmed','game_completed','game_locked','game_unlocked','teams_generated','teams_confirmed','teams_deleted','type_converted'],
+        finance:    ['balance_adjustment'],
+        registrations: ['admin_player_added','admin_player_removed','guest_added','guest_removed'],
+        referees:   ['ref_applied','ref_confirmed','ref_withdrawn','ref_unconfirmed','ref_review_received','ref_review_updated','ref_review_comment','ref_score_updated','ref_score_finalised','referee_invite_created'],
+        moderation: ['dm_reported','discipline_added','player_unbanned'],
+        admins:     ['admin_added','admin_removed','ref_admin_added'],
+        motm:       ['motm_voting_started','motm_vote','motm_finalized'],
+    };
+
+    const allGroups = Object.keys(GROUP_ACTIONS);
+    const filterActions = group && GROUP_ACTIONS[group] ? GROUP_ACTIONS[group] : null;
+
+    try {
+        // Build WHERE clauses
+        const params = [];
+        let wherePlayer = 'WHERE 1=1';
+        let whereGame   = 'WHERE 1=1';
+
+        if (before) {
+            params.push(before);
+            wherePlayer += ` AND al.created_at < $${params.length}`;
+            whereGame   += ` AND gal.created_at < $${params.length}`;
+        }
+        if (filterActions) {
+            params.push(filterActions);
+            wherePlayer += ` AND al.action = ANY($${params.length})`;
+            whereGame   += ` AND gal.action = ANY($${params.length})`;
+        }
+        params.push(limit);
+        const limitParam = params.length;
+
+        const result = await pool.query(`
+            SELECT
+                'player'            AS source,
+                al.action,
+                al.detail,
+                al.created_at,
+                al.target_id::text  AS target_id,
+                NULL::text          AS game_id,
+                COALESCE(ap.alias, ap.full_name) AS admin_name,
+                COALESCE(tp.alias, tp.full_name) AS target_name
+            FROM audit_logs al
+            LEFT JOIN players ap ON ap.id = al.admin_id
+            LEFT JOIN players tp ON tp.id::text = al.target_id::text
+            ${wherePlayer}
+
+            UNION ALL
+
+            SELECT
+                'game'              AS source,
+                gal.action,
+                gal.detail,
+                gal.created_at,
+                NULL::text          AS target_id,
+                gal.game_id::text   AS game_id,
+                COALESCE(ap.alias, ap.full_name) AS admin_name,
+                NULL                AS target_name
+            FROM game_audit_log gal
+            LEFT JOIN players ap ON ap.id = gal.admin_id
+            ${whereGame}
+
+            ORDER BY created_at DESC
+            LIMIT $${limitParam}
+        `, params);
+
+        const records = result.rows;
+        const nextCursor = records.length === limit
+            ? records[records.length - 1].created_at
+            : null;
+
+        res.json({
+            records,
+            nextCursor,
+            groups: allGroups
+        });
+    } catch (error) {
+        console.error('Audit feed error:', error);
+        res.status(500).json({ error: 'Failed to load audit feed' });
+    }
+});
+
 // GET /api/admin/audit/ref-actions — paginated referee audit events from both logs
 app.get('/api/admin/audit/ref-actions', authenticateToken, requireAdmin, async (req, res) => {
     const limit  = Math.min(parseInt(req.query.limit)  || 100, 200);
     const offset = Math.max(parseInt(req.query.offset) || 0,   0);
     const allowedActions = [
         'ref_applied','ref_confirmed','ref_withdrawn','ref_unconfirmed',
-        'ref_review_received','ref_review_updated','ref_review_comment','ref_score_updated'
+        'ref_review_received','ref_review_updated','ref_review_comment','ref_score_updated','ref_score_finalised'
     ];
     try {
         // Combine game_audit_log and audit_logs for referee actions
