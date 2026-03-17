@@ -3058,6 +3058,15 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 p.alias,
                 p.squad_number,
                 p.is_organiser,
+                p.goalkeeper_rating,
+                p.defending_rating,
+                p.strength_rating,
+                p.fitness_rating,
+                p.pace_rating,
+                p.decisions_rating,
+                p.assisting_rating,
+                p.shooting_rating,
+                p.overall_rating,
                 r.status,
                 r.backup_type,
                 r.is_comped,
@@ -3080,6 +3089,9 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             WHERE r.game_id = $1 AND r.status IN ('confirmed', 'backup')
             GROUP BY r.id, r.registered_by_player_id, reg_by.alias, reg_by.full_name,
                      p.id, p.full_name, p.alias, p.squad_number, p.is_organiser,
+                     p.goalkeeper_rating, p.defending_rating, p.strength_rating,
+                     p.fitness_rating, p.pace_rating, p.decisions_rating,
+                     p.assisting_rating, p.shooting_rating, p.overall_rating,
                      r.status, r.backup_type, r.is_comped,
                      r.position_preference, r.tournament_team_preference, t.team_name
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
@@ -6410,11 +6422,85 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
     }
 });
 
+// PUT /api/admin/games/:gameId/player-stats — bulk update player stats from post-game wizard
+// SEC: only confirmed players for this game can be updated; no guest rows; validated ranges
+app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameManager, async (req, res) => {
+    const { gameId } = req.params;
+    const { playerStats } = req.body; // array of { playerId, gk, def, str, fit, pac, dec, ass, sho }
+
+    if (!Array.isArray(playerStats) || playerStats.length === 0) {
+        return res.status(400).json({ error: 'playerStats must be a non-empty array' });
+    }
+
+    // Fetch confirmed players for this game
+    const confirmedRes = await pool.query(
+        `SELECT DISTINCT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+        [gameId]
+    );
+    const confirmedSet = new Set(confirmedRes.rows.map(r => r.player_id));
+
+    const clamp = (v, min, max) => Math.max(min, Math.min(max, Math.round(v)));
+    const errors = [];
+
+    for (const row of playerStats) {
+        // Skip guests (player_id starts with 'guest_')
+        if (!row.playerId || String(row.playerId).startsWith('guest_')) continue;
+        // IDOR: only confirmed participants
+        if (!confirmedSet.has(row.playerId)) {
+            errors.push(row.playerId);
+            continue;
+        }
+        const gk  = clamp(parseInt(row.gk)  || 0, 0, 100);
+        const def = clamp(parseInt(row.def) || 0, 0, 20);
+        const str = clamp(parseInt(row.str) || 0, 0, 20);
+        const fit = clamp(parseInt(row.fit) || 0, 0, 20);
+        const pac = clamp(parseInt(row.pac) || 0, 0, 20);
+        const dec = clamp(parseInt(row.dec) || 0, 0, 20);
+        const ass = clamp(parseInt(row.ass) || 0, 0, 20);
+        const sho = clamp(parseInt(row.sho) || 0, 0, 20);
+        const ovr = def + str + fit + pac + dec + ass + sho;
+
+        await pool.query(
+            `UPDATE players
+             SET goalkeeper_rating = $1,
+                 defending_rating  = $2,
+                 strength_rating   = $3,
+                 fitness_rating    = $4,
+                 pace_rating       = $5,
+                 decisions_rating  = $6,
+                 assisting_rating  = $7,
+                 shooting_rating   = $8,
+                 overall_rating    = $9
+             WHERE id = $10`,
+            [gk, def, str, fit, pac, dec, ass, sho, ovr, row.playerId]
+        );
+    }
+
+    if (errors.length > 0) {
+        console.warn(`player-stats: skipped non-participants: ${errors.join(', ')}`);
+    }
+
+    setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'player_stats_updated',
+        `Bulk stat update: ${playerStats.length} players`));
+
+    res.json({ message: 'Player stats updated', updated: playerStats.length - errors.length });
+});
+
 app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameManager, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        const { winningTeam, disciplineRecords, beefEntries, motmNominees } = req.body;
+        const { winningTeam, disciplineRecords, beefEntries, motmNominees, teamBalanceScore } = req.body;
+
+        // Validate teamBalanceScore
+        let validatedBalanceScore = null;
+        if (teamBalanceScore !== null && teamBalanceScore !== undefined) {
+            const bs = parseInt(teamBalanceScore);
+            if (isNaN(bs) || bs < -3 || bs > 3) {
+                return res.status(400).json({ error: 'teamBalanceScore must be an integer between -3 and 3' });
+            }
+            validatedBalanceScore = bs;
+        }
 
         // FIX-062: Whitelist winningTeam before any DB work
         const validTeams = ['red', 'blue', 'draw', 'Red', 'Blue', 'Draw'];
@@ -6456,10 +6542,11 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             `UPDATE games 
              SET winning_team = $1, 
                  game_status = 'completed',
+                 team_balance_score = $3,
                  motm_voting_ends = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'},
                  ref_review_ends = NOW() + INTERVAL '24 hours'
              WHERE id = $2`,
-            [winningTeam, gameId]
+            [winningTeam, gameId, validatedBalanceScore]
         );
         
         // 2. Get all players in the game
