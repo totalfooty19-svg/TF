@@ -2720,7 +2720,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         }
         if (!isAdminUser && game.exclusivity === 'allstars') {
             const hasAllstars = await pool.query(
-                `SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'Allstars'`,
+                `SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'TF All Star'`,
                 [req.user.playerId]
             );
             if (!hasAllstars.rows.length) return res.status(403).json({ error: 'Access denied' });
