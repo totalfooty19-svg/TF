@@ -10859,9 +10859,18 @@ app.get('/api/public/game/:gameUrl/referees', async (req, res) => {
                    p.photo_url,
                    p.squad_number,
                    gr.status,
-                   gr.final_rating  AS avg_rating,
-                   gr.review_count,
-                   (gr.player_id IS NULL) AS is_external
+                   gr.final_rating  AS game_rating,
+                   gr.review_count  AS game_review_count,
+                   (gr.player_id IS NULL) AS is_external,
+                   (SELECT COUNT(*) FROM game_referees gr2
+                    WHERE gr2.player_id = gr.player_id
+                      AND gr2.status = 'confirmed') AS appearances,
+                   (SELECT ROUND(AVG(rr.rating), 1)
+                    FROM referee_reviews rr
+                    WHERE rr.referee_player_id = gr.player_id) AS career_avg_rating,
+                   (SELECT COUNT(*)
+                    FROM referee_reviews rr
+                    WHERE rr.referee_player_id = gr.player_id) AS career_review_count
             FROM game_referees gr
             LEFT JOIN players p ON p.id = gr.player_id
             WHERE gr.game_id = $1 AND gr.status = 'confirmed'
