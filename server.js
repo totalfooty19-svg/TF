@@ -398,6 +398,16 @@ const dmSendLimiter = rateLimit({
     legacyHeaders: false,
 });
 
+// Rate limit DM reports — max 5 per hour per player
+const dmReportLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    message: { error: 'Too many reports submitted. Please wait before reporting again.' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
 // SEC-010: Rate limiter for fairness votes
 const fairnessLimiter = rateLimit({
     windowMs: 60 * 1000,
@@ -10197,6 +10207,91 @@ app.post('/api/dm/:playerId', authenticateToken, dmSendLimiter, async (req, res)
     } catch (error) {
         console.error('Send DM error:', error);
         res.status(500).json({ error: 'Failed to send message' });
+    }
+});
+
+// POST /api/dm/:playerId/report — report a conversation to superadmin
+app.post('/api/dm/:playerId/report', authenticateToken, dmReportLimiter, async (req, res) => {
+    try {
+        const reporterId  = req.user.playerId;
+        const { playerId } = req.params; // the other person in the conversation
+
+        if (String(playerId) === String(reporterId)) {
+            return res.status(400).json({ error: 'Cannot report yourself' });
+        }
+
+        // Fetch reporter info
+        const reporterResult = await pool.query(
+            'SELECT COALESCE(alias, full_name) AS name FROM players WHERE id = $1',
+            [reporterId]
+        );
+        if (reporterResult.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+        const reporterName = reporterResult.rows[0].name;
+
+        // Fetch sender info
+        const senderResult = await pool.query(
+            'SELECT COALESCE(alias, full_name) AS name FROM players WHERE id = $1',
+            [playerId]
+        );
+        if (senderResult.rows.length === 0) return res.status(404).json({ error: 'Other player not found' });
+        const senderName = senderResult.rows[0].name;
+
+        // Get the most recent message sent FROM the other player TO the reporter
+        const msgResult = await pool.query(`
+            SELECT message, created_at
+            FROM direct_messages
+            WHERE sender_id = $1 AND recipient_id = $2 AND deleted_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+        `, [playerId, reporterId]);
+
+        const latestMsg    = msgResult.rows[0];
+        const messageText  = latestMsg ? latestMsg.message : '(no messages found)';
+        const messageDate  = latestMsg
+            ? new Date(latestMsg.created_at).toLocaleString('en-GB', {
+                day: '2-digit', month: 'short', year: 'numeric',
+                hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London'
+              })
+            : 'Unknown';
+
+        // Fire-and-forget email to superadmin
+        setImmediate(async () => {
+            try {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to: SUPERADMIN_EMAIL || 'totalfooty19@gmail.com',
+                    subject: `🚨 Message Reported — ${htmlEncode(reporterName).replace(/[\r\n]/g, '')}`,
+                    html: wrapEmailHtml(`
+                        <p style="font-weight:700;font-size:16px;margin:0 0 16px;">Message Report</p>
+                        <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
+                            <tr><td style="padding:6px 0;color:#888;width:140px;">Reported by</td>
+                                <td style="font-weight:900;">${htmlEncode(reporterName)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Message from</td>
+                                <td style="font-weight:900;">${htmlEncode(senderName)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Sent at</td>
+                                <td>${htmlEncode(messageDate)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;vertical-align:top;">Message</td>
+                                <td style="background:#1a1a1a;padding:10px;border-radius:6px;border-left:3px solid #ff3366;">
+                                    ${htmlEncode(messageText)}
+                                </td></tr>
+                        </table>
+                        <p style="color:#888;font-size:13px;margin-top:16px;">
+                            Log in to the admin panel to review the full conversation.
+                        </p>
+                    `)
+                });
+            } catch (e) {
+                console.error('DM report email failed (non-critical):', e.message);
+            }
+        });
+
+        setImmediate(() => auditLog(pool, reporterId, 'dm_reported', playerId,
+            `${reporterName} reported a message from ${senderName}`));
+
+        res.json({ message: 'Report submitted successfully' });
+    } catch (error) {
+        console.error('DM report error:', error);
+        res.status(500).json({ error: 'Failed to submit report' });
     }
 });
 
