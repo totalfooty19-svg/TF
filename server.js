@@ -763,6 +763,17 @@ app.post('/api/auth/register', async (req, res) => {
             console.error('Referrals table insert (non-critical):', refErr.message);
         }
         
+        // Auto-assign player_number >= 1000 for new players (squad players get synced when admin assigns squad_number)
+        try {
+            const maxNumResult = await pool.query(
+                'SELECT COALESCE(MAX(player_number), 999) as max_num FROM players WHERE player_number >= 1000'
+            );
+            const newPlayerNumber = parseInt(maxNumResult.rows[0].max_num) + 1;
+            await pool.query('UPDATE players SET player_number = $1 WHERE id = $2', [newPlayerNumber, playerId]);
+        } catch (pnErr) {
+            console.error('Player number assign (non-critical):', pnErr.message);
+        }
+
         // Handle ?referee_invite=CODE — one-time invite that grants Referee badge
         const referee_invite = req.body.referee_invite;
         if (referee_invite) {
@@ -2056,6 +2067,14 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
             ['goalkeeper','outfield'].includes(position) ? position : 'outfield',
             playerId]);
         
+        // Sync player_number with squad_number when a squad number is assigned/changed
+        if (squad_number !== undefined && squad_number !== null) {
+            await pool.query(
+                'UPDATE players SET player_number = $1 WHERE id = $2',
+                [squad_number, playerId]
+            );
+        }
+
         // FIX-053: Update balance with audit trail if changed
         if (balance !== undefined) {
             const prevResult = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
@@ -2720,7 +2739,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         }
         if (!isAdminUser && game.exclusivity === 'allstars') {
             const hasAllstars = await pool.query(
-                `SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'TF All Star'`,
+                `SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'Allstars'`,
                 [req.user.playerId]
             );
             if (!hasAllstars.rows.length) return res.status(403).json({ error: 'Access denied' });
@@ -3444,7 +3463,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 await sendNotification(notifType, req.user.playerId, gameData);
                 // Superadmin: notify on game/tournament registration
                 const playerRow = await pool.query(
-                    'SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+                    'SELECT p.full_name, p.alias, p.player_number, p.squad_number, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
                     [req.user.playerId]
                 );
                 const pName = playerRow.rows[0]?.alias || playerRow.rows[0]?.full_name || req.user.playerId;
@@ -8403,13 +8422,15 @@ app.post('/api/players/me/topup-request', authenticateToken, topupLimiter, async
         const { amount } = req.body;
         const playerId = req.user.playerId;
         const playerResult = await pool.query(
-            'SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+            'SELECT p.full_name, p.alias, p.player_number, p.squad_number, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
             [playerId]
         );
         if (playerResult.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
         const player = playerResult.rows[0];
         const displayName = player.alias || player.full_name;
         const amountStr = amount ? `£${parseFloat(amount).toFixed(2)}` : 'Amount not specified';
+        // Short payment reference: squad_number takes priority (1-999), else player_number (1000+)
+        const paymentRef = player.squad_number ?? player.player_number ?? 'N/A';
 
         setImmediate(async () => {
             try {
@@ -8422,7 +8443,7 @@ app.post('/api/players/me/topup-request', authenticateToken, topupLimiter, async
                         <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
                             <tr><td style="padding:6px 0;color:#888;width:120px;">Player</td><td style="font-weight:900;">${htmlEncode(displayName)}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Email</td><td>${htmlEncode(player.email)}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;">Player ID</td><td style="font-family:monospace;">${htmlEncode(playerId)}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Payment Ref</td><td style="font-weight:900;font-size:18px;">${htmlEncode(String(paymentRef))}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Requested</td><td style="font-weight:900;color:#00cc66;">${htmlEncode(amountStr)}</td></tr>
                         </table>
                         <p style="color:#888;font-size:13px;margin-top:16px;">Once you receive their bank transfer, use the admin panel to add the credits.</p>
