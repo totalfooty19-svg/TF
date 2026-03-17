@@ -8430,7 +8430,10 @@ app.post('/api/players/me/topup-request', authenticateToken, topupLimiter, async
         const displayName = player.alias || player.full_name;
         const amountStr = amount ? `£${parseFloat(amount).toFixed(2)}` : 'Amount not specified';
         // Short payment reference: squad_number takes priority (1-999), else player_number (1000+)
-        const paymentRef = player.squad_number ?? player.player_number ?? 'N/A';
+        // Use squad_number if set (including 0='00'), else player_number, else N/A
+        const paymentRef = (player.squad_number !== null && player.squad_number !== undefined)
+            ? (player.squad_number === 0 ? '00' : player.squad_number)
+            : (player.player_number ?? 'N/A');
 
         setImmediate(async () => {
             try {
