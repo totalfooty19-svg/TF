@@ -9536,6 +9536,20 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             ORDER BY al.created_at DESC
         `, [id]);
 
+        // 8. Discipline records with IDs (for removal UI)
+        const disciplineRecords = await pool.query(`
+            SELECT dr.id, dr.points, dr.offense_type, dr.created_at,
+                   g.game_date, v.name AS venue_name, g.game_url,
+                   COALESCE(p.alias, p.full_name) AS recorded_by_name
+            FROM discipline_records dr
+            LEFT JOIN games g ON g.id = dr.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN users u ON u.id = dr.recorded_by
+            LEFT JOIN players p ON p.user_id = u.id
+            WHERE dr.player_id = $1
+            ORDER BY dr.created_at DESC
+        `, [id]);
+
         // 7. Login events (from audit_logs where action = 'login' and target = this player)
         const loginEvents = await pool.query(`
             SELECT al.created_at, al.detail
@@ -9552,7 +9566,8 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             motmReceived: motmReceived.rows,
             motmVotesCast: motmVotes.rows,
             adminActions: adminActions.rows,
-            loginEvents: loginEvents.rows
+            loginEvents: loginEvents.rows,
+            disciplineRecords: disciplineRecords.rows
         });
     } catch (error) {
         console.error('Player audit error:', error);
@@ -9996,6 +10011,62 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
         await client.query('ROLLBACK').catch(() => {});
         console.error('Add discipline points error:', error);
         res.status(500).json({ error: 'Failed to add discipline points' });
+    } finally {
+        client.release();
+    }
+});
+
+// DELETE /api/admin/discipline/:recordId — remove a discipline record and recalculate tier
+app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, async (req, res) => {
+    const { recordId } = req.params;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Fetch the record before deleting so we can audit it
+        const recordResult = await client.query(
+            'SELECT id, player_id, points, offense_type FROM discipline_records WHERE id = $1',
+            [recordId]
+        );
+        if (recordResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Discipline record not found' });
+        }
+        const record = recordResult.rows[0];
+        const playerId = record.player_id;
+
+        // Delete the record
+        await client.query('DELETE FROM discipline_records WHERE id = $1', [recordId]);
+
+        // Recalculate revolving points (last 10 completed games + manual entries)
+        const revolvingResult = await client.query(`
+            SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
+            FROM discipline_records dr
+            WHERE dr.player_id = $1
+            AND (dr.game_id IS NULL OR dr.game_id IN (
+                SELECT r.game_id FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                WHERE r.player_id = $1 AND r.status = 'confirmed'
+                AND g.game_status = 'completed'
+                ORDER BY g.game_date DESC LIMIT 10
+            ))
+        `, [playerId]);
+        const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
+        const newTier = tierFromRevolvingPoints(revolvingPts);
+
+        await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, playerId]);
+        await client.query('COMMIT');
+
+        res.json({ success: true, newTier, revolvingTotal: revolvingPts, removedPoints: record.points });
+
+        setImmediate(async () => {
+            await auditLog(pool, req.user.playerId, 'discipline_removed', playerId,
+                `${record.points} point(s) removed (${record.offense_type}) | new revolving total: ${revolvingPts} | new tier: ${newTier}`);
+        });
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Remove discipline record error:', error);
+        res.status(500).json({ error: 'Failed to remove discipline record' });
     } finally {
         client.release();
     }
