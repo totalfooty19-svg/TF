@@ -7698,6 +7698,33 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
 });
 
 // Get player profile (public)
+// GET /api/public/players/leaderboard — public leaderboard (no auth, no PII)
+app.get('/api/public/players/leaderboard', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT p.id, p.alias, p.full_name, p.squad_number, p.photo_url,
+                   p.total_appearances, p.total_wins, p.motm_wins,
+                   CASE WHEN p.total_appearances > 0
+                        THEN ROUND(p.total_wins::numeric / p.total_appearances * 100, 1)
+                        ELSE 0 END AS win_percent,
+                   CASE WHEN p.total_appearances > 0
+                        THEN ROUND(p.motm_wins::numeric / p.total_appearances * 100, 1)
+                        ELSE 0 END AS motm_percent,
+                   (SELECT json_agg(json_build_object('name', b.name, 'icon', b.icon))
+                    FROM player_badges pb JOIN badges b ON pb.badge_id = b.id
+                    WHERE pb.player_id = p.id) AS badges
+            FROM players p
+            WHERE p.total_appearances > 0
+            ORDER BY p.total_appearances DESC, p.total_wins DESC
+            LIMIT 50
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Public leaderboard error:', error);
+        res.status(500).json({ error: 'Failed to load leaderboard' });
+    }
+});
+
 app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) => {
     try {
         const { playerId } = req.params;
