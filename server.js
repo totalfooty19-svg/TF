@@ -2889,9 +2889,6 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             if (![4, 6].includes(parseInt(tournamentTeamCount))) {
                 return res.status(400).json({ error: 'Tournament must have 4 or 6 teams' });
             }
-            if (regularity === 'weekly') {
-                return res.status(400).json({ error: 'Tournaments can only be created as one-off events' });
-            }
         }
 
         // Venue Clash validation — MISFITS-exclusive, both team names required
@@ -2943,15 +2940,18 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                         `INSERT INTO games (
                             venue_id, game_date, max_players, cost_per_player, format, regularity, 
                             exclusivity, position_type, game_url, series_id, 
-                            team_selection_type, external_opponent, tf_kit_color, opp_kit_color, star_rating,
+                            team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
+                            tournament_team_count, tournament_name, star_rating,
                             is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                             refs_required, ref_pay
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
                             gameExclusivity, positionType || 'outfield_gk', gameUrl, 
                             seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
+                            selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
+                            selType === 'tournament' ? (tournamentName || null) : null,
                             starRating || null,
                             vcEnabled || false,
                             vcEnabled ? venueClashTeam1Name.trim() : null,
@@ -2972,7 +2972,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                 });
                 setImmediate(() => createdGames.forEach(g => 
                     gameAuditLog(pool, g.id, req.user.playerId, 'game_created',
-                        `format:${format} type:normal cost:£${costPerPlayer} max:${maxPlayers} series:${seriesIdValue}`)
+                        `format:${format} type:${selType} cost:£${costPerPlayer} max:${maxPlayers} series:${seriesIdValue}`)
                 ));
             } catch (e) {
                 await wClient.query('ROLLBACK').catch(() => {});
@@ -9693,7 +9693,7 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             ORDER BY re.created_at DESC
         `, [id]);
 
-        // 3b. Current pair/avoid preferences for this player (across all active games)
+        // 3b. Current pair/avoid preferences for this player (upcoming games only)
         const regPreferences = await pool.query(`
             SELECT
                 r.game_id,
