@@ -2568,19 +2568,19 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
-            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/Daimler_Green_Grass.webp',
+            'Daimler Green': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/Corpus_Christi.jpg',
             'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
             'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
-            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
+            'Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Power League': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
         };
         
         // Add venue photos based on venue name
@@ -2642,19 +2642,19 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
-            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/Daimler_Green_Grass.webp',
+            'Daimler Green': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/Corpus_Christi.jpg',
             'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
             'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
-            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
+            'Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Power League': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
         };
         
         // Format the response
@@ -2802,19 +2802,19 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
-            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/Daimler_Green_Grass.webp',
+            'Daimler Green': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/Corpus_Christi.jpg',
             'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
             'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
-            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
+            'Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Power League': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
         };
         
         if (game.venue_name && venuePhotoMap[game.venue_name]) {
@@ -7438,19 +7438,19 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
         
         // Map venue names to their photo URLs (override database)
         const venuePhotoMap = {
-            'Daimler Green': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/daimler_green.jpg',
-            'Corpus Christi': 'https://totalfooty.co.uk/assets/corpus_Christi.jpg',
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/Daimler_Green_Grass.webp',
+            'Daimler Green': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/Corpus_Christi.jpg',
             'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
             'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
-            'Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Power League': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/powerleague.jpg',
-            'Sidney Stringer': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg',
-            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/sidney_stringer.jpg'
+            'Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Power League': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
         };
         
         const venue_photo = game.venue_name && venuePhotoMap[game.venue_name] 
