@@ -3470,14 +3470,29 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 const regType = status === 'backup'
                     ? (regBackupType === 'confirmed_backup' ? 'confirmed backup' : regBackupType === 'gk_backup' ? 'GK backup' : 'backup')
                     : 'standard';
-                const evtDetail = `Position: ${positionValue}${regBackupType ? ' | Backup type: ' + regBackupType : ''}${isComped ? ' | Comped' : ''}`;
                 // Fetch player name for readable audit trail
                 const _snRow = await pool.query('SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]).catch(() => ({ rows: [] }));
                 const _snName = _snRow.rows[0]?.alias || _snRow.rows[0]?.full_name || req.user.playerId;
+                // Resolve pair/avoid player names for audit (confirmed registrations only)
+                let _pairStr = '', _avoidStr = '';
+                if (status === 'confirmed' && registrationId) {
+                    const _prefRows = await pool.query(`
+                        SELECT rp.preference_type, COALESCE(p.alias, p.full_name) AS name
+                        FROM registration_preferences rp
+                        JOIN players p ON p.id = rp.target_player_id
+                        WHERE rp.registration_id = $1
+                        ORDER BY rp.preference_type, p.alias, p.full_name
+                    `, [registrationId]).catch(() => ({ rows: [] }));
+                    const _pairNames  = _prefRows.rows.filter(r => r.preference_type === 'pair').map(r => r.name);
+                    const _avoidNames = _prefRows.rows.filter(r => r.preference_type === 'avoid').map(r => r.name);
+                    if (_pairNames.length)  _pairStr  = ` | Pair: ${_pairNames.join(', ')}`;
+                    if (_avoidNames.length) _avoidStr = ` | Avoid: ${_avoidNames.join(', ')}`;
+                }
+                const evtDetail = `Position: ${positionValue}${regBackupType ? ' | Backup type: ' + regBackupType : ''}${isComped ? ' | Comped' : ''}${_pairStr}${_avoidStr}`;
                 await registrationEvent(pool, gameId, req.user.playerId, evtType, evtDetail);
                 await gameAuditLog(pool, gameId, null,
                     status === 'backup' ? 'player_backup_joined' : 'player_signed_up',
-                    `${_snName} (${req.user.playerId}) | ${regType} | Position: ${positionValue}${isComped ? ' | Comped' : ''}`);
+                    `${_snName} (${req.user.playerId}) | ${regType} | Position: ${positionValue}${isComped ? ' | Comped' : ''}${_pairStr}${_avoidStr}`);
             } catch (e) { /* non-critical */ }
             try {
                 const gameData = await getGameDataForNotification(gameId);
@@ -4693,6 +4708,32 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
 
         await client.query('COMMIT');
         res.json({ message: 'Preferences updated successfully' });
+
+        // Non-critical: audit preferences change with resolved names
+        setImmediate(async () => {
+            try {
+                const _pRow = await pool.query('SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]).catch(() => ({ rows: [] }));
+                const _pName = _pRow.rows[0]?.alias || _pRow.rows[0]?.full_name || req.user.playerId;
+                let _pairStr = '', _avoidStr = '';
+                if (pairs && pairs.length > 0) {
+                    const _pairRows = await pool.query(
+                        `SELECT COALESCE(alias, full_name) AS name FROM players WHERE id = ANY($1) ORDER BY alias, full_name`,
+                        [pairs]
+                    ).catch(() => ({ rows: [] }));
+                    if (_pairRows.rows.length) _pairStr = ` | Pair: ${_pairRows.rows.map(r => r.name).join(', ')}`;
+                }
+                if (avoids && avoids.length > 0) {
+                    const _avoidRows = await pool.query(
+                        `SELECT COALESCE(alias, full_name) AS name FROM players WHERE id = ANY($1) ORDER BY alias, full_name`,
+                        [avoids]
+                    ).catch(() => ({ rows: [] }));
+                    if (_avoidRows.rows.length) _avoidStr = ` | Avoid: ${_avoidRows.rows.map(r => r.name).join(', ')}`;
+                }
+                const _noPrefs = !_pairStr && !_avoidStr;
+                await gameAuditLog(pool, gameId, null, 'preferences_updated',
+                    `${_pName} (${req.user.playerId})${_noPrefs ? ' | cleared all preferences' : `${_pairStr}${_avoidStr}`}`);
+            } catch (e) { /* non-critical */ }
+        });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Update preferences error:', error);
@@ -9652,6 +9693,25 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             ORDER BY re.created_at DESC
         `, [id]);
 
+        // 3b. Current pair/avoid preferences for this player (across all active games)
+        const regPreferences = await pool.query(`
+            SELECT
+                r.game_id,
+                g.game_date,
+                g.game_url,
+                v.name AS venue_name,
+                rp.preference_type,
+                COALESCE(tp.alias, tp.full_name) AS target_name
+            FROM registrations r
+            JOIN games g ON g.id = r.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            JOIN registration_preferences rp ON rp.registration_id = r.id
+            JOIN players tp ON tp.id = rp.target_player_id
+            WHERE r.player_id = $1
+              AND g.game_status NOT IN ('completed', 'cancelled')
+            ORDER BY g.game_date ASC, rp.preference_type, tp.alias, tp.full_name
+        `, [id]);
+
         // 4. MOTM received
         const motmReceived = await pool.query(`
             SELECT g.game_date, g.format, g.game_url, v.name as venue_name,
@@ -9711,6 +9771,7 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             balance: balance.rows,
             stats: stats.rows,
             registrations: regEvents.rows,
+            registrationPreferences: regPreferences.rows,
             motmReceived: motmReceived.rows,
             motmVotesCast: motmVotes.rows,
             adminActions: adminActions.rows,
@@ -9748,10 +9809,22 @@ app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req
             ORDER BY re.created_at DESC
         `, [id]);
 
-        // 3. Registrations (signed up currently)
+        // 3. Registrations (signed up currently) with pair/avoid names
         const currentRegs = await pool.query(`
             SELECT r.registered_at, r.status, r.backup_type, r.position_preference,
-                   p.alias, p.full_name, p.squad_number
+                   p.alias, p.full_name, p.squad_number,
+                   (
+                       SELECT string_agg(COALESCE(tp.alias, tp.full_name), ', ' ORDER BY tp.alias, tp.full_name)
+                       FROM registration_preferences rp
+                       JOIN players tp ON tp.id = rp.target_player_id
+                       WHERE rp.registration_id = r.id AND rp.preference_type = 'pair'
+                   ) AS pair_names,
+                   (
+                       SELECT string_agg(COALESCE(tp.alias, tp.full_name), ', ' ORDER BY tp.alias, tp.full_name)
+                       FROM registration_preferences rp
+                       JOIN players tp ON tp.id = rp.target_player_id
+                       WHERE rp.registration_id = r.id AND rp.preference_type = 'avoid'
+                   ) AS avoid_names
             FROM registrations r
             JOIN players p ON p.id = r.player_id
             WHERE r.game_id = $1
