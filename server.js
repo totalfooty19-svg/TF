@@ -7698,6 +7698,40 @@ app.post('/api/games/:gameId/motm/vote', authenticateToken, async (req, res) => 
 });
 
 // Get player profile (public)
+// GET /api/public/games — public games list for unauthenticated visitors
+// Returns upcoming + recently completed games. No tier gating, no PII, no registration status.
+app.get('/api/public/games', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT g.id, g.game_url, g.game_date, g.game_status, g.format,
+                   g.max_players, g.team_selection_type, g.tournament_name,
+                   g.winning_team, g.motm_winner_id, g.teams_confirmed,
+                   g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
+                   g.external_opponent, g.tf_kit_color, g.opp_kit_color,
+                   g.exclusivity,
+                   v.name AS venue_name, v.address AS venue_address,
+                   gs.series_name,
+                   TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id) AS current_players,
+                   motm_p.alias AS motm_winner_alias, motm_p.full_name AS motm_winner_name
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN game_series gs ON gs.id = g.series_id
+            LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+            WHERE g.exclusivity IS NULL OR g.exclusivity NOT IN ('clm','allstars','misfits')
+            ORDER BY
+                CASE WHEN g.game_status IN ('available','confirmed') THEN 0 ELSE 1 END,
+                g.game_date ASC
+            LIMIT 50
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Public games list error:', error);
+        res.status(500).json({ error: 'Failed to load games' });
+    }
+});
+
 // GET /api/public/players/leaderboard — public leaderboard (no auth, no PII)
 app.get('/api/public/players/leaderboard', async (req, res) => {
     try {
