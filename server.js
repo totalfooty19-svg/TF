@@ -7857,7 +7857,7 @@ app.get('/api/public/games', async (req, res) => {
                    g.winning_team, g.motm_winner_id, g.teams_confirmed,
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    g.external_opponent, g.tf_kit_color, g.opp_kit_color,
-                   g.exclusivity,
+                   g.exclusivity, g.star_rating, g.cost_per_player,
                    v.name AS venue_name, v.address AS venue_address,
                    gs.series_name,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
