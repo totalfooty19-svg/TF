@@ -4729,12 +4729,32 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 const evtDetail = wasConfirmedBackup ? 'Was confirmed backup' : wasConfirmed ? `Refunded £${cost.toFixed(2)}` : 'No charge';
                 // Enrich audit with player full name for easier cross-reference
                 const _playerNameRow = await pool.query(
-                    'SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]
+                    'SELECT p.full_name, p.alias, u.email FROM players p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $1', [req.user.playerId]
                 ).catch(() => ({ rows: [] }));
                 const _pName = _playerNameRow.rows[0]?.alias || _playerNameRow.rows[0]?.full_name || req.user.playerId;
+                const _pEmail = _playerNameRow.rows[0]?.email || '';
                 await registrationEvent(pool, gameId, req.user.playerId, evtType, evtDetail);
                 await gameAuditLog(pool, gameId, null, evtType,
                     `${_pName} (${req.user.playerId}) | ${evtDetail}${promotedPlayer ? ` | Promoted: ${promotedPlayer.alias || promotedPlayer.full_name}` : ''}`);
+                // Notify superadmin
+                const _dropType = wasConfirmed ? 'Confirmed player' : wasConfirmedBackup ? 'Confirmed backup' : 'Backup';
+                const _notifRows = [
+                    ['Player',   _pName],
+                    ['Email',    _pEmail],
+                    ['Type',     _dropType],
+                    ['Game',     `${gameData.day} ${gameData.time}`],
+                    ['Venue',    gameData.venue],
+                ];
+                if (!wasComped && (wasConfirmed || wasConfirmedBackup) && cost > 0) {
+                    _notifRows.push(['Refunded', `£${cost.toFixed(2)}${refundTargetId !== req.user.playerId ? ' (to original payer)' : ''}`]);
+                }
+                if (promotedPlayer) {
+                    _notifRows.push(['Promoted', promotedPlayer.alias || promotedPlayer.full_name]);
+                }
+                if (guestRefunded && guestRefunded.count > 0) {
+                    _notifRows.push(['Guests removed', `${guestRefunded.count} (${guestRefunded.names})`]);
+                }
+                await notifyAdmin(`🚪 Drop Out — ${_pName}`, _notifRows);
             } catch (e) { /* non-critical */ }
         });
     } catch (error) {
