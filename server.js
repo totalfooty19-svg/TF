@@ -7874,7 +7874,26 @@ app.get('/api/public/games', async (req, res) => {
                 g.game_date ASC
             LIMIT 50
         `);
-        res.json(result.rows);
+        const venuePhotoMap = {
+            'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green - Grass': 'https://totalfooty.co.uk/assets/Daimler_Green_Grass.webp',
+            'Daimler Green': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Corpus Christi': 'https://totalfooty.co.uk/assets/Corpus_Christi.jpg',
+            'War Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Memorial Park': 'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Power League': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Coventry Powerleague': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+            'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+        };
+        const rows = result.rows.map(game => {
+            game.venue_photo = (game.venue_name && venuePhotoMap[game.venue_name]) || null;
+            return game;
+        });
+        res.json(rows);
     } catch (error) {
         console.error('Public games list error:', error);
         res.status(500).json({ error: 'Failed to load games' });
