@@ -10216,6 +10216,8 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
                  game_status = 'completed',
                  tournament_results_finalised = TRUE,
                  motm_voting_ends = NOW() + INTERVAL '24 hours',
+                 awards_open = true,
+                 awards_close_at = NOW() + INTERVAL '24 hours',
                  ref_review_ends = NOW() + INTERVAL '24 hours'
              WHERE id = $2`,
             [winningTeam, gameId]
