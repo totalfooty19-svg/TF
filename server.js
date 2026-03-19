@@ -250,6 +250,33 @@ async function statHistory(pool, playerId, changedBy, stats, tier = null) {
 
 
 
+// ── CREDIT TRANSACTION HELPER ────────────────────────────────────────────────
+// Records a credit_transactions row with balance_before / balance_after.
+// Call AFTER the UPDATE credits statement so the SELECT sees the new balance.
+//   db          — pool or client (transaction-aware)
+//   playerId    — player whose balance changed
+//   amount      — signed amount (negative = spend, positive = credit)
+//   type        — 'game_fee' | 'refund' | 'admin_adjustment' | …
+//   description — human-readable string
+//   adminId     — users.id of acting admin (null for player-initiated)
+async function recordCreditTransaction(db, playerId, amount, type, description, adminId = null) {
+    try {
+        const balRes = await db.query(
+            'SELECT balance FROM credits WHERE player_id = $1', [playerId]
+        );
+        const balAfter  = balRes.rows.length > 0 ? parseFloat(balRes.rows[0].balance) : 0;
+        const balBefore = parseFloat((balAfter - parseFloat(amount)).toFixed(2));
+        await db.query(
+            `INSERT INTO credit_transactions
+             (player_id, amount, type, description, admin_id, balance_before, balance_after)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [playerId, amount, type, description, adminId || null, balBefore, balAfter]
+        );
+    } catch (e) {
+        console.error('recordCreditTransaction failed (non-critical):', e.message);
+    }
+}
+
 // ── MIN RATING HELPER ────────────────────────────────────────────────────────
 // Single source of truth for the effective minimum OVR at any moment.
 // Visibility-only rating filter — determines which games appear on a player's list.
@@ -2011,10 +2038,7 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
             [parsedAmount, req.params.id]
         );
         
-        await pool.query(
-            'INSERT INTO credit_transactions (player_id, amount, type, description, admin_id) VALUES ($1, $2, $3, $4, $5)',
-            [req.params.id, amount, 'admin_adjustment', description, req.user.userId]
-        );
+        await recordCreditTransaction(pool, req.params.id, amount, 'admin_adjustment', description, req.user.userId);
         
         res.json({ message: 'Credits adjusted' });
 
@@ -2106,10 +2130,7 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
             const diff = parseFloat((newBalance - prevBalance).toFixed(2));
             await pool.query('UPDATE credits SET balance = $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [newBalance, playerId]);
             if (diff !== 0) {
-                await pool.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description, admin_id) VALUES ($1, $2, $3, $4, $5)',
-                    [playerId, diff, 'admin_adjustment', `Direct balance set to £${newBalance.toFixed(2)} by admin`, req.user.userId]
-                );
+                await recordCreditTransaction(pool, playerId, diff, 'admin_adjustment', `Direct balance set to £${newBalance.toFixed(2)} by admin`, req.user.userId);
                 // SEC-028: Audit log every balance change — tamper-evident record for disputes
                 await auditLog(pool, req.user.playerId, 'balance_adjustment',
                     playerId, `prev=£${prevBalance.toFixed(2)} new=£${newBalance.toFixed(2)} diff=£${diff}`);
@@ -3396,10 +3417,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                         [game.cost_per_player, req.user.playerId]
                     );
                     
-                    await client.query(
-                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                        [req.user.playerId, -game.cost_per_player, 'game_fee', `Confirmed backup for game ${gameId}`]
-                    );
+                    await recordCreditTransaction(client, req.user.playerId, -game.cost_per_player, 'game_fee', `Confirmed backup for game ${gameId}`);
                 }
             }
         } else {
@@ -3423,10 +3441,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     [game.cost_per_player, req.user.playerId]
                 );
                 
-                await client.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [req.user.playerId, -game.cost_per_player, 'game_fee', `Registration for game ${gameId}`]
-                );
+                await recordCreditTransaction(client, req.user.playerId, -game.cost_per_player, 'game_fee', `Registration for game ${gameId}`);
             }
         }
         
@@ -3695,10 +3710,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
             [cost, playerId]
         );
-        await client.query(
-            'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-            [playerId, -cost, 'game_fee', `+1 guest (${guestName.trim()}) for game`]
-        );
+        await recordCreditTransaction(client, playerId, -cost, 'game_fee', `+1 guest (${guestName.trim()}) for game`);
 
         // Get player's overall rating (compute from individual stats if overall_rating is NULL)
         const playerRating = await client.query(
@@ -3851,10 +3863,7 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                 [refundAmt, refundTargetId]
             );
-            await client.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [refundTargetId, refundAmt, 'refund', `Guest (${guest.guest_name}) removed - refund`]
-            );
+            await recordCreditTransaction(client, refundTargetId, refundAmt, 'refund', `Guest (${guest.guest_name}) removed - refund`);
         }
 
         // Re-number remaining guests for the original inviter so numbers stay sequential
@@ -3949,10 +3958,7 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                 [refundAmt, playerId]
             );
-            await client.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [playerId, refundAmt, 'refund', `Removed ${playerName} from game`]
-            );
+            await recordCreditTransaction(client, playerId, refundAmt, 'refund', `Removed ${playerName} from game`);
         }
 
         await client.query('COMMIT');
@@ -4187,10 +4193,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                 }
                 await client.query('UPDATE credits SET balance = balance - $1 WHERE player_id = $2', [game.cost_per_player, registeringPlayerId]);
-                await client.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [registeringPlayerId, -game.cost_per_player, 'game_fee', `Confirmed backup for ${friendName} in game ${gameId}`]
-                );
+                await recordCreditTransaction(client, registeringPlayerId, -game.cost_per_player, 'game_fee', `Confirmed backup for ${friendName} in game ${gameId}`);
             }
         } else {
             status = 'confirmed';
@@ -4200,10 +4203,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
             await client.query('UPDATE credits SET balance = balance - $1 WHERE player_id = $2', [game.cost_per_player, registeringPlayerId]);
-            await client.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [registeringPlayerId, -game.cost_per_player, 'game_fee', `Registration for ${friendName} in game ${gameId}`]
-            );
+            await recordCreditTransaction(client, registeringPlayerId, -game.cost_per_player, 'game_fee', `Registration for ${friendName} in game ${gameId}`);
         }
 
         // Insert registration under friend's player_id, recording who paid
@@ -4484,10 +4484,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             const refundDesc = refundTargetId !== req.user.playerId
                 ? `Dropout refund for ${req.user.playerId} (paid by you)`
                 : 'Dropped out of game - refund';
-            await client.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [refundTargetId, cost, 'refund', refundDesc]
-            );
+            await recordCreditTransaction(client, refundTargetId, cost, 'refund', refundDesc);
         }
         
         // Remove ALL guests if this player had any, and refund guest fees
@@ -4504,10 +4501,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                     [totalGuestRefund, req.user.playerId]
                 );
-                await client.query(
-                    'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                    [req.user.playerId, totalGuestRefund, 'refund', `${guestCheck.rows.length} guest(s) removed - dropout refund`]
-                );
+                await recordCreditTransaction(client, req.user.playerId, totalGuestRefund, 'refund', `${guestCheck.rows.length} guest(s) removed - dropout refund`);
             }
             guestRefunded = { names: guestNames, count: guestCheck.rows.length, amount: totalGuestRefund };
         }
@@ -4608,10 +4602,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                         [cost, promotedPlayer.player_id]
                     );
                     
-                    await client.query(
-                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                        [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
-                    );
+                    await recordCreditTransaction(client, promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`);
                 }
                 
                 // Create notification for promoted player
@@ -4662,10 +4653,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                                 [obCost, ob.player_id]
                             );
-                            await client.query(
-                                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                                [ob.player_id, obCost, 'refund', `Organiser comp — promoted from backup for game ${gameId}`]
-                            );
+                            await recordCreditTransaction(client, ob.player_id, obCost, 'refund', `Organiser comp — promoted from backup for game ${gameId}`);
                         }
                     }
                     // Promote: mark confirmed, comped, clear backup_type
@@ -5402,7 +5390,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
             const refundTarget = reg.registered_by_player_id || reg.player_id;
             if (refundAmt > 0) {
                 await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundAmt, refundTarget]);
-                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [refundTarget, refundAmt, 'refund', 'Game cancelled - refund']);
+                await recordCreditTransaction(client, refundTarget, refundAmt, 'refund', 'Game cancelled - refund');
                 totalRefunded++;
             }
         }
@@ -5411,7 +5399,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
             const guestRefund = parseFloat(guest.amount_paid || 0);
             if (guestRefund > 0) {
                 await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [guestRefund, guest.invited_by]);
-                await client.query('INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)', [guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund']);
+                await recordCreditTransaction(client, guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund');
             }
         }
         await client.query('DELETE FROM motm_votes WHERE game_id = $1', [gameId]);
@@ -5538,10 +5526,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
                         'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                         [refundAmt, refundTarget]
                     );
-                    await client.query(
-                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                        [refundTarget, refundAmt, 'refund', 'Series ' + seriesName + ' cancelled - refund']
-                    );
+                    await recordCreditTransaction(client, refundTarget, refundAmt, 'refund', 'Series ' + seriesName + ' cancelled - refund');
                     totalRefunded++;
                 }
             }
@@ -5558,10 +5543,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
                         'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                         [guestRefund, guest.invited_by]
                     );
-                    await client.query(
-                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                        [guest.invited_by, guestRefund, 'refund', 'Series ' + seriesName + ' cancelled - +1 guest refund']
-                    );
+                    await recordCreditTransaction(client, guest.invited_by, guestRefund, 'refund', 'Series ' + seriesName + ' cancelled - +1 guest refund');
                     guestRefunds++;
                 }
             }
@@ -6318,11 +6300,7 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                         );
                         
                         // Log the refund
-                        await client.query(
-                            `INSERT INTO credit_transactions (player_id, amount, type, description)
-                             VALUES ($1, $2, 'refund', $3)`,
-                            [playerId, refundAmount, `Removed from game - £${refundAmount.toFixed(2)} refund`]
-                        );
+                        await recordCreditTransaction(client, playerId, refundAmount, 'refund', `Removed from game - £${refundAmount.toFixed(2)} refund`);
                     }
                     
                     // Award discipline points if late dropout
@@ -7950,10 +7928,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
                 [cost, playerId]
             );
         
-            await txClient.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [playerId, -cost, 'game_fee', `Admin added to game ${gameId}`]
-            );
+            await recordCreditTransaction(txClient, playerId, -cost, 'game_fee', `Admin added to game ${gameId}`);
         
             // Add player
             await txClient.query(
@@ -8067,11 +8042,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         );
         
         // Record transaction
-        await pool.query(
-            `INSERT INTO credit_transactions (player_id, amount, type, description)
-             VALUES ($1, $2, $3, $4)`,
-            [playerId, -customCharge, 'game_fee', `Game registration (custom charge: £${customCharge.toFixed(2)})`]
-        );
+        await recordCreditTransaction(pool, playerId, -customCharge, 'game_fee', `Game registration (custom charge: £${customCharge.toFixed(2)})`);
         
         // Add player
         await pool.query(
@@ -8128,10 +8099,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             const refundDesc = refundTargetId !== playerId
                 ? `Admin removed ${playerId} from game — refund to original payer`
                 : `Admin removed from game ${gameId}`;
-            await pool.query(
-                'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                [refundTargetId, cost, 'refund', refundDesc]
-            );
+            await recordCreditTransaction(pool, refundTargetId, cost, 'refund', refundDesc);
         }
         
         // Delete registration
@@ -8201,10 +8169,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                         'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
                         [cost, promotedPlayer.player_id]
                     );
-                    await pool.query(
-                        'INSERT INTO credit_transactions (player_id, amount, type, description) VALUES ($1, $2, $3, $4)',
-                        [promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`]
-                    );
+                    await recordCreditTransaction(pool, promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`);
                 }
                 
                 try {
@@ -10246,6 +10211,32 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             LIMIT 100
         `, [id]);
 
+        // 9a. Award votes CAST by this player
+        const awardVotesCast = await pool.query(`
+            SELECT gav.award_type, COALESCE(gav.created_at, g.game_date) AS created_at,
+                   g.game_date, g.game_url, v.name AS venue_name,
+                   p.alias AS nominee_alias, p.full_name AS nominee_name
+            FROM game_award_votes gav
+            JOIN games g ON g.id = gav.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            JOIN players p ON p.id = gav.nominee_player_id
+            WHERE gav.voter_player_id = $1
+            ORDER BY COALESCE(gav.created_at, g.game_date) DESC
+        `, [id]);
+
+        // 9b. Award votes RECEIVED by this player
+        const awardVotesReceived = await pool.query(`
+            SELECT gav.award_type, COALESCE(gav.created_at, g.game_date) AS created_at,
+                   g.game_date, g.game_url, v.name AS venue_name,
+                   p.alias AS voter_alias, p.full_name AS voter_name
+            FROM game_award_votes gav
+            JOIN games g ON g.id = gav.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            JOIN players p ON p.id = gav.voter_player_id
+            WHERE gav.nominee_player_id = $1
+            ORDER BY COALESCE(gav.created_at, g.game_date) DESC
+        `, [id]);
+
         res.json({
             balance: balance.rows,
             stats: stats.rows,
@@ -10253,6 +10244,8 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             registrationPreferences: regPreferences.rows,
             motmReceived: motmReceived.rows,
             motmVotesCast: motmVotes.rows,
+            awardVotesCast: awardVotesCast.rows,
+            awardVotesReceived: awardVotesReceived.rows,
             adminActions: adminActions.rows,
             loginEvents: loginEvents.rows,
             disciplineRecords: disciplineRecords.rows
@@ -10322,11 +10315,26 @@ app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req
             LIMIT 200
         `, [id]).catch(() => ({ rows: [] })); // graceful if table doesn't exist yet
 
+        // 5. Award votes for this game (full breakdown — who voted for whom per award)
+        const awardVotes = await pool.query(`
+            SELECT gav.award_type,
+                   vp.alias AS voter_alias, vp.full_name AS voter_name, vp.squad_number AS voter_squad,
+                   np.alias AS nominee_alias, np.full_name AS nominee_name, np.squad_number AS nominee_squad,
+                   COALESCE(gav.created_at, g.game_date) AS voted_at
+            FROM game_award_votes gav
+            JOIN games g ON g.id = gav.game_id
+            JOIN players vp ON vp.id = gav.voter_player_id
+            JOIN players np ON np.id = gav.nominee_player_id
+            WHERE gav.game_id = $1
+            ORDER BY gav.award_type ASC, COALESCE(gav.created_at, g.game_date) ASC
+        `, [id]).catch(() => ({ rows: [] }));
+
         res.json({
             gameLogs: gameLogs.rows,
             registrationEvents: regEvents.rows,
             currentRegistrations: currentRegs.rows,
-            urlViews: urlViews.rows
+            urlViews: urlViews.rows,
+            awardVotes: awardVotes.rows
         });
     } catch (error) {
         console.error('Game audit error:', error);
@@ -11715,6 +11723,7 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
         moderation: ['dm_reported','discipline_added','player_unbanned'],
         admins:     ['admin_added','admin_removed','ref_admin_added'],
         motm:       ['motm_voting_started','motm_vote','motm_finalized'],
+        awards:     ['award_vote'],
     };
 
     const allGroups = Object.keys(GROUP_ACTIONS);
@@ -11725,16 +11734,23 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
         const params = [];
         let wherePlayer = 'WHERE 1=1';
         let whereGame   = 'WHERE 1=1';
+        // award_vote is synthetic (game_award_votes has no action col) — include unless filtering to another group
+        let whereAward  = 'WHERE 1=1';
 
         if (before) {
             params.push(before);
             wherePlayer += ` AND al.created_at < $${params.length}`;
             whereGame   += ` AND gal.created_at < $${params.length}`;
+            whereAward  += ` AND COALESCE(gav.created_at, g.game_date) < $${params.length}`;
         }
         if (filterActions) {
             params.push(filterActions);
             wherePlayer += ` AND al.action = ANY($${params.length})`;
             whereGame   += ` AND gal.action = ANY($${params.length})`;
+            // If the active filter doesn't include award_vote, suppress the awards branch entirely
+            if (!filterActions.includes('award_vote')) {
+                whereAward = 'WHERE 1=0';
+            }
         }
         params.push(limit);
         const limitParam = params.length;
@@ -11768,6 +11784,25 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
             FROM game_audit_log gal
             LEFT JOIN players ap ON ap.id = gal.admin_id
             ${whereGame}
+
+            UNION ALL
+
+            SELECT
+                'award'             AS source,
+                'award_vote'        AS action,
+                CONCAT(gav.award_type, ' | ',
+                       COALESCE(vp.alias, vp.full_name), ' → ',
+                       COALESCE(np.alias, np.full_name))  AS detail,
+                COALESCE(gav.created_at, g.game_date)     AS created_at,
+                gav.voter_player_id::text                 AS target_id,
+                gav.game_id::text                         AS game_id,
+                COALESCE(vp.alias, vp.full_name)          AS admin_name,
+                COALESCE(np.alias, np.full_name)          AS target_name
+            FROM game_award_votes gav
+            JOIN games g ON g.id = gav.game_id
+            JOIN players vp ON vp.id = gav.voter_player_id
+            JOIN players np ON np.id = gav.nominee_player_id
+            ${whereAward}
 
             ORDER BY created_at DESC
             LIMIT $${limitParam}
