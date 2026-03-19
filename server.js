@@ -9194,10 +9194,13 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
             [gameId]
         );
 
-        // Get confirmed awards (after close)
+        // Get confirmed awards (after close) — include player name for frontend rendering
         const awardsResult = await pool.query(
-            `SELECT ga.award_type, ga.recipient_player_id, ga.motm_value, ga.vote_count, ga.award_source, ga.series_day
-             FROM game_awards ga WHERE ga.game_id = $1`,
+            `SELECT ga.award_type, ga.recipient_player_id, ga.motm_value, ga.vote_count, ga.award_source, ga.series_day,
+                    p.alias, p.full_name
+             FROM game_awards ga
+             JOIN players p ON p.id = ga.recipient_player_id
+             WHERE ga.game_id = $1`,
             [gameId]
         );
 
