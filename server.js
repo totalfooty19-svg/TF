@@ -318,6 +318,19 @@ const NOTIF_TEMPLATES = {
     ref_review_open:   d => ({ title: 'Rate the referee 🌟',       body: `How was the ref on ${d.day}? Leave your rating.` }),
     account_reinstated: _d => ({ title: 'Account Reinstated ✅',   body: 'Your account has been reinstated. Welcome back.' }),
     new_dm:            d => ({ title: 'New message 💬',            body: d.preview || 'You have a new message.' }),
+    // TF Game Awards
+    award_motm:           d => ({ title: '⭐ Man of the Match!',          body: `You won MOTM for ${d.day} at ${d.venue}!` }),
+    award_engine:         d => ({ title: '🔋 Best Engine!',               body: `Voted Best Engine for ${d.day} at ${d.venue}.` }),
+    award_wall:           d => ({ title: '🧱 Brick Wall!',                body: `Voted Brick Wall for ${d.day} at ${d.venue}.` }),
+    award_reckless:       d => ({ title: '🦵 Reckless Tackler',           body: `You won Reckless Tackler for ${d.day}. You know what you did.` }),
+    award_hollywood:      d => ({ title: '🎬 Mr Hollywood',               body: `You won Mr Hollywood for ${d.day}. No end product, as always.` }),
+    award_moaner:         d => ({ title: '😩 The Moaner',                 body: `You won The Moaner for ${d.day}. The team appreciated your encouragement.` }),
+    award_howler:         d => ({ title: '🤦 Howler Award',               body: `You won The Howler for ${d.day}. Moment of the match, for the wrong reasons.` }),
+    award_mr_day:         d => ({ title: `📅 Mr ${d.day}!`,              body: `7 consecutive ${d.day} appearances in a row. Legendary consistency.` }),
+    award_on_fire:        d => ({ title: "🔥 You're On Fire!",           body: `4 wins in a row. Your team can't stop winning right now.` }),
+    award_back_from_dead: d => ({ title: "🧟 Back from the Dead!",        body: `Welcome back! You've been away for a while. Good to have you back.` }),
+    award_engine_badge:   _d => ({ title: '🔋 Engine Badge Earned!',      body: '5 Best Engine awards — the Engine Badge is now on your profile.' }),
+    award_wall_badge:     _d => ({ title: '🧱 Brick Wall Badge Earned!',  body: '5 Brick Wall awards — the Brick Wall Badge is now on your profile.' }),
 };
 
 // sendNotification: send an Expo push notification to a player's registered devices.
@@ -6683,12 +6696,15 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         const shouldHaveMotm = !(isExternal && winningTeam === 'blue');
         
         // 1. Update game winning team and status
+        // awards_open = true opens TF Game Awards voting automatically (replaces old MOTM nominee selection)
         await client.query(
             `UPDATE games 
              SET winning_team = $1, 
                  game_status = 'completed',
                  team_balance_score = $3,
                  motm_voting_ends = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'},
+                 awards_open = ${shouldHaveMotm ? 'true' : 'false'},
+                 awards_close_at = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'},
                  ref_review_ends = NOW() + INTERVAL '24 hours'
              WHERE id = $2`,
             [winningTeam, gameId, validatedBalanceScore]
@@ -6856,6 +6872,47 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             }
         });
 
+        // TF Game Awards — automated award checks (non-critical, run after commit)
+        if (shouldHaveMotm) {
+            setImmediate(async () => {
+                try {
+                    // Get day name and series info for Mr Day check
+                    const gameInfoResult = await pool.query(
+                        `SELECT series_id, TO_CHAR(game_date AT TIME ZONE 'Europe/London', 'Day') as day_name
+                         FROM games WHERE id = $1`,
+                        [gameId]
+                    );
+                    const gameInfo = gameInfoResult.rows[0];
+                    const dayName = (gameInfo?.day_name || '').trim();
+                    const seriesId = gameInfo?.series_id;
+
+                    // Get winning player IDs for On Fire check
+                    let winningPlayerIds = [];
+                    if (winningTeam && winningTeam !== 'draw') {
+                        if (isExternal && winningTeam === 'red') {
+                            winningPlayerIds = showedUpPlayerIds;
+                        } else if (!isExternal) {
+                            const winningTeamName = winningTeam === 'red' ? 'Red' : 'Blue';
+                            const wpResult = await pool.query(
+                                `SELECT tp.player_id FROM team_players tp
+                                 JOIN teams t ON t.id = tp.team_id
+                                 WHERE t.game_id = $1 AND t.team_name = $2`,
+                                [gameId, winningTeamName]
+                            );
+                            winningPlayerIds = wpResult.rows.map(r => r.player_id);
+                        }
+                    }
+
+                    // Run all three automated checks
+                    await checkMrDay(gameId, showedUpPlayerIds, seriesId, dayName);
+                    await checkOnFire(gameId, showedUpPlayerIds, winningPlayerIds);
+                    await checkBackFromDead(gameId, showedUpPlayerIds);
+                } catch (e) {
+                    console.error('Automated award checks failed (non-critical):', e.message);
+                }
+            });
+        }
+
         // Recalculate reliability tiers for disciplined players AFTER commit, using pool
         // (not client) with ::uuid cast so the overloaded DB function resolves correctly
         if (uniqueDisciplinedIds.length > 0) {
@@ -6882,7 +6939,9 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         res.json({ 
             message: 'Game completed successfully',
             motmNominees: nomineesInserted,
-            motmVotingEnds: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+            motmVotingEnds: shouldHaveMotm ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null,
+            awardsOpen: shouldHaveMotm,
+            awardsCloseAt: shouldHaveMotm ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null,
         });
         setImmediate(async () => {
             await gameAuditLog(pool, gameId, req.user.playerId, 'game_completed',
@@ -8699,6 +8758,703 @@ async function finaliseRefereeReviews(gameId) {
     }
 }
 
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TF GAME AWARDS — helper functions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler'];
+const POSITIVE_AWARDS = ['motm','best_engine','brick_wall'];
+const BANTER_AWARDS   = ['reckless_tackler','mr_hollywood','the_moaner','howler'];
+const MIN_VOTES_REQUIRED = 3; // all awards except MOTM
+
+// Send email to a player for an award win — fire-and-forget, never throws
+async function sendAwardEmail(playerId, awardType, extraData = {}) {
+    try {
+        const playerResult = await pool.query(
+            'SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+            [playerId]
+        );
+        if (playerResult.rows.length === 0) return;
+        const player = playerResult.rows[0];
+        const displayName = player.alias || player.full_name;
+        const to = player.email;
+        if (!to) return;
+
+        const templateMap = {
+            motm:           'award_motm',
+            best_engine:    'award_engine',
+            brick_wall:     'award_wall',
+            reckless_tackler: 'award_reckless',
+            mr_hollywood:   'award_hollywood',
+            the_moaner:     'award_moaner',
+            howler:         'award_howler',
+            mr_day:         'award_mr_day',
+            on_fire:        'award_on_fire',
+            back_from_dead: 'award_back_from_dead',
+            engine_badge:   'award_engine_badge',
+            wall_badge:     'award_wall_badge',
+        };
+        const tmplKey = templateMap[awardType];
+        if (!tmplKey || !NOTIF_TEMPLATES[tmplKey]) return;
+        const { title, body } = NOTIF_TEMPLATES[tmplKey]({ ...extraData, winnerName: displayName });
+
+        await emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to,
+            subject: title,
+            html: wrapEmailHtml(
+                `<p style="color:#888;font-size:14px;margin:0 0 16px">${htmlEncode(title)}</p>` +
+                `<p style="color:#ccc;font-size:15px;margin:0 0 24px">${htmlEncode(body)}</p>` +
+                `<p style="color:#555;font-size:13px;">View the game: ` +
+                `<a href="https://totalfooty.co.uk/game.html?url=${encodeURIComponent(extraData.gameUrl || '')}" ` +
+                `style="color:#c0392b;">See game page</a></p>`
+            ),
+        });
+    } catch (e) {
+        console.warn(`sendAwardEmail(${awardType}, ${playerId}) failed (non-critical):`, e.message);
+    }
+}
+
+// Check and grant Engine or Brick Wall badge after award confirmation
+async function checkAndGrantAwardBadge(playerId, awardType) {
+    try {
+        const badgeNameMap = { best_engine: 'Engine', brick_wall: 'Brick Wall' };
+        const badgeName = badgeNameMap[awardType];
+        if (!badgeName) return;
+
+        const countResult = await pool.query(
+            'SELECT COUNT(*) as cnt FROM game_awards WHERE recipient_player_id = $1 AND award_type = $2',
+            [playerId, awardType]
+        );
+        const cnt = parseInt(countResult.rows[0].cnt);
+        if (cnt < 5) return;
+
+        // Check badge exists and player doesn't already have it
+        const badgeResult = await pool.query('SELECT id FROM badges WHERE name = $1', [badgeName]);
+        if (badgeResult.rows.length === 0) return;
+        const badgeId = badgeResult.rows[0].id;
+
+        const alreadyHas = await pool.query(
+            'SELECT 1 FROM player_badges WHERE player_id = $1 AND badge_id = $2',
+            [playerId, badgeId]
+        );
+        if (alreadyHas.rows.length > 0) return;
+
+        await pool.query(
+            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+            [playerId, badgeId]
+        );
+        const emailType = awardType === 'best_engine' ? 'engine_badge' : 'wall_badge';
+        setImmediate(() => sendAwardEmail(playerId, emailType, {}));
+        console.log(`✅ ${badgeName} badge auto-granted to player ${playerId}`);
+    } catch (e) {
+        console.warn(`checkAndGrantAwardBadge(${awardType}, ${playerId}) failed:`, e.message);
+    }
+}
+
+// Close awards for a game — tally votes, confirm winners, handle ties, send emails
+async function closeAwards(gameId) {
+    try {
+        // Get game info
+        const gameResult = await pool.query(
+            `SELECT g.awards_open, g.awards_close_at, g.game_url,
+                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'Day') as day_name,
+                    v.name as venue_name
+             FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE g.id = $1`,
+            [gameId]
+        );
+        if (gameResult.rows.length === 0) return;
+        const game = gameResult.rows[0];
+        const dayName = (game.day_name || '').trim();
+        const venueName = game.venue_name || 'the match';
+        const gameUrl = game.game_url || '';
+
+        // Mark awards closed
+        await pool.query(
+            'UPDATE games SET awards_open = false WHERE id = $1',
+            [gameId]
+        );
+
+        // Get all votes for this game
+        const votesResult = await pool.query(
+            `SELECT award_type, nominee_player_id, COUNT(*) as votes
+             FROM game_award_votes
+             WHERE game_id = $1
+             GROUP BY award_type, nominee_player_id`,
+            [gameId]
+        );
+
+        // Group by award type
+        const votesByAward = {};
+        for (const row of votesResult.rows) {
+            if (!votesByAward[row.award_type]) votesByAward[row.award_type] = [];
+            votesByAward[row.award_type].push({ playerId: row.nominee_player_id, votes: parseInt(row.votes) });
+        }
+
+        const confirmedWinners = [];
+
+        for (const awardType of AWARD_TYPES) {
+            const nominees = (votesByAward[awardType] || []).sort((a, b) => b.votes - a.votes);
+            if (nominees.length === 0) continue;
+
+            const maxVotes = nominees[0].votes;
+            if (awardType !== 'motm' && maxVotes < MIN_VOTES_REQUIRED) continue;
+
+            const winners = nominees.filter(n => n.votes === maxVotes);
+
+            for (const winner of winners) {
+                const motmValue = awardType === 'motm' ? (1.0 / winners.length) : 1.00;
+
+                // Check not already inserted (idempotency)
+                const exists = await pool.query(
+                    'SELECT 1 FROM game_awards WHERE game_id = $1 AND recipient_player_id = $2 AND award_type = $3',
+                    [gameId, winner.playerId, awardType]
+                );
+                if (exists.rows.length > 0) continue;
+
+                await pool.query(
+                    `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, motm_value, vote_count)
+                     VALUES ($1, $2, $3, 'voted', $4, $5)`,
+                    [gameId, winner.playerId, awardType, motmValue, winner.votes]
+                );
+
+                // Update players.motm_wins for MOTM
+                if (awardType === 'motm') {
+                    await pool.query(
+                        'UPDATE players SET motm_wins = motm_wins + $1 WHERE id = $2',
+                        [motmValue, winner.playerId]
+                    );
+                }
+
+                confirmedWinners.push({ awardType, playerId: winner.playerId, votes: winner.votes, motmValue });
+
+                // Send notification + email (non-critical, async)
+                setImmediate(async () => {
+                    try {
+                        const notifTypeMap = {
+                            motm: 'motm_winner', best_engine: 'teams_created',
+                        };
+                        await sendAwardEmail(winner.playerId, awardType, {
+                            day: dayName, venue: venueName, gameUrl
+                        });
+                        if (awardType === 'motm') {
+                            // Also send existing push notification for MOTM
+                            const pResult = await pool.query(
+                                'SELECT p.alias, p.full_name FROM players p WHERE p.id = $1', [winner.playerId]
+                            );
+                            const winnerName = pResult.rows[0]?.alias || pResult.rows[0]?.full_name || 'Player';
+                            await sendNotification('motm_winner', winner.playerId, {
+                                day: dayName, venue: venueName, winnerName
+                            });
+                        }
+                        // Badge checks for Best Engine and Brick Wall
+                        if (awardType === 'best_engine' || awardType === 'brick_wall') {
+                            await checkAndGrantAwardBadge(winner.playerId, awardType);
+                        }
+                    } catch (e) {
+                        console.warn(`Post-close award processing failed (${awardType}):`, e.message);
+                    }
+                });
+            }
+        }
+
+        // Admin summary email
+        if (confirmedWinners.length > 0) {
+            setImmediate(async () => {
+                try {
+                    const rows = confirmedWinners.map(w => {
+                        const pResult = pool.query('SELECT alias, full_name FROM players WHERE id = $1', [w.playerId]);
+                        return [`${w.awardType}`, `${w.playerId} (${w.votes} votes)`];
+                    });
+                    await notifyAdmin(`📋 TF Game Awards closed — ${dayName} at ${venueName}`, [
+                        ['Game', `${dayName} at ${venueName}`],
+                        ['Awards confirmed', String(confirmedWinners.length)],
+                        ...confirmedWinners.map(w => [w.awardType, `${w.votes} votes`]),
+                    ]);
+                } catch (e) { /* non-critical */ }
+            });
+        }
+
+        console.log(`✅ Awards closed for game ${gameId}: ${confirmedWinners.length} award(s) confirmed`);
+        return { confirmedWinners };
+    } catch (e) {
+        console.error(`closeAwards(${gameId}) failed:`, e.message);
+    }
+}
+
+// Check Mr [Day] — 7 consecutive appearances in same series
+async function checkMrDay(gameId, playerIds, seriesId, dayName) {
+    if (!seriesId || !playerIds.length || !dayName) return;
+    const normalizedDay = dayName.trim().toLowerCase();
+    const awardType = `mr_${normalizedDay}`; // e.g. mr_wednesday
+
+    for (const playerId of playerIds) {
+        try {
+            // Get this player's streak row
+            const streakResult = await pool.query(
+                'SELECT series_streaks, mr_day_awarded FROM player_streaks WHERE player_id = $1',
+                [playerId]
+            );
+            if (streakResult.rows.length === 0) continue;
+            const streaks = streakResult.rows[0].series_streaks || {};
+            const awarded = streakResult.rows[0].mr_day_awarded || {};
+
+            // Check if already awarded for this series
+            if (awarded[seriesId]) continue;
+
+            // Count consecutive appearances in this series (check last game before this one)
+            const prevGamesResult = await pool.query(
+                `SELECT g.id FROM games g
+                 JOIN registrations r ON r.game_id = g.id
+                 WHERE g.series_id = $1
+                   AND r.player_id = $2
+                   AND r.status = 'confirmed'
+                   AND g.game_status = 'completed'
+                   AND g.id != $3
+                 ORDER BY g.game_date DESC`,
+                [seriesId, playerId, gameId]
+            );
+
+            // Count consecutive from most recent backwards
+            let consecutive = 1; // include current game
+            const prevIds = prevGamesResult.rows.map(r => r.id);
+
+            // Get all series games in order to check for gaps
+            const allSeriesGamesResult = await pool.query(
+                `SELECT g.id,
+                        EXISTS(SELECT 1 FROM registrations r2
+                               WHERE r2.game_id = g.id AND r2.player_id = $1 AND r2.status = 'confirmed') as played
+                 FROM games g
+                 WHERE g.series_id = $2 AND g.game_status = 'completed' AND g.id != $3
+                 ORDER BY g.game_date DESC
+                 LIMIT 10`,
+                [playerId, seriesId, gameId]
+            );
+
+            for (const row of allSeriesGamesResult.rows) {
+                if (row.played) consecutive++;
+                else break; // gap found
+            }
+
+            if (consecutive >= 7) {
+                // Grant Mr Day award
+                const exists = await pool.query(
+                    'SELECT 1 FROM game_awards WHERE game_id = $1 AND recipient_player_id = $2 AND award_type = $3',
+                    [gameId, playerId, awardType]
+                );
+                if (exists.rows.length === 0) {
+                    await pool.query(
+                        `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, series_day)
+                         VALUES ($1, $2, $3, 'automated', $4)`,
+                        [gameId, playerId, awardType, normalizedDay]
+                    );
+                    // Mark as awarded for this series
+                    awarded[seriesId] = true;
+                    await pool.query(
+                        'UPDATE player_streaks SET mr_day_awarded = $1 WHERE player_id = $2',
+                        [JSON.stringify(awarded), playerId]
+                    );
+                    const capDay = normalizedDay.charAt(0).toUpperCase() + normalizedDay.slice(1);
+                    setImmediate(() => sendAwardEmail(playerId, 'mr_day', { day: capDay }));
+                    console.log(`✅ Mr ${capDay} awarded to player ${playerId} (${consecutive} consecutive)`);
+                }
+            } else {
+                // Update streak count for info
+                streaks[seriesId] = consecutive;
+                await pool.query(
+                    'UPDATE player_streaks SET series_streaks = $1 WHERE player_id = $2',
+                    [JSON.stringify(streaks), playerId]
+                );
+            }
+        } catch (e) {
+            console.warn(`checkMrDay failed for player ${playerId}:`, e.message);
+        }
+    }
+}
+
+// Check On Fire — 4 consecutive wins (one award per streak, live counter always shown)
+async function checkOnFire(gameId, playerIds, winningPlayerIds) {
+    const winnerSet = new Set(winningPlayerIds);
+
+    for (const playerId of playerIds) {
+        try {
+            const streakResult = await pool.query(
+                'SELECT current_win_streak, on_fire_awarded FROM player_streaks WHERE player_id = $1',
+                [playerId]
+            );
+            if (streakResult.rows.length === 0) continue;
+
+            let streak = streakResult.rows[0].current_win_streak || 0;
+            let onFireAwarded = streakResult.rows[0].on_fire_awarded || false;
+            const isWinner = winnerSet.has(playerId);
+
+            if (isWinner) {
+                streak++;
+                if (streak >= 4 && !onFireAwarded) {
+                    // Grant On Fire award
+                    const exists = await pool.query(
+                        'SELECT 1 FROM game_awards WHERE game_id = $1 AND recipient_player_id = $2 AND award_type = $3',
+                        [gameId, playerId, 'on_fire']
+                    );
+                    if (exists.rows.length === 0) {
+                        await pool.query(
+                            `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source)
+                             VALUES ($1, $2, 'on_fire', 'automated')`,
+                            [gameId, playerId]
+                        );
+                        onFireAwarded = true;
+                        setImmediate(() => sendAwardEmail(playerId, 'on_fire', {}));
+                        console.log(`✅ On Fire awarded to player ${playerId} (${streak} wins in a row)`);
+                    }
+                }
+            } else {
+                // Loss or draw — reset streak
+                streak = 0;
+                onFireAwarded = false;
+            }
+
+            await pool.query(
+                'UPDATE player_streaks SET current_win_streak = $1, on_fire_awarded = $2, updated_at = NOW() WHERE player_id = $3',
+                [streak, onFireAwarded, playerId]
+            );
+        } catch (e) {
+            console.warn(`checkOnFire failed for player ${playerId}:`, e.message);
+        }
+    }
+}
+
+// Check Back from the Dead — 3 months absence, fires on registration day
+async function checkBackFromDead(gameId, playerIds) {
+    const THREE_MONTHS_MS = 90 * 24 * 60 * 60 * 1000;
+
+    for (const playerId of playerIds) {
+        try {
+            const streakResult = await pool.query(
+                'SELECT last_game_date FROM player_streaks WHERE player_id = $1',
+                [playerId]
+            );
+            if (streakResult.rows.length === 0) continue;
+            const lastGame = streakResult.rows[0].last_game_date;
+
+            if (lastGame && (Date.now() - new Date(lastGame).getTime()) >= THREE_MONTHS_MS) {
+                // Grant Back from the Dead
+                const exists = await pool.query(
+                    'SELECT 1 FROM game_awards WHERE game_id = $1 AND recipient_player_id = $2 AND award_type = $3',
+                    [gameId, playerId, 'back_from_dead']
+                );
+                if (exists.rows.length === 0) {
+                    await pool.query(
+                        `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source)
+                         VALUES ($1, $2, 'back_from_dead', 'automated')`,
+                        [gameId, playerId]
+                    );
+                    setImmediate(() => sendAwardEmail(playerId, 'back_from_dead', {}));
+                    console.log(`✅ Back from the Dead awarded to player ${playerId}`);
+                }
+            }
+
+            // Update last_game_date for all players in this game
+            await pool.query(
+                'UPDATE player_streaks SET last_game_date = NOW(), updated_at = NOW() WHERE player_id = $1',
+                [playerId]
+            );
+        } catch (e) {
+            console.warn(`checkBackFromDead failed for player ${playerId}:`, e.message);
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TF GAME AWARDS — API endpoints
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/games/:id/awards — live vote state (auth required)
+app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const playerId = req.user.playerId;
+
+        const gameResult = await pool.query(
+            'SELECT awards_open, awards_close_at, game_status FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const game = gameResult.rows[0];
+
+        // Get all votes for this game
+        const votesResult = await pool.query(
+            `SELECT gav.award_type, gav.nominee_player_id, gav.voter_player_id,
+                    COUNT(*) OVER (PARTITION BY gav.award_type, gav.nominee_player_id) as vote_count
+             FROM game_award_votes gav
+             WHERE gav.game_id = $1`,
+            [gameId]
+        );
+
+        // Get confirmed awards (after close)
+        const awardsResult = await pool.query(
+            `SELECT ga.award_type, ga.recipient_player_id, ga.motm_value, ga.vote_count, ga.award_source, ga.series_day
+             FROM game_awards ga WHERE ga.game_id = $1`,
+            [gameId]
+        );
+
+        // Get registered player count for participation counter
+        const participantsResult = await pool.query(
+            `SELECT COUNT(DISTINCT voter_player_id) as voted_count FROM game_award_votes WHERE game_id = $1`,
+            [gameId]
+        );
+        const totalRegisteredResult = await pool.query(
+            `SELECT COUNT(*) as total FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+
+        // Check if this player has voted
+        const myVotes = votesResult.rows.filter(v => v.voter_player_id === playerId);
+
+        // Build vote counts per award per nominee
+        const voteCounts = {};
+        for (const row of votesResult.rows) {
+            if (!voteCounts[row.award_type]) voteCounts[row.award_type] = {};
+            voteCounts[row.award_type][row.nominee_player_id] = parseInt(row.vote_count);
+        }
+
+        res.json({
+            awardsOpen: game.awards_open,
+            awardsCloseAt: game.awards_close_at,
+            gameStatus: game.game_status,
+            votedCount: parseInt(participantsResult.rows[0].voted_count),
+            totalPlayers: parseInt(totalRegisteredResult.rows[0].total),
+            voteCounts,
+            myVotes: myVotes.map(v => ({ awardType: v.award_type, nomineeId: v.nominee_player_id })),
+            confirmedAwards: awardsResult.rows,
+        });
+    } catch (error) {
+        console.error('GET awards error:', error);
+        res.status(500).json({ error: 'Failed to fetch awards' });
+    }
+});
+
+// POST /api/games/:id/awards/vote — cast or update a vote
+app.post('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { awardType, nomineePlayerId } = req.body;
+        const voterId = req.user.playerId;
+
+        // Validate award type
+        if (!AWARD_TYPES.includes(awardType)) {
+            return res.status(400).json({ error: 'Invalid award type' });
+        }
+
+        // Validate nominee ID is a non-empty string
+        if (!nomineePlayerId || typeof nomineePlayerId !== 'string') {
+            return res.status(400).json({ error: 'Invalid nominee' });
+        }
+
+        // Block self-nomination for positive awards
+        if (POSITIVE_AWARDS.includes(awardType) && nomineePlayerId === voterId) {
+            return res.status(400).json({ error: 'You cannot nominate yourself for this award' });
+        }
+
+        // Check awards are open
+        const gameResult = await pool.query(
+            'SELECT awards_open, awards_close_at FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        if (!gameResult.rows[0].awards_open) {
+            return res.status(400).json({ error: 'Award voting is not currently open for this game' });
+        }
+
+        // Check voter is confirmed-registered for this game
+        const regResult = await pool.query(
+            'SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = $3',
+            [gameId, voterId, 'confirmed']
+        );
+        if (regResult.rows.length === 0) {
+            return res.status(403).json({ error: 'You must be a confirmed player in this game to vote' });
+        }
+
+        // Check nominee is confirmed-registered for this game
+        const nomineeRegResult = await pool.query(
+            'SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = $3',
+            [gameId, nomineePlayerId, 'confirmed']
+        );
+        if (nomineeRegResult.rows.length === 0) {
+            return res.status(400).json({ error: 'Nominee is not a confirmed player in this game' });
+        }
+
+        // Upsert vote (insert or ignore if already exists — player can add more nominees per award)
+        await pool.query(
+            `INSERT INTO game_award_votes (game_id, voter_player_id, nominee_player_id, award_type)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (game_id, voter_player_id, nominee_player_id, award_type) DO NOTHING`,
+            [gameId, voterId, nomineePlayerId, awardType]
+        );
+
+        res.json({ message: 'Vote recorded' });
+    } catch (error) {
+        console.error('POST awards vote error:', error);
+        res.status(500).json({ error: 'Failed to record vote' });
+    }
+});
+
+// DELETE /api/games/:id/awards/vote — retract a vote
+app.delete('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const { awardType, nomineePlayerId } = req.body;
+        const voterId = req.user.playerId;
+
+        // Check awards are still open
+        const gameResult = await pool.query(
+            'SELECT awards_open FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (!gameResult.rows[0]?.awards_open) {
+            return res.status(400).json({ error: 'Voting is closed' });
+        }
+
+        await pool.query(
+            `DELETE FROM game_award_votes
+             WHERE game_id = $1 AND voter_player_id = $2 AND nominee_player_id = $3 AND award_type = $4`,
+            [gameId, voterId, nomineePlayerId, awardType]
+        );
+
+        res.json({ message: 'Vote retracted' });
+    } catch (error) {
+        console.error('DELETE awards vote error:', error);
+        res.status(500).json({ error: 'Failed to retract vote' });
+    }
+});
+
+// GET /api/public/game/:gameUrl/awards — public confirmed results (no auth)
+app.get('/api/public/game/:gameUrl/awards', async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+
+        const gameResult = await pool.query(
+            'SELECT id, awards_open, awards_close_at, game_status FROM games WHERE game_url = $1',
+            [gameUrl]
+        );
+        if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const game = gameResult.rows[0];
+
+        const awardsResult = await pool.query(
+            `SELECT ga.award_type, ga.motm_value, ga.vote_count, ga.award_source, ga.series_day,
+                    p.alias, p.full_name, p.id as player_id
+             FROM game_awards ga
+             JOIN players p ON p.id = ga.recipient_player_id
+             WHERE ga.game_id = $1
+             ORDER BY ga.created_at ASC`,
+            [game.id]
+        );
+
+        res.json({
+            awardsOpen: game.awards_open,
+            awardsCloseAt: game.awards_close_at,
+            awards: awardsResult.rows.map(a => ({
+                awardType: a.award_type,
+                motmValue: a.motm_value,
+                voteCount: a.vote_count,
+                awardSource: a.award_source,
+                seriesDay: a.series_day,
+                playerId: a.player_id,
+                playerAlias: a.alias || a.full_name,
+            })),
+        });
+    } catch (error) {
+        console.error('GET public awards error:', error);
+        res.status(500).json({ error: 'Failed to fetch awards' });
+    }
+});
+
+// GET /api/players/:id/awards — player award history (auth required)
+app.get('/api/players/:playerId/awards', authenticateToken, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+
+        const awardsResult = await pool.query(
+            `SELECT ga.award_type, ga.motm_value, ga.vote_count, ga.award_source,
+                    ga.series_day, ga.created_at,
+                    g.game_url, g.game_date,
+                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'Day') as day_name,
+                    v.name as venue_name
+             FROM game_awards ga
+             JOIN games g ON g.id = ga.game_id
+             LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE ga.recipient_player_id = $1
+             ORDER BY ga.created_at DESC`,
+            [playerId]
+        );
+
+        // Also get live streak
+        const streakResult = await pool.query(
+            'SELECT current_win_streak FROM player_streaks WHERE player_id = $1',
+            [playerId]
+        );
+
+        // Count by type
+        const counts = {};
+        let motmTotal = 0;
+        for (const row of awardsResult.rows) {
+            counts[row.award_type] = (counts[row.award_type] || 0) + 1;
+            if (row.award_type === 'motm') motmTotal += parseFloat(row.motm_value || 1);
+        }
+
+        res.json({
+            awards: awardsResult.rows,
+            counts,
+            motmTotal: Math.round(motmTotal * 100) / 100,
+            currentWinStreak: streakResult.rows[0]?.current_win_streak || 0,
+        });
+    } catch (error) {
+        console.error('GET player awards error:', error);
+        res.status(500).json({ error: 'Failed to fetch player awards' });
+    }
+});
+
+// POST /api/admin/games/:gameId/awards/close — admin manual close
+app.post('/api/admin/games/:gameId/awards/close', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const result = await closeAwards(gameId);
+        res.json({ message: 'Awards closed', confirmedWinners: result?.confirmedWinners?.length || 0 });
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'awards_closed_manually',
+            `Confirmed: ${result?.confirmedWinners?.length || 0} award(s)`));
+    } catch (error) {
+        console.error('Admin close awards error:', error);
+        res.status(500).json({ error: 'Failed to close awards' });
+    }
+});
+
+// GET /api/public/players/leaderboard/awards — award count leaderboard (public)
+app.get('/api/public/players/leaderboard/awards', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT
+                p.id, p.alias, p.full_name,
+                COALESCE(SUM(CASE WHEN ga.award_type = 'motm'        THEN ga.motm_value  ELSE 0 END), 0) as motm_total,
+                COALESCE(SUM(CASE WHEN ga.award_type = 'best_engine' THEN 1              ELSE 0 END), 0) as engine_count,
+                COALESCE(SUM(CASE WHEN ga.award_type = 'brick_wall'  THEN 1              ELSE 0 END), 0) as wall_count,
+                COALESCE(SUM(CASE WHEN ga.award_type = 'howler'      THEN 1              ELSE 0 END), 0) as howler_count,
+                COALESCE(COUNT(ga.id), 0) as total_awards
+             FROM players p
+             LEFT JOIN game_awards ga ON ga.recipient_player_id = p.id
+             GROUP BY p.id, p.alias, p.full_name
+             HAVING COALESCE(COUNT(ga.id), 0) > 0
+             ORDER BY motm_total DESC, engine_count DESC`,
+            []
+        );
+        res.json({ leaderboard: result.rows });
+    } catch (error) {
+        console.error('Awards leaderboard error:', error);
+        res.status(500).json({ error: 'Failed to fetch leaderboard' });
+    }
+});
 
 app.post('/api/admin/games/:gameId/finalize-motm', authenticateToken, requireGameManager, async (req, res) => {
     try {
@@ -12411,6 +13167,36 @@ app.listen(PORT, () => {
             console.error('✗ Baby badge sweep error:', error.message);
         }
     }, 24 * 60 * 60 * 1000); // Once every 24 hours
+
+    // TF Game Awards — auto-close expired voting every 10 minutes
+    setInterval(async () => {
+        try {
+            const expiredAwards = await pool.query(`
+                SELECT id FROM games
+                WHERE awards_open = true
+                  AND awards_close_at IS NOT NULL
+                  AND awards_close_at < NOW()
+                  AND game_status = 'completed'
+            `);
+
+            if (expiredAwards.rows.length === 0) return;
+
+            console.log(`⏰ Auto-closing TF Game Awards for ${expiredAwards.rows.length} game(s)...`);
+            for (const row of expiredAwards.rows) {
+                try {
+                    const result = await closeAwards(row.id);
+                    const count = result?.confirmedWinners?.length || 0;
+                    console.log(`✅ Awards auto-closed for game ${row.id}: ${count} award(s) confirmed`);
+                    await gameAuditLog(pool, row.id, null, 'awards_auto_closed',
+                        `${count} award(s) confirmed`).catch(() => {});
+                } catch (e) {
+                    console.error(`✗ Awards auto-close failed for game ${row.id}:`, e.message);
+                }
+            }
+        } catch (error) {
+            console.error('✗ Awards scheduler error:', error.message);
+        }
+    }, 10 * 60 * 1000); // 10 minutes
 
     // Auto-finalize expired MOTM voting every 10 minutes
     setInterval(async () => {
