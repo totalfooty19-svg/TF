@@ -7900,6 +7900,31 @@ app.get('/api/public/games', async (req, res) => {
     }
 });
 
+// GET /api/public/games/completed — all completed games with MOTM winners (no exclusivity filter)
+// Used by admin social graphics hub — MOTM card needs to see CLM/restricted games too
+app.get('/api/public/games/completed', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT g.id, g.game_url, g.game_date, g.format,
+                   g.motm_winner_id, g.exclusivity,
+                   v.name AS venue_name,
+                   TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
+                   motm_p.alias AS motm_winner_alias, motm_p.full_name AS motm_winner_name
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+            WHERE g.game_status = 'completed'
+              AND g.motm_winner_id IS NOT NULL
+            ORDER BY g.game_date DESC
+            LIMIT 100
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Public completed games error:', error);
+        res.status(500).json({ error: 'Failed to load completed games' });
+    }
+});
+
 // GET /api/public/players/leaderboard — public leaderboard (no auth, no PII)
 app.get('/api/public/players/leaderboard', async (req, res) => {
     try {
