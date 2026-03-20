@@ -8697,6 +8697,52 @@ async function generatePlayerBio(player, awardsData, recentForm) {
 }
 
 // Fetch awards + recent form for a player, then generate + save bio
+async function regeneratePlayerBioForce(playerId, force = false) {
+    // Wrapper that bypasses the 5-appearance threshold when force=true
+    if (force) {
+        // Temporarily patch the player object to pass the threshold check
+        try {
+            const playerRes = await pool.query(
+                `SELECT p.*,
+                    (SELECT json_agg(json_build_object('name', b.name, 'icon', b.icon))
+                     FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                     WHERE pb.player_id = p.id) as badges
+                 FROM players p WHERE p.id = $1`, [playerId]
+            );
+            if (!playerRes.rows[0]) return;
+            const player = { ...playerRes.rows[0], total_appearances: Math.max(playerRes.rows[0].total_appearances || 0, 5) };
+
+            const [awardsRes, formRes, streakRes] = await Promise.all([
+                pool.query(`SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1`, [playerId]),
+                pool.query(`SELECT g.winning_team, tp.team_name FROM registrations r JOIN games g ON g.id = r.game_id LEFT JOIN team_players tp ON tp.player_id = r.player_id AND tp.game_id = g.id WHERE r.player_id = $1 AND g.game_status = 'completed' ORDER BY g.game_date DESC LIMIT 5`, [playerId]),
+                pool.query(`SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]).catch(() => ({ rows: [] }))
+            ]);
+
+            const counts = {};
+            let motmTotal = 0;
+            for (const row of awardsRes.rows) {
+                counts[row.award_type] = (counts[row.award_type] || 0) + 1;
+                if (row.award_type === 'motm') motmTotal += parseFloat(row.motm_value || 1);
+            }
+            const awardsData = { counts, motmTotal: Math.round(motmTotal * 100) / 100, currentWinStreak: streakRes.rows[0]?.current_win_streak || 0 };
+            const recentForm = formRes.rows.map(r => ({
+                won: r.winning_team && r.team_name && r.winning_team.toLowerCase() === r.team_name.toLowerCase(),
+                drew: r.winning_team === 'draw',
+            }));
+
+            const bio = await generatePlayerBio(player, awardsData, recentForm);
+            if (bio) {
+                await pool.query(`UPDATE players SET ai_bio = $1, ai_bio_updated_at = NOW() WHERE id = $2`, [bio, playerId]);
+                console.log(`✅ Bio force-generated for player ${playerId}`);
+            }
+        } catch (e) {
+            console.warn(`regeneratePlayerBioForce(${playerId}) failed:`, e.message);
+        }
+        return;
+    }
+    return regeneratePlayerBio(playerId);
+}
+
 async function regeneratePlayerBio(playerId) {
     try {
         const playerRes = await pool.query(
@@ -9246,10 +9292,11 @@ app.post('/api/admin/players/:id/regenerate-bio', authenticateToken, requireAdmi
     try {
         const playerCheck = await pool.query('SELECT id, total_appearances FROM players WHERE id = $1', [id]);
         if (!playerCheck.rows[0]) return res.status(404).json({ error: 'Player not found' });
-        if ((playerCheck.rows[0].total_appearances || 0) < 5)
+        const forceOverride = req.query.force === 'true' && req.user.role === 'superadmin';
+        if (!forceOverride && (playerCheck.rows[0].total_appearances || 0) < 5)
             return res.status(400).json({ error: 'Player needs at least 5 appearances for a bio' });
-        // Run async — respond immediately
-        setImmediate(() => regeneratePlayerBio(id));
+        // Run async — respond immediately (bypass threshold if force=true and superadmin)
+        setImmediate(() => regeneratePlayerBioForce(id, forceOverride));
         res.json({ message: 'Bio regeneration started' });
     } catch (e) {
         console.error('Admin regen bio error:', e.message);
