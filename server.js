@@ -9032,6 +9032,20 @@ app.get('/api/public/players/leaderboard/awards', async (req, res) => {
 // ==========================================
 
 // Get my referral info (code, link, who I referred)
+// Returns the superadmin's player ID — used by feature request form
+app.get('/api/players/superadmin-id', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT id FROM players WHERE role = 'superadmin' LIMIT 1"
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ id: result.rows[0].id });
+    } catch (err) {
+        console.error('superadmin-id error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
     try {
         const playerId = req.user.playerId;
