@@ -707,7 +707,7 @@ const requireGameManager = async (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam } = req.body;
+        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam, ageRange } = req.body;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -743,6 +743,15 @@ app.post('/api/auth/register', async (req, res) => {
         // Skipped = casual. Same overall (84), same GK (86). skill_level stored as null.
         const stats = SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
 
+        // Validate age range — required for insurance purposes
+        const VALID_AGE_RANGES = ['16_18', '18_plus'];
+        if (!ageRange || ageRange === 'under_16') {
+            return res.status(400).json({ error: 'You must be at least 16 years old to register with TotalFooty.' });
+        }
+        if (!VALID_AGE_RANGES.includes(ageRange)) {
+            return res.status(400).json({ error: 'Invalid age range.' });
+        }
+
         // Check if email already exists
         const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
         if (existingUser.rows.length > 0) {
@@ -773,9 +782,9 @@ app.post('/api/auth/register', async (req, res) => {
             `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
                 goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
                 pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
-                skill_level)
+                skill_level, age_range)
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
-                     $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING id`,
+                     $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING id`,
             [
                 userId,               // $1
                 fullName.trim(),      // $2
@@ -793,13 +802,31 @@ app.post('/api/auth/register', async (req, res) => {
                 stats.ast,            // $14 assisting_rating
                 stats.sht,            // $15 shooting_rating
                 stats.overall,        // $16 overall_rating
-                validatedSkillLevel   // $17 skill_level (null if skipped)
+                validatedSkillLevel,  // $17 skill_level (null if skipped)
+                ageRange              // $18 age_range
             ]
         );
         const playerId = playerResult.rows[0].id;
 
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
+
+        // Auto-assign Youth badge for 16-18 players (non-public, for insurance tracking)
+        if (ageRange === '16_18') {
+            try {
+                const youthBadge = await pool.query("SELECT id FROM badges WHERE name = 'Youth'");
+                if (youthBadge.rows.length > 0) {
+                    await pool.query(
+                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                        [playerId, youthBadge.rows[0].id]
+                    );
+                    setImmediate(() => auditLog(pool, null, 'badge_auto_awarded', playerId,
+                        'badge: Youth (age 16-18 at registration)'));
+                }
+            } catch (youthErr) {
+                console.error('Youth badge assign (non-critical):', youthErr.message);
+            }
+        }
 
         // Generate referral code (TF + 8 hex chars) on players table + referrals table (backward compat)
         const referralCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -1688,6 +1715,20 @@ app.get('/api/players/:playerId/ref-stats', async (req, res) => {
     }
 });
 
+
+// Must be defined before /api/players/:id to avoid route collision
+app.get('/api/players/superadmin-id', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT id FROM players WHERE role = 'superadmin' LIMIT 1"
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ id: result.rows[0].id });
+    } catch (err) {
+        console.error('superadmin-id error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 
 app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, res) => {
     try {
@@ -9033,19 +9074,6 @@ app.get('/api/public/players/leaderboard/awards', async (req, res) => {
 
 // Get my referral info (code, link, who I referred)
 // Returns the superadmin's player ID — used by feature request form
-app.get('/api/players/superadmin-id', authenticateToken, async (req, res) => {
-    try {
-        const result = await pool.query(
-            "SELECT id FROM players WHERE role = 'superadmin' LIMIT 1"
-        );
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-        res.json({ id: result.rows[0].id });
-    } catch (err) {
-        console.error('superadmin-id error:', err);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
 app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
     try {
         const playerId = req.user.playerId;
