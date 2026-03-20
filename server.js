@@ -1124,6 +1124,11 @@ app.post('/api/auth/login', async (req, res) => {
 
         const player = playerResult.rows[0];
 
+        if (!player) {
+            console.error(`Login error: no player record found for user ${user.id} (${email})`);
+            return res.status(401).json({ error: 'Account setup incomplete. Please contact support.' });
+        }
+
         // SEC-017: Include token_version so revocation works (see authenticateToken)
         const token = jwt.sign(
             {
@@ -1720,7 +1725,7 @@ app.get('/api/players/:playerId/ref-stats', async (req, res) => {
 app.get('/api/players/superadmin-id', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
-            "SELECT id FROM players WHERE role = 'superadmin' LIMIT 1"
+            `SELECT p.id FROM players p JOIN users u ON u.id = p.user_id WHERE u.role = 'superadmin' LIMIT 1`
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
         res.json({ id: result.rows[0].id });
