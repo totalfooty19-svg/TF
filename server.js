@@ -8714,7 +8714,7 @@ async function regeneratePlayerBioForce(playerId, force = false) {
 
             const [awardsRes, formRes, streakRes] = await Promise.all([
                 pool.query(`SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1`, [playerId]),
-                pool.query(`SELECT g.winning_team, tp.team_name FROM registrations r JOIN games g ON g.id = r.game_id LEFT JOIN team_players tp ON tp.player_id = r.player_id AND tp.game_id = g.id WHERE r.player_id = $1 AND g.game_status = 'completed' ORDER BY g.game_date DESC LIMIT 5`, [playerId]),
+                pool.query(`SELECT g.winning_team, t.team_name FROM registrations r JOIN games g ON g.id = r.game_id LEFT JOIN team_players tp ON tp.player_id = r.player_id LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id WHERE r.player_id = $1 AND g.game_status = 'completed' ORDER BY g.game_date DESC LIMIT 5`, [playerId]),
                 pool.query(`SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]).catch(() => ({ rows: [] }))
             ]);
 
@@ -8762,10 +8762,11 @@ async function regeneratePlayerBio(playerId) {
                 [playerId]
             ),
             pool.query(
-                `SELECT g.winning_team, tp.team_name
+                `SELECT g.winning_team, t.team_name
                  FROM registrations r
                  JOIN games g ON g.id = r.game_id
-                 LEFT JOIN team_players tp ON tp.player_id = r.player_id AND tp.game_id = g.id
+                 LEFT JOIN team_players tp ON tp.player_id = r.player_id
+                 LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                  WHERE r.player_id = $1 AND g.game_status = 'completed'
                  ORDER BY g.game_date DESC LIMIT 5`, [playerId]
             ),
