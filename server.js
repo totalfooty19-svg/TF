@@ -541,6 +541,7 @@ if (!JWT_SECRET) {
 
 // FIX-034: Superadmin email from env var — never hardcoded in source
 const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!SUPERADMIN_EMAIL) console.warn('WARNING: SUPERADMIN_EMAIL not set — auto-assign disabled');
 
 // ==========================================
@@ -7728,7 +7729,7 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
             // UUID
             playerResult = await pool.query(
                 `SELECT id, full_name, alias, squad_number, photo_url, reliability_tier,
-                        total_appearances, total_wins, motm_wins
+                        total_appearances, total_wins, motm_wins, ai_bio
                  FROM players WHERE id = $1`,
                 [playerId]
             );
@@ -7736,7 +7737,7 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
             // Squad number
             playerResult = await pool.query(
                 `SELECT id, full_name, alias, squad_number, photo_url, reliability_tier,
-                        total_appearances, total_wins, motm_wins
+                        total_appearances, total_wins, motm_wins, ai_bio
                  FROM players WHERE squad_number = $1`,
                 [parseInt(playerId)]
             );
@@ -7777,7 +7778,8 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
                 total_wins: wins,
                 motm_wins: motmWins,
                 win_ratio: winRatio,
-                motm_ratio: motmRatio
+                motm_ratio: motmRatio,
+                ai_bio: player.ai_bio || null
             },
             badges: badgesResult.rows
         });
@@ -8562,10 +8564,14 @@ async function closeAwards(gameId) {
                             await sendNotification('motm_winner', winner.playerId, {
                                 day: dayName, venue: venueName, winnerName
                             });
+                            // Regenerate bio after MOTM win
+                            setImmediate(() => regeneratePlayerBio(winner.playerId));
                         }
                         // Badge checks for Best Engine and Brick Wall
                         if (awardType === 'best_engine' || awardType === 'brick_wall') {
                             await checkAndGrantAwardBadge(winner.playerId, awardType);
+                            // Regenerate bio after badge grant
+                            setImmediate(() => regeneratePlayerBio(winner.playerId));
                         }
                     } catch (e) {
                         console.warn(`Post-close award processing failed (${awardType}):`, e.message);
@@ -8595,6 +8601,161 @@ async function closeAwards(gameId) {
         return { confirmedWinners };
     } catch (e) {
         console.error(`closeAwards(${gameId}) failed:`, e.message);
+    }
+}
+
+
+// ============================================================
+// WS2: AI PLAYER BIOS
+// ============================================================
+
+const BIO_SYSTEM_PROMPT = `You are the TotalFooty bio writer for a Coventry grassroots football community.
+Write a player bio that reads like a Football Manager scouting report crossed with WhatsApp group banter. Tone: factual, specific, readable, confident.
+Do not be sycophantic. Do not use filler phrases like 'a true asset to the team'.
+Do not mention specific scores or opponents. Do not invent facts.
+Keep it to 3-4 sentences maximum. Use the player's alias (not full name).
+Reference specific stats where they add colour — not just to pad the bio.
+If the player is a goalkeeper, focus on GK stats. If outfield, focus on their strongest attributes and role. If they have notable awards, weave them in naturally.
+Output plain text only — no markdown, no bullet points, no headers.`;
+
+function buildAwardsText(player, awardsData) {
+    if (!awardsData) return 'No awards yet';
+    const parts = [];
+    const c = awardsData.counts || {};
+    if (parseFloat(awardsData.motmTotal) > 0) parts.push(`MOTM wins: ${awardsData.motmTotal}`);
+    if (c.best_engine > 0) parts.push(`Best Engine wins: ${c.best_engine}`);
+    if (c.brick_wall > 0) parts.push(`Brick Wall wins: ${c.brick_wall}`);
+    const badges = (player.badges || []).map(b => b.name).filter(Boolean);
+    if (badges.length > 0) parts.push(`Badges: ${badges.join(', ')}`);
+    return parts.length > 0 ? parts.join('\n') : 'No awards yet';
+}
+
+async function generatePlayerBio(player, awardsData, recentForm) {
+    if (!ANTHROPIC_API_KEY) return null;
+    if ((player.total_appearances || 0) < 5) return null;
+
+    try {
+        const winPct  = player.total_appearances > 0
+            ? ((player.total_wins / player.total_appearances) * 100).toFixed(1) : '0.0';
+        const motmPct = player.total_appearances > 0
+            ? ((player.motm_wins / player.total_appearances) * 100).toFixed(1) : '0.0';
+        const awardsText = buildAwardsText(player, awardsData);
+        const formStr = recentForm.map(g => g.won ? 'W' : g.drew ? 'D' : 'L').join(' ');
+        const year = new Date(player.created_at).getFullYear();
+        const isGK = (player.position || '').toLowerCase() === 'goalkeeper';
+
+        const userMessage = [
+            `Write a bio for this TotalFooty player:`,
+            `Name: ${player.alias || player.full_name}`,
+            `Position: ${isGK ? 'Goalkeeper' : 'Outfield'}`,
+            player.squad_number != null ? `Squad number: #${player.squad_number}` : null,
+            `Overall rating: ${player.overall_rating}/100`,
+            `Attributes: Defending ${player.defending_rating}/20, Strength ${player.strength_rating}/20,`,
+            ` Fitness ${player.fitness_rating}/20, Pace ${player.pace_rating}/20,`,
+            ` Decisions ${player.decisions_rating}/20, Assisting ${player.assisting_rating}/20, Shooting ${player.shooting_rating}/20`,
+            isGK ? `GK rating: ${player.goalkeeper_rating}/100` : null,
+            ``,
+            `Stats:`,
+            `- Appearances: ${player.total_appearances}`,
+            `- Win rate: ${winPct}% (${player.total_wins} wins)`,
+            `- MOTM wins: ${player.motm_wins} (MOTM rate: ${motmPct}%)`,
+            `- Member since: ${year}`,
+            `- Reliability tier: ${player.reliability_tier || 'new'}`,
+            recentForm.length > 0 ? `- Recent form (last 5): ${formStr}` : null,
+            awardsData?.currentWinStreak >= 2 ? `- Current win streak: ${awardsData.currentWinStreak} games` : null,
+            ``,
+            `Awards:`,
+            awardsText,
+        ].filter(l => l !== null).join('\n');
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+                model: 'claude-sonnet-4-20250514',
+                max_tokens: 300,
+                system: BIO_SYSTEM_PROMPT,
+                messages: [{ role: 'user', content: userMessage }],
+            }),
+        });
+
+        if (!response.ok) {
+            console.warn(`Anthropic API error: ${response.status}`);
+            return null;
+        }
+        const data = await response.json();
+        return data.content?.[0]?.text?.trim() || null;
+
+    } catch (e) {
+        console.warn('generatePlayerBio error:', e.message);
+        return null;
+    }
+}
+
+// Fetch awards + recent form for a player, then generate + save bio
+async function regeneratePlayerBio(playerId) {
+    try {
+        const playerRes = await pool.query(
+            `SELECT p.*,
+                (SELECT json_agg(json_build_object('name', b.name, 'icon', b.icon))
+                 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                 WHERE pb.player_id = p.id) as badges
+             FROM players p WHERE p.id = $1`, [playerId]
+        );
+        if (!playerRes.rows[0]) return;
+        const player = playerRes.rows[0];
+        if ((player.total_appearances || 0) < 5) return;
+
+        const [awardsRes, formRes, streakRes] = await Promise.all([
+            pool.query(
+                `SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1`,
+                [playerId]
+            ),
+            pool.query(
+                `SELECT g.winning_team, tp.team_name
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 LEFT JOIN team_players tp ON tp.player_id = r.player_id AND tp.game_id = g.id
+                 WHERE r.player_id = $1 AND g.game_status = 'completed'
+                 ORDER BY g.game_date DESC LIMIT 5`, [playerId]
+            ),
+            pool.query(
+                `SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]
+            ).catch(() => ({ rows: [] }))
+        ]);
+
+        const counts = {};
+        let motmTotal = 0;
+        for (const row of awardsRes.rows) {
+            counts[row.award_type] = (counts[row.award_type] || 0) + 1;
+            if (row.award_type === 'motm') motmTotal += parseFloat(row.motm_value || 1);
+        }
+        const awardsData = {
+            counts,
+            motmTotal: Math.round(motmTotal * 100) / 100,
+            currentWinStreak: streakRes.rows[0]?.current_win_streak || 0,
+        };
+
+        const recentForm = formRes.rows.map(r => ({
+            won: r.winning_team && r.team_name &&
+                 r.winning_team.toLowerCase() === r.team_name.toLowerCase(),
+            drew: r.winning_team === 'draw',
+        }));
+
+        const bio = await generatePlayerBio(player, awardsData, recentForm);
+        if (bio) {
+            await pool.query(
+                `UPDATE players SET ai_bio = $1, ai_bio_updated_at = NOW() WHERE id = $2`,
+                [bio, playerId]
+            );
+            console.log(`✅ Bio generated for player ${playerId}`);
+        }
+    } catch (e) {
+        console.warn(`regeneratePlayerBio(${playerId}) failed:`, e.message);
     }
 }
 
@@ -9079,6 +9240,23 @@ app.get('/api/public/players/leaderboard/awards', async (req, res) => {
 
 // Get my referral info (code, link, who I referred)
 // Returns the superadmin's player ID — used by feature request form
+// POST /api/admin/players/:id/regenerate-bio — admin-triggered bio regen
+app.post('/api/admin/players/:id/regenerate-bio', authenticateToken, requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const playerCheck = await pool.query('SELECT id, total_appearances FROM players WHERE id = $1', [id]);
+        if (!playerCheck.rows[0]) return res.status(404).json({ error: 'Player not found' });
+        if ((playerCheck.rows[0].total_appearances || 0) < 5)
+            return res.status(400).json({ error: 'Player needs at least 5 appearances for a bio' });
+        // Run async — respond immediately
+        setImmediate(() => regeneratePlayerBio(id));
+        res.json({ message: 'Bio regeneration started' });
+    } catch (e) {
+        console.error('Admin regen bio error:', e.message);
+        res.status(500).json({ error: 'Failed to start bio regeneration' });
+    }
+});
+
 app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
     try {
         const playerId = req.user.playerId;
@@ -12981,4 +13159,35 @@ app.listen(PORT, () => {
             minRatingDropRunning = false;
         }
     }, 5 * 60 * 1000);
+
+    // ── AI Bio: Sunday 2am batch regeneration ──
+    let bioRunning = false;
+    setInterval(async () => {
+        if (bioRunning) return;
+        const now = new Date();
+        // Sunday (0) at 2am
+        // Render runs UTC — UK is UTC+0 (GMT) or UTC+1 (BST). Check hours 1-2 UTC to cover both.
+        if (now.getDay() !== 0 || (now.getHours() !== 1 && now.getHours() !== 2)) return;
+        bioRunning = true;
+        console.log('🤖 Starting weekly AI bio generation...');
+        try {
+            const players = await pool.query(
+                `SELECT id FROM players WHERE total_appearances >= 5 ORDER BY total_appearances DESC`
+            );
+            for (const row of players.rows) {
+                try {
+                    await regeneratePlayerBio(row.id);
+                    // 1 second delay between players — respects API rate limits
+                    await new Promise(r => setTimeout(r, 1000));
+                } catch (e) {
+                    console.warn(`Bio batch failed for player ${row.id}:`, e.message);
+                }
+            }
+            console.log(`🤖 Bio batch complete: ${players.rows.length} players processed`);
+        } catch (e) {
+            console.error('Bio cron failed:', e.message);
+        } finally {
+            bioRunning = false;
+        }
+    }, 60 * 1000); // Check every minute, run only at Sunday 2am
 });
