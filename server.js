@@ -13147,7 +13147,7 @@ async function sendCoachingEmail(playerIds, subject, htmlBody) {
 app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT p.id, p.full_name AS player_name, p.alias, p.profile_photo,
+            SELECT p.id, p.full_name AS player_name, p.alias, p.photo_url AS profile_photo,
                    p.coach_certifications, p.coach_experience,
                    p.coach_min_hourly_rate, p.coaching_appearances,
                    COALESCE(AVG(cf.rating), 0)::NUMERIC(3,2) AS avg_rating,
@@ -13157,7 +13157,7 @@ app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req
             JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
             LEFT JOIN coaching_feedback cf ON cf.coach_player_id = p.id
             WHERE p.status = 'active'
-            GROUP BY p.id, p.full_name, p.alias, p.profile_photo,
+            GROUP BY p.id, p.full_name, p.alias, p.photo_url AS profile_photo,
                      p.coach_certifications, p.coach_experience,
                      p.coach_min_hourly_rate, p.coaching_appearances
             ORDER BY p.coaching_appearances DESC
@@ -13181,7 +13181,7 @@ app.get('/api/coaching/sessions', optionalAuth, publicEndpointLimiter, async (re
                    cs.min_price, cs.max_price, cs.is_full,
                    cs.session_notes,
                    p.full_name AS coach_name, p.alias AS coach_alias,
-                   p.profile_photo AS coach_photo, p.coaching_appearances,
+                   p.photo_url AS profile_photo AS coach_photo, p.coaching_appearances,
                    COALESCE(AVG(cf.rating), 0)::NUMERIC(3,2) AS coach_avg_rating,
                    v.name AS venue_name, v.address AS venue_address,
                    (SELECT COUNT(*) FROM coaching_registrations cr
@@ -13218,7 +13218,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                    cs.min_price, cs.max_price, cs.is_full, cs.session_notes,
                    cs.coach_confirmed, cs.created_at,
                    p.id AS coach_id, p.full_name AS coach_name,
-                   p.alias AS coach_alias, p.profile_photo AS coach_photo,
+                   p.alias AS coach_alias, p.photo_url AS profile_photo AS coach_photo,
                    p.coach_certifications, p.coaching_appearances,
                    COALESCE(avg_sub.avg_rating, 0) AS coach_avg_rating,
                    v.id AS venue_id, v.name AS venue_name, v.address AS venue_address,
@@ -13242,7 +13242,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
         // Registered players (only show names + start times if finalised)
         const regResult = await pool.query(`
             SELECT cr.id, cr.start_time, cr.activity_focus, cr.status,
-                   p.full_name AS player_name, p.alias, p.profile_photo, p.id AS player_id
+                   p.full_name AS player_name, p.alias, p.photo_url AS profile_photo, p.id AS player_id
             FROM coaching_registrations cr
             JOIN players p ON p.id = cr.player_id
             WHERE cr.session_id = $1 AND cr.status = 'registered'
@@ -13342,7 +13342,7 @@ app.get('/api/coaching/coach/:id/profile', optionalAuth, publicEndpointLimiter, 
     }
     try {
         const cResult = await pool.query(`
-            SELECT p.id, p.full_name AS player_name, p.alias, p.profile_photo,
+            SELECT p.id, p.full_name AS player_name, p.alias, p.photo_url AS profile_photo,
                    p.coach_certifications, p.coach_experience,
                    p.coach_min_hourly_rate, p.coaching_appearances,
                    p.created_at AS member_since,
@@ -14225,7 +14225,7 @@ app.get('/api/coaching/manage', authenticateToken, async (req, res) => {
         const requestsResult = await pool.query(`
             SELECT cr.id, cr.activity_type, cr.group_type, cr.time_preference,
                    cr.notes, cr.status, cr.created_at,
-                   p.player_name AS player_name, p.id AS player_id
+                   p.full_name AS player_name, p.id AS player_id
             FROM coaching_requests cr
             JOIN players p ON p.id = cr.player_id
             WHERE cr.status = 'pending'
