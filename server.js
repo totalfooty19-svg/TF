@@ -13028,8 +13028,7 @@ app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async 
     } catch (error) { console.error('Reports player games error:', error); res.status(500).json({ error: 'Failed to load player game history' }); }
 });
 
-// FIX-043: Catch-all 404 handler (must be after all routes)
-app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
+// FIX-043: Catch-all 404 handler moved to after coaching routes
 
 // FIX-037: Global handlers — SEC-012: uncaughtException now exits to prevent undefined server state
 process.on('unhandledRejection', (reason) => {
@@ -14457,6 +14456,9 @@ app.get('/api/coaching/venues/available', optionalAuth, publicEndpointLimiter, a
 // END COACHING ENDPOINTS
 // ════════════════════════════════════════════════════════════
 
+
+// FIX-043: Catch-all 404 handler (must be after ALL routes including coaching)
+app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
