@@ -13040,6 +13040,1424 @@ process.on('uncaughtException', (err) => {
     process.exit(1);
 });
 
+// ═══════════════════════════════════════════════════════════════
+// COACHING SYSTEM — S2 Endpoints
+// Inserted before app.listen()
+// ═══════════════════════════════════════════════════════════════
+
+// ── Coaching helper: audit log ────────────────────────────────
+async function logCoachingAudit(sessionId, requestId, actorPlayerId, action, detail) {
+    try {
+        await pool.query(
+            `INSERT INTO coaching_audit_log
+             (session_id, request_id, actor_player_id, action, detail)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [sessionId || null, requestId || null, actorPlayerId || null, action, detail || null]
+        );
+    } catch (e) {
+        console.error('coaching audit log failed:', e.message);
+    }
+}
+
+// ── Coaching helper: venue availability check ─────────────────
+// Returns true if venue is valid for the given session date + duration
+function isVenueAvailable(rule, sessionDate, durationHours) {
+    if (!sessionDate) return true; // no date yet — allow at creation time
+    const d = new Date(sessionDate);
+    const month = d.getMonth() + 1; // 1-indexed
+    const day   = d.getDay();        // 0=Sun,6=Sat
+    const hour  = d.getHours();
+
+    if (rule === 'anytime') return true;
+
+    if (rule === 'no_weekday_after_16_outside_may_aug') {
+        const isSummer = month >= 5 && month <= 8;
+        const isWeekday = day >= 1 && day <= 5;
+        if (isWeekday && !isSummer && hour >= 16) return false;
+        return true;
+    }
+
+    if (rule === 'weekend_only_before_15') {
+        const isWeekend = day === 0 || day === 6;
+        if (!isWeekend) return false;
+        // session must start before 15:00
+        if (hour >= 15) return false;
+        return true;
+    }
+
+    return true;
+}
+
+// ── Coaching helper: price range calculator ───────────────────
+// Returns { minPrice, maxPrice } across all candidate venues
+function calcSessionPriceRange(venues, coachHourlyRate, durationHours, maxPlayers) {
+    const TF_MARGIN_PER_HOUR = 20;
+    const FLOOR = 13.50;
+
+    let bestMin = Infinity;
+    let worstMax = 0;
+
+    for (const v of venues) {
+        const pitchHire   = (parseFloat(v.coaching_cost_per_hour) || 0) * durationHours;
+        const coachTotal  = coachHourlyRate * durationHours;
+        const tfTotal     = TF_MARGIN_PER_HOUR * durationHours;
+        const ppCoach     = (parseFloat(v.pay_and_play_coach_hourly) || 0) * durationHours;
+        const ppPlayer    = (parseFloat(v.pay_and_play_player_hourly) || 0) * durationHours;
+
+        const sessionFixed = pitchHire + coachTotal + tfTotal + ppCoach;
+
+        const priceAtMax = Math.max(FLOOR, sessionFixed / maxPlayers + ppPlayer);
+        const priceAtOne = Math.max(FLOOR, sessionFixed / 1 + ppPlayer);
+
+        if (priceAtMax < bestMin) bestMin = priceAtMax;
+        if (priceAtOne > worstMax) worstMax = priceAtOne;
+    }
+
+    if (venues.length === 0) return { minPrice: null, maxPrice: null };
+    return {
+        minPrice: Math.round(bestMin * 100) / 100,
+        maxPrice: Math.round(worstMax * 100) / 100
+    };
+}
+
+// ── Coaching helper: send email to list of players ────────────
+async function sendCoachingEmail(playerIds, subject, htmlBody) {
+    if (!playerIds || playerIds.length === 0) return;
+    try {
+        const result = await pool.query(
+            'SELECT email FROM players WHERE id = ANY($1) AND email IS NOT NULL',
+            [playerIds]
+        );
+        const emails = result.rows.map(r => r.email);
+        if (emails.length === 0) return;
+        await emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            bcc:  emails.join(', '),
+            subject,
+            html: wrapEmailHtml(htmlBody)
+        });
+    } catch (e) {
+        console.error('sendCoachingEmail failed:', e.message);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// PUBLIC: GET /api/coaching/coaches
+// List all players with Coach badge + coaching stats
+// ══════════════════════════════════════════════════════════════
+app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT p.id, p.player_name, p.alias, p.profile_photo,
+                   p.coach_certifications, p.coach_experience,
+                   p.coach_min_hourly_rate, p.coaching_appearances,
+                   COALESCE(AVG(cf.rating), 0)::NUMERIC(3,2) AS avg_rating,
+                   COUNT(cf.id) AS review_count
+            FROM players p
+            JOIN player_badges pb ON pb.player_id = p.id
+            JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
+            LEFT JOIN coaching_feedback cf ON cf.coach_player_id = p.id
+            WHERE p.status = 'active'
+            GROUP BY p.id, p.player_name, p.alias, p.profile_photo,
+                     p.coach_certifications, p.coach_experience,
+                     p.coach_min_hourly_rate, p.coaching_appearances
+            ORDER BY p.coaching_appearances DESC
+        `);
+        res.json(result.rows);
+    } catch (e) {
+        console.error('GET /api/coaching/coaches:', e.message);
+        res.status(500).json({ error: 'Failed to fetch coaches' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// PUBLIC: GET /api/coaching/sessions
+// List upcoming open coaching sessions (public browse)
+// ══════════════════════════════════════════════════════════════
+app.get('/api/coaching/sessions', optionalAuth, publicEndpointLimiter, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type,
+                   cs.max_players, cs.session_date, cs.status, cs.duration_hours,
+                   cs.min_price, cs.max_price, cs.is_full,
+                   cs.session_notes,
+                   p.player_name AS coach_name, p.alias AS coach_alias,
+                   p.profile_photo AS coach_photo, p.coaching_appearances,
+                   COALESCE(AVG(cf.rating), 0)::NUMERIC(3,2) AS coach_avg_rating,
+                   v.name AS venue_name, v.address AS venue_address,
+                   (SELECT COUNT(*) FROM coaching_registrations cr
+                    WHERE cr.session_id = cs.id AND cr.status = 'registered') AS registered_count
+            FROM coaching_sessions cs
+            LEFT JOIN players p ON p.id = cs.coach_player_id
+            LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+            LEFT JOIN coaching_feedback cf ON cf.coach_player_id = cs.coach_player_id
+            WHERE cs.status IN ('open','coach_confirmed','venue_confirmed','finalised')
+              AND (cs.session_date IS NULL OR cs.session_date > NOW())
+            GROUP BY cs.id, p.id, v.id
+            ORDER BY cs.session_date ASC NULLS LAST
+        `);
+        res.json(result.rows);
+    } catch (e) {
+        console.error('GET /api/coaching/sessions:', e.message);
+        res.status(500).json({ error: 'Failed to fetch sessions' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// PUBLIC: GET /api/coaching/session/:url
+// Full session details for session.html
+// ══════════════════════════════════════════════════════════════
+app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async (req, res) => {
+    const { url } = req.params;
+    if (!url || !/^[a-zA-Z0-9_-]{3,50}$/.test(url)) {
+        return res.status(400).json({ error: 'Invalid session URL' });
+    }
+    try {
+        const sResult = await pool.query(`
+            SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type,
+                   cs.max_players, cs.session_date, cs.status, cs.duration_hours,
+                   cs.min_price, cs.max_price, cs.is_full, cs.session_notes,
+                   cs.coach_confirmed, cs.created_at,
+                   p.id AS coach_id, p.player_name AS coach_name,
+                   p.alias AS coach_alias, p.profile_photo AS coach_photo,
+                   p.coach_certifications, p.coaching_appearances,
+                   COALESCE(avg_sub.avg_rating, 0) AS coach_avg_rating,
+                   v.id AS venue_id, v.name AS venue_name, v.address AS venue_address,
+                   v.postcode AS venue_postcode, v.parking_pin AS venue_parking_pin,
+                   v.pitch_pin AS venue_pitch_pin, v.boot_type AS venue_boot_type,
+                   v.pitch_name AS venue_pitch_name,
+                   v.special_instructions AS venue_special_instructions
+            FROM coaching_sessions cs
+            LEFT JOIN players p ON p.id = cs.coach_player_id
+            LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+            LEFT JOIN (
+                SELECT coach_player_id, AVG(rating)::NUMERIC(3,2) AS avg_rating
+                FROM coaching_feedback GROUP BY coach_player_id
+            ) avg_sub ON avg_sub.coach_player_id = cs.coach_player_id
+            WHERE cs.session_url = $1
+        `, [url]);
+
+        if (sResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+        const session = sResult.rows[0];
+
+        // Registered players (only show names + start times if finalised)
+        const regResult = await pool.query(`
+            SELECT cr.id, cr.start_time, cr.activity_focus, cr.status,
+                   p.player_name, p.alias, p.profile_photo, p.id AS player_id
+            FROM coaching_registrations cr
+            JOIN players p ON p.id = cr.player_id
+            WHERE cr.session_id = $1 AND cr.status = 'registered'
+            ORDER BY cr.start_time ASC NULLS LAST, cr.registered_at ASC
+        `, [session.id]);
+
+        // Candidate venues (before confirmed)
+        const venueResult = await pool.query(`
+            SELECT v.id, v.name, v.address
+            FROM coaching_session_venues csv
+            JOIN venues v ON v.id = csv.venue_id
+            WHERE csv.session_id = $1
+        `, [session.id]);
+
+        // Feedback (post-completion)
+        const feedbackResult = await pool.query(`
+            SELECT cf.rating, cf.comment, cf.created_at,
+                   p.player_name, p.alias
+            FROM coaching_feedback cf
+            JOIN players p ON p.id = cf.player_id
+            WHERE cf.session_id = $1
+            ORDER BY cf.created_at DESC
+        `, [session.id]);
+
+        // Has the calling player already given feedback?
+        let playerRegistered = false;
+        let playerFeedbackGiven = false;
+        if (req.user) {
+            const preg = await pool.query(
+                `SELECT id FROM coaching_registrations
+                 WHERE session_id=$1 AND player_id=$2 AND status='registered'`,
+                [session.id, req.user.playerId]
+            );
+            playerRegistered = preg.rows.length > 0;
+            const pfb = await pool.query(
+                `SELECT id FROM coaching_feedback WHERE session_id=$1 AND player_id=$2`,
+                [session.id, req.user.playerId]
+            );
+            playerFeedbackGiven = pfb.rows.length > 0;
+        }
+
+        res.json({
+            id: session.id,
+            session_url: session.session_url,
+            activity_type: session.activity_type,
+            group_type: session.group_type,
+            max_players: session.max_players,
+            session_date: session.session_date,
+            status: session.status,
+            duration_hours: session.duration_hours,
+            min_price: session.min_price,
+            max_price: session.max_price,
+            is_full: session.is_full,
+            session_notes: session.session_notes,
+            coach_confirmed: session.coach_confirmed,
+            coach: session.coach_id ? {
+                id: session.coach_id,
+                name: session.coach_name,
+                alias: session.coach_alias,
+                photo: session.coach_photo,
+                certifications: session.coach_certifications,
+                appearances: session.coaching_appearances,
+                avg_rating: session.coach_avg_rating
+            } : null,
+            venue: session.venue_id ? {
+                id: session.venue_id,
+                name: session.venue_name,
+                address: session.venue_address,
+                postcode: session.venue_postcode,
+                parking_pin: session.venue_parking_pin,
+                pitch_pin: session.venue_pitch_pin,
+                boot_type: session.venue_boot_type,
+                pitch_name: session.venue_pitch_name,
+                special_instructions: session.venue_special_instructions
+            } : null,
+            candidate_venues: venueResult.rows,
+            registrations: regResult.rows,
+            feedback: feedbackResult.rows,
+            player_registered: playerRegistered,
+            player_feedback_given: playerFeedbackGiven,
+            registered_count: regResult.rows.length
+        });
+    } catch (e) {
+        console.error('GET /api/coaching/session/:url:', e.message);
+        res.status(500).json({ error: 'Failed to fetch session' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// PUBLIC: GET /api/coaching/coach/:id/profile
+// Full coach profile + stats + upcoming sessions
+// ══════════════════════════════════════════════════════════════
+app.get('/api/coaching/coach/:id/profile', optionalAuth, publicEndpointLimiter, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) {
+        return res.status(400).json({ error: 'Invalid coach ID' });
+    }
+    try {
+        const cResult = await pool.query(`
+            SELECT p.id, p.player_name, p.alias, p.profile_photo,
+                   p.coach_certifications, p.coach_experience,
+                   p.coach_min_hourly_rate, p.coaching_appearances,
+                   p.created_at AS member_since,
+                   COALESCE(AVG(cf.rating), 0)::NUMERIC(3,2) AS avg_rating,
+                   COUNT(cf.id) AS review_count
+            FROM players p
+            JOIN player_badges pb ON pb.player_id = p.id
+            JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
+            LEFT JOIN coaching_feedback cf ON cf.coach_player_id = p.id
+            WHERE p.id = $1 AND p.status = 'active'
+            GROUP BY p.id
+        `, [id]);
+
+        if (cResult.rows.length === 0) return res.status(404).json({ error: 'Coach not found' });
+
+        const feedbackResult = await pool.query(`
+            SELECT cf.rating, cf.comment, cf.created_at,
+                   p.player_name, p.alias
+            FROM coaching_feedback cf
+            JOIN players p ON p.id = cf.player_id
+            WHERE cf.coach_player_id = $1
+            ORDER BY cf.created_at DESC
+            LIMIT 5
+        `, [id]);
+
+        const upcomingResult = await pool.query(`
+            SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type,
+                   cs.session_date, cs.status, cs.min_price, cs.max_price,
+                   v.name AS venue_name
+            FROM coaching_sessions cs
+            LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+            WHERE cs.coach_player_id = $1
+              AND cs.status IN ('open','coach_confirmed','venue_confirmed','finalised')
+              AND (cs.session_date IS NULL OR cs.session_date > NOW())
+            ORDER BY cs.session_date ASC NULLS LAST
+            LIMIT 5
+        `, [id]);
+
+        const coach = cResult.rows[0];
+        res.json({
+            id: coach.id,
+            name: coach.player_name,
+            alias: coach.alias,
+            photo: coach.profile_photo,
+            certifications: coach.coach_certifications,
+            experience: coach.coach_experience,
+            min_hourly_rate: coach.coach_min_hourly_rate,
+            appearances: coach.coaching_appearances,
+            member_since: coach.member_since,
+            avg_rating: coach.avg_rating,
+            review_count: coach.review_count,
+            recent_feedback: feedbackResult.rows,
+            upcoming_sessions: upcomingResult.rows
+        });
+    } catch (e) {
+        console.error('GET /api/coaching/coach/:id/profile:', e.message);
+        res.status(500).json({ error: 'Failed to fetch coach profile' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: POST /api/coaching/sessions
+// Create a coaching session (coach or superadmin)
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
+    const { activity_type, group_type, duration_hours, session_date,
+            session_notes, venue_ids } = req.body;
+
+    const VALID_ACTIVITIES = ['fitness','ball_control','defending','shooting','positioning','goalkeeping'];
+    const VALID_GROUPS     = ['one_to_one','small_group','large_group'];
+    const GROUP_MAX        = { one_to_one: 1, small_group: 6, large_group: 15 };
+
+    if (!VALID_ACTIVITIES.includes(activity_type))
+        return res.status(400).json({ error: 'Invalid activity_type' });
+    if (!VALID_GROUPS.includes(group_type))
+        return res.status(400).json({ error: 'Invalid group_type' });
+    if (!Number.isInteger(duration_hours) || duration_hours < 1 || duration_hours > 8)
+        return res.status(400).json({ error: 'duration_hours must be 1–8' });
+    if (!Array.isArray(venue_ids) || venue_ids.length === 0)
+        return res.status(400).json({ error: 'At least one venue_id required' });
+    if (venue_ids.length > 6)
+        return res.status(400).json({ error: 'Maximum 6 candidate venues' });
+    if (venue_ids.some(v => typeof v !== 'string' || !/^[0-9a-f-]{36}$/.test(v)))
+        return res.status(400).json({ error: 'Invalid venue_id format' });
+    if (session_notes && session_notes.length > 1000)
+        return res.status(400).json({ error: 'session_notes too long' });
+    if (session_date && isNaN(Date.parse(session_date)))
+        return res.status(400).json({ error: 'Invalid session_date' });
+
+    // Must be coach or superadmin
+    const isCoach = await pool.query(
+        `SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+         WHERE pb.player_id = $1 AND b.name = 'Coach'`,
+        [req.user.playerId]
+    );
+    if (isCoach.rows.length === 0 && req.user.role !== 'superadmin')
+        return res.status(403).json({ error: 'Coach badge required' });
+
+    // Validate all venues exist + get coaching data for price calc
+    const venueResult = await pool.query(
+        `SELECT id, name, coaching_cost_per_hour, pay_and_play_coach_hourly,
+                pay_and_play_player_hourly, availability_rule, coaching_suitable
+         FROM venues WHERE id = ANY($1)`,
+        [venue_ids]
+    );
+    if (venueResult.rows.length !== venue_ids.length)
+        return res.status(400).json({ error: 'One or more venue IDs not found' });
+
+    const unsuitable = venueResult.rows.filter(v => !v.coaching_suitable);
+    if (unsuitable.length > 0)
+        return res.status(400).json({ error: `Venue(s) not suitable for coaching: ${unsuitable.map(v => v.name).join(', ')}` });
+
+    // Check availability rule against session date if provided
+    if (session_date) {
+        const blocked = venueResult.rows.filter(v =>
+            !isVenueAvailable(v.availability_rule, session_date, duration_hours)
+        );
+        if (blocked.length > 0)
+            return res.status(400).json({
+                error: `Venue(s) not available at that time: ${blocked.map(v => v.name).join(', ')}`
+            });
+    }
+
+    // Get coach rate for pricing
+    const coachRate = isCoach.rows.length > 0
+        ? (await pool.query('SELECT coach_min_hourly_rate FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.coach_min_hourly_rate || 0
+        : 0;
+
+    const maxPlayers = GROUP_MAX[group_type];
+    const { minPrice, maxPrice } = calcSessionPriceRange(
+        venueResult.rows, parseFloat(coachRate), duration_hours, maxPlayers
+    );
+
+    // Generate unique session URL
+    const sessionUrl = 'cs' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const sessionResult = await client.query(`
+            INSERT INTO coaching_sessions
+              (session_url, coach_player_id, created_by, duration_hours, activity_type,
+               group_type, max_players, session_date, session_notes, min_price, max_price)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            RETURNING id
+        `, [
+            sessionUrl,
+            isCoach.rows.length > 0 ? req.user.playerId : null,
+            req.user.playerId,
+            duration_hours, activity_type, group_type, maxPlayers,
+            session_date || null,
+            session_notes || null,
+            minPrice, maxPrice
+        ]);
+        const sessionId = sessionResult.rows[0].id;
+
+        // Insert candidate venues
+        for (const vid of venue_ids) {
+            await client.query(
+                'INSERT INTO coaching_session_venues (session_id, venue_id) VALUES ($1,$2)',
+                [sessionId, vid]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        await logCoachingAudit(sessionId, null, req.user.playerId, 'session_created',
+            `Created by ${req.user.role}. Activity: ${activity_type}, group: ${group_type}, ${duration_hours}hr`);
+
+        // Emails
+        const coachName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A coach';
+        const activityLabel = activity_type.replace(/_/g, ' ');
+
+        if (req.user.role === 'superadmin') {
+            // Email all coaches
+            const coaches = await pool.query(
+                `SELECT p.id FROM players p JOIN player_badges pb ON pb.player_id=p.id
+                 JOIN badges b ON b.id=pb.badge_id AND b.name='Coach' WHERE p.status='active'`
+            );
+            await sendCoachingEmail(
+                coaches.rows.map(r => r.id),
+                'New Coaching Session Created',
+                `<p style="color:#888">A new coaching session has been created by the TotalFooty admin.</p>
+                 <table><tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${htmlEncode(activityLabel)}</td></tr>
+                 <tr><td style="color:#888">Group Type</td><td style="color:#fff">${htmlEncode(group_type)}</td></tr>
+                 <tr><td style="color:#888">Duration</td><td style="color:#fff">${duration_hours}hr</td></tr></table>
+                 <p style="color:#888;margin-top:16px">Log in to TotalFooty to view details.</p>`
+            );
+        } else {
+            // Email superadmin
+            notifyAdmin(
+                `New Coaching Session — ${htmlEncode(activityLabel)}`,
+                `${htmlEncode(coachName)} created a new ${duration_hours}hr ${activityLabel} session (${group_type}).`
+            );
+        }
+
+        // Email all coachable players
+        const coachablePlayers = await pool.query(
+            `SELECT id FROM players WHERE coachable=TRUE AND status='active'`
+        );
+        await sendCoachingEmail(
+            coachablePlayers.rows.map(r => r.id),
+            'New Coaching Session Available',
+            `<p style="color:#888">A new coaching session is available on TotalFooty.</p>
+             <table><tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${htmlEncode(activityLabel)}</td></tr>
+             <tr><td style="color:#888">Group Type</td><td style="color:#fff">${htmlEncode(group_type)}</td></tr>
+             <tr><td style="color:#888">Duration</td><td style="color:#fff">${duration_hours}hr</td></tr>
+             <tr><td style="color:#888">Price Range</td><td style="color:#fff">£${minPrice?.toFixed(2) || 'TBC'} – £${maxPrice?.toFixed(2) || 'TBC'}</td></tr></table>
+             <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/vibecoding/session.html?url=${sessionUrl}" style="color:#C0392B">View Session →</a></p>`
+        );
+
+        res.status(201).json({ id: sessionId, session_url: sessionUrl, min_price: minPrice, max_price: maxPrice });
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/coaching/sessions:', e.message);
+        res.status(500).json({ error: 'Failed to create session' });
+    } finally {
+        client.release();
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: POST /api/coaching/sessions/:id/register
+// Player signs up for a coaching session
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    try {
+        const sessionResult = await pool.query(
+            `SELECT id, max_players, is_full, status, coach_player_id, activity_type
+             FROM coaching_sessions WHERE id=$1`,
+            [id]
+        );
+        if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+        const session = sessionResult.rows[0];
+        if (!['open','coach_confirmed','venue_confirmed','finalised'].includes(session.status))
+            return res.status(400).json({ error: 'Session is not open for registration' });
+        if (session.is_full)
+            return res.status(400).json({ error: 'Session is full' });
+
+        // Check not already registered
+        const existing = await pool.query(
+            `SELECT id FROM coaching_registrations WHERE session_id=$1 AND player_id=$2`,
+            [id, req.user.playerId]
+        );
+        if (existing.rows.length > 0)
+            return res.status(400).json({ error: 'Already registered' });
+
+        await pool.query(
+            `INSERT INTO coaching_registrations (session_id, player_id) VALUES ($1,$2)`,
+            [id, req.user.playerId]
+        );
+
+        // Check if now full
+        const countResult = await pool.query(
+            `SELECT COUNT(*) AS cnt FROM coaching_registrations
+             WHERE session_id=$1 AND status='registered'`,
+            [id]
+        );
+        const count = parseInt(countResult.rows[0].cnt);
+        if (count >= session.max_players) {
+            await pool.query(`UPDATE coaching_sessions SET is_full=TRUE WHERE id=$1`, [id]);
+            // Notify superadmin + coach
+            const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+            notifyAdmin('Coaching Session Full', `Session ${htmlEncode(id)} is now full (${session.max_players} players).`);
+            if (session.coach_player_id) {
+                await sendCoachingEmail([session.coach_player_id], 'Your Coaching Session Is Full',
+                    `<p style="color:#888">Your ${htmlEncode(session.activity_type)} coaching session is now full with ${session.max_players} registered players.</p>`
+                );
+            }
+        } else {
+            // Notify coach + admin of new signup
+            const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+            notifyAdmin('New Coaching Registration',
+                `${htmlEncode(playerName)} signed up for a coaching session (${htmlEncode(session.activity_type)}). ${count}/${session.max_players} players.`);
+            if (session.coach_player_id) {
+                await sendCoachingEmail([session.coach_player_id], 'New Coaching Sign-Up',
+                    `<p style="color:#888">${htmlEncode(playerName)} has signed up for your ${htmlEncode(session.activity_type)} session. You now have ${count}/${session.max_players} players.</p>`
+                );
+            }
+        }
+
+        await logCoachingAudit(id, null, req.user.playerId, 'player_registered',
+            `Player registered for session. ${count}/${session.max_players} spots filled.`);
+
+        res.json({ success: true, registered_count: count });
+    } catch (e) {
+        console.error('POST /api/coaching/sessions/:id/register:', e.message);
+        res.status(500).json({ error: 'Failed to register' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: DELETE /api/coaching/sessions/:id/register
+// Player drops out of a coaching session
+// ══════════════════════════════════════════════════════════════
+app.delete('/api/coaching/sessions/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    try {
+        const regResult = await pool.query(
+            `SELECT cr.id FROM coaching_registrations cr
+             JOIN coaching_sessions cs ON cs.id = cr.session_id
+             WHERE cr.session_id=$1 AND cr.player_id=$2 AND cr.status='registered'
+               AND cs.status NOT IN ('completed','cancelled')`,
+            [id, req.user.playerId]
+        );
+        if (regResult.rows.length === 0)
+            return res.status(404).json({ error: 'Registration not found or session already completed' });
+
+        await pool.query(
+            `UPDATE coaching_registrations SET status='dropped' WHERE id=$1`,
+            [regResult.rows[0].id]
+        );
+        // Un-fill if was full
+        await pool.query(
+            `UPDATE coaching_sessions SET is_full=FALSE WHERE id=$1 AND is_full=TRUE`,
+            [id]
+        );
+
+        const sessionResult = await pool.query(
+            'SELECT coach_player_id, activity_type FROM coaching_sessions WHERE id=$1', [id]
+        );
+        const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+
+        notifyAdmin('Coaching Drop-Out', `${htmlEncode(playerName)} dropped out of a coaching session (${htmlEncode(sessionResult.rows[0]?.activity_type || 'unknown')}).`);
+        if (sessionResult.rows[0]?.coach_player_id) {
+            await sendCoachingEmail([sessionResult.rows[0].coach_player_id], 'Player Dropped Out',
+                `<p style="color:#888">${htmlEncode(playerName)} has dropped out of your ${htmlEncode(sessionResult.rows[0].activity_type)} coaching session.</p>`
+            );
+        }
+
+        await logCoachingAudit(id, null, req.user.playerId, 'player_dropped', `Player dropped out.`);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('DELETE /api/coaching/sessions/:id/register:', e.message);
+        res.status(500).json({ error: 'Failed to drop out' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: POST /api/coaching/requests
+// Player submits a coaching session request
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/requests', authenticateToken, registrationLimiter, async (req, res) => {
+    const { coach_player_id, activity_type, group_type, time_preference, notes } = req.body;
+
+    const VALID_ACTIVITIES = ['fitness','ball_control','defending','shooting','positioning','goalkeeping'];
+    const VALID_GROUPS     = ['one_to_one','small_group','large_group'];
+
+    if (activity_type && !VALID_ACTIVITIES.includes(activity_type))
+        return res.status(400).json({ error: 'Invalid activity_type' });
+    if (group_type && !VALID_GROUPS.includes(group_type))
+        return res.status(400).json({ error: 'Invalid group_type' });
+    if (coach_player_id && !/^[0-9a-f-]{36}$/.test(coach_player_id))
+        return res.status(400).json({ error: 'Invalid coach_player_id' });
+    if (time_preference && time_preference.length > 500)
+        return res.status(400).json({ error: 'time_preference too long' });
+    if (notes && notes.length > 1000)
+        return res.status(400).json({ error: 'notes too long' });
+
+    // If specific coach, verify they have Coach badge
+    if (coach_player_id) {
+        const check = await pool.query(
+            `SELECT 1 FROM player_badges pb JOIN badges b ON b.id=pb.badge_id
+             WHERE pb.player_id=$1 AND b.name='Coach'`,
+            [coach_player_id]
+        );
+        if (check.rows.length === 0) return res.status(400).json({ error: 'Specified player is not a coach' });
+    }
+
+    const result = await pool.query(
+        `INSERT INTO coaching_requests
+           (player_id, coach_player_id, activity_type, group_type, time_preference, notes)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [req.user.playerId, coach_player_id || null, activity_type || null,
+         group_type || null, time_preference || null, notes || null]
+    );
+    const requestId = result.rows[0].id;
+
+    await logCoachingAudit(null, requestId, req.user.playerId, 'session_request_submitted',
+        `Activity: ${activity_type || 'any'}, group: ${group_type || 'any'}, coach: ${coach_player_id || 'any'}`);
+
+    const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+    notifyAdmin('New Coaching Request',
+        `${htmlEncode(playerName)} submitted a coaching request. Activity: ${htmlEncode(activity_type || 'any')}.`);
+
+    if (coach_player_id) {
+        await sendCoachingEmail([coach_player_id], 'New Coaching Request For You',
+            `<p style="color:#888">${htmlEncode(playerName)} has requested a coaching session with you.</p>
+             <table>
+             ${activity_type ? `<tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff">${htmlEncode(activity_type.replace(/_/g,' '))}</td></tr>` : ''}
+             ${group_type ? `<tr><td style="color:#888">Group Type</td><td style="color:#fff">${htmlEncode(group_type)}</td></tr>` : ''}
+             ${time_preference ? `<tr><td style="color:#888">Time Pref</td><td style="color:#fff">${htmlEncode(time_preference)}</td></tr>` : ''}
+             </table>
+             <p style="color:#888;margin-top:16px">Log in to TotalFooty to respond.</p>`
+        );
+    } else {
+        // Notify all coaches
+        const allCoaches = await pool.query(
+            `SELECT p.id FROM players p JOIN player_badges pb ON pb.player_id=p.id
+             JOIN badges b ON b.id=pb.badge_id AND b.name='Coach' WHERE p.status='active'`
+        );
+        await sendCoachingEmail(
+            allCoaches.rows.map(r => r.id),
+            'New Coaching Request (Any Coach)',
+            `<p style="color:#888">${htmlEncode(playerName)} is looking for any available coach.</p>
+             ${activity_type ? `<p style="color:#888">Activity: ${htmlEncode(activity_type.replace(/_/g,' '))}</p>` : ''}
+             <p style="color:#888;margin-top:16px">Log in to TotalFooty to respond.</p>`
+        );
+    }
+
+    res.status(201).json({ id: requestId });
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: POST /api/coaching/requests/:id/respond
+// Coach or superadmin responds to a request (approve/reject/reply)
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/requests/:id/respond', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { action, message } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid request ID' });
+    if (!['approve','reject','reply'].includes(action)) return res.status(400).json({ error: 'action must be approve / reject / reply' });
+    if (message && message.length > 2000) return res.status(400).json({ error: 'message too long' });
+
+    // Must be coach or superadmin
+    const isCoach = await pool.query(
+        `SELECT 1 FROM player_badges pb JOIN badges b ON b.id=pb.badge_id
+         WHERE pb.player_id=$1 AND b.name='Coach'`,
+        [req.user.playerId]
+    );
+    if (isCoach.rows.length === 0 && req.user.role !== 'superadmin')
+        return res.status(403).json({ error: 'Coach badge required to respond' });
+
+    const reqResult = await pool.query(
+        `SELECT id, player_id, coach_player_id, activity_type, status FROM coaching_requests WHERE id=$1`,
+        [id]
+    );
+    if (reqResult.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+
+    const coachReq = reqResult.rows[0];
+    if (coachReq.status !== 'pending')
+        return res.status(400).json({ error: 'Request already actioned' });
+
+    const newStatus = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'replied';
+    await pool.query(`UPDATE coaching_requests SET status=$1 WHERE id=$2`, [newStatus, id]);
+
+    await logCoachingAudit(null, id, req.user.playerId, `request_${newStatus}`,
+        `${action} by ${req.user.role}. ${message ? 'Message included.' : ''}`);
+
+    const actorName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'TotalFooty';
+    const subjectMap = { approve: 'Your Coaching Request Was Approved ✅', reject: 'Update on Your Coaching Request', reply: 'Reply to Your Coaching Request' };
+    const bodyMap = {
+        approve: `<p style="color:#888">Your coaching request has been approved by ${htmlEncode(actorName)}. A session will be created for you shortly.</p>`,
+        reject:  `<p style="color:#888">Unfortunately your coaching request could not be accommodated at this time.</p>${message ? `<p style="color:#888;margin-top:8px">${htmlEncode(message)}</p>` : ''}`,
+        reply:   `<p style="color:#888">${htmlEncode(actorName)} replied to your coaching request:</p><p style="color:#fff;font-style:italic;margin-top:8px">${htmlEncode(message || '')}</p>`
+    };
+
+    await sendCoachingEmail([coachReq.player_id], subjectMap[action], bodyMap[action]);
+    notifyAdmin(`Coaching Request ${newStatus}`, `${htmlEncode(actorName)} ${action}d a coaching request.`);
+
+    res.json({ success: true, status: newStatus });
+});
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: POST /api/admin/coaching/sessions/:id/confirm
+// Confirm venue and/or coach for a session
+// ══════════════════════════════════════════════════════════════
+app.post('/api/admin/coaching/sessions/:id/confirm', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { confirm_venue_id, confirm_coach } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    const sessionResult = await pool.query(
+        `SELECT id, coach_player_id, coach_confirmed, confirmed_venue_id, status,
+                activity_type, duration_hours, group_type, max_players
+         FROM coaching_sessions WHERE id=$1`,
+        [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const session = sessionResult.rows[0];
+    const updates = [];
+    const params = [];
+    let p = 1;
+
+    if (confirm_venue_id) {
+        if (!/^[0-9a-f-]{36}$/.test(confirm_venue_id)) return res.status(400).json({ error: 'Invalid venue ID' });
+        // Verify it is a candidate venue for this session
+        const csvCheck = await pool.query(
+            `SELECT 1 FROM coaching_session_venues WHERE session_id=$1 AND venue_id=$2`,
+            [id, confirm_venue_id]
+        );
+        if (csvCheck.rows.length === 0) return res.status(400).json({ error: 'Venue is not a candidate for this session' });
+        updates.push(`confirmed_venue_id=$${p++}`); params.push(confirm_venue_id);
+        await logCoachingAudit(id, null, req.user.playerId, 'venue_confirmed', `Venue ${confirm_venue_id} confirmed.`);
+    }
+
+    if (confirm_coach === true) {
+        if (!session.coach_player_id) return res.status(400).json({ error: 'No coach assigned to this session yet' });
+        updates.push(`coach_confirmed=$${p++}`); params.push(true);
+        await logCoachingAudit(id, null, req.user.playerId, 'coach_confirmed', `Coach confirmed.`);
+    }
+
+    if (updates.length === 0) return res.status(400).json({ error: 'Nothing to confirm' });
+
+    // Derive new status
+    const newVenueId = confirm_venue_id || session.confirmed_venue_id;
+    const newCoachConfirmed = confirm_coach === true ? true : session.coach_confirmed;
+    let newStatus = session.status;
+    if (newVenueId && newCoachConfirmed) newStatus = 'venue_confirmed';
+    else if (newCoachConfirmed) newStatus = 'coach_confirmed';
+
+    // Recalculate price with confirmed venue
+    if (confirm_venue_id) {
+        const vResult = await pool.query(
+            `SELECT coaching_cost_per_hour, pay_and_play_coach_hourly, pay_and_play_player_hourly
+             FROM venues WHERE id=$1`,
+            [confirm_venue_id]
+        );
+        const coachRateResult = await pool.query(
+            `SELECT coach_min_hourly_rate FROM players WHERE id=$1`,
+            [session.coach_player_id]
+        );
+        if (vResult.rows.length > 0 && coachRateResult.rows.length > 0) {
+            const { minPrice, maxPrice } = calcSessionPriceRange(
+                vResult.rows,
+                parseFloat(coachRateResult.rows[0].coach_min_hourly_rate) || 0,
+                session.duration_hours,
+                session.max_players
+            );
+            updates.push(`min_price=$${p++}`, `max_price=$${p++}`);
+            params.push(minPrice, maxPrice);
+        }
+    }
+
+    updates.push(`status=$${p++}`, `updated_at=NOW()`); params.push(newStatus);
+    params.push(id);
+    await pool.query(
+        `UPDATE coaching_sessions SET ${updates.join(', ')} WHERE id=$${p}`,
+        params
+    );
+
+    // Email coach when both confirmed
+    if (newVenueId && newCoachConfirmed && session.coach_player_id) {
+        await sendCoachingEmail([session.coach_player_id], 'Your Session Is Confirmed — Please Finalise',
+            `<p style="color:#888">Both venue and coach have been confirmed for your ${htmlEncode(session.activity_type.replace(/_/g,' '))} session.</p>
+             <p style="color:#888;margin-top:8px">Please log in to TotalFooty to finalise the session by assigning player time slots.</p>`
+        );
+    }
+
+    res.json({ success: true, status: newStatus });
+});
+
+// ══════════════════════════════════════════════════════════════
+// COACH: POST /api/coaching/sessions/:id/finalise
+// Assign player start times + activity focus (or edit: PUT)
+// ══════════════════════════════════════════════════════════════
+async function handleFinalise(req, res) {
+    const { id } = req.params;
+    const { assignments } = req.body; // [{ player_id, start_time, activity_focus }]
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!Array.isArray(assignments) || assignments.length === 0)
+        return res.status(400).json({ error: 'assignments array required' });
+
+    // Validate each assignment
+    for (const a of assignments) {
+        if (!a.player_id || !/^[0-9a-f-]{36}$/.test(a.player_id)) return res.status(400).json({ error: 'Invalid player_id in assignment' });
+        if (a.start_time && !/^\d{2}:\d{2}$/.test(a.start_time)) return res.status(400).json({ error: 'start_time must be HH:MM' });
+        if (a.activity_focus && a.activity_focus.length > 100) return res.status(400).json({ error: 'activity_focus too long' });
+    }
+
+    // Must be coach of this session or superadmin
+    const sessionResult = await pool.query(
+        `SELECT id, coach_player_id, status, activity_type, session_date FROM coaching_sessions WHERE id=$1`,
+        [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const session = sessionResult.rows[0];
+    if (session.coach_player_id !== req.user.playerId && req.user.role !== 'superadmin')
+        return res.status(403).json({ error: 'Not your session' });
+    if (!['coach_confirmed','venue_confirmed'].includes(session.status))
+        return res.status(400).json({ error: 'Session must be confirmed before finalising' });
+    if (session.status === 'completed') return res.status(400).json({ error: 'Session already completed' });
+
+    // All assigned players must be registered
+    const registeredResult = await pool.query(
+        `SELECT player_id FROM coaching_registrations WHERE session_id=$1 AND status='registered'`, [id]
+    );
+    const registeredIds = registeredResult.rows.map(r => r.player_id);
+    const invalidAssign = assignments.filter(a => !registeredIds.includes(a.player_id));
+    if (invalidAssign.length > 0) return res.status(400).json({ error: 'Some players are not registered for this session' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (const a of assignments) {
+            await client.query(
+                `UPDATE coaching_registrations
+                 SET start_time=$1, activity_focus=$2
+                 WHERE session_id=$3 AND player_id=$4 AND status='registered'`,
+                [a.start_time || null, a.activity_focus || null, id, a.player_id]
+            );
+        }
+        const isEdit = session.status === 'finalised';
+        await client.query(
+            `UPDATE coaching_sessions SET status='finalised', updated_at=NOW() WHERE id=$1`, [id]
+        );
+        await client.query('COMMIT');
+
+        await logCoachingAudit(id, null, req.user.playerId,
+            isEdit ? 'session_edited' : 'session_finalised',
+            `${assignments.length} player(s) assigned time slots.`
+        );
+
+        // Email all registered players + superadmin
+        const playerDetails = await pool.query(
+            `SELECT cr.player_id, cr.start_time, cr.activity_focus, p.player_name
+             FROM coaching_registrations cr JOIN players p ON p.id=cr.player_id
+             WHERE cr.session_id=$1 AND cr.status='registered'`,
+            [id]
+        );
+        const actLabel = htmlEncode(session.activity_type.replace(/_/g,' '));
+        for (const pd of playerDetails.rows) {
+            await sendCoachingEmail([pd.player_id],
+                `Your Coaching Session Is ${isEdit ? 'Updated' : 'Finalised'} ✅`,
+                `<p style="color:#888">Your coaching session has been ${isEdit ? 'updated' : 'finalised'}.</p>
+                 <table>
+                 <tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${actLabel}</td></tr>
+                 ${session.session_date ? `<tr><td style="color:#888">Date</td><td style="color:#fff">${new Date(session.session_date).toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</td></tr>` : ''}
+                 ${pd.start_time ? `<tr><td style="color:#888">Your Start Time</td><td style="color:#fff;font-weight:700">${htmlEncode(String(pd.start_time))}</td></tr>` : ''}
+                 ${pd.activity_focus ? `<tr><td style="color:#888">Your Focus</td><td style="color:#fff">${htmlEncode(pd.activity_focus)}</td></tr>` : ''}
+                 </table>
+                 <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/vibecoding/session.html?url=${session.session_url || ''}" style="color:#C0392B">View Session →</a></p>`
+            );
+        }
+        notifyAdmin(`Session ${isEdit ? 'Re-Finalised' : 'Finalised'}`,
+            `${actLabel} coaching session finalised with ${assignments.length} player(s).`);
+
+        res.json({ success: true });
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('handleFinalise:', e.message);
+        res.status(500).json({ error: 'Failed to finalise session' });
+    } finally {
+        client.release();
+    }
+}
+
+app.post('/api/coaching/sessions/:id/finalise', authenticateToken, handleFinalise);
+app.put('/api/coaching/sessions/:id/finalise',  authenticateToken, handleFinalise);
+
+// ══════════════════════════════════════════════════════════════
+// COACH: POST /api/coaching/sessions/:id/complete
+// Mark session as completed
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/sessions/:id/complete', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    const sessionResult = await pool.query(
+        `SELECT id, coach_player_id, status, activity_type FROM coaching_sessions WHERE id=$1`, [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const session = sessionResult.rows[0];
+    if (session.coach_player_id !== req.user.playerId && req.user.role !== 'superadmin')
+        return res.status(403).json({ error: 'Not your session' });
+    if (session.status !== 'finalised') return res.status(400).json({ error: 'Session must be finalised before completing' });
+
+    await pool.query(
+        `UPDATE coaching_sessions SET status='completed', updated_at=NOW() WHERE id=$1`, [id]
+    );
+
+    // Increment coach appearances
+    if (session.coach_player_id) {
+        await pool.query(
+            `UPDATE players SET coaching_appearances = COALESCE(coaching_appearances,0) + 1 WHERE id=$1`,
+            [session.coach_player_id]
+        );
+    }
+
+    await logCoachingAudit(id, null, req.user.playerId, 'session_completed',
+        `Session marked complete by ${req.user.role}.`);
+
+    // Email registered players — prompt for feedback
+    const regResult = await pool.query(
+        `SELECT cr.player_id FROM coaching_registrations cr
+         WHERE cr.session_id=$1 AND cr.status='registered'`, [id]
+    );
+    const actLabel = htmlEncode(session.activity_type.replace(/_/g,' '));
+    if (regResult.rows.length > 0) {
+        await sendCoachingEmail(regResult.rows.map(r => r.player_id),
+            'Rate Your Coach ⭐',
+            `<p style="color:#888">Your ${actLabel} coaching session is now complete. Please take a moment to rate your coach.</p>
+             <p style="color:#888;margin-top:12px"><a href="https://totalfooty.co.uk/vibecoding/session.html?url=${id}" style="color:#C0392B;font-weight:700">Rate Your Coach →</a></p>`
+        );
+    }
+    notifyAdmin('Session Completed', `${actLabel} coaching session completed.`);
+
+    res.json({ success: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: POST /api/coaching/sessions/:id/feedback
+// Player submits star rating + comment for coach
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/sessions/:id/feedback', authenticateToken, registrationLimiter, async (req, res) => {
+    const { id } = req.params;
+    const { rating, comment } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'rating must be 1–5' });
+    if (comment && comment.length > 1000) return res.status(400).json({ error: 'comment too long' });
+
+    const sessionResult = await pool.query(
+        `SELECT id, coach_player_id, status FROM coaching_sessions WHERE id=$1`, [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const session = sessionResult.rows[0];
+    if (session.status !== 'completed') return res.status(400).json({ error: 'Session not yet completed' });
+    if (!session.coach_player_id) return res.status(400).json({ error: 'No coach assigned to this session' });
+
+    // Must have been registered
+    const regCheck = await pool.query(
+        `SELECT id FROM coaching_registrations WHERE session_id=$1 AND player_id=$2 AND status='registered'`,
+        [id, req.user.playerId]
+    );
+    if (regCheck.rows.length === 0) return res.status(403).json({ error: 'Not registered for this session' });
+
+    // Unique constraint handles duplicate — catch 23505
+    try {
+        await pool.query(
+            `INSERT INTO coaching_feedback (session_id, player_id, coach_player_id, rating, comment)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [id, req.user.playerId, session.coach_player_id, rating, comment || null]
+        );
+    } catch (e) {
+        if (e.code === '23505') return res.status(400).json({ error: 'Feedback already submitted' });
+        throw e;
+    }
+
+    await logCoachingAudit(id, null, req.user.playerId, 'feedback_submitted',
+        `Rating: ${rating}/5.${comment ? ' Comment included.' : ''}`);
+
+    const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+    await sendCoachingEmail([session.coach_player_id], `New Coach Feedback — ${rating}⭐`,
+        `<p style="color:#888">${htmlEncode(playerName)} has left you feedback.</p>
+         <p style="color:#fff;font-size:18px;margin:12px 0">${'⭐'.repeat(rating)}</p>
+         ${comment ? `<p style="color:#aaa;font-style:italic">"${htmlEncode(comment)}"</p>` : ''}`
+    );
+    notifyAdmin('Coach Feedback Submitted',
+        `${htmlEncode(playerName)} gave ${rating}/5 stars for a coaching session.`);
+
+    res.json({ success: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// ADMIN: GET /api/admin/coaching/sessions
+// All sessions across all coaches (admin view)
+// ══════════════════════════════════════════════════════════════
+app.get('/api/admin/coaching/sessions', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type,
+                   cs.max_players, cs.session_date, cs.status, cs.duration_hours,
+                   cs.min_price, cs.max_price, cs.is_full, cs.session_notes,
+                   cs.coach_confirmed, cs.created_at, cs.updated_at,
+                   p.player_name AS coach_name, p.id AS coach_id,
+                   v.name AS venue_name, v.id AS venue_id,
+                   (SELECT COUNT(*) FROM coaching_registrations cr
+                    WHERE cr.session_id=cs.id AND cr.status='registered') AS registered_count,
+                   (SELECT json_agg(json_build_object('id',ve.id,'name',ve.name))
+                    FROM coaching_session_venues csv2
+                    JOIN venues ve ON ve.id=csv2.venue_id
+                    WHERE csv2.session_id=cs.id) AS candidate_venues
+            FROM coaching_sessions cs
+            LEFT JOIN players p ON p.id = cs.coach_player_id
+            LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+            ORDER BY cs.created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (e) {
+        console.error('GET /api/admin/coaching/sessions:', e.message);
+        res.status(500).json({ error: 'Failed to fetch sessions' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// ADMIN: GET /api/admin/coaching/requests
+// All pending session requests
+// ══════════════════════════════════════════════════════════════
+app.get('/api/admin/coaching/requests', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT cr.id, cr.activity_type, cr.group_type, cr.time_preference,
+                   cr.notes, cr.status, cr.created_at,
+                   p.player_name AS player_name, p.id AS player_id,
+                   c.player_name AS coach_name, c.id AS coach_id
+            FROM coaching_requests cr
+            JOIN players p ON p.id = cr.player_id
+            LEFT JOIN players c ON c.id = cr.coach_player_id
+            ORDER BY cr.created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (e) {
+        console.error('GET /api/admin/coaching/requests:', e.message);
+        res.status(500).json({ error: 'Failed to fetch requests' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// ADMIN: GET /api/coaching/audit
+// Coaching audit log
+// ══════════════════════════════════════════════════════════════
+app.get('/api/coaching/audit', authenticateToken, requireAdmin, async (req, res) => {
+    const { limit = 100, offset = 0, action, player_id } = req.query;
+    const lim = Math.min(parseInt(limit) || 100, 500);
+    const off = Math.max(parseInt(offset) || 0, 0);
+
+    const conditions = [];
+    const params = [];
+    let p = 1;
+
+    if (action && /^[a-z_]{3,60}$/.test(action)) {
+        conditions.push(`cal.action = $${p++}`); params.push(action);
+    }
+    if (player_id && /^[0-9a-f-]{36}$/.test(player_id)) {
+        conditions.push(`cal.actor_player_id = $${p++}`); params.push(player_id);
+    }
+
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    try {
+        const result = await pool.query(`
+            SELECT cal.id, cal.action, cal.detail, cal.created_at,
+                   cal.session_id, cal.request_id,
+                   p.player_name AS actor_name, p.id AS actor_id,
+                   cs.activity_type, cs.session_url
+            FROM coaching_audit_log cal
+            LEFT JOIN players p ON p.id = cal.actor_player_id
+            LEFT JOIN coaching_sessions cs ON cs.id = cal.session_id
+            ${where}
+            ORDER BY cal.created_at DESC
+            LIMIT $${p++} OFFSET $${p++}
+        `, [...params, lim, off]);
+        res.json(result.rows);
+    } catch (e) {
+        console.error('GET /api/coaching/audit:', e.message);
+        res.status(500).json({ error: 'Failed to fetch audit log' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// COACH MANAGE: GET /api/coaching/manage
+// Coach's own view: requests + upcoming + confirmed + completed
+// ══════════════════════════════════════════════════════════════
+app.get('/api/coaching/manage', authenticateToken, async (req, res) => {
+    // Must be coach or superadmin
+    const isCoach = await pool.query(
+        `SELECT 1 FROM player_badges pb JOIN badges b ON b.id=pb.badge_id
+         WHERE pb.player_id=$1 AND b.name='Coach'`,
+        [req.user.playerId]
+    );
+    if (isCoach.rows.length === 0 && req.user.role !== 'superadmin')
+        return res.status(403).json({ error: 'Coach badge required' });
+
+    const coachId = req.user.playerId;
+    const isSuperadmin = req.user.role === 'superadmin';
+
+    try {
+        // Open requests directed to this coach (or all, for superadmin)
+        const requestsResult = await pool.query(`
+            SELECT cr.id, cr.activity_type, cr.group_type, cr.time_preference,
+                   cr.notes, cr.status, cr.created_at,
+                   p.player_name AS player_name, p.id AS player_id
+            FROM coaching_requests cr
+            JOIN players p ON p.id = cr.player_id
+            WHERE cr.status = 'pending'
+              AND (cr.coach_player_id = $1 OR cr.coach_player_id IS NULL OR $2)
+            ORDER BY cr.created_at ASC
+        `, [coachId, isSuperadmin]);
+
+        // All my sessions grouped by status
+        const sessionWhere = isSuperadmin ? '' : 'AND cs.coach_player_id = $1';
+        const sessionParams = isSuperadmin ? [] : [coachId];
+
+        const sessionsResult = await pool.query(`
+            SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type,
+                   cs.max_players, cs.session_date, cs.status, cs.duration_hours,
+                   cs.min_price, cs.max_price, cs.is_full, cs.coach_confirmed,
+                   v.name AS venue_name,
+                   (SELECT COUNT(*) FROM coaching_registrations cr
+                    WHERE cr.session_id=cs.id AND cr.status='registered') AS registered_count,
+                   (SELECT json_agg(json_build_object(
+                       'player_id', cr.player_id,
+                       'player_name', p2.player_name,
+                       'start_time', cr.start_time,
+                       'activity_focus', cr.activity_focus
+                   ))
+                    FROM coaching_registrations cr
+                    JOIN players p2 ON p2.id = cr.player_id
+                    WHERE cr.session_id=cs.id AND cr.status='registered') AS registrations
+            FROM coaching_sessions cs
+            LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+            WHERE cs.status != 'cancelled'
+            ${sessionWhere}
+            ORDER BY cs.session_date ASC NULLS LAST
+        `, sessionParams);
+
+        res.json({
+            requests:   requestsResult.rows,
+            sessions:   sessionsResult.rows
+        });
+    } catch (e) {
+        console.error('GET /api/coaching/manage:', e.message);
+        res.status(500).json({ error: 'Failed to fetch manage data' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: POST /api/coaching/apply
+// Player applies to become a coach
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/apply', authenticateToken, registrationLimiter, async (req, res) => {
+    const { certifications, experience, min_hourly_rate, license_doc } = req.body;
+    if (!certifications || certifications.length < 5 || certifications.length > 1000)
+        return res.status(400).json({ error: 'certifications required (5–1000 chars)' });
+    if (!experience || experience.length < 10 || experience.length > 2000)
+        return res.status(400).json({ error: 'experience required (10–2000 chars)' });
+    if (min_hourly_rate !== undefined && (isNaN(parseFloat(min_hourly_rate)) || parseFloat(min_hourly_rate) < 0))
+        return res.status(400).json({ error: 'Invalid min_hourly_rate' });
+    if (license_doc && license_doc.length > 500) return res.status(400).json({ error: 'license_doc too long' });
+
+    // Check not already a coach
+    const alreadyCoach = await pool.query(
+        `SELECT 1 FROM player_badges pb JOIN badges b ON b.id=pb.badge_id
+         WHERE pb.player_id=$1 AND b.name='Coach'`,
+        [req.user.playerId]
+    );
+    if (alreadyCoach.rows.length > 0) return res.status(400).json({ error: 'Already a coach' });
+
+    // Check not already pending
+    const pending = await pool.query(
+        `SELECT id FROM pending_applications WHERE player_id=$1 AND application_type='coach' AND status='pending'`,
+        [req.user.playerId]
+    );
+    if (pending.rows.length > 0) return res.status(400).json({ error: 'Application already pending' });
+
+    const result = await pool.query(
+        `INSERT INTO pending_applications
+           (player_id, application_type, certifications, experience, min_hourly_rate, license_doc)
+         VALUES ($1,'coach',$2,$3,$4,$5) RETURNING id`,
+        [req.user.playerId, certifications, experience, min_hourly_rate || null, license_doc || null]
+    );
+
+    const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+    notifyAdmin('New Coach Application',
+        `${htmlEncode(playerName)} has applied to become a TotalFooty coach. Certifications: ${htmlEncode(certifications.substring(0,100))}`);
+
+    await logCoachingAudit(null, null, req.user.playerId, 'coach_application_submitted',
+        `Certifications: ${certifications.substring(0,100)}`);
+
+    res.status(201).json({ id: result.rows[0].id });
+});
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: GET /api/admin/coaching/applications
+// View all pending coach applications
+// ══════════════════════════════════════════════════════════════
+app.get('/api/admin/coaching/applications', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT pa.id, pa.certifications, pa.experience, pa.min_hourly_rate,
+                   pa.license_doc, pa.status, pa.created_at, pa.notes,
+                   p.player_name, p.id AS player_id, p.alias,
+                   r.player_name AS reviewed_by_name
+            FROM pending_applications pa
+            JOIN players p ON p.id = pa.player_id
+            LEFT JOIN players r ON r.id = pa.reviewed_by
+            WHERE pa.application_type = 'coach'
+            ORDER BY pa.created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (e) {
+        console.error('GET /api/admin/coaching/applications:', e.message);
+        res.status(500).json({ error: 'Failed to fetch applications' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: POST /api/admin/coaching/applications/:id/review
+// Approve (grants Coach badge) or reject an application
+// ══════════════════════════════════════════════════════════════
+app.post('/api/admin/coaching/applications/:id/review', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { decision, notes } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid ID' });
+    if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be approve or reject' });
+    if (notes && notes.length > 1000) return res.status(400).json({ error: 'notes too long' });
+
+    const appResult = await pool.query(
+        `SELECT pa.id, pa.player_id, pa.status, pa.certifications, pa.experience, pa.min_hourly_rate
+         FROM pending_applications pa WHERE pa.id=$1 AND pa.application_type='coach'`,
+        [id]
+    );
+    if (appResult.rows.length === 0) return res.status(404).json({ error: 'Application not found' });
+    if (appResult.rows[0].status !== 'pending') return res.status(400).json({ error: 'Application already reviewed' });
+
+    const app = appResult.rows[0];
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        await client.query(
+            `UPDATE pending_applications SET status=$1, reviewed_by=$2, reviewed_at=NOW(), notes=$3 WHERE id=$4`,
+            [decision === 'approve' ? 'approved' : 'rejected', req.user.playerId, notes || null, id]
+        );
+
+        if (decision === 'approve') {
+            // Grant Coach badge
+            const badgeResult = await client.query(`SELECT id FROM badges WHERE name='Coach'`);
+            if (badgeResult.rows.length > 0) {
+                await client.query(
+                    `INSERT INTO player_badges (player_id, badge_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+                    [app.player_id, badgeResult.rows[0].id]
+                );
+            }
+            // Copy coaching credentials to player record
+            await client.query(
+                `UPDATE players SET
+                   coach_certifications=$1, coach_experience=$2, coach_min_hourly_rate=$3
+                 WHERE id=$4`,
+                [app.certifications, app.experience, app.min_hourly_rate || null, app.player_id]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        await logCoachingAudit(null, null, req.user.playerId,
+            decision === 'approve' ? 'coach_badge_assigned' : 'application_rejected',
+            `Application ${decision}d for player ${app.player_id}.${notes ? ' Note: ' + notes.substring(0,100) : ''}`
+        );
+
+        const playerName = (await pool.query('SELECT player_name, email FROM players WHERE id=$1', [app.player_id])).rows[0];
+        if (decision === 'approve') {
+            await sendCoachingEmail([app.player_id], 'Welcome to TotalFooty Coaching! 🎓',
+                `<p style="color:#888">Congratulations ${htmlEncode(playerName?.player_name || '')}! Your coach application has been approved.</p>
+                 <p style="color:#888;margin-top:8px">You now have access to the <strong style="color:#fff">Manage Coaching</strong> section in TotalFooty. You can create sessions, respond to requests, and start coaching!</p>
+                 ${notes ? `<p style="color:#888;margin-top:8px">Note from admin: ${htmlEncode(notes)}</p>` : ''}`
+            );
+        } else {
+            await sendCoachingEmail([app.player_id], 'Update on Your Coaching Application',
+                `<p style="color:#888">Thank you for your interest in coaching with TotalFooty. Unfortunately your application was not approved at this time.</p>
+                 ${notes ? `<p style="color:#888;margin-top:8px">${htmlEncode(notes)}</p>` : ''}`
+            );
+        }
+
+        res.json({ success: true, decision });
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/admin/coaching/applications/:id/review:', e.message);
+        res.status(500).json({ error: 'Failed to process application' });
+    } finally {
+        client.release();
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// PUBLIC: GET /api/coaching/venues/available
+// Returns venues valid for a given date/time + duration
+// Used by the session creation form to filter venue dropdown
+// ══════════════════════════════════════════════════════════════
+app.get('/api/coaching/venues/available', optionalAuth, publicEndpointLimiter, async (req, res) => {
+    const { session_date, duration_hours } = req.query;
+    const dur = parseInt(duration_hours) || 1;
+    if (session_date && isNaN(Date.parse(session_date)))
+        return res.status(400).json({ error: 'Invalid session_date' });
+
+    try {
+        const result = await pool.query(`
+            SELECT id, name, address, coaching_cost_per_hour,
+                   pay_and_play_coach_hourly, pay_and_play_player_hourly,
+                   availability_rule, boot_type, pitch_name,
+                   parking_pin, pitch_pin, special_instructions
+            FROM venues
+            WHERE coaching_suitable = TRUE
+            ORDER BY name ASC
+        `);
+
+        const filtered = session_date
+            ? result.rows.filter(v => isVenueAvailable(v.availability_rule, session_date, dur))
+            : result.rows;
+
+        res.json(filtered);
+    } catch (e) {
+        console.error('GET /api/coaching/venues/available:', e.message);
+        res.status(500).json({ error: 'Failed to fetch venues' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════
+// END COACHING ENDPOINTS
+// ════════════════════════════════════════════════════════════
+
+
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT}`);
     
