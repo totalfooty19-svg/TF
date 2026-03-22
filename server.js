@@ -13148,7 +13148,7 @@ async function sendCoachingEmail(playerIds, subject, htmlBody) {
 app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT p.id, p.player_name, p.alias, p.profile_photo,
+            SELECT p.id, p.full_name AS player_name, p.alias, p.profile_photo,
                    p.coach_certifications, p.coach_experience,
                    p.coach_min_hourly_rate, p.coaching_appearances,
                    COALESCE(AVG(cf.rating), 0)::NUMERIC(3,2) AS avg_rating,
@@ -13158,7 +13158,7 @@ app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req
             JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
             LEFT JOIN coaching_feedback cf ON cf.coach_player_id = p.id
             WHERE p.status = 'active'
-            GROUP BY p.id, p.player_name, p.alias, p.profile_photo,
+            GROUP BY p.id, p.full_name, p.alias, p.profile_photo,
                      p.coach_certifications, p.coach_experience,
                      p.coach_min_hourly_rate, p.coaching_appearances
             ORDER BY p.coaching_appearances DESC
@@ -13181,7 +13181,7 @@ app.get('/api/coaching/sessions', optionalAuth, publicEndpointLimiter, async (re
                    cs.max_players, cs.session_date, cs.status, cs.duration_hours,
                    cs.min_price, cs.max_price, cs.is_full,
                    cs.session_notes,
-                   p.player_name AS coach_name, p.alias AS coach_alias,
+                   p.full_name AS coach_name, p.alias AS coach_alias,
                    p.profile_photo AS coach_photo, p.coaching_appearances,
                    COALESCE(AVG(cf.rating), 0)::NUMERIC(3,2) AS coach_avg_rating,
                    v.name AS venue_name, v.address AS venue_address,
@@ -13218,7 +13218,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                    cs.max_players, cs.session_date, cs.status, cs.duration_hours,
                    cs.min_price, cs.max_price, cs.is_full, cs.session_notes,
                    cs.coach_confirmed, cs.created_at,
-                   p.id AS coach_id, p.player_name AS coach_name,
+                   p.id AS coach_id, p.full_name AS coach_name,
                    p.alias AS coach_alias, p.profile_photo AS coach_photo,
                    p.coach_certifications, p.coaching_appearances,
                    COALESCE(avg_sub.avg_rating, 0) AS coach_avg_rating,
@@ -13243,7 +13243,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
         // Registered players (only show names + start times if finalised)
         const regResult = await pool.query(`
             SELECT cr.id, cr.start_time, cr.activity_focus, cr.status,
-                   p.player_name, p.alias, p.profile_photo, p.id AS player_id
+                   p.full_name AS player_name, p.alias, p.profile_photo, p.id AS player_id
             FROM coaching_registrations cr
             JOIN players p ON p.id = cr.player_id
             WHERE cr.session_id = $1 AND cr.status = 'registered'
@@ -13261,7 +13261,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
         // Feedback (post-completion)
         const feedbackResult = await pool.query(`
             SELECT cf.rating, cf.comment, cf.created_at,
-                   p.player_name, p.alias
+                   p.full_name AS player_name, p.alias
             FROM coaching_feedback cf
             JOIN players p ON p.id = cf.player_id
             WHERE cf.session_id = $1
@@ -13343,7 +13343,7 @@ app.get('/api/coaching/coach/:id/profile', optionalAuth, publicEndpointLimiter, 
     }
     try {
         const cResult = await pool.query(`
-            SELECT p.id, p.player_name, p.alias, p.profile_photo,
+            SELECT p.id, p.full_name AS player_name, p.alias, p.profile_photo,
                    p.coach_certifications, p.coach_experience,
                    p.coach_min_hourly_rate, p.coaching_appearances,
                    p.created_at AS member_since,
@@ -13361,7 +13361,7 @@ app.get('/api/coaching/coach/:id/profile', optionalAuth, publicEndpointLimiter, 
 
         const feedbackResult = await pool.query(`
             SELECT cf.rating, cf.comment, cf.created_at,
-                   p.player_name, p.alias
+                   p.full_name AS player_name, p.alias
             FROM coaching_feedback cf
             JOIN players p ON p.id = cf.player_id
             WHERE cf.coach_player_id = $1
@@ -13515,7 +13515,7 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
             `Created by ${req.user.role}. Activity: ${activity_type}, group: ${group_type}, ${duration_hours}hr`);
 
         // Emails
-        const coachName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A coach';
+        const coachName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A coach';
         const activityLabel = activity_type.replace(/_/g, ' ');
 
         if (req.user.role === 'superadmin') {
@@ -13611,7 +13611,7 @@ app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationL
         if (count >= session.max_players) {
             await pool.query(`UPDATE coaching_sessions SET is_full=TRUE WHERE id=$1`, [id]);
             // Notify superadmin + coach
-            const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+            const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
             notifyAdmin('Coaching Session Full', `Session ${htmlEncode(id)} is now full (${session.max_players} players).`);
             if (session.coach_player_id) {
                 await sendCoachingEmail([session.coach_player_id], 'Your Coaching Session Is Full',
@@ -13620,7 +13620,7 @@ app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationL
             }
         } else {
             // Notify coach + admin of new signup
-            const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+            const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
             notifyAdmin('New Coaching Registration',
                 `${htmlEncode(playerName)} signed up for a coaching session (${htmlEncode(session.activity_type)}). ${count}/${session.max_players} players.`);
             if (session.coach_player_id) {
@@ -13672,7 +13672,7 @@ app.delete('/api/coaching/sessions/:id/register', authenticateToken, registratio
         const sessionResult = await pool.query(
             'SELECT coach_player_id, activity_type FROM coaching_sessions WHERE id=$1', [id]
         );
-        const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+        const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
 
         notifyAdmin('Coaching Drop-Out', `${htmlEncode(playerName)} dropped out of a coaching session (${htmlEncode(sessionResult.rows[0]?.activity_type || 'unknown')}).`);
         if (sessionResult.rows[0]?.coach_player_id) {
@@ -13732,7 +13732,7 @@ app.post('/api/coaching/requests', authenticateToken, registrationLimiter, async
     await logCoachingAudit(null, requestId, req.user.playerId, 'session_request_submitted',
         `Activity: ${activity_type || 'any'}, group: ${group_type || 'any'}, coach: ${coach_player_id || 'any'}`);
 
-    const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+    const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
     notifyAdmin('New Coaching Request',
         `${htmlEncode(playerName)} submitted a coaching request. Activity: ${htmlEncode(activity_type || 'any')}.`);
 
@@ -13800,7 +13800,7 @@ app.post('/api/coaching/requests/:id/respond', authenticateToken, async (req, re
     await logCoachingAudit(null, id, req.user.playerId, `request_${newStatus}`,
         `${action} by ${req.user.role}. ${message ? 'Message included.' : ''}`);
 
-    const actorName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'TotalFooty';
+    const actorName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'TotalFooty';
     const subjectMap = { approve: 'Your Coaching Request Was Approved ✅', reject: 'Update on Your Coaching Request', reply: 'Reply to Your Coaching Request' };
     const bodyMap = {
         approve: `<p style="color:#888">Your coaching request has been approved by ${htmlEncode(actorName)}. A session will be created for you shortly.</p>`,
@@ -13968,7 +13968,7 @@ async function handleFinalise(req, res) {
 
         // Email all registered players + superadmin
         const playerDetails = await pool.query(
-            `SELECT cr.player_id, cr.start_time, cr.activity_focus, p.player_name
+            `SELECT cr.player_id, cr.start_time, cr.activity_focus, p.full_name AS player_name
              FROM coaching_registrations cr JOIN players p ON p.id=cr.player_id
              WHERE cr.session_id=$1 AND cr.status='registered'`,
             [id]
@@ -14096,7 +14096,7 @@ app.post('/api/coaching/sessions/:id/feedback', authenticateToken, registrationL
     await logCoachingAudit(id, null, req.user.playerId, 'feedback_submitted',
         `Rating: ${rating}/5.${comment ? ' Comment included.' : ''}`);
 
-    const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+    const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
     await sendCoachingEmail([session.coach_player_id], `New Coach Feedback — ${rating}⭐`,
         `<p style="color:#888">${htmlEncode(playerName)} has left you feedback.</p>
          <p style="color:#fff;font-size:18px;margin:12px 0">${'⭐'.repeat(rating)}</p>
@@ -14119,7 +14119,7 @@ app.get('/api/admin/coaching/sessions', authenticateToken, requireAdmin, async (
                    cs.max_players, cs.session_date, cs.status, cs.duration_hours,
                    cs.min_price, cs.max_price, cs.is_full, cs.session_notes,
                    cs.coach_confirmed, cs.created_at, cs.updated_at,
-                   p.player_name AS coach_name, p.id AS coach_id,
+                   p.full_name AS coach_name, p.id AS coach_id,
                    v.name AS venue_name, v.id AS venue_id,
                    (SELECT COUNT(*) FROM coaching_registrations cr
                     WHERE cr.session_id=cs.id AND cr.status='registered') AS registered_count,
@@ -14148,8 +14148,8 @@ app.get('/api/admin/coaching/requests', authenticateToken, requireAdmin, async (
         const result = await pool.query(`
             SELECT cr.id, cr.activity_type, cr.group_type, cr.time_preference,
                    cr.notes, cr.status, cr.created_at,
-                   p.player_name AS player_name, p.id AS player_id,
-                   c.player_name AS coach_name, c.id AS coach_id
+                   p.full_name AS player_name, p.id AS player_id,
+                   c.full_name AS coach_name, c.id AS coach_id
             FROM coaching_requests cr
             JOIN players p ON p.id = cr.player_id
             LEFT JOIN players c ON c.id = cr.coach_player_id
@@ -14188,7 +14188,7 @@ app.get('/api/coaching/audit', authenticateToken, requireAdmin, async (req, res)
         const result = await pool.query(`
             SELECT cal.id, cal.action, cal.detail, cal.created_at,
                    cal.session_id, cal.request_id,
-                   p.player_name AS actor_name, p.id AS actor_id,
+                   p.full_name AS actor_name, p.id AS actor_id,
                    cs.activity_type, cs.session_url
             FROM coaching_audit_log cal
             LEFT JOIN players p ON p.id = cal.actor_player_id
@@ -14247,7 +14247,7 @@ app.get('/api/coaching/manage', authenticateToken, async (req, res) => {
                     WHERE cr.session_id=cs.id AND cr.status='registered') AS registered_count,
                    (SELECT json_agg(json_build_object(
                        'player_id', cr.player_id,
-                       'player_name', p2.player_name,
+                       'player_name', p2.full_name,
                        'start_time', cr.start_time,
                        'activity_focus', cr.activity_focus
                    ))
@@ -14307,7 +14307,7 @@ app.post('/api/coaching/apply', authenticateToken, registrationLimiter, async (r
         [req.user.playerId, certifications, experience, min_hourly_rate || null, license_doc || null]
     );
 
-    const playerName = (await pool.query('SELECT player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+    const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
     notifyAdmin('New Coach Application',
         `${htmlEncode(playerName)} has applied to become a TotalFooty coach. Certifications: ${htmlEncode(certifications.substring(0,100))}`);
 
@@ -14326,8 +14326,8 @@ app.get('/api/admin/coaching/applications', authenticateToken, requireSuperAdmin
         const result = await pool.query(`
             SELECT pa.id, pa.certifications, pa.experience, pa.min_hourly_rate,
                    pa.license_doc, pa.status, pa.created_at, pa.notes,
-                   p.player_name, p.id AS player_id, p.alias,
-                   r.player_name AS reviewed_by_name
+                   p.full_name AS player_name, p.id AS player_id, p.alias,
+                   r.full_name AS reviewed_by_name
             FROM pending_applications pa
             JOIN players p ON p.id = pa.player_id
             LEFT JOIN players r ON r.id = pa.reviewed_by
@@ -14396,7 +14396,7 @@ app.post('/api/admin/coaching/applications/:id/review', authenticateToken, requi
             `Application ${decision}d for player ${app.player_id}.${notes ? ' Note: ' + notes.substring(0,100) : ''}`
         );
 
-        const playerName = (await pool.query('SELECT player_name, email FROM players WHERE id=$1', [app.player_id])).rows[0];
+        const playerName = (await pool.query('SELECT full_name AS player_name, email FROM players WHERE id=$1', [app.player_id])).rows[0];
         if (decision === 'approve') {
             await sendCoachingEmail([app.player_id], 'Welcome to TotalFooty Coaching! 🎓',
                 `<p style="color:#888">Congratulations ${htmlEncode(playerName?.player_name || '')}! Your coach application has been approved.</p>
