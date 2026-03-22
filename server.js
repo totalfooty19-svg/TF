@@ -3129,6 +3129,69 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
 });
 
 // Get players registered for a specific game
+// GET /api/games/:id/calendar.ics — download ICS file for a registered game
+app.get('/api/games/:id/calendar.ics', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query(`
+            SELECT g.game_date, g.format, g.cost_per_player, g.game_url,
+                   v.name as venue_name, v.address as venue_address, v.postcode as venue_postcode
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.id = $1
+        `, [id]);
+
+        if (!result.rows[0]) return res.status(404).json({ error: 'Game not found' });
+
+        // Verify player is registered
+        const regCheck = await pool.query(
+            `SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [id, req.user.playerId]
+        );
+        if (!regCheck.rows.length) return res.status(403).json({ error: 'Not registered for this game' });
+
+        const game = result.rows[0];
+        const start = new Date(game.game_date);
+        const end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour default
+
+        const pad = n => String(n).padStart(2, '0');
+        const icsDate = (d) => `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}00Z`;
+        // RFC 5545: escape backslash, semicolon, comma, newline in TEXT values
+        const icsEscape = s => (s || '').replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
+        const locationRaw = [game.venue_name, game.venue_address, game.venue_postcode].filter(Boolean).join(', ');
+        const uid = `tf-game-${id}@totalfooty.co.uk`;
+        const summary = icsEscape(`⚽ TotalFooty — ${game.format || 'Football'}`);
+        const description = icsEscape(`TotalFooty game at ${game.venue_name || 'TBA'}. View details: https://totalfooty.co.uk/vibecoding/game.html?url=${game.game_url || ''}`);
+        const location = icsEscape(locationRaw);
+
+        const ics = [
+            'BEGIN:VCALENDAR',
+            'VERSION:2.0',
+            'PRODID:-//TotalFooty//Game Calendar//EN',
+            'CALSCALE:GREGORIAN',
+            'METHOD:PUBLISH',
+            'BEGIN:VEVENT',
+            `UID:${uid}`,
+            `DTSTAMP:${icsDate(new Date())}`,
+            `DTSTART:${icsDate(start)}`,
+            `DTEND:${icsDate(end)}`,
+            `SUMMARY:${summary}`,
+            `DESCRIPTION:${description}`,
+            `LOCATION:${location}`,
+            'STATUS:CONFIRMED',
+            'END:VEVENT',
+            'END:VCALENDAR'
+        ].join('\r\n');
+
+        res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="totalfooty-game.ics"`);
+        res.send(ics);
+    } catch (e) {
+        console.error('ICS generation error:', e.message);
+        res.status(500).json({ error: 'Failed to generate calendar file' });
+    }
+});
+
 app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
     try {
         // Check if this is a draft_memory game so we can join fixed_team data
