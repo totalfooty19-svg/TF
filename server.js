@@ -13157,7 +13157,7 @@ app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req
             JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
             LEFT JOIN coaching_feedback cf ON cf.coach_player_id = p.id
             WHERE p.status = 'active'
-            GROUP BY p.id, p.full_name, p.alias, p.photo_url AS profile_photo,
+            GROUP BY p.id, p.full_name, p.alias, p.photo_url,
                      p.coach_certifications, p.coach_experience,
                      p.coach_min_hourly_rate, p.coaching_appearances
             ORDER BY p.coaching_appearances DESC
