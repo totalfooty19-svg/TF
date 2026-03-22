@@ -13156,7 +13156,6 @@ app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req
             JOIN player_badges pb ON pb.player_id = p.id
             JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
             LEFT JOIN coaching_feedback cf ON cf.coach_player_id = p.id
-            WHERE p.status = 'active'
             GROUP BY p.id, p.full_name, p.alias, p.photo_url,
                      p.coach_certifications, p.coach_experience,
                      p.coach_min_hourly_rate, p.coaching_appearances
@@ -13352,7 +13351,7 @@ app.get('/api/coaching/coach/:id/profile', optionalAuth, publicEndpointLimiter, 
             JOIN player_badges pb ON pb.player_id = p.id
             JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
             LEFT JOIN coaching_feedback cf ON cf.coach_player_id = p.id
-            WHERE p.id = $1 AND p.status = 'active'
+            WHERE p.id = $1
             GROUP BY p.id
         `, [id]);
 
@@ -13521,7 +13520,7 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
             // Email all coaches
             const coaches = await pool.query(
                 `SELECT p.id FROM players p JOIN player_badges pb ON pb.player_id=p.id
-                 JOIN badges b ON b.id=pb.badge_id AND b.name='Coach' WHERE p.status='active'`
+                 JOIN badges b ON b.id=pb.badge_id AND b.name='Coach'`
             );
             await sendCoachingEmail(
                 coaches.rows.map(r => r.id),
@@ -13542,7 +13541,7 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
 
         // Email all coachable players
         const coachablePlayers = await pool.query(
-            `SELECT id FROM players WHERE coachable=TRUE AND status='active'`
+            `SELECT id FROM players WHERE coachable=TRUE`
         );
         await sendCoachingEmail(
             coachablePlayers.rows.map(r => r.id),
@@ -13749,7 +13748,7 @@ app.post('/api/coaching/requests', authenticateToken, registrationLimiter, async
         // Notify all coaches
         const allCoaches = await pool.query(
             `SELECT p.id FROM players p JOIN player_badges pb ON pb.player_id=p.id
-             JOIN badges b ON b.id=pb.badge_id AND b.name='Coach' WHERE p.status='active'`
+             JOIN badges b ON b.id=pb.badge_id AND b.name='Coach'`
         );
         await sendCoachingEmail(
             allCoaches.rows.map(r => r.id),
