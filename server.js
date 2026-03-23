@@ -5754,6 +5754,8 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
         
         // Update the game (include game_date if provided, tournament_team_count if provided)
         if (game_date) {
+            // Evaluate the 48hr check in JS to avoid PostgreSQL type ambiguity on $1
+            const resetMinRatingFlag = new Date(game_date) > new Date(Date.now() + 48 * 60 * 60 * 1000);
             await pool.query(`
                 UPDATE games 
                 SET game_date = $1,
@@ -5765,13 +5767,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     min_rating_enabled = COALESCE($7, min_rating_enabled),
                     refs_required = COALESCE($9, refs_required),
                     ref_pay = COALESCE($10, ref_pay),
-                    min_rating_drop_sent = CASE
-                        WHEN ($1::text)::timestamptz > NOW() + INTERVAL '48 hours' THEN 0
-                        ELSE min_rating_drop_sent
-                    END,
+                    min_rating_drop_sent = CASE WHEN $12 THEN 0 ELSE min_rating_drop_sent END,
                     requires_organiser = COALESCE($11, requires_organiser)
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null]);
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag]);
         } else {
             await pool.query(`
                 UPDATE games 
