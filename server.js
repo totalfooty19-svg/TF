@@ -9130,6 +9130,11 @@ app.post('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) =
         const { awardType, nomineePlayerId } = req.body;
         const voterId = req.user.playerId;
 
+        // Block guests — their IDs are not valid UUIDs and they have no registrations
+        if (!voterId || typeof voterId !== 'string' || voterId.startsWith('guest_')) {
+            return res.status(403).json({ error: 'Guests cannot vote for awards' });
+        }
+
         // Validate award type
         if (!AWARD_TYPES.includes(awardType)) {
             return res.status(400).json({ error: 'Invalid award type' });
