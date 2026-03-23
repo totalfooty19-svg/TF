@@ -13124,7 +13124,7 @@ async function sendCoachingEmail(playerIds, subject, htmlBody) {
     if (!playerIds || playerIds.length === 0) return;
     try {
         const result = await pool.query(
-            'SELECT email FROM players WHERE id = ANY($1) AND email IS NOT NULL',
+            'SELECT u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = ANY($1) AND email IS NOT NULL',
             [playerIds]
         );
         const emails = result.rows.map(r => r.email);
@@ -13180,7 +13180,7 @@ app.get('/api/coaching/sessions', optionalAuth, publicEndpointLimiter, async (re
                    cs.min_price, cs.max_price, cs.is_full,
                    cs.session_notes,
                    p.full_name AS coach_name, p.alias AS coach_alias,
-                   p.photo_url AS profile_photo AS coach_photo, p.coaching_appearances,
+                   p.photo_url AS coach_photo, p.coaching_appearances,
                    COALESCE(AVG(cf.rating), 0)::NUMERIC(3,2) AS coach_avg_rating,
                    v.name AS venue_name, v.address AS venue_address,
                    (SELECT COUNT(*) FROM coaching_registrations cr
@@ -13217,7 +13217,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                    cs.min_price, cs.max_price, cs.is_full, cs.session_notes,
                    cs.coach_confirmed, cs.created_at,
                    p.id AS coach_id, p.full_name AS coach_name,
-                   p.alias AS coach_alias, p.photo_url AS profile_photo AS coach_photo,
+                   p.alias AS coach_alias, p.photo_url AS coach_photo,
                    p.coach_certifications, p.coaching_appearances,
                    COALESCE(avg_sub.avg_rating, 0) AS coach_avg_rating,
                    v.id AS venue_id, v.name AS venue_name, v.address AS venue_address,
@@ -13535,7 +13535,7 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
             // Email superadmin
             notifyAdmin(
                 `New Coaching Session — ${htmlEncode(activityLabel)}`,
-                `${htmlEncode(coachName)} created a new ${duration_hours}hr ${activityLabel} session (${group_type}).`
+                [['Coach', htmlEncode(coachName)], ['Duration', `${duration_hours}hr`], ['Activity', htmlEncode(activityLabel)], ['Group', htmlEncode(group_type)]]
             );
         }
 
@@ -13610,7 +13610,7 @@ app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationL
             await pool.query(`UPDATE coaching_sessions SET is_full=TRUE WHERE id=$1`, [id]);
             // Notify superadmin + coach
             const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
-            notifyAdmin('Coaching Session Full', `Session ${htmlEncode(id)} is now full (${session.max_players} players).`);
+            notifyAdmin('Coaching Session Full', [['Details', `Session ${htmlEncode(id)} is now full (${session.max_players} players).`]]);
             if (session.coach_player_id) {
                 await sendCoachingEmail([session.coach_player_id], 'Your Coaching Session Is Full',
                     `<p style="color:#888">Your ${htmlEncode(session.activity_type)} coaching session is now full with ${session.max_players} registered players.</p>`
@@ -13619,8 +13619,7 @@ app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationL
         } else {
             // Notify coach + admin of new signup
             const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
-            notifyAdmin('New Coaching Registration',
-                `${htmlEncode(playerName)} signed up for a coaching session (${htmlEncode(session.activity_type)}). ${count}/${session.max_players} players.`);
+            notifyAdmin('New Coaching Registration', [['Details', `${htmlEncode(playerName)} signed up for a coaching session (${htmlEncode(session.activity_type)}). ${count}/${session.max_players} players.`]]);
             if (session.coach_player_id) {
                 await sendCoachingEmail([session.coach_player_id], 'New Coaching Sign-Up',
                     `<p style="color:#888">${htmlEncode(playerName)} has signed up for your ${htmlEncode(session.activity_type)} session. You now have ${count}/${session.max_players} players.</p>`
@@ -13672,7 +13671,7 @@ app.delete('/api/coaching/sessions/:id/register', authenticateToken, registratio
         );
         const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
 
-        notifyAdmin('Coaching Drop-Out', `${htmlEncode(playerName)} dropped out of a coaching session (${htmlEncode(sessionResult.rows[0]?.activity_type || 'unknown')}).`);
+        notifyAdmin('Coaching Drop-Out', [['Details', `${htmlEncode(playerName)} dropped out of a coaching session (${htmlEncode(sessionResult.rows[0]?.activity_type || 'unknown')}).`]]);
         if (sessionResult.rows[0]?.coach_player_id) {
             await sendCoachingEmail([sessionResult.rows[0].coach_player_id], 'Player Dropped Out',
                 `<p style="color:#888">${htmlEncode(playerName)} has dropped out of your ${htmlEncode(sessionResult.rows[0].activity_type)} coaching session.</p>`
@@ -13731,8 +13730,7 @@ app.post('/api/coaching/requests', authenticateToken, registrationLimiter, async
         `Activity: ${activity_type || 'any'}, group: ${group_type || 'any'}, coach: ${coach_player_id || 'any'}`);
 
     const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
-    notifyAdmin('New Coaching Request',
-        `${htmlEncode(playerName)} submitted a coaching request. Activity: ${htmlEncode(activity_type || 'any')}.`);
+    notifyAdmin('New Coaching Request', [['Details', `${htmlEncode(playerName)} submitted a coaching request. Activity: ${htmlEncode(activity_type || 'any')}.`]]);
 
     if (coach_player_id) {
         await sendCoachingEmail([coach_player_id], 'New Coaching Request For You',
@@ -13807,7 +13805,7 @@ app.post('/api/coaching/requests/:id/respond', authenticateToken, async (req, re
     };
 
     await sendCoachingEmail([coachReq.player_id], subjectMap[action], bodyMap[action]);
-    notifyAdmin(`Coaching Request ${newStatus}`, `${htmlEncode(actorName)} ${action}d a coaching request.`);
+    notifyAdmin(`Coaching Request ${newStatus}`, [['Details', `${htmlEncode(actorName)} ${action}d a coaching request.`]]);
 
     res.json({ success: true, status: newStatus });
 });
@@ -13985,8 +13983,7 @@ async function handleFinalise(req, res) {
                  <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/vibecoding/session.html?url=${session.session_url || ''}" style="color:#C0392B">View Session →</a></p>`
             );
         }
-        notifyAdmin(`Session ${isEdit ? 'Re-Finalised' : 'Finalised'}`,
-            `${actLabel} coaching session finalised with ${assignments.length} player(s).`);
+        notifyAdmin(`Session ${isEdit ? 'Re-Finalised' : 'Finalised'}`, [['Details', `${actLabel} coaching session finalised with ${assignments.length} player(s).`]]);
 
         res.json({ success: true });
     } catch (e) {
@@ -14047,7 +14044,7 @@ app.post('/api/coaching/sessions/:id/complete', authenticateToken, async (req, r
              <p style="color:#888;margin-top:12px"><a href="https://totalfooty.co.uk/vibecoding/session.html?url=${id}" style="color:#C0392B;font-weight:700">Rate Your Coach →</a></p>`
         );
     }
-    notifyAdmin('Session Completed', `${actLabel} coaching session completed.`);
+    notifyAdmin('Session Completed', [['Details', `${actLabel} coaching session completed.`]]);
 
     res.json({ success: true });
 });
@@ -14100,8 +14097,7 @@ app.post('/api/coaching/sessions/:id/feedback', authenticateToken, registrationL
          <p style="color:#fff;font-size:18px;margin:12px 0">${'⭐'.repeat(rating)}</p>
          ${comment ? `<p style="color:#aaa;font-style:italic">"${htmlEncode(comment)}"</p>` : ''}`
     );
-    notifyAdmin('Coach Feedback Submitted',
-        `${htmlEncode(playerName)} gave ${rating}/5 stars for a coaching session.`);
+    notifyAdmin('Coach Feedback Submitted', [['Details', `${htmlEncode(playerName)} gave ${rating}/5 stars for a coaching session.`]]);
 
     res.json({ success: true });
 });
@@ -14306,8 +14302,7 @@ app.post('/api/coaching/apply', authenticateToken, registrationLimiter, async (r
     );
 
     const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
-    notifyAdmin('New Coach Application',
-        `${htmlEncode(playerName)} has applied to become a TotalFooty coach. Certifications: ${htmlEncode(certifications.substring(0,100))}`);
+    notifyAdmin('New Coach Application', [['Details', `${htmlEncode(playerName)} has applied to become a TotalFooty coach. Certifications: ${htmlEncode(certifications.substring(0,100))}`]]);
 
     await logCoachingAudit(null, null, req.user.playerId, 'coach_application_submitted',
         `Certifications: ${certifications.substring(0,100)}`);
@@ -14394,7 +14389,7 @@ app.post('/api/admin/coaching/applications/:id/review', authenticateToken, requi
             `Application ${decision}d for player ${app.player_id}.${notes ? ' Note: ' + notes.substring(0,100) : ''}`
         );
 
-        const playerName = (await pool.query('SELECT full_name AS player_name, email FROM players WHERE id=$1', [app.player_id])).rows[0];
+        const playerName = (await pool.query('SELECT p.full_name AS player_name FROM players p WHERE p.id=$1', [app.player_id])).rows[0];
         if (decision === 'approve') {
             await sendCoachingEmail([app.player_id], 'Welcome to TotalFooty Coaching! 🎓',
                 `<p style="color:#888">Congratulations ${htmlEncode(playerName?.player_name || '')}! Your coach application has been approved.</p>
