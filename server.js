@@ -5766,7 +5766,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     refs_required = COALESCE($9, refs_required),
                     ref_pay = COALESCE($10, ref_pay),
                     min_rating_drop_sent = CASE
-                        WHEN $1::timestamptz > NOW() + INTERVAL '48 hours' THEN 0
+                        WHEN ($1::text)::timestamptz > NOW() + INTERVAL '48 hours' THEN 0
                         ELSE min_rating_drop_sent
                     END,
                     requires_organiser = COALESCE($11, requires_organiser)
