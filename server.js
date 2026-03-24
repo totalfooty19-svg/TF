@@ -101,12 +101,29 @@ app.use('/api/auth/register', registerLimiter);
 app.use('/api/auth/forgot-password', authLimiter);
 app.use('/api/auth/reset-password', resetLimiter);
 
-// FIX-036: Global 500kb body limit (photo upload route overrides to 5mb below)
+// FIX-036: Global 500kb body limit — large-payload routes listed explicitly below
+const LARGE_PAYLOAD_PATHS = [
+    '/api/players/me/photo',
+    '/api/players/me/coach-document',
+    '/api/players/me/ref-document',
+    '/api/coaching/apply',
+    '/api/ref/apply',
+];
+// Also match admin doc-upload paths: /api/admin/players/:id/coach-document etc.
 app.use((req, res, next) => {
-    if (req.path === '/api/players/me/photo') return next();
+    const isLarge = LARGE_PAYLOAD_PATHS.includes(req.path)
+        || /^\/api\/admin\/players\/[0-9a-f-]{36}\/(coach|ref)-document$/.test(req.path);
+    if (isLarge) return next();
     express.json({ limit: '500kb' })(req, res, next);
 });
-app.post('/api/players/me/photo', express.json({ limit: '5mb' }));
+// 5mb body parser for large-payload routes
+const largeJson = express.json({ limit: '5mb' });
+app.post('/api/players/me/photo', largeJson);
+app.post('/api/players/me/coach-document', largeJson);
+app.post('/api/players/me/ref-document',   largeJson);
+app.post('/api/coaching/apply',            largeJson);
+app.post('/api/ref/apply',                 largeJson);
+// Admin doc-upload routes get largeJson via their own inline middleware (already applied)
 
 // FIX-055: No-cache headers on all API responses
 app.use('/api', (req, res, next) => {
@@ -2038,6 +2055,148 @@ app.post('/api/players/me/photo', authenticateToken, async (req, res) => {
         res.json({ message: 'Photo uploaded successfully' });
     } catch (error) {
         console.error('Photo upload error:', error);
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/players/me/coach-document
+// Upload coaching license/certificate (base64) — stores in players.coach_license_doc
+// ══════════════════════════════════════════════════════════════
+app.post('/api/players/me/coach-document',
+    authenticateToken,
+    express.json({ limit: '5mb' }),
+async (req, res) => {
+    const { docData } = req.body;
+    if (!docData) return res.status(400).json({ error: 'No document data provided' });
+    if (docData.length > 3_000_000) return res.status(400).json({ error: 'Document too large. Max ~2MB.' });
+
+    const DOC_PREFIXES = {
+        'data:application/pdf;base64,':  { magic: [0x25, 0x50, 0x44, 0x46], label: 'PDF'  },
+        'data:image/jpeg;base64,':       { magic: [0xFF, 0xD8, 0xFF],        label: 'JPEG' },
+        'data:image/png;base64,':        { magic: [0x89, 0x50, 0x4E, 0x47],  label: 'PNG'  },
+    };
+    const matchedPrefix = Object.keys(DOC_PREFIXES).find(p => docData.startsWith(p));
+    if (!matchedPrefix) return res.status(400).json({ error: 'Invalid format. PDF, JPEG or PNG only.' });
+
+    const b64Data   = docData.slice(matchedPrefix.length);
+    const rawBytes  = Buffer.from(b64Data, 'base64');
+    const expected  = DOC_PREFIXES[matchedPrefix].magic;
+    const actual    = [...rawBytes.slice(0, expected.length)];
+    if (!expected.every((byte, i) => actual[i] === byte))
+        return res.status(400).json({ error: 'File contents do not match declared type.' });
+
+    try {
+        await pool.query('UPDATE players SET coach_license_doc = $1 WHERE id = $2',
+            [docData, req.user.playerId]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Coach document upload error:', e.message);
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+// Superadmin: upload coach document for a specific player
+app.post('/api/admin/players/:id/coach-document',
+    authenticateToken, requireSuperAdmin,
+    express.json({ limit: '5mb' }),
+async (req, res) => {
+    const { id } = req.params;
+    const { docData } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid player ID' });
+    if (!docData) return res.status(400).json({ error: 'No document data provided' });
+    if (docData.length > 3_000_000) return res.status(400).json({ error: 'Document too large. Max ~2MB.' });
+
+    const DOC_PREFIXES = {
+        'data:application/pdf;base64,':  { magic: [0x25, 0x50, 0x44, 0x46] },
+        'data:image/jpeg;base64,':       { magic: [0xFF, 0xD8, 0xFF]        },
+        'data:image/png;base64,':        { magic: [0x89, 0x50, 0x4E, 0x47] },
+    };
+    const matchedPrefix = Object.keys(DOC_PREFIXES).find(p => docData.startsWith(p));
+    if (!matchedPrefix) return res.status(400).json({ error: 'Invalid format. PDF, JPEG or PNG only.' });
+
+    const b64     = docData.slice(matchedPrefix.length);
+    const raw     = Buffer.from(b64, 'base64');
+    const exp     = DOC_PREFIXES[matchedPrefix].magic;
+    if (!exp.every((byte, i) => raw[i] === byte))
+        return res.status(400).json({ error: 'File contents do not match declared type.' });
+
+    try {
+        await pool.query('UPDATE players SET coach_license_doc = $1 WHERE id = $2', [docData, id]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Admin coach document upload error:', e.message);
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/players/me/ref-document
+// Upload referee certification (base64) — stores in players.ref_license_doc
+// ══════════════════════════════════════════════════════════════
+app.post('/api/players/me/ref-document',
+    authenticateToken,
+    express.json({ limit: '5mb' }),
+async (req, res) => {
+    const { docData } = req.body;
+    if (!docData) return res.status(400).json({ error: 'No document data provided' });
+    if (docData.length > 3_000_000) return res.status(400).json({ error: 'Document too large. Max ~2MB.' });
+
+    const DOC_PREFIXES = {
+        'data:application/pdf;base64,':  { magic: [0x25, 0x50, 0x44, 0x46] },
+        'data:image/jpeg;base64,':       { magic: [0xFF, 0xD8, 0xFF]        },
+        'data:image/png;base64,':        { magic: [0x89, 0x50, 0x4E, 0x47] },
+    };
+    const matchedPrefix = Object.keys(DOC_PREFIXES).find(p => docData.startsWith(p));
+    if (!matchedPrefix) return res.status(400).json({ error: 'Invalid format. PDF, JPEG or PNG only.' });
+
+    const b64     = docData.slice(matchedPrefix.length);
+    const raw     = Buffer.from(b64, 'base64');
+    const exp     = DOC_PREFIXES[matchedPrefix].magic;
+    if (!exp.every((byte, i) => raw[i] === byte))
+        return res.status(400).json({ error: 'File contents do not match declared type.' });
+
+    try {
+        await pool.query('UPDATE players SET ref_license_doc = $1 WHERE id = $2',
+            [docData, req.user.playerId]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Ref document upload error:', e.message);
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+// Superadmin: upload ref document for a specific player
+app.post('/api/admin/players/:id/ref-document',
+    authenticateToken, requireSuperAdmin,
+    express.json({ limit: '5mb' }),
+async (req, res) => {
+    const { id } = req.params;
+    const { docData } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid player ID' });
+    if (!docData) return res.status(400).json({ error: 'No document data provided' });
+    if (docData.length > 3_000_000) return res.status(400).json({ error: 'Document too large. Max ~2MB.' });
+
+    const DOC_PREFIXES = {
+        'data:application/pdf;base64,':  { magic: [0x25, 0x50, 0x44, 0x46] },
+        'data:image/jpeg;base64,':       { magic: [0xFF, 0xD8, 0xFF]        },
+        'data:image/png;base64,':        { magic: [0x89, 0x50, 0x4E, 0x47] },
+    };
+    const matchedPrefix = Object.keys(DOC_PREFIXES).find(p => docData.startsWith(p));
+    if (!matchedPrefix) return res.status(400).json({ error: 'Invalid format. PDF, JPEG or PNG only.' });
+
+    const b64     = docData.slice(matchedPrefix.length);
+    const raw     = Buffer.from(b64, 'base64');
+    const exp     = DOC_PREFIXES[matchedPrefix].magic;
+    if (!exp.every((byte, i) => raw[i] === byte))
+        return res.status(400).json({ error: 'File contents do not match declared type.' });
+
+    try {
+        await pool.query('UPDATE players SET ref_license_doc = $1 WHERE id = $2', [docData, id]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Admin ref document upload error:', e.message);
         res.status(500).json({ error: 'Upload failed' });
     }
 });
@@ -13219,7 +13378,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
             SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type,
                    cs.max_players, cs.session_date, cs.status, cs.duration_hours,
                    cs.min_price, cs.max_price, cs.is_full, cs.session_notes,
-                   cs.coach_confirmed, cs.created_at,
+                   cs.coach_confirmed, cs.created_at, cs.pitch_number,
                    p.id AS coach_id, p.full_name AS coach_name,
                    p.alias AS coach_alias, p.photo_url AS coach_photo,
                    p.coach_certifications, p.coaching_appearances,
@@ -13319,7 +13478,8 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                 pitch_pin: session.venue_pitch_pin,
                 boot_type: session.venue_boot_type,
                 pitch_name: session.venue_pitch_name,
-                special_instructions: session.venue_special_instructions
+                special_instructions: session.venue_special_instructions,
+                pitch_number: session.pitch_number
             } : null,
             candidate_venues: venueResult.rows,
             registrations: regResult.rows,
@@ -13486,7 +13646,20 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        const sessionResult = await client.query(`
+        // Superadmin can pass an existing coach player_id to pre-assign
+    let assignedCoachId = isCoach.rows.length > 0 ? req.user.playerId : null;
+    if (!assignedCoachId && req.user.role === 'superadmin' && req.body.assigned_coach_player_id) {
+        const acId = req.body.assigned_coach_player_id;
+        if (/^[0-9a-f-]{36}$/.test(acId)) {
+            const acCheck = await pool.query(
+                `SELECT 1 FROM player_badges pb JOIN badges b ON b.id=pb.badge_id WHERE pb.player_id=$1 AND b.name='Coach'`,
+                [acId]
+            );
+            if (acCheck.rows.length > 0) assignedCoachId = acId;
+        }
+    }
+
+    const sessionResult = await client.query(`
             INSERT INTO coaching_sessions
               (session_url, coach_player_id, created_by, duration_hours, activity_type,
                group_type, max_players, session_date, session_notes, min_price, max_price)
@@ -13494,7 +13667,7 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
             RETURNING id
         `, [
             sessionUrl,
-            isCoach.rows.length > 0 ? req.user.playerId : null,
+            assignedCoachId,
             req.user.playerId,
             duration_hours, activity_type, group_type, maxPlayers,
             session_date || null,
@@ -13820,8 +13993,10 @@ app.post('/api/coaching/requests/:id/respond', authenticateToken, async (req, re
 // ══════════════════════════════════════════════════════════════
 app.post('/api/admin/coaching/sessions/:id/confirm', authenticateToken, requireSuperAdmin, async (req, res) => {
     const { id } = req.params;
-    const { confirm_venue_id, confirm_coach } = req.body;
+    const { confirm_venue_id, confirm_coach, pitch_number } = req.body;
     if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (pitch_number !== undefined && pitch_number !== null && (!Number.isInteger(pitch_number) || pitch_number < 1 || pitch_number > 99))
+        return res.status(400).json({ error: 'pitch_number must be an integer between 1 and 99' });
 
     const sessionResult = await pool.query(
         `SELECT id, coach_player_id, coach_confirmed, confirmed_venue_id, status,
@@ -13845,7 +14020,10 @@ app.post('/api/admin/coaching/sessions/:id/confirm', authenticateToken, requireS
         );
         if (csvCheck.rows.length === 0) return res.status(400).json({ error: 'Venue is not a candidate for this session' });
         updates.push(`confirmed_venue_id=$${p++}`); params.push(confirm_venue_id);
-        await logCoachingAudit(id, null, req.user.playerId, 'venue_confirmed', `Venue ${confirm_venue_id} confirmed.`);
+        if (pitch_number !== undefined && pitch_number !== null) {
+            updates.push(`pitch_number=$${p++}`); params.push(pitch_number);
+        }
+        await logCoachingAudit(id, null, req.user.playerId, 'venue_confirmed', `Venue ${confirm_venue_id} confirmed${pitch_number ? `, pitch ${pitch_number}` : ''}.`);
     }
 
     if (confirm_coach === true) {
@@ -14240,6 +14418,7 @@ app.get('/api/coaching/manage', authenticateToken, async (req, res) => {
             SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type,
                    cs.max_players, cs.session_date, cs.status, cs.duration_hours,
                    cs.min_price, cs.max_price, cs.is_full, cs.coach_confirmed,
+                   cs.cancel_requested, cs.pitch_number,
                    v.name AS venue_name,
                    (SELECT COUNT(*) FROM coaching_registrations cr
                     WHERE cr.session_id=cs.id AND cr.status='registered') AS registered_count,
@@ -14281,7 +14460,7 @@ app.post('/api/coaching/apply', authenticateToken, registrationLimiter, async (r
         return res.status(400).json({ error: 'experience required (10–2000 chars)' });
     if (min_hourly_rate !== undefined && (isNaN(parseFloat(min_hourly_rate)) || parseFloat(min_hourly_rate) < 0))
         return res.status(400).json({ error: 'Invalid min_hourly_rate' });
-    if (license_doc && license_doc.length > 500) return res.status(400).json({ error: 'license_doc too long' });
+    if (license_doc && license_doc.length > 3_000_000) return res.status(400).json({ error: 'license_doc too large. Max ~2MB.' });
 
     // Check not already a coach
     const alreadyCoach = await pool.query(
@@ -14315,6 +14494,64 @@ app.post('/api/coaching/apply', authenticateToken, registrationLimiter, async (r
 });
 
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: PUT /api/admin/players/:id/coaching
+// Save coaching credentials from manage-players.html
+// ══════════════════════════════════════════════════════════════
+app.put('/api/admin/players/:id/coaching', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { coach_certifications, coach_experience, coach_min_hourly_rate, coachable } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid player ID' });
+    if (coach_certifications && coach_certifications.length > 500) return res.status(400).json({ error: 'coach_certifications too long' });
+    if (coach_experience && coach_experience.length > 2000) return res.status(400).json({ error: 'coach_experience too long' });
+    if (coach_min_hourly_rate !== undefined && (isNaN(parseFloat(coach_min_hourly_rate)) || parseFloat(coach_min_hourly_rate) < 0))
+        return res.status(400).json({ error: 'Invalid hourly rate' });
+    try {
+        await pool.query(`
+            UPDATE players SET
+                coach_certifications  = $1,
+                coach_experience      = $2,
+                coach_min_hourly_rate = $3,
+                coachable             = $4
+            WHERE id = $5
+        `, [
+            coach_certifications || null,
+            coach_experience     || null,
+            coach_min_hourly_rate !== undefined ? parseFloat(coach_min_hourly_rate) : null,
+            coachable === true || coachable === 'true',
+            id
+        ]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('PUT /api/admin/players/:id/coaching:', e.message);
+        res.status(500).json({ error: 'Failed to update coaching credentials' });
+    }
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: PUT /api/admin/players/:id/ref-credentials
+// Save referee credentials from manage-players.html
+// ══════════════════════════════════════════════════════════════
+app.put('/api/admin/players/:id/ref-credentials', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { ref_certifications, ref_experience } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid player ID' });
+    if (ref_certifications && ref_certifications.length > 500) return res.status(400).json({ error: 'ref_certifications too long' });
+    if (ref_experience && ref_experience.length > 2000) return res.status(400).json({ error: 'ref_experience too long' });
+    try {
+        await pool.query(
+            `UPDATE players SET ref_certifications=$1, ref_experience=$2 WHERE id=$3`,
+            [ref_certifications || null, ref_experience || null, id]
+        );
+        res.json({ success: true });
+    } catch (e) {
+        console.error('PUT /api/admin/players/:id/ref-credentials:', e.message);
+        res.status(500).json({ error: 'Failed to update referee credentials' });
+    }
+});
+
 // SUPERADMIN: GET /api/admin/coaching/applications
 // View all pending coach applications
 // ══════════════════════════════════════════════════════════════
@@ -14448,6 +14685,306 @@ app.get('/api/coaching/venues/available', optionalAuth, publicEndpointLimiter, a
         console.error('GET /api/coaching/venues/available:', e.message);
         res.status(500).json({ error: 'Failed to fetch venues' });
     }
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: POST /api/ref/apply
+// Player applies to become a TotalFooty referee
+// ══════════════════════════════════════════════════════════════
+app.post('/api/ref/apply', authenticateToken, registrationLimiter, async (req, res) => {
+    const { certifications, experience, license_doc } = req.body;
+    if (!certifications || certifications.length < 5 || certifications.length > 1000)
+        return res.status(400).json({ error: 'certifications required (5–1000 chars)' });
+    if (!experience || experience.length < 10 || experience.length > 2000)
+        return res.status(400).json({ error: 'experience required (10–2000 chars)' });
+
+    // Check not already a ref
+    const alreadyRef = await pool.query(
+        `SELECT 1 FROM player_badges pb JOIN badges b ON b.id=pb.badge_id
+         WHERE pb.player_id=$1 AND b.name='Referee'`,
+        [req.user.playerId]
+    );
+    if (alreadyRef.rows.length > 0) return res.status(400).json({ error: 'Already a referee' });
+
+    // Check not already pending
+    const pending = await pool.query(
+        `SELECT id FROM pending_applications WHERE player_id=$1 AND application_type='referee' AND status='pending'`,
+        [req.user.playerId]
+    );
+    if (pending.rows.length > 0) return res.status(400).json({ error: 'Application already pending' });
+
+    const result = await pool.query(
+        `INSERT INTO pending_applications
+           (player_id, application_type, certifications, experience, license_doc)
+         VALUES ($1,'referee',$2,$3,$4) RETURNING id`,
+        [req.user.playerId, certifications, experience, license_doc || null]
+    );
+
+    const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
+    notifyAdmin('New Referee Application', [['Details', `${htmlEncode(playerName)} has applied to become a TotalFooty referee. Certifications: ${htmlEncode(certifications.substring(0,100))}`]]);
+
+    await auditLog(pool, req.user.playerId, 'ref_application_submitted', null,
+        `Certifications: ${certifications.substring(0,100)}`);
+
+    res.status(201).json({ id: result.rows[0].id });
+});
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: GET /api/admin/ref/applications
+// View all referee applications
+// ══════════════════════════════════════════════════════════════
+app.get('/api/admin/ref/applications', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT pa.id, pa.certifications, pa.experience, pa.license_doc,
+                   pa.status, pa.created_at, pa.notes,
+                   p.full_name AS player_name, p.id AS player_id, p.alias,
+                   r.full_name AS reviewed_by_name
+            FROM pending_applications pa
+            JOIN players p ON p.id = pa.player_id
+            LEFT JOIN players r ON r.id = pa.reviewed_by
+            WHERE pa.application_type = 'referee'
+            ORDER BY pa.created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (e) {
+        console.error('GET /api/admin/ref/applications:', e.message);
+        res.status(500).json({ error: 'Failed to fetch referee applications' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: POST /api/admin/ref/applications/:id/review
+// Approve (grants Referee badge) or reject a referee application
+// ══════════════════════════════════════════════════════════════
+app.post('/api/admin/ref/applications/:id/review', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { decision, notes } = req.body;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid ID' });
+    if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be approve or reject' });
+    if (notes && notes.length > 1000) return res.status(400).json({ error: 'notes too long' });
+
+    const appResult = await pool.query(
+        `SELECT pa.id, pa.player_id, pa.status, pa.certifications, pa.experience
+         FROM pending_applications pa WHERE pa.id=$1 AND pa.application_type='referee'`,
+        [id]
+    );
+    if (appResult.rows.length === 0) return res.status(404).json({ error: 'Application not found' });
+    if (appResult.rows[0].status !== 'pending') return res.status(400).json({ error: 'Application already reviewed' });
+
+    const app = appResult.rows[0];
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        await client.query(
+            `UPDATE pending_applications SET status=$1, reviewed_by=$2, reviewed_at=NOW(), notes=$3 WHERE id=$4`,
+            [decision === 'approve' ? 'approved' : 'rejected', req.user.playerId, notes || null, id]
+        );
+
+        if (decision === 'approve') {
+            // Grant Referee badge
+            const refBadge = await client.query(`SELECT id FROM badges WHERE name='Referee'`);
+            if (refBadge.rows.length > 0) {
+                await client.query(
+                    `INSERT INTO player_badges (player_id, badge_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+                    [app.player_id, refBadge.rows[0].id]
+                );
+            }
+            // Copy certifications to player record
+            await client.query(
+                `UPDATE players SET ref_certifications=$1, ref_experience=$2 WHERE id=$3`,
+                [app.certifications, app.experience, app.player_id]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        // Email the applicant
+        const actorName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'TotalFooty';
+        const subject = decision === 'approve'
+            ? '🎉 Referee Application Approved!'
+            : 'Update on Your Referee Application';
+        const body = decision === 'approve'
+            ? `<p style="color:#888">Congratulations! Your referee application has been approved by ${htmlEncode(actorName)}.</p>
+               <p style="color:#888;margin-top:8px">You now have the <strong style="color:#fff">Referee</strong> badge and can apply to officiate games in TotalFooty.</p>
+               <p style="color:#888;margin-top:8px">Head to the Referee section in the app to see available games.</p>`
+            : `<p style="color:#888">Thank you for your interest in refereeing with TotalFooty. Unfortunately your application was not approved at this time.</p>
+               ${notes ? `<p style="color:#888;margin-top:8px">${htmlEncode(notes)}</p>` : ''}`;
+
+        try {
+            const emailRow = await pool.query(
+                'SELECT u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1',
+                [app.player_id]
+            );
+            if (emailRow.rows[0]?.email) {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to:   emailRow.rows[0].email,
+                    subject,
+                    html: wrapEmailHtml(body)
+                });
+            }
+        } catch (e) { console.error('Ref application email failed:', e.message); }
+
+        await auditLog(pool, req.user.playerId, `ref_application_${decision}d`, app.player_id,
+            `Ref application ${decision}d. ${notes ? 'Notes: ' + notes.substring(0,100) : ''}`);
+
+        res.json({ success: true, decision });
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/admin/ref/applications/:id/review:', e.message);
+        res.status(500).json({ error: 'Failed to process application' });
+    } finally {
+        client.release();
+    }
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// COACH: POST /api/coaching/sessions/:id/cancel-request
+// Request cancellation of a session (coach of session only, not completed)
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/sessions/:id/cancel-request', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    const sessionResult = await pool.query(
+        `SELECT id, coach_player_id, status, activity_type, session_date, cancel_requested
+         FROM coaching_sessions WHERE id=$1`,
+        [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    const session = sessionResult.rows[0];
+
+    // Only coach of this session or superadmin can request cancellation
+    const isSA = req.user.role === 'superadmin';
+    if (!isSA && session.coach_player_id !== req.user.playerId)
+        return res.status(403).json({ error: 'Not authorised' });
+
+    if (session.status === 'completed')
+        return res.status(400).json({ error: 'Cannot cancel a completed session' });
+    if (session.status === 'cancelled')
+        return res.status(400).json({ error: 'Session is already cancelled' });
+    if (session.cancel_requested)
+        return res.status(400).json({ error: 'Cancellation already requested' });
+
+    await pool.query(
+        `UPDATE coaching_sessions SET cancel_requested=TRUE, updated_at=NOW() WHERE id=$1`,
+        [id]
+    );
+    await logCoachingAudit(id, null, req.user.playerId, 'cancel_requested', 'Coach requested session cancellation.');
+
+    // Notify superadmin
+    const coachRow = await pool.query('SELECT full_name FROM players WHERE id=$1', [req.user.playerId]);
+    const coachName = coachRow.rows[0]?.full_name || 'Coach';
+    const activityLabel = session.activity_type ? session.activity_type.replace(/_/g,' ') : 'coaching';
+    const dateStr = session.session_date
+        ? new Date(session.session_date).toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short', year:'numeric', timeZone:'Europe/London' })
+        : 'TBC';
+    await notifyAdmin('⚠️ Coaching Session Cancellation Requested', [
+        ['Coach',    coachName],
+        ['Session',  activityLabel],
+        ['Date',     dateStr],
+        ['Action',   'Log in to approve or reject this cancellation request'],
+    ]);
+
+    res.json({ success: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: POST /api/admin/coaching/sessions/:id/cancel-approve
+// Approve a cancellation request — status → cancelled, email coach + players
+// ══════════════════════════════════════════════════════════════
+app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    const sessionResult = await pool.query(
+        `SELECT id, coach_player_id, status, cancel_requested, activity_type, session_date
+         FROM coaching_sessions WHERE id=$1`,
+        [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    const session = sessionResult.rows[0];
+    if (!session.cancel_requested) return res.status(400).json({ error: 'No cancellation request pending' });
+    if (session.status === 'cancelled') return res.status(400).json({ error: 'Session already cancelled' });
+
+    // Get registered players
+    const regsResult = await pool.query(
+        `SELECT cr.player_id FROM coaching_registrations cr
+         WHERE cr.session_id=$1 AND cr.status='registered'`,
+        [id]
+    );
+    const playerIds = regsResult.rows.map(r => r.player_id);
+    // Include coach
+    if (session.coach_player_id) playerIds.push(session.coach_player_id);
+    const uniqueIds = [...new Set(playerIds)];
+
+    await pool.query(
+        `UPDATE coaching_sessions SET status='cancelled', cancel_requested=FALSE, updated_at=NOW() WHERE id=$1`,
+        [id]
+    );
+    await logCoachingAudit(id, null, req.user.playerId, 'session_cancelled', 'Cancellation approved by superadmin.');
+
+    // Email all affected players + coach
+    if (uniqueIds.length > 0) {
+        const activityLabel = htmlEncode(session.activity_type ? session.activity_type.replace(/_/g,' ') : 'coaching');
+        const dateStr = session.session_date
+            ? new Date(session.session_date).toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short', year:'numeric', timeZone:'Europe/London' })
+            : 'TBC';
+        try {
+            await sendCoachingEmail(uniqueIds,
+                'Coaching Session Cancelled',
+                `<p style="color:#888">Unfortunately, the <strong style="color:#fff">${activityLabel}</strong> coaching session scheduled for <strong style="color:#fff">${htmlEncode(dateStr)}</strong> has been cancelled.</p>
+                 <p style="color:#888;margin-top:8px">If you have any questions please contact TotalFooty.</p>`
+            );
+        } catch(e) { console.error('cancel-approve email failed:', e.message); }
+    }
+
+    res.json({ success: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN: POST /api/admin/coaching/sessions/:id/cancel-reject
+// Reject a cancellation request — clears flag, emails coach
+// ══════════════════════════════════════════════════════════════
+app.post('/api/admin/coaching/sessions/:id/cancel-reject', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    const sessionResult = await pool.query(
+        `SELECT id, coach_player_id, status, cancel_requested, activity_type, session_date
+         FROM coaching_sessions WHERE id=$1`,
+        [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    const session = sessionResult.rows[0];
+    if (!session.cancel_requested) return res.status(400).json({ error: 'No cancellation request pending' });
+
+    await pool.query(
+        `UPDATE coaching_sessions SET cancel_requested=FALSE, updated_at=NOW() WHERE id=$1`,
+        [id]
+    );
+    await logCoachingAudit(id, null, req.user.playerId, 'cancel_rejected', 'Cancellation request rejected by superadmin.');
+
+    // Email coach
+    if (session.coach_player_id) {
+        const activityLabel = htmlEncode(session.activity_type ? session.activity_type.replace(/_/g,' ') : 'coaching');
+        const dateStr = session.session_date
+            ? new Date(session.session_date).toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short', year:'numeric', timeZone:'Europe/London' })
+            : 'TBC';
+        try {
+            await sendCoachingEmail([session.coach_player_id],
+                'Cancellation Request — Not Approved',
+                `<p style="color:#888">Your request to cancel the <strong style="color:#fff">${activityLabel}</strong> session on <strong style="color:#fff">${htmlEncode(dateStr)}</strong> has not been approved.</p>
+                 <p style="color:#888;margin-top:8px">The session will continue as planned. Please log in to TotalFooty if you have any questions.</p>`
+            );
+        } catch(e) { console.error('cancel-reject email failed:', e.message); }
+    }
+
+    res.json({ success: true });
 });
 
 // ════════════════════════════════════════════════════════════
@@ -14719,4 +15256,67 @@ app.listen(PORT, () => {
             bioRunning = false;
         }
     }, 60 * 1000); // Check every minute, run only at Sunday 2am
+
+
+    // ── Coaching session reminder — 24 hours before ──────────────
+    // Email: coach + all registered players + superadmin
+    let coachingReminderRunning = false;
+    setInterval(async () => {
+        if (coachingReminderRunning) return;
+        coachingReminderRunning = true;
+        try {
+            // Find sessions starting in 23h55m–24h05m that haven't had reminder sent
+            const sessions = await pool.query(`
+                SELECT cs.id, cs.session_url, cs.activity_type, cs.session_date,
+                       cs.coach_player_id, v.name AS venue_name
+                FROM coaching_sessions cs
+                LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+                WHERE cs.session_date BETWEEN NOW() + INTERVAL '23 hours 55 minutes'
+                  AND NOW() + INTERVAL '24 hours 5 minutes'
+                  AND cs.status IN ('finalised','venue_confirmed','coach_confirmed')
+                  AND cs.reminder_sent IS NOT TRUE
+            `);
+            for (const sess of sessions.rows) {
+                // Atomic claim
+                const claimed = await pool.query(
+                    `UPDATE coaching_sessions SET reminder_sent=TRUE WHERE id=$1 AND (reminder_sent IS NOT TRUE) RETURNING id`,
+                    [sess.id]
+                );
+                if (claimed.rowCount === 0) continue;
+
+                const dateStr = sess.session_date
+                    ? new Date(sess.session_date).toLocaleString('en-GB', {
+                        weekday:'long', day:'numeric', month:'long', hour:'2-digit', minute:'2-digit', timeZone:'Europe/London'
+                      })
+                    : 'TBC';
+                const actLabel = (sess.activity_type || '').replace(/_/g, ' ');
+                const sessionLink = `https://totalfooty.co.uk/vibecoding/session.html?url=${sess.session_url}`;
+                const emailBody = `
+                    <p style="color:#888">This is a reminder that you have a coaching session tomorrow.</p>
+                    <table style="margin:12px 0;">
+                        <tr><td style="color:#888;width:120px;">Date &amp; Time</td><td style="color:#fff;font-weight:700;">${htmlEncode(dateStr)}</td></tr>
+                        <tr><td style="color:#888;">Activity</td><td style="color:#fff;">${htmlEncode(actLabel)}</td></tr>
+                        ${sess.venue_name ? `<tr><td style="color:#888;">Venue</td><td style="color:#fff;">${htmlEncode(sess.venue_name)}</td></tr>` : ''}
+                    </table>
+                    <p style="color:#888;margin-top:12px;"><a href="${sessionLink}" style="color:#C0392B;">View Session Details →</a></p>`;
+
+                // Get registered players
+                const players = await pool.query(
+                    `SELECT player_id FROM coaching_registrations WHERE session_id=$1 AND status='registered'`,
+                    [sess.id]
+                );
+                const recipientIds = players.rows.map(r => r.player_id);
+                if (sess.coach_player_id) recipientIds.push(sess.coach_player_id);
+
+                await sendCoachingEmail(recipientIds, `Coaching Session Tomorrow — ${actLabel}`, emailBody);
+                notifyAdmin('Coaching Session Reminder Sent', [['Details', `${actLabel} session on ${dateStr} — ${recipientIds.length} reminder(s) sent.`]]);
+                console.log(`⏰ Coaching reminder sent for session ${sess.id} (${recipientIds.length} recipients)`);
+            }
+        } catch (e) {
+            console.error('Coaching reminder scheduler error:', e.message);
+        } finally {
+            coachingReminderRunning = false;
+        }
+    }, 5 * 60 * 1000); // Check every 5 minutes
+
 });
