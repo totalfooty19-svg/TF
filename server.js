@@ -7432,60 +7432,14 @@ app.get('/api/admin/games/:gameId/views', authenticateToken, requireAdmin, async
 // Returns minimal HTML with OG tags (date + venue), then redirects to game.html.
 // WhatsApp crawler sees the OG tags; real users are bounced in <1s.
 app.get('/g/:gameUrl', async (req, res) => {
+    // Legacy share-link route — kept so old /g/XXXX links still work after domain migration.
+    // OG tag injection is now handled by the Cloudflare CSP Worker on game.html?url=...
+    // This route simply redirects to the canonical game page URL.
     const { gameUrl } = req.params;
-    if (!gameUrl || !/^[a-f0-9]{16}$/.test(gameUrl)) {
-        return res.redirect(`https://totalfooty.co.uk/vibecoding/game.html?url=${encodeURIComponent(gameUrl)}`);
-    }
-    try {
-        const result = await pool.query(`
-            SELECT g.game_date, g.format, v.name as venue_name
-            FROM games g
-            LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.game_url = $1
-        `, [gameUrl]);
-
-        const refParam = req.query.ref ? `&ref=${encodeURIComponent(req.query.ref)}` : '';
-        const gameUrl_ = `https://totalfooty.co.uk/vibecoding/game.html?url=${gameUrl}${refParam}`;
-
-        if (result.rows.length === 0) {
-            return res.redirect(gameUrl_);
-        }
-
-        const game = result.rows[0];
-        const dateStr = new Date(game.game_date).toLocaleDateString('en-GB', {
-            weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
-            timeZone: 'Europe/London'
-        });
-        const venue = game.venue_name || 'TBC';
-        const format = game.format || 'Football';
-        const title = `Total Footy | ${dateStr}, ${venue}`;
-        const desc = `${format} at ${venue} — view squad, teams & more on Total Footy.`;
-
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.send(`<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>${title}</title>
-<meta property="og:title" content="${title}">
-<meta property="og:description" content="${desc}">
-<meta property="og:image" content="https://totalfooty.co.uk/assets/logo.png">
-<meta property="og:url" content="${gameUrl_}">
-<meta property="og:type" content="website">
-<meta property="og:site_name" content="Total Footy">
-<meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="${title}">
-<meta name="twitter:description" content="${desc}">
-<meta name="twitter:image" content="https://totalfooty.co.uk/assets/logo.png">
-<meta http-equiv="refresh" content="0;url=${gameUrl_}">
-<script>window.location.replace("${gameUrl_}");</script>
-</head>
-<body></body>
-</html>`);
-    } catch (e) {
-        console.error('OG preview error:', e.message);
-        res.redirect(`https://totalfooty.co.uk/vibecoding/game.html?url=${gameUrl}`);
-    }
+    const refParam = (req.query.ref && /^[a-zA-Z0-9_-]{1,40}$/.test(req.query.ref))
+        ? `&ref=${encodeURIComponent(req.query.ref)}` : '';
+    const dest = `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(gameUrl)}${refParam}`;
+    res.redirect(301, dest);
 });
 
 // PUT /api/games/:id/my-team-preference — let a confirmed player set their venue clash team side
