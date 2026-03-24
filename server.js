@@ -13207,33 +13207,30 @@ function isVenueAvailable(rule, sessionDate, durationHours) {
 // ── Coaching helper: price range calculator ───────────────────
 // Returns { minPrice, maxPrice } across all candidate venues
 function calcSessionPriceRange(venues, coachHourlyRate, durationHours, maxPlayers) {
+    // Duration = how long coach is present. Players each get 1hr, so total player slots = maxPlayers * durationHours.
+    // Price = fixed running costs / total slots + ppPlayer (flat per player, 1hr only).
     const TF_MARGIN_PER_HOUR = 20;
     const FLOOR = 13.50;
 
-    let bestMin = Infinity;
-    let worstMax = 0;
+    let bestPrice = Infinity;
 
     for (const v of venues) {
-        const pitchHire   = (parseFloat(v.coaching_cost_per_hour) || 0) * durationHours;
-        const coachTotal  = coachHourlyRate * durationHours;
-        const tfTotal     = TF_MARGIN_PER_HOUR * durationHours;
-        const ppCoach     = (parseFloat(v.pay_and_play_coach_hourly) || 0) * durationHours;
-        const ppPlayer    = (parseFloat(v.pay_and_play_player_hourly) || 0) * durationHours;
+        const pitchHire    = (parseFloat(v.coaching_cost_per_hour) || 0) * durationHours;
+        const coachTotal   = coachHourlyRate * durationHours;
+        const tfTotal      = TF_MARGIN_PER_HOUR * durationHours;
+        const ppCoach      = (parseFloat(v.pay_and_play_coach_hourly) || 0) * durationHours;
+        const ppPlayer     = parseFloat(v.pay_and_play_player_hourly) || 0;
 
         const sessionFixed = pitchHire + coachTotal + tfTotal + ppCoach;
+        const totalSlots   = maxPlayers * durationHours;
+        const pricePerPlayer = Math.max(FLOOR, sessionFixed / totalSlots + ppPlayer);
 
-        const priceAtMax = Math.max(FLOOR, sessionFixed / maxPlayers + ppPlayer);
-        const priceAtOne = Math.max(FLOOR, sessionFixed / 1 + ppPlayer);
-
-        if (priceAtMax < bestMin) bestMin = priceAtMax;
-        if (priceAtOne > worstMax) worstMax = priceAtOne;
+        if (pricePerPlayer < bestPrice) bestPrice = pricePerPlayer;
     }
 
     if (venues.length === 0) return { minPrice: null, maxPrice: null };
-    return {
-        minPrice: Math.round(bestMin * 100) / 100,
-        maxPrice: Math.round(worstMax * 100) / 100
-    };
+    const price = Math.round(bestPrice * 100) / 100;
+    return { minPrice: price, maxPrice: price };
 }
 
 // ── Coaching helper: send email to list of players ────────────
@@ -13528,7 +13525,7 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
     const { activity_type, group_type, duration_hours, session_date,
             session_notes, venue_ids } = req.body;
 
-    const VALID_ACTIVITIES = ['fitness','ball_control','defending','shooting','positioning','goalkeeping'];
+    const VALID_ACTIVITIES = ['fitness','ball_control','defending','shooting','positioning','goalkeeping','various'];
     const VALID_GROUPS     = ['one_to_one','small_group','large_group'];
     const GROUP_MAX        = { one_to_one: 1, small_group: 6, large_group: 15 };
 
@@ -13600,9 +13597,9 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Superadmin can pass an existing coach player_id to pre-assign
-    let assignedCoachId = isCoach.rows.length > 0 ? req.user.playerId : null;
-    if (!assignedCoachId && req.user.role === 'superadmin' && req.body.assigned_coach_player_id) {
+        // Superadmin-selected coach always takes priority; fall back to req.user only if no explicit selection
+    let assignedCoachId = null;
+    if (req.user.role === 'superadmin' && req.body.assigned_coach_player_id) {
         const acId = req.body.assigned_coach_player_id;
         if (/^[0-9a-f-]{36}$/.test(acId)) {
             const acCheck = await pool.query(
@@ -13611,6 +13608,9 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
             );
             if (acCheck.rows.length > 0) assignedCoachId = acId;
         }
+    }
+    if (!assignedCoachId && isCoach.rows.length > 0) {
+        assignedCoachId = req.user.playerId;
     }
 
     const sessionResult = await client.query(`
@@ -13824,7 +13824,7 @@ app.delete('/api/coaching/sessions/:id/register', authenticateToken, registratio
 app.post('/api/coaching/requests', authenticateToken, registrationLimiter, async (req, res) => {
     const { coach_player_id, activity_type, group_type, time_preference, notes } = req.body;
 
-    const VALID_ACTIVITIES = ['fitness','ball_control','defending','shooting','positioning','goalkeeping'];
+    const VALID_ACTIVITIES = ['fitness','ball_control','defending','shooting','positioning','goalkeeping','various'];
     const VALID_GROUPS     = ['one_to_one','small_group','large_group'];
 
     if (activity_type && !VALID_ACTIVITIES.includes(activity_type))
@@ -14942,6 +14942,91 @@ app.post('/api/admin/coaching/sessions/:id/cancel-reject', authenticateToken, re
 });
 
 // ════════════════════════════════════════════════════════════
+// SUPERADMIN: DELETE /api/admin/coaching/sessions/:id
+// Force-delete a session: notify registered players, then hard-delete.
+// ════════════════════════════════════════════════════════════
+app.delete('/api/admin/coaching/sessions/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const sessionResult = await client.query(
+            `SELECT cs.id, cs.activity_type, cs.session_date, cs.coach_player_id,
+                    cs.status, cs.session_url
+             FROM coaching_sessions cs WHERE cs.id=$1`,
+            [id]
+        );
+        if (sessionResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Session not found' });
+        }
+        const session = sessionResult.rows[0];
+        const activityLabel = (session.activity_type || 'coaching').replace(/_/g, ' ');
+        const dateStr = session.session_date
+            ? new Date(session.session_date).toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short', year:'numeric' })
+            : 'TBC';
+
+        // Get all registered players before deletion
+        const regResult = await client.query(
+            `SELECT cr.player_id FROM coaching_registrations cr
+             WHERE cr.session_id=$1 AND cr.status='registered'`,
+            [id]
+        );
+        const registeredPlayerIds = regResult.rows.map(r => r.player_id);
+
+        // Cascade delete all child records
+        await client.query('DELETE FROM coaching_registrations  WHERE session_id=$1', [id]);
+        await client.query('DELETE FROM coaching_session_venues WHERE session_id=$1', [id]);
+        await client.query('DELETE FROM coaching_feedback        WHERE session_id=$1', [id]);
+        await client.query('DELETE FROM coaching_audit_log       WHERE session_id=$1', [id]);
+        await client.query('DELETE FROM coaching_sessions        WHERE id=$1',         [id]);
+
+        await client.query('COMMIT');
+
+        // Notify registered players
+        if (registeredPlayerIds.length > 0) {
+            try {
+                await sendCoachingEmail(
+                    registeredPlayerIds,
+                    'Coaching Session Cancelled',
+                    `<p style="color:#888">We're sorry, the following coaching session has been cancelled by TotalFooty admin.</p>
+                     <table>
+                       <tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${htmlEncode(activityLabel)}</td></tr>
+                       <tr><td style="color:#888">Date</td><td style="color:#fff">${htmlEncode(dateStr)}</td></tr>
+                     </table>
+                     <p style="color:#888;margin-top:16px">If you paid in advance, a full refund will be issued shortly. Apologies for any inconvenience.</p>`
+                );
+            } catch(e) { console.error('delete session email failed:', e.message); }
+        }
+
+        // Notify coach if assigned
+        if (session.coach_player_id) {
+            try {
+                await sendCoachingEmail(
+                    [session.coach_player_id],
+                    'Coaching Session Deleted by Admin',
+                    `<p style="color:#888">Your <strong style="color:#fff">${htmlEncode(activityLabel)}</strong> session on <strong style="color:#fff">${htmlEncode(dateStr)}</strong> has been deleted by TotalFooty admin.</p>`
+                );
+            } catch(e) { console.error('delete session coach email failed:', e.message); }
+        }
+
+        await logCoachingAudit(id, null, req.user.playerId, 'session_deleted',
+            `Session force-deleted by superadmin. ${registeredPlayerIds.length} player(s) notified.`);
+
+        res.json({ success: true, notified: registeredPlayerIds.length });
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('DELETE /api/admin/coaching/sessions/:id:', e.message);
+        res.status(500).json({ error: 'Failed to delete session' });
+    } finally {
+        client.release();
+    }
+});
+
+// ════════════════════════════════════════════════════════════
 // END COACHING ENDPOINTS
 // ════════════════════════════════════════════════════════════
 
@@ -14950,7 +15035,7 @@ app.post('/api/admin/coaching/sessions/:id/cancel-reject', authenticateToken, re
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT}`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: coaching-delete-v2`);
     
     // Keep database AND backend warm (ping every 5 minutes)
     setInterval(async () => {
