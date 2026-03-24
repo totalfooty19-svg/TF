@@ -7494,7 +7494,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
                    v.pitch_pin as venue_pitch_pin, v.boot_type as venue_boot_type,
-                   v.pitch_name as venue_pitch_name, v.special_instructions as venue_special_instructions,
+                   v.pitch_name as venue_pitch_name, v.special_instructions as venue_special_instructions, v.region as venue_region,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) as confirmed_organiser_count
             FROM games g
@@ -7560,6 +7560,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             venue_boot_type: game.venue_boot_type || null,
             venue_pitch_name: game.venue_pitch_name || null,
             venue_special_instructions: game.venue_special_instructions || null,
+            venue_region: game.venue_region || null,
             format: game.format,
             max_players: game.max_players,
             current_players: game.current_players,
