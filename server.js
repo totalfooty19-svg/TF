@@ -1931,15 +1931,7 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
                 return res.status(400).json({ error: 'Email already in use by another account' });
             }
 
-            // N5: Require current password to change email — prevents account takeover via stolen session
-            if (!currentPassword) {
-                return res.status(400).json({ error: 'Current password is required to change your email address' });
-            }
-            const userResult = await pool.query('SELECT password_hash, email FROM users WHERE id = $1', [req.user.userId]);
-            const valid = await bcrypt.compare(currentPassword, userResult.rows[0].password_hash);
-            if (!valid) {
-                return res.status(403).json({ error: 'Current password is incorrect' });
-            }
+            // N5 removed — password not required to change email; session auth is sufficient
         }
 
         // N10: Fetch old email before update so we can alert it afterwards
