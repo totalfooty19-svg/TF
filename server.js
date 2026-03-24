@@ -7792,7 +7792,7 @@ app.get('/api/public/games', async (req, res) => {
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    g.external_opponent, g.tf_kit_color, g.opp_kit_color,
                    g.exclusivity, g.star_rating, g.cost_per_player,
-                   v.name AS venue_name, v.address AS venue_address,
+                   v.name AS venue_name, v.address AS venue_address, v.region AS venue_region,
                    gs.series_name,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
