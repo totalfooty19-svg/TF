@@ -318,6 +318,66 @@ function effectiveMinRating(game) {
 // Backwards-compatible alias used by scheduler logging — returns overall threshold only
 function effectiveMinOvr(game) { return effectiveMinRating(game).minOvr; }
 
+// ── DYNAMIC STAR RATINGS ─────────────────────────────────────────────────────
+// reviewDynamicStarRating: recalculate star_rating for a game based on avg OVR.
+// Rules:
+//   - Only runs if star_rating_locked = FALSE (games originally created at 4★ or 5★ are locked)
+//   - Only runs once ≥ 8 confirmed players are signed up
+//   - avg OVR < 85  → 1★ | 85–<86 → 2★ | 86–<87 → 3★ | ≥87 → 4★
+//   - Called non-critically (never throws to caller)
+async function reviewDynamicStarRating(pool, gameId) {
+    try {
+        const gameRow = await pool.query(
+            `SELECT star_rating, star_rating_locked FROM games WHERE id = $1`,
+            [gameId]
+        );
+        if (!gameRow.rows.length) return;
+
+        const { star_rating_locked } = gameRow.rows[0];
+        if (star_rating_locked) return; // 4★ / 5★ at creation — never touch
+
+        // Count confirmed players + guests
+        const countRow = await pool.query(
+            `SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed')
+                  + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS total`,
+            [gameId]
+        );
+        const total = parseInt(countRow.rows[0].total) || 0;
+        if (total < 8) return; // Minimum 8 players before dynamic rating kicks in
+
+        // Avg OVR of confirmed registered players (guests have no OVR, so we exclude them)
+        const ovrRow = await pool.query(
+            `SELECT ROUND(AVG(p.overall_rating)::numeric, 2) AS avg_ovr
+             FROM registrations r
+             JOIN players p ON p.id = r.player_id
+             WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.overall_rating IS NOT NULL`,
+            [gameId]
+        );
+        const avgOvr = parseFloat(ovrRow.rows[0]?.avg_ovr);
+        if (isNaN(avgOvr)) return; // No OVR data — leave rating unchanged
+
+        // Map avg OVR → star rating
+        let newStars;
+        if (avgOvr < 85)      newStars = 1;
+        else if (avgOvr < 86) newStars = 2;
+        else if (avgOvr < 87) newStars = 3;
+        else                   newStars = 4;
+
+        // Only write if changed
+        const currentStars = parseInt(gameRow.rows[0].star_rating) || 0;
+        if (newStars !== currentStars) {
+            await pool.query(
+                `UPDATE games SET star_rating = $1 WHERE id = $2`,
+                [newStars, gameId]
+            );
+            await gameAuditLog(pool, gameId, null, 'star_rating_auto_updated',
+                `Dynamic review: avg OVR ${avgOvr.toFixed(2)} → ${newStars}★ (was ${currentStars}★, players: ${total})`);
+        }
+    } catch (e) {
+        console.warn(`reviewDynamicStarRating failed for game ${gameId} (non-critical):`, e.message);
+    }
+}
+
 // ── PUSH NOTIFICATIONS ───────────────────────────────────────────────────────
 // getGameDataForNotification: fetch minimal game info for push payloads
 async function getGameDataForNotification(gameId) {
@@ -3185,10 +3245,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             venue_id, game_date, max_players, cost_per_player, format, regularity, 
                             exclusivity, position_type, game_url, series_id, 
                             team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
-                            tournament_team_count, tournament_name, star_rating,
+                            tournament_team_count, tournament_name, star_rating, star_rating_locked,
                             is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                             refs_required, ref_pay, requires_organiser
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -3197,6 +3257,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                             selType === 'tournament' ? (tournamentName || null) : null,
                             starRating || null,
+                            parseInt(starRating) >= 4, // DYNSTAR: lock if originally 4★ or 5★
                             vcEnabled || false,
                             vcEnabled ? venueClashTeam1Name.trim() : null,
                             vcEnabled ? venueClashTeam2Name.trim() : null,
@@ -3248,10 +3309,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     venue_id, game_date, max_players, cost_per_player, format, regularity, 
                     exclusivity, position_type, game_url, series_id,
                     team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
-                    tournament_team_count, tournament_name, star_rating,
+                    tournament_team_count, tournament_name, star_rating, star_rating_locked,
                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                     refs_required, ref_pay, requires_organiser
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -3260,6 +3321,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                     selType === 'tournament' ? (tournamentName || null) : null,
                     starRating || null,
+                    parseInt(starRating) >= 4, // DYNSTAR: lock if originally 4★ or 5★
                     vcEnabled || false,
                     vcEnabled ? venueClashTeam1Name.trim() : null,
                     vcEnabled ? venueClashTeam2Name.trim() : null,
@@ -3848,6 +3910,8 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             } catch (e) {
                 console.error('Registration notification failed (non-critical):', e.message);
             }
+            // DYNSTAR: review star rating on every confirmed sign-up
+            if (status === 'confirmed') await reviewDynamicStarRating(pool, gameId);
         });
         
     } catch (error) {
@@ -4620,6 +4684,8 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             } catch (e) {
                 console.error('Friend registration notification failed (non-critical):', e.message);
             }
+            // DYNSTAR: review star rating on every confirmed friend sign-up
+            if (status === 'confirmed') await reviewDynamicStarRating(pool, gameId);
         });
 
     } catch (error) {
@@ -5017,6 +5083,8 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 }
                 await notifyAdmin(`🚪 Drop Out — ${_pName}`, _notifRows);
             } catch (e) { /* non-critical */ }
+            // DYNSTAR: review star rating on every confirmed dropout
+            if (wasConfirmed) await reviewDynamicStarRating(pool, gameId);
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -5914,6 +5982,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $3, 
                     cost_per_player = $4,
                     star_rating = $5,
+                    star_rating_locked = CASE WHEN $5::int >= 4 THEN TRUE ELSE star_rating_locked END,
                     tournament_team_count = COALESCE($6, tournament_team_count),
                     min_rating_enabled = COALESCE($7, min_rating_enabled),
                     refs_required = COALESCE($9, refs_required),
@@ -5929,6 +5998,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $2, 
                     cost_per_player = $3,
                     star_rating = $4,
+                    star_rating_locked = CASE WHEN $4::int >= 4 THEN TRUE ELSE star_rating_locked END,
                     tournament_team_count = COALESCE($5, tournament_team_count),
                     min_rating_enabled = COALESCE($6, min_rating_enabled),
                     refs_required = COALESCE($8, refs_required),
@@ -6044,12 +6114,12 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
                 const utcDate = new Date(new Date(londonLocal).getTime() - offset);
 
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser) WHERE id=$7',
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::int >= 4 THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser) WHERE id=$7',
                     [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null]
                 );
             } else {
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser) WHERE id=$6',
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::int >= 4 THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser) WHERE id=$6',
                     [venue_id, max_players, cost_per_player, star_rating || null, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null]
                 );
             }
