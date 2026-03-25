@@ -5982,7 +5982,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $3, 
                     cost_per_player = $4,
                     star_rating = $5,
-                    star_rating_locked = CASE WHEN $5::int >= 4 THEN TRUE ELSE star_rating_locked END,
+                    star_rating_locked = CASE WHEN $5::smallint >= 4 THEN TRUE ELSE star_rating_locked END,
                     tournament_team_count = COALESCE($6, tournament_team_count),
                     min_rating_enabled = COALESCE($7, min_rating_enabled),
                     refs_required = COALESCE($9, refs_required),
@@ -5998,7 +5998,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $2, 
                     cost_per_player = $3,
                     star_rating = $4,
-                    star_rating_locked = CASE WHEN $4::int >= 4 THEN TRUE ELSE star_rating_locked END,
+                    star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END,
                     tournament_team_count = COALESCE($5, tournament_team_count),
                     min_rating_enabled = COALESCE($6, min_rating_enabled),
                     refs_required = COALESCE($8, refs_required),
@@ -6114,12 +6114,12 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
                 const utcDate = new Date(new Date(londonLocal).getTime() - offset);
 
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::int >= 4 THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser) WHERE id=$7',
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser) WHERE id=$7',
                     [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null]
                 );
             } else {
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::int >= 4 THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser) WHERE id=$6',
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser) WHERE id=$6',
                     [venue_id, max_players, cost_per_player, star_rating || null, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null]
                 );
             }
