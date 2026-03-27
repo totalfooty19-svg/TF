@@ -1900,6 +1900,7 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
                 tournament_wins,
                 external_game_wins,
                 badges:           player.badges,
+                ai_bio:           player.ai_bio || null,
                 // Socials are public — players opt in by adding them
                 social_tiktok:    player.social_tiktok,
                 social_instagram: player.social_instagram,
@@ -5040,8 +5041,10 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
 
         // Non-critical: fire notifications after response
         setImmediate(async () => {
+            // FIX: declare gameData outside try blocks so it's accessible to both
+            let gameData = {};
             try {
-                const gameData = await getGameDataForNotification(gameId);
+                gameData = await getGameDataForNotification(gameId);
                 if (wasConfirmed || wasConfirmedBackup) {
                     await sendNotification('dropout_confirmed', req.user.playerId, gameData);
                 }
@@ -5082,6 +5085,27 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     _notifRows.push(['Guests removed', `${guestRefunded.count} (${guestRefunded.names})`]);
                 }
                 await notifyAdmin(`🚪 Drop Out — ${_pName}`, _notifRows);
+                // FIX: email confirmation to the player who dropped out
+                if (_pEmail) {
+                    const _refundLine = (!wasComped && (wasConfirmed || wasConfirmedBackup) && cost > 0)
+                        ? `<tr><td style="padding:6px 0;color:#888;width:140px;">Refund</td><td style="font-weight:700;color:#00ff41;">+£${cost.toFixed(2)} credit</td></tr>`
+                        : '';
+                    await emailTransporter.sendMail({
+                        from: '"TotalFooty" <totalfooty19@gmail.com>',
+                        to:   _pEmail,
+                        subject: `🚪 You've dropped out — TotalFooty`,
+                        html: wrapEmailHtml(
+                            `<p style="color:#888;font-size:14px;margin:0 0 16px;">You've been removed from the following game.</p>` +
+                            `<table style="width:100%;border-collapse:collapse;font-size:14px;">` +
+                            `<tr><td style="padding:6px 0;color:#888;width:140px;">Game</td><td style="font-weight:700;color:#fff;">${htmlEncode(gameData.day || 'TBC')}</td></tr>` +
+                            `<tr><td style="padding:6px 0;color:#888;">Time</td><td style="font-weight:700;color:#fff;">${htmlEncode(gameData.time || 'TBC')}</td></tr>` +
+                            `<tr><td style="padding:6px 0;color:#888;">Venue</td><td style="font-weight:700;color:#fff;">${htmlEncode(gameData.venue || 'TBC')}</td></tr>` +
+                            _refundLine +
+                            `</table>` +
+                            `<p style="color:#888;font-size:13px;margin-top:20px;">If this was a mistake, sign up again from the game page.</p>`
+                        ),
+                    }).catch(e => console.error('Dropout player email failed (non-critical):', e.message));
+                }
             } catch (e) { /* non-critical */ }
             // DYNSTAR: review star rating on every confirmed dropout
             if (wasConfirmed) await reviewDynamicStarRating(pool, gameId);
@@ -8914,7 +8938,7 @@ async function generatePlayerBio(player, awardsData, recentForm) {
                 'anthropic-version': '2023-06-01',
             },
             body: JSON.stringify({
-                model: 'claude-sonnet-4-20250514',
+                model: 'claude-sonnet-4-6',
                 max_tokens: 300,
                 system: BIO_SYSTEM_PROMPT,
                 messages: [{ role: 'user', content: userMessage }],
@@ -8922,14 +8946,20 @@ async function generatePlayerBio(player, awardsData, recentForm) {
         });
 
         if (!response.ok) {
-            console.warn(`Anthropic API error: ${response.status}`);
+            let errBody = '';
+            try { errBody = JSON.stringify(await response.json()); } catch (_) {}
+            console.error(`❌ Anthropic API error for player ${player.id}: HTTP ${response.status} — ${errBody}`);
             return null;
         }
         const data = await response.json();
-        return data.content?.[0]?.text?.trim() || null;
+        const bio = data.content?.[0]?.text?.trim() || null;
+        if (!bio) {
+            console.error(`❌ Anthropic returned empty bio for player ${player.id}:`, JSON.stringify(data));
+        }
+        return bio;
 
     } catch (e) {
-        console.warn('generatePlayerBio error:', e.message);
+        console.error(`❌ generatePlayerBio network/parse error for player ${player.id}:`, e.message);
         return null;
     }
 }
@@ -8972,9 +9002,11 @@ async function regeneratePlayerBioForce(playerId, force = false) {
             if (bio) {
                 await pool.query(`UPDATE players SET ai_bio = $1, ai_bio_updated_at = NOW() WHERE id = $2`, [bio, playerId]);
                 console.log(`✅ Bio force-generated for player ${playerId}`);
+            } else {
+                console.error(`❌ Bio force-regen returned null for player ${playerId} — check Anthropic API key and logs above`);
             }
         } catch (e) {
-            console.warn(`regeneratePlayerBioForce(${playerId}) failed:`, e.message);
+            console.error(`❌ regeneratePlayerBioForce(${playerId}) failed:`, e.message);
         }
         return;
     }
@@ -9038,9 +9070,11 @@ async function regeneratePlayerBio(playerId) {
                 [bio, playerId]
             );
             console.log(`✅ Bio generated for player ${playerId}`);
+        } else {
+            console.error(`❌ Bio regen returned null for player ${playerId} — check Anthropic API key and logs above`);
         }
     } catch (e) {
-        console.warn(`regeneratePlayerBio(${playerId}) failed:`, e.message);
+        console.error(`❌ regeneratePlayerBio(${playerId}) failed:`, e.message);
     }
 }
 
