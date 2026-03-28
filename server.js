@@ -5666,8 +5666,16 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             shooting:  blueTeam.reduce((sum, p) => sum + (p.shooting_rating  || 0), 0)
         };
         
+        // Build a name lookup for pairs/avoids resolution
+        const allGamePlayers = [...players, ...Array.from(guestGroups.values()).flat()];
+        const playerNameLookup = new Map();
+        for (const pl of allGamePlayers) {
+            playerNameLookup.set(String(pl.player_id), pl.alias || pl.full_name || String(pl.player_id));
+        }
         const mapPlayer = p => {
-            const isGKOnly = p.position_preference?.trim().toLowerCase() === 'gk';
+            const isGKOnly  = p.position_preference?.trim().toLowerCase() === 'gk';
+            const pairIds   = (p.pairs  || []).filter(Boolean).map(String);
+            const avoidIds  = (p.avoids || []).filter(Boolean).map(String);
             return {
                 id:           p.player_id,
                 name:         p.alias || p.full_name,
@@ -5685,7 +5693,9 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 gk:           p.goalkeeper_rating || 0,
                 isGK:         isGKOnly,
                 position_preference: p.position_preference || 'outfield',
-                is_guest:     p.is_guest || false
+                is_guest:     p.is_guest || false,
+                pair_names:   pairIds.map(id => playerNameLookup.get(id)).filter(Boolean),
+                avoid_names:  avoidIds.map(id => playerNameLookup.get(id)).filter(Boolean)
             };
         };
         
@@ -5965,7 +5975,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -6020,9 +6030,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     refs_required = COALESCE($9, refs_required),
                     ref_pay = COALESCE($10, ref_pay),
                     min_rating_drop_sent = CASE WHEN $12 THEN 0 ELSE min_rating_drop_sent END,
-                    requires_organiser = COALESCE($11, requires_organiser)
+                    requires_organiser = COALESCE($11, requires_organiser),
+                    external_opponent = $13
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag]);
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, external_opponent !== undefined ? (external_opponent || null) : null]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -6035,9 +6046,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     min_rating_enabled = COALESCE($6, min_rating_enabled),
                     refs_required = COALESCE($8, refs_required),
                     ref_pay = COALESCE($9, ref_pay),
-                    requires_organiser = COALESCE($10, requires_organiser)
+                    requires_organiser = COALESCE($10, requires_organiser),
+                    external_opponent = $11
                 WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null]);
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, external_opponent !== undefined ? (external_opponent || null) : null]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
