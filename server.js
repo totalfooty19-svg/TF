@@ -5169,8 +5169,8 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
         await client.query('DELETE FROM registration_preferences WHERE registration_id = $1', [registrationId]);
         
         // Add new pairs
-        if (pairs && pairs.length > 0) {
-            for (const pairPlayerId of pairs) {
+        if (safePairs.length > 0) {
+            for (const pairPlayerId of safePairs) {
                 await client.query(
                     `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
                      VALUES ($1, $2, 'pair')`,
@@ -5180,8 +5180,8 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
         }
         
         // Add new avoids
-        if (avoids && avoids.length > 0) {
-            for (const avoidPlayerId of avoids) {
+        if (safeAvoids.length > 0) {
+            for (const avoidPlayerId of safeAvoids) {
                 await client.query(
                     `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
                      VALUES ($1, $2, 'avoid')`,
@@ -5199,17 +5199,17 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
                 const _pRow = await pool.query('SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]).catch(() => ({ rows: [] }));
                 const _pName = _pRow.rows[0]?.alias || _pRow.rows[0]?.full_name || req.user.playerId;
                 let _pairStr = '', _avoidStr = '';
-                if (pairs && pairs.length > 0) {
+                if (safePairs.length > 0) {
                     const _pairRows = await pool.query(
                         `SELECT COALESCE(alias, full_name) AS name FROM players WHERE id = ANY($1) ORDER BY alias, full_name`,
-                        [pairs]
+                        [safePairs]
                     ).catch(() => ({ rows: [] }));
                     if (_pairRows.rows.length) _pairStr = ` | Pair: ${_pairRows.rows.map(r => r.name).join(', ')}`;
                 }
-                if (avoids && avoids.length > 0) {
+                if (safeAvoids.length > 0) {
                     const _avoidRows = await pool.query(
                         `SELECT COALESCE(alias, full_name) AS name FROM players WHERE id = ANY($1) ORDER BY alias, full_name`,
-                        [avoids]
+                        [safeAvoids]
                     ).catch(() => ({ rows: [] }));
                     if (_avoidRows.rows.length) _avoidStr = ` | Avoid: ${_avoidRows.rows.map(r => r.name).join(', ')}`;
                 }
