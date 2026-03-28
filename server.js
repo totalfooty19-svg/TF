@@ -10147,7 +10147,7 @@ function calculateLeagueTable(results, teamNames) {
 app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { teamA, teamB, teamAScore, teamBScore } = req.body;
+        const { teamA, teamB, teamAScore, teamBScore, force } = req.body;
         
         // Validate game is a tournament and not finalised
         const gameCheck = await pool.query(
@@ -10187,8 +10187,8 @@ app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requir
              )`,
             [gameId, teamA, teamB]
         );
-        if (dupCheck.rows.length > 0) {
-            return res.status(400).json({ error: `Result already entered for ${teamA} vs ${teamB}. Delete or edit the existing result first.` });
+        if (dupCheck.rows.length > 0 && !force) {
+            return res.status(409).json({ isDuplicate: true, error: `A result already exists for ${teamA} vs ${teamB}.` });
         }
         
         // Insert result
