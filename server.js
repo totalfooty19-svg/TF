@@ -7272,7 +7272,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             SELECT g.*, v.name as venue_name, v.address as venue_address
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.game_url = $1 AND g.teams_confirmed = TRUE
+            WHERE g.game_url = $1 AND (g.teams_confirmed = TRUE OR g.is_venue_clash = TRUE)
         `, [gameUrl]);
         
         if (gameResult.rows.length === 0) {
@@ -7280,7 +7280,51 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         }
         
         const game = gameResult.rows[0];
-        
+
+        // ── VENUE CLASH BRANCH ───────────────────────────────────────────────
+        if (game.is_venue_clash && !game.teams_confirmed) {
+            const t1 = game.venue_clash_team1_name;
+            const t2 = game.venue_clash_team2_name;
+
+            const playersResult = await pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                       r.venue_clash_team_preference, r.position_preference
+                FROM registrations r
+                JOIN players p ON p.id = r.player_id
+                WHERE r.game_id = $1 AND r.status = 'confirmed'
+                ORDER BY COALESCE(p.alias, p.full_name)
+            `, [game.id]);
+
+            const team1 = [], team2 = [], flexible = [], undecided = [];
+            for (const p of playersResult.rows) {
+                const obj = {
+                    id: p.id, name: p.alias || p.full_name,
+                    squadNumber: p.squad_number, photo_url: p.photo_url,
+                    isGK: p.position_preference === 'goalkeeper'
+                };
+                const pref = p.venue_clash_team_preference;
+                if (pref === t1 || pref === 'team1') team1.push(obj);
+                else if (pref === t2 || pref === 'team2') team2.push(obj);
+                else if (pref === 'both') flexible.push(obj);
+                else undecided.push(obj);
+            }
+
+            return res.json({
+                isVenueClash: true,
+                team1Name: t1, team2Name: t2,
+                redTeam: team1, blueTeam: team2,
+                flexible, undecided,
+                game: {
+                    id: game.id, game_url: game.game_url,
+                    team_selection_type: game.team_selection_type,
+                    is_venue_clash: game.is_venue_clash,
+                    venue_clash_team1_name: t1,
+                    venue_clash_team2_name: t2,
+                    teams_confirmed: false
+                }
+            });
+        }
+
         // Get teams
         const teamsResult = await pool.query(`
             SELECT t.id, t.team_name
@@ -12762,12 +12806,25 @@ app.get('/api/games/:gameId/my-team', authenticateToken, async (req, res) => {
         // 3. Check venue_clash team preference (pre-confirmed)
         if (g.is_venue_clash) {
             const vcResult = await pool.query(
-                'SELECT venue_clash_team_preference FROM registrations WHERE player_id = $1 AND game_id = $2 AND status = $3',
-                [req.user.playerId, gameId, 'confirmed']
+                `SELECT r.venue_clash_team_preference,
+                        g.venue_clash_team1_name, g.venue_clash_team2_name
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = $1 AND r.game_id = $2 AND r.status = 'confirmed'`,
+                [req.user.playerId, gameId]
             );
-            if (vcResult.rows.length > 0 && vcResult.rows[0].venue_clash_team_preference) {
-                const name = vcResult.rows[0].venue_clash_team_preference;
-                return res.json({ teamId: `vc-${name}`, teamName: name });
+            if (vcResult.rows.length > 0) {
+                const row = vcResult.rows[0];
+                let pref = row.venue_clash_team_preference;
+                const t1Name = row.venue_clash_team1_name;
+                const t2Name = row.venue_clash_team2_name;
+                // Resolve positional keys stored by signup form → actual names
+                if (pref === 'team1') pref = t1Name;
+                else if (pref === 'team2') pref = t2Name;
+                // 'both' and null mean no firm assignment yet
+                if (pref && pref !== 'both') {
+                    return res.json({ teamId: `vc-${pref}`, teamName: pref });
+                }
             }
         }
 
@@ -13885,6 +13942,212 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
         await client.query('ROLLBACK');
         console.error('POST /api/coaching/sessions:', e.message);
         res.status(500).json({ error: 'Failed to create session' });
+    } finally {
+        client.release();
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: GET /api/coaching/sessions/:id/edit-data
+// Fetch all fields needed to pre-populate the edit modal
+// Accessible by session coach or superadmin only
+// ══════════════════════════════════════════════════════════════
+app.get('/api/coaching/sessions/:id/edit-data', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    try {
+        const sRes = await pool.query(
+            `SELECT cs.*, p.full_name AS coach_name
+             FROM coaching_sessions cs
+             LEFT JOIN players p ON p.id = cs.coach_player_id
+             WHERE cs.id = $1`,
+            [id]
+        );
+        if (sRes.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+        const s = sRes.rows[0];
+
+        // Auth: must be the session coach or superadmin
+        const isSA = req.user.role === 'superadmin';
+        if (!isSA && s.coach_player_id !== req.user.playerId)
+            return res.status(403).json({ error: 'Not authorised to edit this session' });
+
+        if (s.status === 'completed' || s.status === 'cancelled')
+            return res.status(400).json({ error: 'Cannot edit a completed or cancelled session' });
+
+        // Fetch candidate venues
+        const venueRes = await pool.query(
+            `SELECT csv.venue_id AS id, v.name
+             FROM coaching_session_venues csv
+             JOIN venues v ON v.id = csv.venue_id
+             WHERE csv.session_id = $1`,
+            [id]
+        );
+        const candidateVenueIds = venueRes.rows.map(v => v.id);
+        const candidateVenues   = venueRes.rows.map(v => ({ id: v.id, name: v.name }));
+
+        res.json({
+            id: s.id,
+            activity_type: s.activity_type,
+            group_type: s.group_type,
+            duration_hours: s.duration_hours,
+            session_date: s.session_date,
+            session_notes: s.session_notes,
+            status: s.status,
+            coach_player_id: s.coach_player_id,
+            coach_name: s.coach_name,
+            max_players: s.max_players,
+            candidate_venue_ids: candidateVenueIds,
+            candidate_venues: candidateVenues
+        });
+    } catch (e) {
+        console.error('GET /api/coaching/sessions/:id/edit-data:', e.message);
+        res.status(500).json({ error: 'Failed to fetch session edit data' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: PUT /api/coaching/sessions/:id
+// Update core fields of an existing coaching session
+// Accessible by session coach or superadmin only
+// ══════════════════════════════════════════════════════════════
+app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+
+    const { activity_type, group_type, duration_hours, venue_ids,
+            session_date, session_notes, assigned_coach_player_id } = req.body;
+
+    const VALID_ACTIVITIES = ['fitness','ball_control','defending','shooting','positioning','goalkeeping','various'];
+    const VALID_GROUPS     = ['one_to_one','small_group','large_group'];
+    const GROUP_MAX        = { one_to_one: 1, small_group: 6, large_group: 15 };
+
+    if (!VALID_ACTIVITIES.includes(activity_type))
+        return res.status(400).json({ error: 'Invalid activity_type' });
+    if (!VALID_GROUPS.includes(group_type))
+        return res.status(400).json({ error: 'Invalid group_type' });
+    if (!Number.isInteger(duration_hours) || duration_hours < 1 || duration_hours > 8)
+        return res.status(400).json({ error: 'duration_hours must be 1–8' });
+    if (!Array.isArray(venue_ids) || venue_ids.length === 0)
+        return res.status(400).json({ error: 'At least one venue_id required' });
+    if (venue_ids.length > 6)
+        return res.status(400).json({ error: 'Maximum 6 candidate venues' });
+    if (venue_ids.some(v => typeof v !== 'string' || !/^[0-9a-f-]{36}$/.test(v)))
+        return res.status(400).json({ error: 'Invalid venue_id format' });
+    if (session_notes && session_notes.length > 1000)
+        return res.status(400).json({ error: 'session_notes too long (max 1000 chars)' });
+    if (session_date && isNaN(Date.parse(session_date)))
+        return res.status(400).json({ error: 'Invalid session_date' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Fetch current session
+        const sRes = await client.query('SELECT * FROM coaching_sessions WHERE id = $1 FOR UPDATE', [id]);
+        if (sRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Session not found' }); }
+        const session = sRes.rows[0];
+
+        // Auth: must be session coach or superadmin
+        const isSA = req.user.role === 'superadmin';
+        if (!isSA && session.coach_player_id !== req.user.playerId) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'Not authorised to edit this session' });
+        }
+        if (session.status === 'completed' || session.status === 'cancelled') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Cannot edit a completed or cancelled session' });
+        }
+
+        // Validate venues exist and are coaching-suitable
+        const venueResult = await client.query(
+            `SELECT id, name, coaching_cost_per_hour, pay_and_play_coach_hourly,
+                    pay_and_play_player_hourly, coaching_suitable
+             FROM venues WHERE id = ANY($1)`,
+            [venue_ids]
+        );
+        if (venueResult.rows.length !== venue_ids.length)
+            { await client.query('ROLLBACK'); return res.status(400).json({ error: 'One or more venue IDs not found' }); }
+        const unsuitable = venueResult.rows.filter(v => !v.coaching_suitable);
+        if (unsuitable.length > 0)
+            { await client.query('ROLLBACK'); return res.status(400).json({ error: `Venues not suitable: ${unsuitable.map(v => v.name).join(', ')}` }); }
+
+        // Resolve new coach (SA only)
+        let newCoachId = session.coach_player_id;
+        if (isSA && assigned_coach_player_id && /^[0-9a-f-]{36}$/.test(assigned_coach_player_id)) {
+            const coachCheck = await client.query(
+                `SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                 WHERE pb.player_id = $1 AND b.name = 'Coach'`,
+                [assigned_coach_player_id]
+            );
+            if (coachCheck.rows.length === 0)
+                { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Assigned player does not hold the Coach badge' }); }
+            newCoachId = assigned_coach_player_id;
+        }
+
+        // Detect coach change → reset coach_confirmed
+        const coachChanged = newCoachId !== session.coach_player_id;
+        let newCoachConfirmed = coachChanged ? false : session.coach_confirmed;
+
+        // Recalculate max_players + prices
+        const maxPlayers = GROUP_MAX[group_type];
+        const coachRateRes = await client.query('SELECT coach_min_hourly_rate FROM players WHERE id = $1', [newCoachId]);
+        const coachRate = parseFloat(coachRateRes.rows[0]?.coach_min_hourly_rate || 0);
+        const { minPrice, maxPrice } = calcSessionPriceRange(venueResult.rows, coachRate, duration_hours, maxPlayers);
+
+        // Replace candidate venues atomically
+        await client.query('DELETE FROM coaching_session_venues WHERE session_id = $1', [id]);
+        for (const vid of venue_ids) {
+            await client.query('INSERT INTO coaching_session_venues (session_id, venue_id) VALUES ($1, $2)', [id, vid]);
+        }
+
+        // Clear confirmed_venue_id if it is no longer a candidate
+        let newConfirmedVenueId = session.confirmed_venue_id;
+        if (newConfirmedVenueId && !venue_ids.includes(String(newConfirmedVenueId))) {
+            newConfirmedVenueId = null;
+        }
+
+        // Recalculate status
+        let newStatus = 'open';
+        if (newConfirmedVenueId && newCoachConfirmed) newStatus = 'venue_confirmed';
+        else if (newCoachConfirmed) newStatus = 'coach_confirmed';
+        // Preserve finalised
+        if (session.status === 'finalised') newStatus = 'finalised';
+
+        await client.query(
+            `UPDATE coaching_sessions SET
+                activity_type     = $1,
+                group_type        = $2,
+                duration_hours    = $3,
+                session_date      = $4,
+                session_notes     = $5,
+                max_players       = $6,
+                min_price         = $7,
+                max_price         = $8,
+                coach_player_id   = $9,
+                coach_confirmed   = $10,
+                confirmed_venue_id = $11,
+                status            = $12,
+                updated_at        = NOW()
+             WHERE id = $13`,
+            [activity_type, group_type, duration_hours,
+             session_date || null, session_notes || null,
+             maxPlayers, minPrice, maxPrice,
+             newCoachId, newCoachConfirmed, newConfirmedVenueId,
+             newStatus, id]
+        );
+
+        await client.query('COMMIT');
+
+        const editorRole = isSA ? 'superadmin' : 'coach';
+        await logCoachingAudit(id, null, req.user.playerId, 'session_edited',
+            `Edited by ${editorRole} — activity: ${activity_type}, group: ${group_type}, duration: ${duration_hours}h`
+        ).catch(() => {});
+
+        res.json({ ok: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('PUT /api/coaching/sessions/:id:', e.message);
+        res.status(500).json({ error: 'Failed to update session' });
     } finally {
         client.release();
     }
