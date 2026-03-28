@@ -1466,7 +1466,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 GROUP BY r.player_id
             )
             SELECT 
-                p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
+                p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.photo_url, 
                 p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
                 p.phone, u.email,
                 p.is_clm_admin, p.is_organiser,
@@ -1534,7 +1534,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
     try {
         const result = await pool.query(`
             SELECT 
-                p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
+                p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.photo_url, 
                 p.reliability_tier, p.phone,
                 p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
@@ -3792,8 +3792,11 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         
         const registrationId = regResult.rows[0].id;
         
-        // Insert pair preferences (only for confirmed players)
-        if (status === 'confirmed' && pairs && Array.isArray(pairs)) {
+        // Insert pair/avoid preferences — only for confirmed players on modes where teams are auto-drafted
+        const regNoDraftMode = game.team_selection_type === 'draft_memory'
+            || game.team_selection_type === 'vs_external'
+            || game.is_venue_clash;
+        if (status === 'confirmed' && !regNoDraftMode && pairs && Array.isArray(pairs)) {
             for (const pairPlayerId of pairs) {
                 await client.query(
                     `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
@@ -3802,9 +3805,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 );
             }
         }
-        
-        // Insert avoid preferences (only for confirmed players)
-        if (status === 'confirmed' && avoids && Array.isArray(avoids)) {
+        if (status === 'confirmed' && !regNoDraftMode && avoids && Array.isArray(avoids)) {
             for (const avoidPlayerId of avoids) {
                 await client.query(
                     `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
@@ -5127,13 +5128,20 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
         const { positions, pairs, avoids } = req.body;
 
         // FIX-047: Block updates after teams generated
-        const state = await client.query('SELECT teams_generated FROM games WHERE id = $1', [gameId]);
+        const state = await client.query('SELECT teams_generated, team_selection_type, is_venue_clash FROM games WHERE id = $1', [gameId]);
         if (state.rows[0]?.teams_generated) {
             return res.status(400).json({ error: 'Cannot update preferences after teams have been generated' });
         }
 
+        // Strip pairs/avoids for game modes where teams are never auto-drafted
+        const noDraftMode = state.rows[0]?.team_selection_type === 'draft_memory'
+            || state.rows[0]?.team_selection_type === 'vs_external'
+            || state.rows[0]?.is_venue_clash;
+        const safePairs  = noDraftMode ? [] : (pairs  || []);
+        const safeAvoids = noDraftMode ? [] : (avoids || []);
+
         // FIX-047: Cap pairs/avoids at 10 each
-        if ((pairs?.length || 0) > 10 || (avoids?.length || 0) > 10) {
+        if (safePairs.length > 10 || safeAvoids.length > 10) {
             return res.status(400).json({ error: 'Max 10 pairs/avoids allowed' });
         }
         
@@ -7062,7 +7070,78 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         await client.query('COMMIT');
         // FIX-063: Single summary log replacing all step-by-step debug logs
         console.log(`Game ${gameId} completed. Winner: ${winningTeam}. MOTM nominees: ${nomineesInserted}`);
-        
+
+        // FIX-099: Refund confirmed backups who were never promoted when game completes
+        // Runs after COMMIT in setImmediate — uses its own client per player to avoid blocking the response
+        // NOTE: cost_per_player is NOT in scope here (game completion does not fetch it),
+        // so we JOIN g.cost_per_player directly in the query
+        setImmediate(async () => {
+            try {
+                const unpromotedBackups = await pool.query(
+                    `SELECT r.id, r.player_id, r.is_comped, r.registered_by_player_id,
+                            g.cost_per_player
+                     FROM registrations r
+                     JOIN games g ON g.id = r.game_id
+                     WHERE r.game_id = $1
+                       AND r.status = 'backup'
+                       AND r.backup_type = 'confirmed_backup'`,
+                    [gameId]
+                );
+
+                if (unpromotedBackups.rows.length === 0) return;
+
+                console.log(`⏰ FIX-099: Refunding ${unpromotedBackups.rows.length} unused confirmed backup(s) for game ${gameId}`);
+
+                for (const backup of unpromotedBackups.rows) {
+                    const refundTarget = backup.registered_by_player_id || backup.player_id;
+                    const wasComped    = !!backup.is_comped;
+                    const refundAmt    = parseFloat(backup.cost_per_player || 0);
+
+                    const refundClient = await pool.connect();
+                    try {
+                        await refundClient.query('BEGIN');
+
+                        if (!wasComped && refundAmt > 0) {
+                            await refundClient.query(
+                                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                                [refundAmt, refundTarget]
+                            );
+                            await recordCreditTransaction(
+                                refundClient, refundTarget, refundAmt, 'refund',
+                                `Confirmed backup unused — game ${gameId} completed without promotion`
+                            );
+                        }
+
+                        const notifMsg = wasComped
+                            ? `The game has now ended. You were on the confirmed backup list but weren't needed — no charge was made.`
+                            : `The game has now ended. You were on the confirmed backup list but weren't needed — £${refundAmt.toFixed(2)} has been refunded to your balance.`;
+
+                        await refundClient.query(
+                            `INSERT INTO notifications (player_id, type, message, game_id)
+                             VALUES ($1, 'backup_refund', $2, $3)`,
+                            [backup.player_id, notifMsg, gameId]
+                        );
+
+                        await refundClient.query('COMMIT');
+
+                        await auditLog(pool, null, 'confirmed_backup_refund', backup.player_id,
+                            `Game ${gameId} completed — ${wasComped ? 'comped, no charge' : `refunded £${refundAmt.toFixed(2)}`}`
+                        ).catch(() => {});
+
+                        console.log(`✅ FIX-099: Confirmed backup refund — player ${backup.player_id} ${wasComped ? '(comped, no charge)' : `refunded £${refundAmt.toFixed(2)}`} for game ${gameId}`);
+
+                    } catch (e) {
+                        await refundClient.query('ROLLBACK').catch(() => {});
+                        console.error(`✗ FIX-099: Confirmed backup refund failed for player ${backup.player_id} game ${gameId}:`, e.message);
+                    } finally {
+                        refundClient.release();
+                    }
+                }
+            } catch (e) {
+                console.error(`✗ FIX-099: Confirmed backup refund sweep failed for game ${gameId}:`, e.message);
+            }
+        });
+
         // FIX-085: Auto-allocate badges OUTSIDE transaction in setImmediate (was N+1 inside transaction)
         setImmediate(async () => {
             for (const playerId of allPlayerIds) {
@@ -8126,6 +8205,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
                 p.alias,
                 p.squad_number,
                 p.overall_rating,
+                p.goalkeeper_rating,
                 r.status,
                 r.position_preference,
                 r.tournament_team_preference
@@ -8260,11 +8340,14 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         
             await recordCreditTransaction(txClient, playerId, -cost, 'game_fee', `Admin added to game ${gameId}`);
         
-            // Add player
+            // Add player — normalise 'goalkeeper' -> 'GK' to match all server-side position checks
+            const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper'
+                ? 'GK'
+                : (position || 'outfield');
             await txClient.query(
                 `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
                  VALUES ($1, $2, 'confirmed', $3, $4)`,
-                [gameId, playerId, position || 'outfield', cost]
+                [gameId, playerId, normPosition, cost]
             );
 
             await txClient.query('COMMIT');
@@ -8374,11 +8457,14 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         // Record transaction
         await recordCreditTransaction(pool, playerId, -customCharge, 'game_fee', `Game registration (custom charge: £${customCharge.toFixed(2)})`);
         
-        // Add player
+        // Add player — normalise 'goalkeeper' -> 'GK' to match all server-side position checks
+        const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper'
+            ? 'GK'
+            : (position || 'outfield');
         await pool.query(
             `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
              VALUES ($1, $2, 'confirmed', $3, $4)`,
-            [gameId, playerId, position || 'outfield', customCharge]
+            [gameId, playerId, normPosition, customCharge]
         );
         
         res.json({ message: 'Player added with custom charge' });
