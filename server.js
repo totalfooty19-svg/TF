@@ -1683,6 +1683,20 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                  WHERE gg.invited_by = p.id AND g.exclusivity = 'clm'
                  AND g.game_date >= DATE_TRUNC('year', NOW())), 0) as clm_revenue_year,
 
+                -- FREE CREDITS: all time
+                COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'free_credit'), 0) as free_credits,
+
+                -- FREE CREDITS: last 3 months
+                COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'free_credit'
+                 AND ct.created_at >= NOW() - INTERVAL '3 months'), 0) as free_credits_3m,
+
+                -- FREE CREDITS: calendar year
+                COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
+                 WHERE ct.player_id = p.id AND ct.type = 'free_credit'
+                 AND ct.created_at >= DATE_TRUNC('year', NOW())), 0) as free_credits_year,
+
                 -- FEATURED PROFILE & SOCIALS
                 COALESCE(p.is_featured, false) as is_featured,
                 p.social_tiktok,
@@ -2317,6 +2331,26 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
     }
 });
 
+// POST /api/admin/players/:id/free-credits — record free credit grant (superadmin only)
+// Does NOT change the player's real balance — informational record only
+app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { amount, description } = req.body;
+        const parsedAmount = parseFloat(amount);
+        if (isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Amount must be a positive number' });
+        if (parsedAmount > 500) return res.status(400).json({ error: 'Amount too large — max £500' });
+
+        // Record transaction with type free_credit — balance is NOT updated
+        await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
+            description?.trim() || 'Free credit grant', req.user.userId);
+
+        res.json({ message: 'Free credits recorded' });
+    } catch (error) {
+        console.error('Free credit record error:', error);
+        res.status(500).json({ error: 'Failed to record free credits' });
+    }
+});
+
 // Update player (admin)
 app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (req, res) => {
     try {
@@ -2876,6 +2910,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+                'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
         };
         
         // Add venue photos based on venue name
@@ -2950,6 +2985,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+                'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
         };
         
         // Format the response
@@ -3110,6 +3146,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+                'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
         };
         
         if (game.venue_name && venuePhotoMap[game.venue_name]) {
@@ -3380,7 +3417,7 @@ app.get('/api/games/:id/calendar.ics', authenticateToken, async (req, res) => {
         const locationRaw = [game.venue_name, game.venue_address, game.venue_postcode].filter(Boolean).join(', ');
         const uid = `tf-game-${id}@totalfooty.co.uk`;
         const summary = icsEscape(`⚽ TotalFooty — ${game.format || 'Football'}`);
-        const description = icsEscape(`TotalFooty game at ${game.venue_name || 'TBA'}. View details: https://totalfooty.co.uk/vibecoding/game.html?url=${game.game_url || ''}`);
+        const description = icsEscape(`TotalFooty game at ${game.venue_name || 'TBA'}. View details: https://totalfooty.co.uk/game.html?url=${game.game_url || ''}`);
         const location = icsEscape(locationRaw);
 
         const ics = [
@@ -4090,7 +4127,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             guestNumber: nextGuestNumber,
             totalGuests: nextGuestNumber,
             amountCharged: cost,
-            referralLink: referralCode ? `https://totalfooty.co.uk/vibecoding/?ref=${referralCode}` : null,
+            referralLink: referralCode ? `https://totalfooty.co.uk/?ref=${referralCode}` : null,
             referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
         });
         setImmediate(async () => {
@@ -4583,7 +4620,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 const gameData = await getGameDataForNotification(gameId);
                 const gameDate = gameData.game_date || gameData.day || 'upcoming game';
                 const venue = gameData.venue || 'the venue';
-                const gameUrl = `https://totalfooty.co.uk/vibecoding/game.html?url=${gameData.game_url || ''}`;
+                const gameUrl = `https://totalfooty.co.uk/game.html?url=${gameData.game_url || ''}`;
 
                 // Push notification to friend
                 const notifType = status === 'confirmed' ? 'game_registered' : 'backup_added';
@@ -5768,7 +5805,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
             day: cancelDate,
             time: cancelGameRow.game_date ? new Date(cancelGameRow.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '',
             venue: cancelGameRow.venue_name || 'TBC',
-            gameurl: `https://totalfooty.co.uk/vibecoding/game.html?url=${cancelGameRow.game_url}`
+            gameurl: `https://totalfooty.co.uk/game.html?url=${cancelGameRow.game_url}`
         };
         const cancelledPlayerIds = registrations.rows.map(r => r.player_id);
 
@@ -6583,12 +6620,23 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             ]);
             
             // Fix 06: fetch pairs/avoids so fine-tune modal can show pref icons
+            // FIX-100: was reading dead r.pairs/r.avoids columns on registrations (always null).
+            // Must JOIN registration_preferences — same pattern as generate-teams endpoint.
             const prefsResult = await pool.query(
                 `SELECT r.player_id,
-                        COALESCE(r.pairs,  '{}') AS pairs,
-                        COALESCE(r.avoids, '{}') AS avoids
+                        array_agg(DISTINCT rp_pair.target_player_id)
+                            FILTER (WHERE rp_pair.preference_type  = 'pair')  AS pairs,
+                        array_agg(DISTINCT rp_avoid.target_player_id)
+                            FILTER (WHERE rp_avoid.preference_type = 'avoid') AS avoids
                  FROM registrations r
-                 WHERE r.game_id = $1 AND r.status = 'confirmed'`,
+                 LEFT JOIN registration_preferences rp_pair
+                        ON rp_pair.registration_id  = r.id
+                       AND rp_pair.preference_type = 'pair'
+                 LEFT JOIN registration_preferences rp_avoid
+                        ON rp_avoid.registration_id = r.id
+                       AND rp_avoid.preference_type = 'avoid'
+                 WHERE r.game_id = $1 AND r.status = 'confirmed'
+                 GROUP BY r.player_id`,
                 [gameId]
             );
             const prefsMap = new Map();
@@ -7784,6 +7832,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+                'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
         };
         
         const venue_photo = game.venue_name && venuePhotoMap[game.venue_name] 
@@ -8085,6 +8134,7 @@ app.get('/api/public/games', async (req, res) => {
             'Powerleague Coventry': 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+                'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
         };
         const rows = result.rows.map(game => {
             game.venue_photo = (game.venue_name && venuePhotoMap[game.venue_name]) || null;
@@ -8103,15 +8153,27 @@ app.get('/api/public/games/completed', async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT g.id, g.game_url, g.game_date, g.format,
-                   g.motm_winner_id, g.exclusivity,
+                   COALESCE(g.motm_winner_id, tfa.tfa_winner_id) AS motm_winner_id,
+                   g.exclusivity,
                    v.name AS venue_name,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
-                   motm_p.alias AS motm_winner_alias, motm_p.full_name AS motm_winner_name
+                   COALESCE(motm_p.alias,     tfa.tfa_alias)  AS motm_winner_alias,
+                   COALESCE(motm_p.full_name, tfa.tfa_name)   AS motm_winner_name
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+            LEFT JOIN LATERAL (
+                SELECT ga.recipient_player_id AS tfa_winner_id,
+                       p2.alias              AS tfa_alias,
+                       p2.full_name          AS tfa_name
+                FROM game_awards ga
+                JOIN players p2 ON p2.id = ga.recipient_player_id
+                WHERE ga.game_id = g.id AND ga.award_type = 'motm'
+                ORDER BY ga.vote_count DESC NULLS LAST, ga.id ASC
+                LIMIT 1
+            ) tfa ON TRUE
             WHERE g.game_status = 'completed'
-              AND g.motm_winner_id IS NOT NULL
+              AND (g.motm_winner_id IS NOT NULL OR tfa.tfa_winner_id IS NOT NULL)
             ORDER BY g.game_date DESC
             LIMIT 100
         `);
@@ -8979,6 +9041,12 @@ async function closeAwards(gameId) {
                         'UPDATE players SET motm_wins = motm_wins + $1 WHERE id = $2',
                         [motmValue, winner.playerId]
                     );
+                    // FIX-100: Also write winner back to games.motm_winner_id
+                    // AND motm_winner_id IS NULL guards against overwriting in a tie
+                    await pool.query(
+                        'UPDATE games SET motm_winner_id = $1 WHERE id = $2 AND motm_winner_id IS NULL',
+                        [winner.playerId, gameId]
+                    );
                 }
 
                 confirmedWinners.push({ awardType, playerId: winner.playerId, votes: winner.votes, motmValue });
@@ -9046,7 +9114,7 @@ async function closeAwards(gameId) {
 // WS2: AI PLAYER BIOS
 // ============================================================
 
-const BIO_SYSTEM_PROMPT = `You are the TotalFooty bio writer for a Coventry grassroots football community.
+const BIO_SYSTEM_PROMPT = `You are the TotalFooty bio writer for a grassroots football community across Coventry and Nuneaton.
 Write a player bio that reads like a Football Manager scouting report crossed with WhatsApp group banter. Tone: factual, specific, readable, confident.
 Do not be sycophantic. Do not use filler phrases like 'a true asset to the team'.
 Do not mention specific scores or opponents. Do not invent facts.
@@ -9784,7 +9852,7 @@ app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
         res.json({
             referralCode: me.referral_code,
             referralLink: me.referral_code
-                ? 'https://totalfooty.co.uk/vibecoding/?ref=' + me.referral_code
+                ? 'https://totalfooty.co.uk/?ref=' + me.referral_code
                 : null,
             referredBy: me.referred_by ? { id: me.referred_by, alias: me.referred_by_alias } : null,
             referrals: referred.rows.map(r => ({
@@ -9918,7 +9986,7 @@ app.get('/api/public/player/:playerId/referral', async (req, res) => {
         res.json({
             referralCode: p.referral_code,
             referralLink: p.referral_code
-                ? 'https://totalfooty.co.uk/vibecoding/?ref=' + p.referral_code
+                ? 'https://totalfooty.co.uk/?ref=' + p.referral_code
                 : null
             // FIX-094: playerName intentionally omitted
         });
@@ -9975,7 +10043,12 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count,
                 (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'pending')   AS pending_referee_applications,
-                (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_referees
+                (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_referees,
+                COALESCE((SELECT SUM(g.cost_per_player - r.amount_paid)
+                 FROM registrations r
+                 WHERE r.game_id = g.id AND r.status = 'confirmed'
+                 AND r.is_comped = FALSE AND r.amount_paid IS NOT NULL
+                 AND r.amount_paid > 0 AND r.amount_paid < g.cost_per_player), 0) as discount_gap
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 ORDER BY g.game_date DESC`;
             params = [];
@@ -10000,7 +10073,12 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count,
                 (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'pending')   AS pending_referee_applications,
-                (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_referees
+                (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_referees,
+                COALESCE((SELECT SUM(g.cost_per_player - r.amount_paid)
+                 FROM registrations r
+                 WHERE r.game_id = g.id AND r.status = 'confirmed'
+                 AND r.is_comped = FALSE AND r.amount_paid IS NOT NULL
+                 AND r.amount_paid > 0 AND r.amount_paid < g.cost_per_player), 0) as discount_gap
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
@@ -11921,7 +11999,7 @@ app.post('/api/games/:gameId/apply-ref', authenticateToken, registrationLimiter,
                 const name = pRow.rows[0].alias || pRow.rows[0].full_name;
 
                 const gameData = await getGameDataForNotification(gameId);
-                const gameUrl = `https://totalfooty.co.uk/vibecoding/game.html?url=${gameData.game_url || ''}`;
+                const gameUrl = `https://totalfooty.co.uk/game.html?url=${gameData.game_url || ''}`;
 
                 await emailTransporter.sendMail({
                     from: '"TotalFooty" <totalfooty19@gmail.com>',
@@ -12075,7 +12153,7 @@ app.post('/api/admin/games/:gameId/referees/:refPlayerId/confirm', authenticateT
                 const name = pRow.rows[0].alias || pRow.rows[0].full_name;
 
                 const gameData = await getGameDataForNotification(gameId);
-                const gameUrl = `https://totalfooty.co.uk/vibecoding/game.html?url=${gameData.game_url || ''}`;
+                const gameUrl = `https://totalfooty.co.uk/game.html?url=${gameData.game_url || ''}`;
 
                 await emailTransporter.sendMail({
                     from: '"TotalFooty" <totalfooty19@gmail.com>',
@@ -12633,7 +12711,7 @@ app.post('/api/admin/referee-invite', authenticateToken, requireAdmin, async (re
             `INSERT INTO referee_invites (code, created_by, expires_at) VALUES ($1, $2, $3)`,
             [code, req.user.playerId, expiresAt]
         );
-        const link = `https://totalfooty.co.uk/vibecoding/?referee_invite=${code}`;
+        const link = `https://totalfooty.co.uk/?referee_invite=${code}`;
         setImmediate(() => auditLog(pool, req.user.playerId, 'referee_invite_created',
             req.user.playerId, `code: ${code}`));
         res.json({ code, link, expiresAt });
@@ -13186,7 +13264,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
             }
 
             // Send email — decoupled from main try/catch so email failure doesn't 500 the request
-            const resetLink = `https://totalfooty.co.uk/vibecoding/reset-password.html?token=${token}`;
+            const resetLink = `https://totalfooty.co.uk/reset-password.html?token=${token}`;
             emailTransporter.sendMail({
                 from: '"TotalFooty" <totalfooty19@gmail.com>',
                 to: email.trim(),
@@ -13967,7 +14045,7 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
              <tr><td style="color:#888">Group Type</td><td style="color:#fff">${htmlEncode(group_type)}</td></tr>
              <tr><td style="color:#888">Duration</td><td style="color:#fff">${duration_hours}hr</td></tr>
              <tr><td style="color:#888">Price Range</td><td style="color:#fff">£${minPrice?.toFixed(2) || 'TBC'} – £${maxPrice?.toFixed(2) || 'TBC'}</td></tr></table>
-             <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/vibecoding/session.html?url=${sessionUrl}" style="color:#C0392B">View Session →</a></p>`
+             <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/session.html?url=${sessionUrl}" style="color:#C0392B">View Session →</a></p>`
         );
 
         res.status(201).json({ id: sessionId, session_url: sessionUrl, min_price: minPrice, max_price: maxPrice });
@@ -14607,7 +14685,7 @@ async function handleFinalise(req, res) {
                  ${pd.start_time ? `<tr><td style="color:#888">Your Start Time</td><td style="color:#fff;font-weight:700">${htmlEncode(String(pd.start_time))}</td></tr>` : ''}
                  ${pd.activity_focus ? `<tr><td style="color:#888">Your Focus</td><td style="color:#fff">${htmlEncode(pd.activity_focus)}</td></tr>` : ''}
                  </table>
-                 <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/vibecoding/session.html?url=${session.session_url || ''}" style="color:#C0392B">View Session →</a></p>`
+                 <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/session.html?url=${session.session_url || ''}" style="color:#C0392B">View Session →</a></p>`
             );
         }
         notifyAdmin(`Session ${isEdit ? 'Re-Finalised' : 'Finalised'}`, [['Details', `${actLabel} coaching session finalised with ${assignments.length} player(s).`]]);
@@ -14668,7 +14746,7 @@ app.post('/api/coaching/sessions/:id/complete', authenticateToken, async (req, r
         await sendCoachingEmail(regResult.rows.map(r => r.player_id),
             'Rate Your Coach ⭐',
             `<p style="color:#888">Your ${actLabel} coaching session is now complete. Please take a moment to rate your coach.</p>
-             <p style="color:#888;margin-top:12px"><a href="https://totalfooty.co.uk/vibecoding/session.html?url=${id}" style="color:#C0392B;font-weight:700">Rate Your Coach →</a></p>`
+             <p style="color:#888;margin-top:12px"><a href="https://totalfooty.co.uk/session.html?url=${id}" style="color:#C0392B;font-weight:700">Rate Your Coach →</a></p>`
         );
     }
     notifyAdmin('Session Completed', [['Details', `${actLabel} coaching session completed.`]]);
@@ -15820,7 +15898,7 @@ app.listen(PORT, () => {
                       })
                     : 'TBC';
                 const actLabel = (sess.activity_type || '').replace(/_/g, ' ');
-                const sessionLink = `https://totalfooty.co.uk/vibecoding/session.html?url=${sess.session_url}`;
+                const sessionLink = `https://totalfooty.co.uk/session.html?url=${sess.session_url}`;
                 const emailBody = `
                     <p style="color:#888">This is a reminder that you have a coaching session tomorrow.</p>
                     <table style="margin:12px 0;">
