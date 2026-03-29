@@ -1357,6 +1357,8 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.total_appearances, 
                     p.motm_wins, 
                     p.total_wins,
+                    (SELECT COUNT(*) FROM registrations
+                     WHERE player_id = p.id AND status = 'confirmed')::int AS confirmed_registration_count,
                     p.is_clm_admin,
                     p.is_organiser,
                     p.referred_by,
