@@ -3149,6 +3149,9 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             }
         }
         
+        // FIX-03: server-side boolean so frontend never needs to re-derive from team_selection_type string
+        game.show_pair_avoid = !['draft_memory', 'vs_external'].includes((game.team_selection_type || '').trim().toLowerCase()) && !game.is_venue_clash;
+
         res.json(game);
     } catch (error) {
         console.error('Error fetching game:', error);
@@ -6577,8 +6580,33 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
                 `, [blueTeamId, gameId])
             ]);
             
+            // Fix 06: fetch pairs/avoids so fine-tune modal can show pref icons
+            const prefsResult = await pool.query(
+                `SELECT r.player_id,
+                        COALESCE(r.pairs,  '{}') AS pairs,
+                        COALESCE(r.avoids, '{}') AS avoids
+                 FROM registrations r
+                 WHERE r.game_id = $1 AND r.status = 'confirmed'`,
+                [gameId]
+            );
+            const prefsMap = new Map();
+            for (const row of prefsResult.rows) {
+                prefsMap.set(String(row.player_id), {
+                    pairs:  Array.isArray(row.pairs)  ? row.pairs.map(String)  : [],
+                    avoids: Array.isArray(row.avoids) ? row.avoids.map(String) : []
+                });
+            }
+
+            // Build name lookup from both team results for pair_names/avoid_names resolution
+            const allTeamRows = [...redTeamResult.rows, ...blueTeamResult.rows];
+            const nameMap = new Map();
+            for (const row of allTeamRows) {
+                nameMap.set(String(row.id), row.alias || row.full_name || String(row.id));
+            }
+
             const mapTeamPlayer = p => {
                 const isGKOnly = p.position_preference?.trim().toLowerCase() === 'gk';
+                const prefs    = prefsMap.get(String(p.id)) || { pairs: [], avoids: [] };
                 return {
                     id:           p.id,
                     full_name:    p.full_name,
@@ -6594,7 +6622,9 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
                     shooting:     p.shooting_rating   || 0,
                     gk:           p.goalkeeper_rating || 0,
                     isGK:         isGKOnly,
-                    position_preference: p.position_preference || 'outfield'
+                    position_preference: p.position_preference || 'outfield',
+                    pair_names:   prefs.pairs.map(id => nameMap.get(id)).filter(Boolean),
+                    avoid_names:  prefs.avoids.map(id => nameMap.get(id)).filter(Boolean)
                 };
             };
 
