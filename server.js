@@ -3150,7 +3150,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         }
         
         // FIX-03: server-side boolean so frontend never needs to re-derive from team_selection_type string
-        game.show_pair_avoid = !['draft_memory', 'vs_external'].includes((game.team_selection_type || '').trim().toLowerCase()) && !game.is_venue_clash;
+        game.show_pair_avoid = !['draft_memory', 'vs_external'].includes((game.team_selection_type || '').trim().toLowerCase()) && !game.is_venue_clash && !game.venue_clash_team1_name;
 
         res.json(game);
     } catch (error) {
@@ -7302,7 +7302,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             SELECT g.*, v.name as venue_name, v.address as venue_address
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.game_url = $1 AND (g.teams_confirmed = TRUE OR g.is_venue_clash = TRUE)
+            WHERE g.game_url = $1 AND (g.teams_confirmed = TRUE OR g.is_venue_clash = TRUE OR g.venue_clash_team1_name IS NOT NULL)
         `, [gameUrl]);
         
         if (gameResult.rows.length === 0) {
@@ -7312,7 +7312,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         const game = gameResult.rows[0];
 
         // ── VENUE CLASH BRANCH ───────────────────────────────────────────────
-        if (game.is_venue_clash && !game.teams_confirmed) {
+        if ((game.is_venue_clash || game.venue_clash_team1_name) && !game.teams_confirmed) {
             const t1 = game.venue_clash_team1_name;
             const t2 = game.venue_clash_team2_name;
 
@@ -7846,6 +7846,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             ref_review_ends: game.ref_review_ends || null,
             seriesScoreline,
             is_venue_clash: game.is_venue_clash || false,
+            show_venue_clash_teams: !!(game.is_venue_clash || game.venue_clash_team1_name),
             venue_clash_team1_name: game.venue_clash_team1_name || null,
             venue_clash_team2_name: game.venue_clash_team2_name || null,
             requires_organiser: game.requires_organiser || false,
