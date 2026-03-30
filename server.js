@@ -294,6 +294,48 @@ async function recordCreditTransaction(db, playerId, amount, type, description, 
     }
 }
 
+// ── FREE-CREDIT-FIRST GAME FEE HELPER ───────────────────────────────────────
+// Deducts a game fee, consuming any remaining free credits before real balance.
+// Free credits were added to credits.balance at grant time so the total balance
+// already includes them — we just need to classify the transaction correctly.
+// Returns { realCharged } — the portion paid from real balance (for amount_paid).
+async function applyGameFee(db, playerId, cost, description) {
+    if (!cost || cost <= 0) return { realCharged: 0 };
+
+    // Remaining free credits = net sum of all free_credit transactions
+    const fcResult = await db.query(
+        `SELECT COALESCE(SUM(amount), 0) as remaining_free
+         FROM credit_transactions WHERE player_id = $1 AND type = 'free_credit'`,
+        [playerId]
+    );
+    const remainingFree = Math.max(0, parseFloat(fcResult.rows[0].remaining_free));
+
+    // How much of this charge is covered by free credits (pence-accurate)
+    const costCents = Math.round(cost * 100);
+    const freeCents = Math.min(Math.round(remainingFree * 100), costCents);
+    const realCents = costCents - freeCents;
+    const freeUsed    = freeCents / 100;
+    const realCharged = realCents / 100;
+
+    // Deduct full cost from balance (free credits already live in balance)
+    await db.query(
+        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
+        [cost, playerId]
+    );
+
+    // Record free credit consumption as a negative free_credit transaction
+    if (freeUsed > 0) {
+        await recordCreditTransaction(db, playerId, -freeUsed, 'free_credit',
+            `${description} (free credit used)`);
+    }
+    // Record real balance charge
+    if (realCharged > 0) {
+        await recordCreditTransaction(db, playerId, -realCharged, 'game_fee', description);
+    }
+
+    return { realCharged };
+}
+
 // ── MIN RATING HELPER ────────────────────────────────────────────────────────
 // Single source of truth for the effective minimum OVR at any moment.
 // Visibility-only rating filter — determines which games appear on a player's list.
@@ -2340,8 +2382,13 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
         if (isNaN(parsedAmount) || parsedAmount === 0) return res.status(400).json({ error: 'Amount must be non-zero' });
         if (Math.abs(parsedAmount) > 500) return res.status(400).json({ error: 'Amount too large — max ±£500' });
 
-        // Record transaction with type free_credit — balance is NOT updated
+        // Record transaction and update balance so free credits can actually be spent
         const desc = description?.trim() || (parsedAmount < 0 ? 'Free credit removal' : 'Free credit grant');
+        await pool.query(
+            `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
+             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+            [req.params.id, parsedAmount]
+        );
         await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
             desc, req.user.userId);
 
@@ -3741,7 +3788,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         }
 
         // Determine registration status
-        let status, regBackupType = null;
+        let status, regBackupType = null, regAmountPaid = null;
         
         if (isFull) {
             // Game is full - must be a backup registration
@@ -3779,12 +3826,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                         return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                     }
                     
-                    await client.query(
-                        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                        [game.cost_per_player, req.user.playerId]
-                    );
-                    
-                    await recordCreditTransaction(client, req.user.playerId, -game.cost_per_player, 'game_fee', `Confirmed backup for game ${gameId}`);
+                    await applyGameFee(client, req.user.playerId, game.cost_per_player, `Confirmed backup for game ${gameId}`);
                 }
             }
         } else {
@@ -3803,12 +3845,8 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     return res.status(400).json({ error: 'Insufficient credits' });
                 }
                 
-                await client.query(
-                    'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                    [game.cost_per_player, req.user.playerId]
-                );
-                
-                await recordCreditTransaction(client, req.user.playerId, -game.cost_per_player, 'game_fee', `Registration for game ${gameId}`);
+                const { realCharged: selfRegCharged } = await applyGameFee(client, req.user.playerId, game.cost_per_player, `Registration for game ${gameId}`);
+                regAmountPaid = selfRegCharged;
             }
         }
         
@@ -3829,7 +3867,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
              game.is_venue_clash ? (venueClashTeamPreference || null) : null,
-             isComped ? 0 : (status === 'confirmed' ? game.cost_per_player : 0),
+             isComped ? 0 : (status === 'confirmed' ? (regAmountPaid ?? game.cost_per_player) : 0),
              isComped]
         );
         
@@ -4075,12 +4113,8 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: `Insufficient credits. You need £${cost.toFixed(2)} to add a guest.` });
         }
 
-        // Deduct credits from the inviting player
-        await client.query(
-            'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-            [cost, playerId]
-        );
-        await recordCreditTransaction(client, playerId, -cost, 'game_fee', `+1 guest (${guestName.trim()}) for game`);
+        // Deduct credits from the inviting player (free credits first)
+        await applyGameFee(client, playerId, cost, `+1 guest (${guestName.trim()}) for game`);
 
         // Get player's overall rating (compute from individual stats if overall_rating is NULL)
         const playerRating = await client.query(
@@ -4537,7 +4571,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         }
 
         // Determine status and handle credit deduction from REGISTERING PLAYER
-        let status, regBackupType = null;
+        let status, regBackupType = null, friendAmountPaid = null;
 
         if (isFull) {
             if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
@@ -4562,8 +4596,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                 }
-                await client.query('UPDATE credits SET balance = balance - $1 WHERE player_id = $2', [game.cost_per_player, registeringPlayerId]);
-                await recordCreditTransaction(client, registeringPlayerId, -game.cost_per_player, 'game_fee', `Confirmed backup for ${friendName} in game ${gameId}`);
+                await applyGameFee(client, registeringPlayerId, game.cost_per_player, `Confirmed backup for ${friendName} in game ${gameId}`);
             }
         } else {
             status = 'confirmed';
@@ -4572,8 +4605,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
-            await client.query('UPDATE credits SET balance = balance - $1 WHERE player_id = $2', [game.cost_per_player, registeringPlayerId]);
-            await recordCreditTransaction(client, registeringPlayerId, -game.cost_per_player, 'game_fee', `Registration for ${friendName} in game ${gameId}`);
+            await applyGameFee(client, registeringPlayerId, game.cost_per_player, `Registration for ${friendName} in game ${gameId}`);
         }
 
         // Insert registration under friend's player_id, recording who paid
@@ -4829,7 +4861,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         
         // Get the dropping player's registration — also fetch who paid (registered_by_player_id)
         const regResult = await client.query(
-            'SELECT id, status, backup_type, position_preference, registered_by_player_id, is_comped FROM registrations WHERE game_id = $1 AND player_id = $2',
+            'SELECT id, status, backup_type, position_preference, registered_by_player_id, is_comped, amount_paid FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
         
@@ -4848,15 +4880,19 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         
         // Refund if they paid (confirmed players or confirmed backups) — skip if comped (£0 was taken)
         if (!wasComped && (wasConfirmed || wasConfirmedBackup)) {
-            await client.query(
-                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                [cost, refundTargetId]
-            );
-            
+            const paidAmt = parseFloat(droppingReg.amount_paid ?? cost);
+            const freeAmt = Math.max(0, cost - paidAmt);
             const refundDesc = refundTargetId !== req.user.playerId
                 ? `Dropout refund for ${req.user.playerId} (paid by you)`
                 : 'Dropped out of game - refund';
-            await recordCreditTransaction(client, refundTargetId, cost, 'refund', refundDesc);
+            if (paidAmt > 0) {
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [paidAmt, refundTargetId]);
+                await recordCreditTransaction(client, refundTargetId, paidAmt, 'refund', refundDesc);
+            }
+            if (freeAmt > 0) {
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [freeAmt, refundTargetId]);
+                await recordCreditTransaction(client, refundTargetId, freeAmt, 'free_credit', `Free credit restored — dropped out of game ${droppingReg.id}`);
+            }
         }
         
         // Remove ALL guests if this player had any, and refund guest fees
@@ -4969,12 +5005,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 
                 // If they weren't a confirmed_backup, charge them now
                 if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                    await client.query(
-                        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                        [cost, promotedPlayer.player_id]
-                    );
-                    
-                    await recordCreditTransaction(client, promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`);
+                    await applyGameFee(client, promotedPlayer.player_id, cost, `Promoted from backup - game ${gameId}`);
                 }
                 
                 // Create notification for promoted player
@@ -5001,7 +5032,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 // No confirmed organiser left — look for an organiser in the backup list
                 const orgBackup = await client.query(`
                     SELECT r.id, r.player_id, r.backup_type, r.position_preference,
-                           p.full_name, p.alias
+                           r.amount_paid, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     WHERE r.game_id = $1 AND r.status = 'backup' AND p.is_organiser = true
@@ -5019,13 +5050,16 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     const ob = orgBackup.rows[0];
                     // Refund if confirmed_backup (they pre-paid) — organisers always play free
                     if (ob.backup_type === 'confirmed_backup') {
-                        const obCost = parseFloat(gameCheck.rows[0].cost_per_player);
-                        if (obCost > 0) {
-                            await client.query(
-                                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                                [obCost, ob.player_id]
-                            );
-                            await recordCreditTransaction(client, ob.player_id, obCost, 'refund', `Organiser comp — promoted from backup for game ${gameId}`);
+                        const obCost    = parseFloat(gameCheck.rows[0].cost_per_player);
+                        const obPaid    = parseFloat(ob.amount_paid ?? obCost);
+                        const obFree    = Math.max(0, obCost - obPaid);
+                        if (obPaid > 0) {
+                            await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [obPaid, ob.player_id]);
+                            await recordCreditTransaction(client, ob.player_id, obPaid, 'refund', `Organiser comp — promoted from backup for game ${gameId}`);
+                        }
+                        if (obFree > 0) {
+                            await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [obFree, ob.player_id]);
+                            await recordCreditTransaction(client, ob.player_id, obFree, 'free_credit', `Free credit restored — organiser comp for game ${gameId}`);
                         }
                     }
                     // Promote: mark confirmed, comped, clear backup_type
@@ -7172,7 +7206,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             try {
                 const unpromotedBackups = await pool.query(
                     `SELECT r.id, r.player_id, r.is_comped, r.registered_by_player_id,
-                            g.cost_per_player
+                            r.amount_paid, g.cost_per_player
                      FROM registrations r
                      JOIN games g ON g.id = r.game_id
                      WHERE r.game_id = $1
@@ -7188,26 +7222,46 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 for (const backup of unpromotedBackups.rows) {
                     const refundTarget = backup.registered_by_player_id || backup.player_id;
                     const wasComped    = !!backup.is_comped;
-                    const refundAmt    = parseFloat(backup.cost_per_player || 0);
+                    // amount_paid = real balance charged (after free credits applied)
+                    // freeUsed    = portion covered by free credits — must be restored too
+                    const refundAmt = parseFloat(backup.amount_paid ?? backup.cost_per_player ?? 0);
+                    const freeUsed  = Math.max(0, parseFloat(backup.cost_per_player || 0) - refundAmt);
 
                     const refundClient = await pool.connect();
                     try {
                         await refundClient.query('BEGIN');
 
-                        if (!wasComped && refundAmt > 0) {
-                            await refundClient.query(
-                                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                                [refundAmt, refundTarget]
-                            );
-                            await recordCreditTransaction(
-                                refundClient, refundTarget, refundAmt, 'refund',
-                                `Confirmed backup unused — game ${gameId} completed without promotion`
-                            );
+                        if (!wasComped) {
+                            // Restore real balance charge
+                            if (refundAmt > 0) {
+                                await refundClient.query(
+                                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                                    [refundAmt, refundTarget]
+                                );
+                                await recordCreditTransaction(
+                                    refundClient, refundTarget, refundAmt, 'refund',
+                                    `Confirmed backup unused — game ${gameId} completed without promotion`
+                                );
+                            }
+                            // Restore free credits consumed at signup
+                            if (freeUsed > 0) {
+                                await refundClient.query(
+                                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                                    [freeUsed, refundTarget]
+                                );
+                                await recordCreditTransaction(
+                                    refundClient, refundTarget, freeUsed, 'free_credit',
+                                    `Free credit restored — confirmed backup unused for game ${gameId}`
+                                );
+                            }
                         }
 
+                        const totalRestored = refundAmt + freeUsed;
                         const notifMsg = wasComped
                             ? `The game has now ended. You were on the confirmed backup list but weren't needed — no charge was made.`
-                            : `The game has now ended. You were on the confirmed backup list but weren't needed — £${refundAmt.toFixed(2)} has been refunded to your balance.`;
+                            : totalRestored > 0
+                                ? `The game has now ended. You were on the confirmed backup list but weren't needed — £${refundAmt.toFixed(2)} refunded${freeUsed > 0 ? ` and £${freeUsed.toFixed(2)} free credit restored` : ''} to your balance.`
+                                : `The game has now ended. You were on the confirmed backup list but weren't needed — no charge was made.`;
 
                         await refundClient.query(
                             `INSERT INTO notifications (player_id, type, message, game_id)
@@ -8485,12 +8539,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         try {
             await txClient.query('BEGIN');
         
-            await txClient.query(
-                'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                [cost, playerId]
-            );
-        
-            await recordCreditTransaction(txClient, playerId, -cost, 'game_fee', `Admin added to game ${gameId}`);
+            const { realCharged: adminAddCharged } = await applyGameFee(txClient, playerId, cost, `Admin added to game ${gameId}`);
         
             // Add player — normalise 'goalkeeper' -> 'GK' to match all server-side position checks
             const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper'
@@ -8499,7 +8548,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
             await txClient.query(
                 `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
                  VALUES ($1, $2, 'confirmed', $3, $4)`,
-                [gameId, playerId, normPosition, cost]
+                [gameId, playerId, normPosition, adminAddCharged]
             );
 
             await txClient.query('COMMIT');
@@ -8600,14 +8649,8 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             return res.status(400).json({ error: `Player only has £${currentBalance.toFixed(2)} but custom charge is £${customCharge.toFixed(2)}` });
         }
         
-        // Deduct custom amount from player credits
-        await pool.query(
-            'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-            [customCharge, playerId]
-        );
-        
-        // Record transaction
-        await recordCreditTransaction(pool, playerId, -customCharge, 'game_fee', `Game registration (custom charge: £${customCharge.toFixed(2)})`);
+        // Deduct custom amount from player credits (free credits first)
+        const { realCharged: customAddCharged } = await applyGameFee(pool, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`);
         
         // Add player — normalise 'goalkeeper' -> 'GK' to match all server-side position checks
         const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper'
@@ -8616,7 +8659,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         await pool.query(
             `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
              VALUES ($1, $2, 'confirmed', $3, $4)`,
-            [gameId, playerId, normPosition, customCharge]
+            [gameId, playerId, normPosition, customAddCharged]
         );
         
         res.json({ message: 'Player added with custom charge' });
@@ -8634,7 +8677,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         
         // Get registration details (include position + status + who paid for backup promotion and correct refund)
         const regResult = await pool.query(
-            'SELECT player_id, status, backup_type, position_preference, registered_by_player_id FROM registrations WHERE id = $1 AND game_id = $2',
+            'SELECT player_id, status, backup_type, position_preference, registered_by_player_id, amount_paid FROM registrations WHERE id = $1 AND game_id = $2',
             [registrationId, gameId]
         );
         
@@ -8659,15 +8702,19 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         
         // Only refund if they actually paid (confirmed or confirmed_backup)
         if (wasConfirmed || wasConfirmedBackup) {
-            await pool.query(
-                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                [cost, refundTargetId]
-            );
-            
+            const paidAmt = parseFloat(removedReg.amount_paid ?? cost);
+            const freeAmt = Math.max(0, cost - paidAmt);
             const refundDesc = refundTargetId !== playerId
                 ? `Admin removed ${playerId} from game — refund to original payer`
                 : `Admin removed from game ${gameId}`;
-            await recordCreditTransaction(pool, refundTargetId, cost, 'refund', refundDesc);
+            if (paidAmt > 0) {
+                await pool.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [paidAmt, refundTargetId]);
+                await recordCreditTransaction(pool, refundTargetId, paidAmt, 'refund', refundDesc);
+            }
+            if (freeAmt > 0) {
+                await pool.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [freeAmt, refundTargetId]);
+                await recordCreditTransaction(pool, refundTargetId, freeAmt, 'free_credit', `Free credit restored — admin removed from game ${gameId}`);
+            }
         }
         
         // Delete registration
@@ -8733,11 +8780,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                 );
                 
                 if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                    await pool.query(
-                        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-                        [cost, promotedPlayer.player_id]
-                    );
-                    await recordCreditTransaction(pool, promotedPlayer.player_id, -cost, 'game_fee', `Promoted from backup - game ${gameId}`);
+                    await applyGameFee(pool, promotedPlayer.player_id, cost, `Promoted from backup - game ${gameId}`);
                 }
                 
                 try {
