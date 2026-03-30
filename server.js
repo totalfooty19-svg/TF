@@ -2337,12 +2337,13 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
     try {
         const { amount, description } = req.body;
         const parsedAmount = parseFloat(amount);
-        if (isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Amount must be a positive number' });
-        if (parsedAmount > 500) return res.status(400).json({ error: 'Amount too large — max £500' });
+        if (isNaN(parsedAmount) || parsedAmount === 0) return res.status(400).json({ error: 'Amount must be non-zero' });
+        if (Math.abs(parsedAmount) > 500) return res.status(400).json({ error: 'Amount too large — max ±£500' });
 
         // Record transaction with type free_credit — balance is NOT updated
+        const desc = description?.trim() || (parsedAmount < 0 ? 'Free credit removal' : 'Free credit grant');
         await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
-            description?.trim() || 'Free credit grant', req.user.userId);
+            desc, req.user.userId);
 
         res.json({ message: 'Free credits recorded' });
     } catch (error) {
