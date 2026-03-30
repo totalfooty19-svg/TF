@@ -6183,7 +6183,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -6239,9 +6239,11 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     ref_pay = COALESCE($10, ref_pay),
                     min_rating_drop_sent = CASE WHEN $12 THEN 0 ELSE min_rating_drop_sent END,
                     requires_organiser = COALESCE($11, requires_organiser),
-                    external_opponent = $13
+                    external_opponent = $13,
+                    tf_kit_color  = COALESCE($14, tf_kit_color),
+                    opp_kit_color = COALESCE($15, opp_kit_color)
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, external_opponent !== undefined ? (external_opponent || null) : null]);
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -6255,9 +6257,11 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     refs_required = COALESCE($8, refs_required),
                     ref_pay = COALESCE($9, ref_pay),
                     requires_organiser = COALESCE($10, requires_organiser),
-                    external_opponent = $11
+                    external_opponent = $11,
+                    tf_kit_color  = COALESCE($12, tf_kit_color),
+                    opp_kit_color = COALESCE($13, opp_kit_color)
                 WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, external_opponent !== undefined ? (external_opponent || null) : null]);
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
