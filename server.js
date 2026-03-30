@@ -4834,6 +4834,25 @@ app.get('/api/games/:id/backups', authenticateToken, async (req, res) => {
 });
 
 
+
+// ── PUBLIC lineup — no auth, read-only
+app.get('/api/public/game/:gameId/lineup', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT team_name, positions, subs FROM game_lineups WHERE game_id = $1 ORDER BY team_name',
+            [req.params.gameId]
+        );
+        const lineups = {};
+        for (const row of result.rows) {
+            lineups[row.team_name] = { positions: row.positions || [], subs: row.subs || [] };
+        }
+        res.json({ lineups });
+    } catch (err) {
+        console.error('Public GET lineup error:', err);
+        res.status(500).json({ error: 'Failed to fetch lineup' });
+    }
+});
+
 // ── LINEUP BUILDER ──────────────────────────────────────────────────────────
 app.get('/api/games/:id/lineup', authenticateToken, async (req, res) => {
     try {
