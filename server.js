@@ -4833,6 +4833,70 @@ app.get('/api/games/:id/backups', authenticateToken, async (req, res) => {
     }
 });
 
+
+// ── LINEUP BUILDER ──────────────────────────────────────────────────────────
+app.get('/api/games/:id/lineup', authenticateToken, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        let canEdit = false;
+        if (req.user.role === 'admin' || req.user.role === 'superadmin') {
+            canEdit = true;
+        } else {
+            const regCheck = await pool.query(
+                `SELECT r.id, p.is_organiser FROM registrations r
+                 JOIN players p ON p.id = r.player_id
+                 WHERE r.game_id = $1 AND r.player_id = $2 AND r.status = 'confirmed'`,
+                [gameId, req.user.playerId]
+            );
+            if (regCheck.rows.length === 0) {
+                return res.status(403).json({ error: 'Access denied — confirmed players only' });
+            }
+            if (regCheck.rows[0].is_organiser) canEdit = true;
+        }
+        const result = await pool.query(
+            'SELECT team_name, positions, subs, updated_at FROM game_lineups WHERE game_id = $1 ORDER BY team_name',
+            [gameId]
+        );
+        const lineups = {};
+        for (const row of result.rows) {
+            lineups[row.team_name] = {
+                positions: row.positions || [],
+                subs:      row.subs      || [],
+                updated_at: row.updated_at,
+            };
+        }
+        res.json({ lineups, can_edit: canEdit });
+    } catch (err) {
+        console.error('GET lineup error:', err);
+        res.status(500).json({ error: 'Failed to fetch lineup' });
+    }
+});
+
+app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const gameId   = req.params.id;
+        const teamName = decodeURIComponent(req.params.teamName);
+        const { positions, subs } = req.body;
+        if (!Array.isArray(positions) || !Array.isArray(subs)) {
+            return res.status(400).json({ error: 'positions and subs must be arrays' });
+        }
+        await pool.query(
+            `INSERT INTO game_lineups (game_id, team_name, positions, subs, updated_by, updated_at)
+             VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, NOW())
+             ON CONFLICT (game_id, team_name) DO UPDATE
+             SET positions  = $3::jsonb,
+                 subs       = $4::jsonb,
+                 updated_by = $5,
+                 updated_at = NOW()`,
+            [gameId, teamName, JSON.stringify(positions), JSON.stringify(subs), req.user.playerId]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PUT lineup error:', err);
+        res.status(500).json({ error: 'Failed to save lineup' });
+    }
+});
+
 // Drop out of game with refund + backup promotion
 app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, async (req, res) => {
     const client = await pool.connect();
