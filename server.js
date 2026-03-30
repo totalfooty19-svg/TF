@@ -2340,6 +2340,50 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, as
     }
 });
 
+
+// ── sendBalanceEmail: notify player when their balance is topped up or adjusted
+async function sendBalanceEmail(playerId, oldBalance, newBalance, description) {
+    try {
+        const pr = await pool.query(
+            'SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+            [playerId]
+        );
+        if (!pr.rows.length) return;
+        const p     = pr.rows[0];
+        const name  = p.alias || p.full_name;
+        const diff  = parseFloat((newBalance - oldBalance).toFixed(2));
+        const sign  = diff >= 0 ? '+' : '';
+        const col   = diff >= 0 ? '#00cc66' : '#ff4444';
+        await emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to:   p.email,
+            subject: `Your TotalFooty balance has been updated 💳`,
+            html: wrapEmailHtml(`
+                <p style="color:#888;font-size:14px;margin:0 0 20px;">Hi ${htmlEncode(name)}, your TotalFooty credit balance has been updated.</p>
+                <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;">
+                    <tr>
+                        <td style="padding:8px 0;color:#888;width:150px;">Previous balance</td>
+                        <td style="font-weight:700;">£${parseFloat(oldBalance).toFixed(2)}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 0;color:#888;">Change</td>
+                        <td style="font-weight:900;color:${col};">${sign}£${Math.abs(diff).toFixed(2)}</td>
+                    </tr>
+                    <tr style="border-top:1px solid #222;">
+                        <td style="padding:10px 0 8px;color:#888;">New balance</td>
+                        <td style="font-weight:900;font-size:18px;color:#fff;padding-top:10px;">£${parseFloat(newBalance).toFixed(2)}</td>
+                    </tr>
+                    ${description ? `<tr><td style="padding:8px 0;color:#888;vertical-align:top;">Note</td><td style="color:#aaa;font-size:13px;">${htmlEncode(description)}</td></tr>` : ''}
+                </table>
+                <p style="color:#444;font-size:12px;margin-top:24px;">Questions about your balance? Reply to this email.</p>
+            `),
+        });
+        console.log('Balance email sent to player', playerId);
+    } catch (e) {
+        console.warn('sendBalanceEmail failed (non-critical):', e.message);
+    }
+}
+
 app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const { amount, description } = req.body;
@@ -2350,22 +2394,22 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
         if (!description?.trim()) return res.status(400).json({ error: 'Description is required' });
         if (Math.abs(parsedAmount) > 500) return res.status(400).json({ error: 'Amount too large — max ±£500' });
 
+        // Capture old balance before update so we can show it in the email
+        const prevBalResult = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [req.params.id]);
+        const oldBalance = prevBalResult.rows.length > 0 ? parseFloat(prevBalResult.rows[0].balance) : 0;
+
         await pool.query(
             'UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
             [parsedAmount, req.params.id]
         );
-        
+
         await recordCreditTransaction(pool, req.params.id, amount, 'admin_adjustment', description, req.user.userId);
-        
+
         res.json({ message: 'Credits adjusted' });
 
-        // Non-critical: notify player their balance was updated
+        // Non-critical: email player with old/new balance
         setImmediate(async () => {
-            try {
-                await sendNotification('balance_updated', req.params.id, {});
-            } catch (e) {
-                console.error('Balance notification failed (non-critical):', e.message);
-            }
+            await sendBalanceEmail(req.params.id, oldBalance, oldBalance + parsedAmount, description?.trim() || 'Balance adjustment');
         });
     } catch (error) {
         console.error('Credit adjustment error:', error);
@@ -2477,6 +2521,10 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 // SEC-028: Audit log every balance change — tamper-evident record for disputes
                 await auditLog(pool, req.user.playerId, 'balance_adjustment',
                     playerId, `prev=£${prevBalance.toFixed(2)} new=£${newBalance.toFixed(2)} diff=£${diff}`);
+                // Notify player with old/new balance
+                setImmediate(async () => {
+                    await sendBalanceEmail(playerId, prevBalance, newBalance, `Direct balance set to £${newBalance.toFixed(2)} by admin`);
+                });
             }
         }
         
