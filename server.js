@@ -11655,8 +11655,11 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
         const { id } = req.params;
 
         // 1. Balance history
+        // FIX-102: Added ct.balance_before, ct.balance_after — were missing from SELECT,
+        // causing audit.html to always render null for before→after balance arrows.
         const balance = await pool.query(`
             SELECT ct.created_at, ct.amount, ct.type, ct.description,
+                   ct.balance_before, ct.balance_after,
                    p.alias as admin_alias, p.full_name as admin_name
             FROM credit_transactions ct
             LEFT JOIN users u ON u.id = ct.admin_id
@@ -13372,6 +13375,66 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
     } catch (error) {
         console.error('Audit feed error:', error);
         res.status(500).json({ error: 'Failed to load audit feed' });
+    }
+});
+
+// GET /api/admin/audit/transactions — paginated credit transaction ledger (FIX-102)
+// Query params: type (filter by transaction type), search (player name), limit, offset
+app.get('/api/admin/audit/transactions', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const limit  = Math.min(parseInt(req.query.limit)  || 50, 200);
+        const offset = Math.max(parseInt(req.query.offset) || 0,   0);
+        const type   = req.query.type   || '';
+        const search = req.query.search || '';
+
+        const conditions = [];
+        const params     = [];
+
+        if (type) {
+            params.push(type);
+            conditions.push(`ct.type = $${params.length}`);
+        }
+        if (search) {
+            params.push(`%${search}%`);
+            conditions.push(`(pp.full_name ILIKE $${params.length} OR pp.alias ILIKE $${params.length})`);
+        }
+
+        const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+        // Total count for hasMore
+        const countRes = await pool.query(`
+            SELECT COUNT(*) FROM credit_transactions ct
+            JOIN players pp ON pp.id = ct.player_id
+            ${where}
+        `, params);
+        const total = parseInt(countRes.rows[0].count);
+
+        params.push(limit);
+        params.push(offset);
+
+        const rows = await pool.query(`
+            SELECT ct.id, ct.created_at, ct.amount, ct.type, ct.description,
+                   ct.balance_before, ct.balance_after,
+                   pp.id   AS player_id,
+                   pp.alias AS player_alias, pp.full_name AS player_name,
+                   ap.alias AS admin_alias,  ap.full_name AS admin_name
+            FROM credit_transactions ct
+            JOIN players pp ON pp.id = ct.player_id
+            LEFT JOIN users  au ON au.id = ct.admin_id
+            LEFT JOIN players ap ON ap.user_id = au.id
+            ${where}
+            ORDER BY ct.created_at DESC
+            LIMIT $${params.length - 1} OFFSET $${params.length}
+        `, params);
+
+        res.json({
+            transactions: rows.rows,
+            total,
+            hasMore: offset + limit < total
+        });
+    } catch (error) {
+        console.error('Transactions audit error:', error);
+        res.status(500).json({ error: 'Failed to load transactions' });
     }
 });
 
