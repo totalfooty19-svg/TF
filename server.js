@@ -3154,6 +3154,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
+                'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
         
         // Add venue photos based on venue name
@@ -3229,6 +3230,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
+                'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
         
         // Format the response
@@ -3390,6 +3392,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
+                'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
         
         if (game.venue_name && venuePhotoMap[game.venue_name]) {
@@ -8348,6 +8351,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
+                'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
         
         const venue_photo = game.venue_name && venuePhotoMap[game.venue_name] 
@@ -8651,6 +8655,7 @@ app.get('/api/public/games', async (req, res) => {
             'Sidney Stringer': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
+                'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
         const rows = result.rows.map(game => {
             game.venue_photo = (game.venue_name && venuePhotoMap[game.venue_name]) || null;
