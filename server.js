@@ -116,13 +116,10 @@ app.use((req, res, next) => {
     if (isLarge) return next();
     express.json({ limit: '500kb' })(req, res, next);
 });
-// 5mb body parser for large-payload routes
-const largeJson = express.json({ limit: '5mb' });
-app.post('/api/players/me/photo', largeJson);
-app.post('/api/players/me/coach-document', largeJson);
-app.post('/api/players/me/ref-document',   largeJson);
-app.post('/api/coaching/apply',            largeJson);
-app.post('/api/ref/apply',                 largeJson);
+// 5mb body parser for large-payload routes — applied via LARGE_PAYLOAD_PATHS middleware above.
+// BUG-04: stub app.post() registrations removed — they shadowed the real handlers below and
+// caused photo upload, doc upload, coach/ref apply to hang with no response.
+const largeJson = express.json({ limit: '5mb' }); // kept for inline use in coach/ref-document handlers
 // Admin doc-upload routes get largeJson via their own inline middleware (already applied)
 
 // FIX-055: No-cache headers on all API responses
@@ -357,20 +354,19 @@ async function triggerRafActivation(referredPlayerId) {
             'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
             [referrerId, referredPlayerId]
         );
-        const rr = await pool.query(
-            'SELECT activation_paid FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
+        // BUG-02: Atomic activation — UPDATE only fires if activation_paid IS FALSE, preventing double-pay race condition
+        const activationClaim = await pool.query(
+            `UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+2.00
+             WHERE referrer_id=$1 AND referred_id=$2 AND activation_paid=FALSE
+             RETURNING referrer_id`,
             [referrerId, referredPlayerId]
         );
-        if (rr.rows[0]?.activation_paid) return;
+        if (activationClaim.rows.length === 0) return; // already paid — nothing to do
         await pool.query(
             'UPDATE credits SET balance = balance + 2.00, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
             [referrerId]
         );
         await recordCreditTransaction(pool, referrerId, 2.00, 'raf_reward', `RAF activation bonus — referred player ${referredPlayerId} topped up`);
-        await pool.query(
-            'UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+2.00 WHERE referrer_id=$1 AND referred_id=$2',
-            [referrerId, referredPlayerId]
-        );
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -419,26 +415,26 @@ async function triggerRafGameCredit(referredPlayerId) {
             'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
             [referrerId, referredPlayerId]
         );
-        const rr = await pool.query(
-            'SELECT game_credits_paid, cap_reached FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
-            [referrerId, referredPlayerId]
-        );
-        if (rr.rows[0]?.cap_reached) return;
-        const alreadyCredited = parseInt(rr.rows[0]?.game_credits_paid || 0);
-        if (alreadyCredited >= 24) return;
-        const newCount    = alreadyCredited + 1;
-        const capReached  = newCount >= 24;
+        // BUG-02b: Atomic cap claim — increments counter only if not already capped, prevents race condition double-pay
+        const creditClaim = await pool.query(`
+            UPDATE raf_rewards
+            SET game_credits_paid = game_credits_paid + 1,
+                game_credits_total = game_credits_total + 0.50,
+                total_paid         = total_paid + 0.50,
+                cap_reached        = (game_credits_paid + 1 >= 24),
+                cap_reached_at     = CASE WHEN (game_credits_paid + 1 >= 24) AND cap_reached_at IS NULL THEN NOW() ELSE cap_reached_at END
+            WHERE referrer_id=$1 AND referred_id=$2
+              AND cap_reached = FALSE AND game_credits_paid < 24
+            RETURNING game_credits_paid AS new_count, (game_credits_paid >= 24) AS cap_reached
+        `, [referrerId, referredPlayerId]);
+        if (creditClaim.rows.length === 0) return; // cap already reached or row missing — nothing to do
+        const newCount   = parseInt(creditClaim.rows[0].new_count);
+        const capReached = creditClaim.rows[0].cap_reached;
         await pool.query(
             'UPDATE credits SET balance = balance + 0.50, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
             [referrerId]
         );
         await recordCreditTransaction(pool, referrerId, 0.50, 'raf_reward', `RAF game credit (${newCount}/24) — referred player ${referredPlayerId}`);
-        await pool.query(`
-            UPDATE raf_rewards
-            SET game_credits_paid=$1, game_credits_total=game_credits_total+0.50, total_paid=total_paid+0.50,
-                cap_reached=$2, cap_reached_at=CASE WHEN $2 THEN NOW() ELSE cap_reached_at END
-            WHERE referrer_id=$3 AND referred_id=$4
-        `, [newCount, capReached, referrerId, referredPlayerId]);
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -1953,8 +1949,9 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
     }
 });
 
-// GET /api/players/:playerId/ref-stats — public referee profile stats
-app.get('/api/players/:playerId/ref-stats', async (req, res) => {
+// GET /api/players/:playerId/ref-stats — referee profile stats (authenticated)
+// BUG-05: was unauthenticated — any caller could enumerate referee PII by player ID
+app.get('/api/players/:playerId/ref-stats', authenticateToken, async (req, res) => {
     const { playerId } = req.params;
     try {
         // Total confirmed ref appearances
@@ -9087,21 +9084,25 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             return res.status(400).json({ error: `Player only has £${currentBalance.toFixed(2)} but custom charge is £${customCharge.toFixed(2)}` });
         }
         
-        // Deduct custom amount from player credits (free credits first)
-        const { realCharged: customAddCharged } = await applyGameFee(pool, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`);
-        
-        // Add player — normalise 'goalkeeper' -> 'GK' to match all server-side position checks
-        const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper'
-            ? 'GK'
-            : (position || 'outfield');
-        await pool.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
-             VALUES ($1, $2, 'confirmed', $3, $4)`,
-            [gameId, playerId, normPosition, customAddCharged]
-        );
-        
+        // BUG-01: Use transaction client so credit deduction + INSERT are atomic
+        const discountClient = await pool.connect();
+        try {
+            await discountClient.query('BEGIN');
+            const { realCharged: customAddCharged } = await applyGameFee(discountClient, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`);
+            const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper' ? 'GK' : (position || 'outfield');
+            await discountClient.query(
+                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
+                 VALUES ($1, $2, 'confirmed', $3, $4)`,
+                [gameId, playerId, normPosition, customAddCharged]
+            );
+            await discountClient.query('COMMIT');
+        } catch (txErr) {
+            await discountClient.query('ROLLBACK').catch(() => {});
+            throw txErr;
+        } finally {
+            discountClient.release();
+        }
         res.json({ message: 'Player added with custom charge' });
-        
     } catch (error) {
         console.error('Add player with discount error:', error);
         res.status(500).json({ error: 'Failed to add player with discount' });
@@ -9212,13 +9213,23 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             }
             
             if (promotedPlayer) {
-                await pool.query(
-                    `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
-                    [promotedPlayer.id]
-                );
-                
-                if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                    await applyGameFee(pool, promotedPlayer.player_id, cost, `Promoted from backup - game ${gameId}`);
+                // BUG-01b: Use transaction so status update + credit deduction are atomic
+                const promoClient = await pool.connect();
+                try {
+                    await promoClient.query('BEGIN');
+                    await promoClient.query(
+                        `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
+                        [promotedPlayer.id]
+                    );
+                    if (promotedPlayer.backup_type !== 'confirmed_backup') {
+                        await applyGameFee(promoClient, promotedPlayer.player_id, cost, `Promoted from backup - game ${gameId}`);
+                    }
+                    await promoClient.query('COMMIT');
+                } catch (promoErr) {
+                    await promoClient.query('ROLLBACK').catch(() => {});
+                    throw promoErr;
+                } finally {
+                    promoClient.release();
                 }
                 
                 try {
@@ -9571,14 +9582,21 @@ async function closeAwards(gameId) {
         if (confirmedWinners.length > 0) {
             setImmediate(async () => {
                 try {
-                    const rows = confirmedWinners.map(w => {
-                        const pResult = pool.query('SELECT alias, full_name FROM players WHERE id = $1', [w.playerId]);
-                        return [`${w.awardType}`, `${w.playerId} (${w.votes} votes)`];
+                    // BUG-03: was missing await, pResult was a Promise — player names never resolved
+                    const playerRows = await Promise.all(
+                        confirmedWinners.map(w =>
+                            pool.query('SELECT alias, full_name FROM players WHERE id = $1', [w.playerId])
+                        )
+                    );
+                    const winnerLines = confirmedWinners.map((w, idx) => {
+                        const p = playerRows[idx]?.rows[0];
+                        const name = p?.alias || p?.full_name || `Player ${w.playerId}`;
+                        return [w.awardType, `${name} (${w.votes} votes)`];
                     });
                     await notifyAdmin(`📋 TF Game Awards closed — ${dayName} at ${venueName}`, [
                         ['Game', `${dayName} at ${venueName}`],
                         ['Awards confirmed', String(confirmedWinners.length)],
-                        ...confirmedWinners.map(w => [w.awardType, `${w.votes} votes`]),
+                        ...winnerLines,
                     ]);
                 } catch (e) { /* non-critical */ }
             });
@@ -14827,7 +14845,13 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
         await client.query('BEGIN');
 
         // Fetch current session
-        const sRes = await client.query('SELECT * FROM coaching_sessions WHERE id = $1 FOR UPDATE', [id]);
+        const sRes = await client.query(
+            `SELECT id, coach_player_id, status, coach_confirmed, confirmed_venue_id,
+                    activity_type, group_type, duration_hours, session_date, session_time,
+                    min_price_per_player, max_price_per_player, notes, session_url
+             FROM coaching_sessions WHERE id = $1 FOR UPDATE`,
+            [id]
+        );
         if (sRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Session not found' }); }
         const session = sRes.rows[0];
 
@@ -16283,7 +16307,6 @@ app.listen(PORT, () => {
     setInterval(async () => {
         try {
             await pool.query('SELECT 1');
-            console.log('✓ Keep-alive ping:', new Date().toLocaleTimeString());
         } catch (error) {
             console.error('✗ Keep-alive error:', error.message);
         }
