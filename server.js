@@ -5769,6 +5769,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 p.decisions_rating,
                 p.assisting_rating,
                 p.shooting_rating,
+                p.is_organiser,
                 r.position_preference,
                 array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
@@ -5777,7 +5778,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status = 'confirmed'
-            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.strength_rating, p.fitness_rating, p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating, r.position_preference
+            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.strength_rating, p.fitness_rating, p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating, p.is_organiser, r.position_preference
             ORDER BY p.overall_rating DESC
         `, [gameId]);
         
@@ -5988,6 +5989,8 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             (player.pairs || []).some(pid => team.find(tp => tp.player_id === pid));
         const wantsToAvoid = (player, team) =>
             (player.avoids || []).some(pid => team.find(tp => tp.player_id === pid));
+        // Organiser split helper — counts organisers already placed on a team
+        const orgCount = team => team.filter(p => p.is_organiser).length;
 
         // snakeIdx starts from total players already placed (Phases 0+1)
         // so the snake direction continues correctly rather than resetting.
@@ -6007,7 +6010,15 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 // High beef override
                 if (assignToRed && hasHighBeef(player, redTeam))  assignToRed = false;
                 else if (!assignToRed && hasHighBeef(player, blueTeam)) assignToRed = true;
-                // Pair preference (soft — only if beef didn't already decide)
+                // Organiser split — just below high beef; keeps organisers distributed across teams
+                if (player.is_organiser) {
+                    const redOrgs  = orgCount(redTeam);
+                    const blueOrgs = orgCount(blueTeam);
+                    if (redOrgs > blueOrgs)  assignToRed = false; // red already has more, push to blue
+                    else if (blueOrgs > redOrgs) assignToRed = true;  // blue already has more, push to red
+                    // If equal, snake direction already determined above — leave unchanged
+                }
+                // Pair preference (soft — only if beef/organiser split didn't already decide)
                 const snakeResult = (round % 2 === 0) ? posInRound === 0 : posInRound === 1;
                 if (assignToRed === snakeResult) {
                     if (wantsToPairWith(player, redTeam)  && !wantsToAvoid(player, redTeam))  assignToRed = true;
@@ -6037,6 +6048,10 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             if ((rp.pairs || []).some(pid => redTeam.find(t => t.player_id === pid && t.player_id !== rp.player_id))) return false;
             // Don't move bp if its pair partner is in blue with it
             if ((bp.pairs || []).some(pid => blueTeam.find(t => t.player_id === pid && t.player_id !== bp.player_id))) return false;
+            // Don't worsen organiser balance — a swap that puts both organisers on same team is blocked
+            const orgImbalanceBefore = Math.abs(orgCount(redTeam) - orgCount(blueTeam));
+            const orgImbalanceAfter  = Math.abs(orgCount(newRed)  - orgCount(newBlue));
+            if (orgImbalanceAfter > orgImbalanceBefore) return false;
             return true;
         };
         for (let pass = 0; pass < 5; pass++) {
