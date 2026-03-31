@@ -1457,12 +1457,16 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // CRIT-2: Logout — clear the httpOnly cookie
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', optionalAuth, async (req, res) => {
+    const playerId = req.user?.playerId || null;
     res.clearCookie('tf_token', {
         httpOnly: true,
         secure: true,
         sameSite: 'lax'
     });
+    if (playerId) {
+        setImmediate(() => auditLog(pool, playerId, 'logout', playerId, 'Player logged out'));
+    }
     res.json({ message: 'Logged out' });
 });
 
@@ -2301,6 +2305,7 @@ app.post('/api/players/me/photo', authenticateToken, async (req, res) => {
             [photoData, req.user.playerId]
         );
         
+        setImmediate(() => auditLog(pool, req.user.playerId, 'photo_uploaded', req.user.playerId, 'Player updated profile photo'));
         res.json({ message: 'Photo uploaded successfully' });
     } catch (error) {
         console.error('Photo upload error:', error);
@@ -3022,6 +3027,8 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
         const player = playerCheck.rows[0];
         const referrer = referrerCheck.rows[0];
         
+        setImmediate(() => auditLog(pool, req.user.playerId, 'referral_set', playerId,
+            `Referred by set: ${referrer.alias || referrer.full_name} (${referredBy}) -> ${player.alias || player.full_name} (${playerId})`));
         res.json({ 
             message: `${player.alias || player.full_name} is now linked as referred by ${referrer.alias || referrer.full_name}`,
             player: { id: playerId, name: player.alias || player.full_name },
@@ -6311,6 +6318,8 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
         await client.query('UPDATE discipline_records SET game_id = NULL WHERE game_id = $1', [gameId]);
         await client.query('DELETE FROM games WHERE id = $1', [gameId]);
         await client.query('COMMIT');
+        setImmediate(() => auditLog(pool, req.user.playerId, 'game_deleted', null,
+            `Game ${gameId} deleted by admin. Refunded ${totalRefunded} players. Date: ${cancelDate} | Venue: ${cancelGameData.venue}`));
         res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
 
         // Non-critical: notify all affected players
@@ -8266,6 +8275,8 @@ app.put('/api/games/:id/my-team-preference', authenticateToken, async (req, res)
             'UPDATE registrations SET venue_clash_team_preference = $1 WHERE game_id = $2 AND player_id = $3',
             [venueClashTeam, gameId, req.user.playerId]
         );
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'team_preference_updated',
+            `Player set venue clash team preference: ${venueClashTeam}`));
         res.json({ ok: true, venueClashTeam });
     } catch (error) {
         console.error('Set team preference error:', error);
@@ -11004,6 +11015,8 @@ app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requir
         const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
         const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
         
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'tournament_result_added',
+            `Result: ${teamA} ${teamAScore}–${teamBScore} ${teamB}`));
         res.json({
             message: 'Result entered',
             result: result.rows[0],
@@ -11047,6 +11060,8 @@ app.put('/api/admin/games/:gameId/tournament-result/:resultId', authenticateToke
         const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
         const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
         
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'tournament_result_updated',
+            `Result ${resultId} updated: ${teamAScore}–${teamBScore}`));
         res.json({ message: 'Result updated', results: allResults.rows, leagueTable });
     } catch (error) {
         console.error('Edit tournament result error:', error);
@@ -11073,6 +11088,8 @@ app.delete('/api/admin/games/:gameId/tournament-result/:resultId', authenticateT
         const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
         const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
         
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'tournament_result_deleted',
+            `Result ${resultId} deleted`));
         res.json({ message: 'Result deleted', results: allResults.rows, leagueTable });
     } catch (error) {
         console.error('Delete tournament result error:', error);
@@ -14007,6 +14024,7 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
             [hash, req.user.userId]
         );
 
+        setImmediate(() => auditLog(pool, req.user.playerId, 'password_changed', req.user.playerId, 'Password changed via account settings'));
         res.json({ message: 'Password updated successfully' });
     } catch (error) {
         console.error('Change password error:', error);
@@ -14061,6 +14079,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
         // Mark token as used
         await pool.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [resetToken.id]);
 
+        setImmediate(() => auditLog(pool, resetToken.player_id, 'password_reset', resetToken.player_id, 'Password reset via email token'));
         res.json({ message: 'Password updated successfully. Please log in again.' });
     } catch (error) {
         console.error('Reset password error'); // SEC-037: No error details in log — no token/email leak
@@ -15742,6 +15761,8 @@ app.put('/api/admin/players/:id/coaching', authenticateToken, requireSuperAdmin,
             coachable === true || coachable === 'true',
             id
         ]);
+        setImmediate(() => auditLog(pool, req.user.playerId, 'coaching_credentials_updated', id,
+            `Coach credentials updated by superadmin. coachable=${coachable}, rate=${coach_min_hourly_rate}`))
         res.json({ success: true });
     } catch (e) {
         console.error('PUT /api/admin/players/:id/coaching:', e.message);
