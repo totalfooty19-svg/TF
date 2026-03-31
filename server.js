@@ -5065,32 +5065,66 @@ app.get('/api/games/:id/lineup', authenticateToken, async (req, res) => {
             }
             if (regCheck.rows[0].is_organiser) canEdit = true;
         }
-        const result = await pool.query(
-            'SELECT team_name, positions, subs, updated_at FROM game_lineups WHERE game_id = $1 ORDER BY team_name',
-            [gameId]
-        );
+        // Also check game_captains for edit rights
+        if (!canEdit) {
+            const captainCheck = await pool.query(
+                'SELECT 1 FROM game_captains WHERE game_id = $1 AND player_id = $2',
+                [gameId, req.user.playerId]
+            );
+            if (captainCheck.rows.length > 0) canEdit = true;
+        }
+
+        const [lineupResult, captainsResult] = await Promise.all([
+            pool.query('SELECT team_name, positions, subs, updated_at FROM game_lineups WHERE game_id = $1 ORDER BY team_name', [gameId]),
+            pool.query(
+                `SELECT gc.player_id, COALESCE(p.alias, p.full_name) as name
+                 FROM game_captains gc JOIN players p ON p.id = gc.player_id
+                 WHERE gc.game_id = $1`,
+                [gameId]
+            )
+        ]);
         const lineups = {};
-        for (const row of result.rows) {
+        for (const row of lineupResult.rows) {
             lineups[row.team_name] = {
                 positions: row.positions || [],
                 subs:      row.subs      || [],
                 updated_at: row.updated_at,
             };
         }
-        res.json({ lineups, can_edit: canEdit });
+        const isCaptain = captainsResult.rows.some(c => c.player_id === req.user.playerId);
+        res.json({
+            lineups,
+            can_edit: canEdit,
+            is_captain: isCaptain,
+            captains: captainsResult.rows
+        });
     } catch (err) {
         console.error('GET lineup error:', err);
         res.status(500).json({ error: 'Failed to fetch lineup' });
     }
 });
 
-app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, requireGameManager, async (req, res) => {
+app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, async (req, res) => {
     try {
         const gameId   = req.params.id;
         const teamName = decodeURIComponent(req.params.teamName);
         const { positions, subs } = req.body;
         if (!Array.isArray(positions) || !Array.isArray(subs)) {
             return res.status(400).json({ error: 'positions and subs must be arrays' });
+        }
+        // Allow: admin/superadmin, confirmed organiser, or designated captain
+        if (req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+            const [orgCheck, capCheck] = await Promise.all([
+                pool.query(
+                    `SELECT 1 FROM registrations r JOIN players p ON p.id = r.player_id
+                     WHERE r.game_id = $1 AND r.player_id = $2 AND r.status = 'confirmed' AND p.is_organiser = true`,
+                    [gameId, req.user.playerId]
+                ),
+                pool.query('SELECT 1 FROM game_captains WHERE game_id = $1 AND player_id = $2', [gameId, req.user.playerId])
+            ]);
+            if (orgCheck.rows.length === 0 && capCheck.rows.length === 0) {
+                return res.status(403).json({ error: 'Not authorised to edit lineup' });
+            }
         }
         await pool.query(
             `INSERT INTO game_lineups (game_id, team_name, positions, subs, updated_by, updated_at)
@@ -5106,6 +5140,126 @@ app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, requireGameM
     } catch (err) {
         console.error('PUT lineup error:', err);
         res.status(500).json({ error: 'Failed to save lineup' });
+    }
+});
+
+
+// ── LINEUP BUILDER SETTINGS ───────────────────────────────────────────────────
+
+// GET /api/admin/games/:id/lineup-settings — get lineup_enabled + current captains
+app.get('/api/admin/games/:id/lineup-settings', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        const [gameRes, captainsRes, playersRes] = await Promise.all([
+            pool.query('SELECT lineup_enabled, team_selection_type, external_opponent FROM games WHERE id = $1', [gameId]),
+            pool.query(
+                `SELECT gc.player_id, COALESCE(p.alias, p.full_name) as name, p.squad_number
+                 FROM game_captains gc JOIN players p ON p.id = gc.player_id
+                 WHERE gc.game_id = $1 ORDER BY gc.assigned_at`,
+                [gameId]
+            ),
+            pool.query(
+                `SELECT p.id, COALESCE(p.alias, p.full_name) as name, p.squad_number,
+                        r.status, p.is_organiser
+                 FROM registrations r JOIN players p ON p.id = r.player_id
+                 WHERE r.game_id = $1 AND r.status = 'confirmed'
+                 ORDER BY p.alias, p.full_name`,
+                [gameId]
+            )
+        ]);
+        if (gameRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const game = gameRes.rows[0];
+        // For VS External, only TF-side players (all confirmed players are TF side)
+        res.json({
+            lineupEnabled: game.lineup_enabled || false,
+            teamSelectionType: game.team_selection_type,
+            captains: captainsRes.rows,
+            eligiblePlayers: playersRes.rows  // confirmed players who can be captain
+        });
+    } catch (e) {
+        console.error('GET lineup-settings error:', e.message);
+        res.status(500).json({ error: 'Failed to get lineup settings' });
+    }
+});
+
+// PUT /api/admin/games/:id/lineup-settings — update lineup_enabled + captains
+app.put('/api/admin/games/:id/lineup-settings', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        const { lineupEnabled, captainIds } = req.body;
+        if (typeof lineupEnabled !== 'boolean') return res.status(400).json({ error: 'lineupEnabled must be boolean' });
+        if (!Array.isArray(captainIds)) return res.status(400).json({ error: 'captainIds must be an array' });
+
+        await pool.query('UPDATE games SET lineup_enabled = $1 WHERE id = $2', [lineupEnabled, gameId]);
+
+        // Replace captain list atomically
+        // BUG1-FIX: Validate captainIds — only confirmed players on this game
+        const validCaptains = captainIds.length > 0
+            ? await pool.query(
+                `SELECT player_id FROM registrations
+                 WHERE game_id = $1 AND player_id = ANY($2::uuid[]) AND status = 'confirmed'`,
+                [gameId, captainIds]
+              )
+            : { rows: [] };
+        const validIds = validCaptains.rows.map(r => r.player_id);
+
+        await pool.query('DELETE FROM game_captains WHERE game_id = $1', [gameId]);
+        for (const playerId of validIds) {
+            await pool.query(
+                'INSERT INTO game_captains (game_id, player_id, assigned_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+                [gameId, playerId, req.user.playerId]
+            );
+        }
+        await gameAuditLog(pool, gameId, req.user.playerId, 'lineup_settings_updated',
+            `Lineup builder ${lineupEnabled ? 'ENABLED' : 'DISABLED'}, captains: ${captainIds.length}`);
+        res.json({ success: true, lineupEnabled, captainCount: validIds.length });
+    } catch (e) {
+        console.error('PUT lineup-settings error:', e.message);
+        res.status(500).json({ error: 'Failed to update lineup settings' });
+    }
+});
+
+// POST /api/games/:id/captain/handoff — captain passes captaincy to another player
+app.post('/api/games/:id/captain/handoff', authenticateToken, async (req, res) => {
+    try {
+        const gameId  = req.params.id;
+        const { toPlayerId } = req.body;
+        if (!toPlayerId) return res.status(400).json({ error: 'toPlayerId is required' });
+
+        // Only current captains and admins can hand off
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!isAdmin) {
+            const capCheck = await pool.query(
+                'SELECT 1 FROM game_captains WHERE game_id = $1 AND player_id = $2',
+                [gameId, req.user.playerId]
+            );
+            if (capCheck.rows.length === 0) return res.status(403).json({ error: 'Only captains can hand off captaincy' });
+        }
+
+        // Target must be a confirmed player on this game
+        const targetCheck = await pool.query(
+            `SELECT p.id, COALESCE(p.alias, p.full_name) as name
+             FROM registrations r JOIN players p ON p.id = r.player_id
+             WHERE r.game_id = $1 AND r.player_id = $2 AND r.status = 'confirmed'`,
+            [gameId, toPlayerId]
+        );
+        if (targetCheck.rows.length === 0) return res.status(400).json({ error: 'Target player must be a confirmed player on this game' });
+
+        // Remove current player from captains (if admin handing off, skip removal)
+        if (!isAdmin) {
+            await pool.query('DELETE FROM game_captains WHERE game_id = $1 AND player_id = $2', [gameId, req.user.playerId]);
+        }
+        // Add new captain
+        await pool.query(
+            'INSERT INTO game_captains (game_id, player_id, assigned_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+            [gameId, toPlayerId, req.user.playerId]
+        );
+        await gameAuditLog(pool, gameId, req.user.playerId, 'captain_handoff',
+            `Captaincy handed to player ${toPlayerId} (${targetCheck.rows[0].name})`);
+        res.json({ success: true, newCaptain: targetCheck.rows[0].name });
+    } catch (e) {
+        console.error('Captain handoff error:', e.message);
+        res.status(500).json({ error: 'Failed to hand off captaincy' });
     }
 });
 
@@ -5192,6 +5346,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         
         // Delete registration (cascade deletes preferences)
         await client.query('DELETE FROM registrations WHERE id = $1', [droppingReg.id]);
+        // BUG3-FIX: Clear captaincy when player drops out
+        await client.query('DELETE FROM game_captains WHERE game_id = $1 AND player_id = $2',
+            [gameId, req.user.playerId]).catch(() => {});
         
         // If a confirmed player dropped out, try to promote a backup
         let promotedPlayer = null;
@@ -8133,7 +8290,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.regularity, g.star_rating, g.min_rating_enabled,
                    g.refs_required, g.ref_pay, g.ref_review_ends,
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
-                   g.requires_organiser,
+                   g.requires_organiser, g.lineup_enabled,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
@@ -8236,7 +8393,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             venue_clash_team1_name: game.venue_clash_team1_name || null,
             venue_clash_team2_name: game.venue_clash_team2_name || null,
             requires_organiser: game.requires_organiser || false,
-            confirmed_organiser_count: parseInt(game.confirmed_organiser_count) || 0
+            confirmed_organiser_count: parseInt(game.confirmed_organiser_count) || 0,
+            lineup_enabled: game.lineup_enabled || false
         });
         
     } catch (error) {
