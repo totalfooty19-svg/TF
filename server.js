@@ -336,6 +336,162 @@ async function applyGameFee(db, playerId, cost, description) {
     return { realCharged };
 }
 
+// ── RAF (REFER A FRIEND) HELPERS ─────────────────────────────────────────────
+
+async function getRafEnabled() {
+    try {
+        const r = await pool.query("SELECT value FROM system_settings WHERE key = 'raf_enabled'");
+        return r.rows[0]?.value === 'true';
+    } catch (e) { return false; }
+}
+
+// Trigger £2 activation bonus — called when admin tops up a referred player for the first time
+async function triggerRafActivation(referredPlayerId) {
+    try {
+        const enabled = await getRafEnabled();
+        if (!enabled) return;
+        const ref = await pool.query('SELECT referred_by FROM players WHERE id = $1', [referredPlayerId]);
+        if (!ref.rows[0]?.referred_by) return;
+        const referrerId = ref.rows[0].referred_by;
+        await pool.query(
+            'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
+            [referrerId, referredPlayerId]
+        );
+        const rr = await pool.query(
+            'SELECT activation_paid FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
+            [referrerId, referredPlayerId]
+        );
+        if (rr.rows[0]?.activation_paid) return;
+        await pool.query(
+            'UPDATE credits SET balance = balance + 2.00, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
+            [referrerId]
+        );
+        await recordCreditTransaction(pool, referrerId, 2.00, 'raf_reward', `RAF activation bonus — referred player ${referredPlayerId} topped up`);
+        await pool.query(
+            'UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+2.00 WHERE referrer_id=$1 AND referred_id=$2',
+            [referrerId, referredPlayerId]
+        );
+        const [refRow, rfdRow] = await Promise.all([
+            pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
+            pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
+        ]);
+        const referrerName  = refRow.rows[0]?.alias  || refRow.rows[0]?.full_name  || 'Referrer';
+        const referrerEmail = refRow.rows[0]?.email;
+        const referredName  = rfdRow.rows[0]?.alias  || rfdRow.rows[0]?.full_name  || 'Your referral';
+        if (referrerEmail) {
+            await emailTransporter.sendMail({
+                from: '"TotalFooty" <totalfooty19@gmail.com>',
+                to: referrerEmail,
+                subject: '💰 Refer a Friend — £2 Activation Bonus Earned!',
+                html: wrapEmailHtml(`
+                    <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">YOU'VE EARNED £2! 💰</h2>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> — your referral — has just topped up their TF account.</p>
+                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Your <strong style="color:#00cc66;">£2 activation bonus</strong> has been added to your balance. You'll also earn <strong style="color:#fff;">50p for every game they sign up to</strong>, capped at £12 in game credits — so up to <strong style="color:#00cc66;">£14 total</strong> per referral!</p>
+                    <div style="background:#111;border:2px solid #333;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
+                        <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">MAXIMUM PER REFERRAL</div>
+                        <div style="font-size:30px;font-weight:900;color:#00cc66;">£14.00</div>
+                        <div style="font-size:12px;color:#666;">£2 activation + 24 × 50p game credits</div>
+                    </div>
+                    <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY PROFILE →</a>
+                `)
+            }).catch(() => {});
+        }
+        await notifyAdmin(`💰 RAF Activation — ${referredName} topped up`, [
+            ['Referrer', referrerName], ['Referred Player', referredName],
+            ['Amount Credited', '£2.00'], ['Type', 'Activation Bonus']
+        ]);
+    } catch (e) { console.error('triggerRafActivation error (non-critical):', e.message); }
+}
+
+// Trigger 50p game credit — called on every confirmed self-registration by a referred player
+async function triggerRafGameCredit(referredPlayerId) {
+    try {
+        const enabled = await getRafEnabled();
+        if (!enabled) return;
+        const ref = await pool.query('SELECT referred_by, created_at FROM players WHERE id=$1', [referredPlayerId]);
+        if (!ref.rows[0]?.referred_by) return;
+        const referrerId = ref.rows[0].referred_by;
+        const joinedAt   = ref.rows[0].created_at;
+        const windowEnd  = new Date(joinedAt);
+        windowEnd.setFullYear(windowEnd.getFullYear() + 1);
+        if (new Date() > windowEnd) return; // 1-year window expired
+        await pool.query(
+            'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
+            [referrerId, referredPlayerId]
+        );
+        const rr = await pool.query(
+            'SELECT game_credits_paid, cap_reached FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
+            [referrerId, referredPlayerId]
+        );
+        if (rr.rows[0]?.cap_reached) return;
+        const alreadyCredited = parseInt(rr.rows[0]?.game_credits_paid || 0);
+        if (alreadyCredited >= 24) return;
+        const newCount    = alreadyCredited + 1;
+        const capReached  = newCount >= 24;
+        await pool.query(
+            'UPDATE credits SET balance = balance + 0.50, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
+            [referrerId]
+        );
+        await recordCreditTransaction(pool, referrerId, 0.50, 'raf_reward', `RAF game credit (${newCount}/24) — referred player ${referredPlayerId}`);
+        await pool.query(`
+            UPDATE raf_rewards
+            SET game_credits_paid=$1, game_credits_total=game_credits_total+0.50, total_paid=total_paid+0.50,
+                cap_reached=$2, cap_reached_at=CASE WHEN $2 THEN NOW() ELSE cap_reached_at END
+            WHERE referrer_id=$3 AND referred_id=$4
+        `, [newCount, capReached, referrerId, referredPlayerId]);
+        const [refRow, rfdRow] = await Promise.all([
+            pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
+            pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
+        ]);
+        const referrerName  = refRow.rows[0]?.alias  || refRow.rows[0]?.full_name  || 'Referrer';
+        const referrerEmail = refRow.rows[0]?.email;
+        const referredName  = rfdRow.rows[0]?.alias  || rfdRow.rows[0]?.full_name  || 'Your referral';
+        await notifyAdmin(`💰 RAF Game Credit — ${referredName} signed up (${newCount}/24)`, [
+            ['Referrer', referrerName], ['Referred Player', referredName],
+            ['Amount Credited', '£0.50'], ['Sign-ups Counted', `${newCount} / 24`],
+            ['Cap Reached', capReached ? 'YES — £12 game credits fully earned' : 'No']
+        ]);
+        if (referrerEmail && (newCount === 10 || capReached)) {
+            const gameCreditsSoFar = (newCount * 0.50).toFixed(2);
+            // BUG3-FIX: fetch actual total_paid (activation may not have been paid)
+            const rrActual = await pool.query(
+                'SELECT total_paid, activation_paid FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
+                [referrerId, referredPlayerId]
+            );
+            const actualTotal = parseFloat(rrActual.rows[0]?.total_paid || 0).toFixed(2);
+            const activationWasPaid = rrActual.rows[0]?.activation_paid || false;
+            await emailTransporter.sendMail({
+                from: '"TotalFooty" <totalfooty19@gmail.com>',
+                to: referrerEmail,
+                subject: capReached
+                    ? `🏆 Refer a Friend — Maximum Earned from ${referredName}!`
+                    : `🎉 Refer a Friend — ${referredName} has played 10 games!`,
+                html: wrapEmailHtml(capReached ? `
+                    <h2 style="color:#FFD700;font-size:22px;font-weight:900;margin:0 0 16px;">MAXIMUM EARNED! 🏆</h2>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has played <strong style="color:#FFD700;">24 games</strong> — you've earned the full reward from this referral.</p>
+                    <div style="background:#111;border:2px solid #FFD700;border-radius:10px;padding:20px;margin:0 0 24px;text-align:center;">
+                        <div style="font-size:11px;color:#888;font-weight:700;letter-spacing:1px;margin-bottom:6px;">TOTAL EARNED FROM ${htmlEncode(referredName.toUpperCase())}</div>
+                        <div style="font-size:36px;font-weight:900;color:#FFD700;">£${actualTotal}</div>
+                        <div style="font-size:12px;color:#888;">${activationWasPaid ? '£2 activation + ' : ''}£12 game credits (24 sign-ups)</div>
+                    </div>
+                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Know anyone else? Keep referring — every friend earns you up to £14!</p>
+                    <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY REFERRALS →</a>
+                ` : `
+                    <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">🎉 10 GAME MILESTONE!</h2>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has now played <strong style="color:#fff;">10 games</strong>. You've earned <strong style="color:#00cc66;">£${gameCreditsSoFar}</strong> in game credits from their sign-ups so far.</p>
+                    <div style="background:#111;border:2px solid #333;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
+                        <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">STILL TO EARN</div>
+                        <div style="font-size:28px;font-weight:900;color:#00cc66;">£${(12 - parseFloat(gameCreditsSoFar)).toFixed(2)}</div>
+                        <div style="font-size:12px;color:#666;">${24 - newCount} more sign-ups to go</div>
+                    </div>
+                    <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY PROFILE →</a>
+                `)
+            }).catch(() => {});
+        }
+    } catch (e) { console.error('triggerRafGameCredit error (non-critical):', e.message); }
+}
+
+
 // ── MIN RATING HELPER ────────────────────────────────────────────────────────
 // Single source of truth for the effective minimum OVR at any moment.
 // Visibility-only rating filter — determines which games appear on a player's list.
@@ -1086,21 +1242,6 @@ app.post('/api/auth/register', async (req, res) => {
                                     }
                                 }
 
-                                // Misfits badge inheritance (social group, kept intentionally)
-                                const referrerMisfits = await pool.query(
-                                    "SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'Misfits'",
-                                    [referrerId]
-                                );
-                                if (referrerMisfits.rows.length > 0) {
-                                    const misfitsBadge = await pool.query("SELECT id FROM badges WHERE name = 'Misfits'");
-                                    if (misfitsBadge.rows.length > 0) {
-                                        await pool.query(
-                                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                                            [playerId, misfitsBadge.rows[0].id]
-                                        );
-                                        await auditLog(pool, null, 'badge_auto_awarded', playerId, `badge: Misfits (inherited via referral from player ${referrerId})`);
-                                    }
-                                }
                             }
                         }
                     }
@@ -2407,9 +2548,11 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
 
         res.json({ message: 'Credits adjusted' });
 
-        // Non-critical: email player with old/new balance
+        // Non-critical: email player with old/new balance + RAF activation check
         setImmediate(async () => {
             await sendBalanceEmail(req.params.id, oldBalance, oldBalance + parsedAmount, description?.trim() || 'Balance adjustment');
+            // FIX-101-RAF: trigger £2 RAF activation if this is a positive top-up for a referred player
+            if (parsedAmount > 0) await triggerRafActivation(req.params.id);
         });
     } catch (error) {
         console.error('Credit adjustment error:', error);
@@ -4043,6 +4186,8 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             }
             // DYNSTAR: review star rating on every confirmed sign-up
             if (status === 'confirmed') await reviewDynamicStarRating(pool, gameId);
+            // FIX-101-RAF: trigger 50p game credit for referrer if this is a confirmed self-registration
+            if (status === 'confirmed') await triggerRafGameCredit(req.user.playerId);
         });
         
     } catch (error) {
@@ -10019,27 +10164,43 @@ app.get('/api/players/me/referral', authenticateToken, async (req, res) => {
         if (myInfo.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
         const me = myInfo.rows[0];
         
-        // Get list of players I referred
+        // Get list of players I referred with RAF earnings
         const referred = await pool.query(
             `SELECT p.id, p.alias, p.full_name, p.created_at,
-             p.total_appearances, p.reliability_tier
-             FROM players p WHERE p.referred_by = $1
+             p.total_appearances, p.reliability_tier,
+             rr.activation_paid, rr.game_credits_paid, rr.game_credits_total,
+             rr.total_paid, rr.cap_reached,
+             (p.created_at + INTERVAL '1 year') as window_expires
+             FROM players p
+             LEFT JOIN raf_rewards rr ON rr.referrer_id = $1 AND rr.referred_id = p.id
+             WHERE p.referred_by = $1
              ORDER BY p.created_at DESC`,
             [playerId]
         );
-        
+
+        const rafEnabled = await getRafEnabled();
+        const totalEarned = referred.rows.reduce((sum, r) => sum + parseFloat(r.total_paid || 0), 0);
+
         res.json({
             referralCode: me.referral_code,
             referralLink: me.referral_code
                 ? 'https://totalfooty.co.uk/?ref=' + me.referral_code
                 : null,
             referredBy: me.referred_by ? { id: me.referred_by, alias: me.referred_by_alias } : null,
+            rafEnabled,
+            totalEarned: totalEarned.toFixed(2),
             referrals: referred.rows.map(r => ({
                 id: r.id,
                 alias: r.alias || r.full_name,
                 joinedAt: r.created_at,
                 appearances: r.total_appearances || 0,
-                tier: r.reliability_tier
+                tier: r.reliability_tier,
+                activationPaid: r.activation_paid || false,
+                gamesCredited: parseInt(r.game_credits_paid || 0),
+                gameCreditsTotal: parseFloat(r.game_credits_total || 0).toFixed(2),
+                totalPaid: parseFloat(r.total_paid || 0).toFixed(2),
+                capReached: r.cap_reached || false,
+                windowExpires: r.window_expires
             })),
             totalReferred: referred.rows.length
         });
@@ -10193,6 +10354,181 @@ app.get('/api/admin/referrals', authenticateToken, requireAdmin, async (req, res
         res.status(500).json({ error: 'Failed to get referral data' });
     }
 });
+
+// ── RAF SYSTEM ENDPOINTS ──────────────────────────────────────────────────────
+
+// GET /api/public/raf/status — frontend uses this to show/hide RAF signposts
+app.get('/api/public/raf/status', async (req, res) => {
+    try {
+        const enabled = await getRafEnabled();
+        res.json({ enabled });
+    } catch (e) {
+        res.json({ enabled: false });
+    }
+});
+
+// GET /api/admin/raf/status — full stats for superadmin
+app.get('/api/admin/raf/status', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const [setting, stats] = await Promise.all([
+            pool.query("SELECT value FROM system_settings WHERE key='raf_enabled'"),
+            pool.query(`
+                SELECT
+                    COUNT(*) as total_pairs,
+                    COUNT(*) FILTER (WHERE activation_paid) as activations_paid,
+                    COUNT(*) FILTER (WHERE cap_reached) as caps_reached,
+                    COALESCE(SUM(total_paid), 0) as total_credited
+                FROM raf_rewards
+            `)
+        ]);
+        res.json({
+            enabled: setting.rows[0]?.value === 'true',
+            totalPairs: parseInt(stats.rows[0].total_pairs || 0),
+            activationsPaid: parseInt(stats.rows[0].activations_paid || 0),
+            capsReached: parseInt(stats.rows[0].caps_reached || 0),
+            totalCredited: parseFloat(stats.rows[0].total_credited || 0).toFixed(2)
+        });
+    } catch (e) {
+        console.error('RAF status error:', e.message);
+        res.status(500).json({ error: 'Failed to get RAF status' });
+    }
+});
+
+// PUT /api/admin/raf/toggle — enable or disable the RAF scheme
+app.put('/api/admin/raf/toggle', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { enabled } = req.body;
+        if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled must be boolean' });
+        await pool.query(
+            `INSERT INTO system_settings (key, value, updated_at) VALUES ('raf_enabled', $1, NOW())
+             ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+            [enabled ? 'true' : 'false']
+        );
+        await auditLog(pool, req.user.playerId, 'raf_toggle', null, `RAF scheme ${enabled ? 'ENABLED' : 'DISABLED'} by superadmin`);
+        res.json({ enabled, message: `RAF scheme ${enabled ? 'enabled' : 'disabled'}` });
+    } catch (e) {
+        console.error('RAF toggle error:', e.message);
+        res.status(500).json({ error: 'Failed to update RAF setting' });
+    }
+});
+
+// POST /api/admin/raf/backfill — one-time backfill of existing referrals
+// Credits activation bonuses and historic game sign-up credits to all existing referrers
+app.post('/api/admin/raf/backfill', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        // BUG4-FIX: backfill credits real money — require RAF to be enabled (or explicit override)
+        const { force } = req.body;
+        const rafOn = await getRafEnabled();
+        if (!rafOn && !force) {
+            return res.status(400).json({ error: 'RAF scheme is currently disabled. Pass { force: true } in the request body to backfill anyway.' });
+        }
+
+        const referred = await pool.query(
+            `SELECT p.id, p.referred_by, p.created_at, p.alias, p.full_name
+             FROM players p WHERE p.referred_by IS NOT NULL`
+        );
+
+        let activationCredits = 0, gameCreditsCount = 0;
+        let totalCredited = 0;
+
+        for (const player of referred.rows) {
+            const referrerId = player.referred_by;
+            const referredId = player.id;
+
+            // Upsert raf_rewards row
+            await pool.query(
+                `INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2)
+                 ON CONFLICT (referrer_id, referred_id) DO NOTHING`,
+                [referrerId, referredId]
+            );
+
+            const rr = await pool.query(
+                'SELECT activation_paid, game_credits_paid, cap_reached FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
+                [referrerId, referredId]
+            );
+            const row = rr.rows[0];
+
+            // Activation bonus — check if player ever received a positive admin_adjustment
+            if (!row.activation_paid) {
+                const topupCheck = await pool.query(
+                    `SELECT 1 FROM credit_transactions WHERE player_id=$1 AND type='admin_adjustment' AND amount>0 LIMIT 1`,
+                    [referredId]
+                );
+                if (topupCheck.rows.length > 0) {
+                    await pool.query(
+                        'UPDATE credits SET balance=balance+2.00, last_updated=CURRENT_TIMESTAMP WHERE player_id=$1',
+                        [referrerId]
+                    );
+                    await recordCreditTransaction(pool, referrerId, 2.00, 'raf_reward',
+                        `RAF backfill: activation bonus — ${referredId} previously topped up`);
+                    await pool.query(
+                        `UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+2.00
+                         WHERE referrer_id=$1 AND referred_id=$2`,
+                        [referrerId, referredId]
+                    );
+                    activationCredits++;
+                    totalCredited += 2;
+                }
+            }
+
+            // Game credits — count confirmed registrations within 1-year window
+            if (!row.cap_reached) {
+                const windowEnd = new Date(player.created_at);
+                windowEnd.setFullYear(windowEnd.getFullYear() + 1);
+
+                const regCount = await pool.query(
+                    `SELECT COUNT(*) as cnt FROM registrations
+                     WHERE player_id=$1 AND status='confirmed' AND registered_at <= $2`,
+                    [referredId, windowEnd]
+                );
+                const totalConfirmed = parseInt(regCount.rows[0].cnt || 0);
+                const alreadyCredited = parseInt(row.game_credits_paid || 0);
+                const toCredit = Math.min(totalConfirmed, 24) - alreadyCredited;
+
+                if (toCredit > 0) {
+                    const creditAmt = toCredit * 0.50;
+                    const newCount = alreadyCredited + toCredit;
+                    const capReached = newCount >= 24;
+                    await pool.query(
+                        'UPDATE credits SET balance=balance+$1, last_updated=CURRENT_TIMESTAMP WHERE player_id=$2',
+                        [creditAmt, referrerId]
+                    );
+                    await recordCreditTransaction(pool, referrerId, creditAmt, 'raf_reward',
+                        `RAF backfill: ${toCredit} game credit(s) for referred player ${referredId} (${alreadyCredited+1}-${newCount}/24)`);
+                    await pool.query(
+                        `UPDATE raf_rewards
+                         SET game_credits_paid=$1, game_credits_total=game_credits_total+$2,
+                             total_paid=total_paid+$2, cap_reached=$3,
+                             cap_reached_at=CASE WHEN $3 THEN NOW() ELSE cap_reached_at END
+                         WHERE referrer_id=$4 AND referred_id=$5`,
+                        [newCount, creditAmt, capReached, referrerId, referredId]
+                    );
+                    gameCreditsCount += toCredit;
+                    totalCredited += creditAmt;
+                }
+            }
+        }
+
+        await notifyAdmin('🔄 RAF Backfill Complete', [
+            ['Players Processed', String(referred.rows.length)],
+            ['Activation Bonuses', String(activationCredits)],
+            ['Game Credits Issued', `${gameCreditsCount} × 50p`],
+            ['Total Credited', `£${totalCredited.toFixed(2)}`],
+        ]);
+
+        res.json({
+            message: 'RAF backfill complete',
+            playersProcessed: referred.rows.length,
+            activationCredits,
+            gameCreditsCount,
+            totalCredited: totalCredited.toFixed(2)
+        });
+    } catch (e) {
+        console.error('RAF backfill error:', e.message);
+        res.status(500).json({ error: 'Backfill failed: ' + e.message });
+    }
+});
+
 
 // ==========================================
 // MANAGE GAMES (scoped for CLM admin / Organiser)
