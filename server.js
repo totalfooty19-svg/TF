@@ -2579,15 +2579,17 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
 
         const desc = description?.trim() || (parsedAmount < 0 ? 'Free credit removal' : 'Free credit grant');
 
-        // Ensure credits row exists, then add amount — matches pattern of working /credits endpoint
-        await pool.query(
-            'INSERT INTO credits (player_id, balance) VALUES ($1, 0) ON CONFLICT (player_id) DO NOTHING',
-            [req.params.id]
-        );
-        await pool.query(
+        // UPDATE first; if no row existed yet, INSERT — credits table has no unique constraint on player_id
+        const upd = await pool.query(
             'UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
             [parsedAmount, req.params.id]
         );
+        if (upd.rowCount === 0) {
+            await pool.query(
+                'INSERT INTO credits (player_id, balance) VALUES ($1, $2)',
+                [req.params.id, parsedAmount]
+            );
+        }
 
         await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
             desc, req.user.userId);
