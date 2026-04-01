@@ -624,11 +624,13 @@ const NOTIF_TEMPLATES = {
     award_hollywood:      d => ({ title: '🎬 Mr Hollywood',               body: `You won Mr Hollywood for ${d.day}. No end product, as always.` }),
     award_moaner:         d => ({ title: '😩 The Moaner',                 body: `You won The Moaner for ${d.day}. The team appreciated your encouragement.` }),
     award_howler:         d => ({ title: '🤦 Howler Award',               body: `You won The Howler for ${d.day}. Moment of the match, for the wrong reasons.` }),
+    award_donkey:         d => ({ title: '🫏 Donkey Award',               body: `You won the Donkey Award for ${d.day}. Below par — even for yourself.` }),
     award_mr_day:         d => ({ title: `📅 Mr ${d.day}!`,              body: `7 consecutive ${d.day} appearances in a row. Legendary consistency.` }),
     award_on_fire:        d => ({ title: "🔥 You're On Fire!",           body: `4 wins in a row. Your team can't stop winning right now.` }),
     award_back_from_dead: d => ({ title: "🧟 Back from the Dead!",        body: `Welcome back! You've been away for a while. Good to have you back.` }),
     award_engine_badge:   _d => ({ title: '🔋 Engine Badge Earned!',      body: '5 Best Engine awards — the Engine Badge is now on your profile.' }),
     award_wall_badge:     _d => ({ title: '🧱 Brick Wall Badge Earned!',  body: '5 Brick Wall awards — the Brick Wall Badge is now on your profile.' }),
+    award_donkey_badge:   _d => ({ title: '🫏 Donkey Badge Earned!',      body: '5 Donkey Awards — the Donkey Badge is now on your profile. A bad smell that won\'t go away.' }),
 };
 
 // sendNotification: send an Expo push notification to a player's registered devices.
@@ -1320,7 +1322,7 @@ app.post('/api/auth/login', async (req, res) => {
         if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
 
         const userResult = await pool.query(
-            'SELECT id, email, password_hash, role, token_version FROM users WHERE email = $1',
+            'SELECT id, email, password_hash, role, token_version, force_password_change FROM users WHERE email = $1',
             [email.toLowerCase()]
         );
         if (userResult.rows.length === 0) {
@@ -1412,6 +1414,7 @@ app.post('/api/auth/login', async (req, res) => {
         });
 
         res.json({
+            mustChangePassword: user.force_password_change === true,
             user: {
                 id: player.id,
                 userId: user.id,
@@ -1546,6 +1549,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.is_organiser,
                     p.referred_by,
                     c.balance as credits,
+                    COALESCE((SELECT SUM(amount) FROM credit_transactions WHERE player_id = p.id AND type = 'free_credit'), 0) as free_credits,
                     u.email,
                     u.role,
                     (SELECT COALESCE(alias, full_name)
@@ -2547,6 +2551,7 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
         );
 
         await recordCreditTransaction(pool, req.params.id, amount, 'admin_adjustment', description, req.user.userId);
+        await auditLog(pool, req.user.userId, 'credit_adjustment', req.params.id, `${parsedAmount >= 0 ? '+' : ''}£${parsedAmount.toFixed(2)} — ${description.trim()}`);
 
         res.json({ message: 'Credits adjusted' });
 
@@ -2580,6 +2585,7 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
         );
         await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
             desc, req.user.userId);
+        await auditLog(pool, req.user.userId, 'free_credit_grant', req.params.id, `${parsedAmount >= 0 ? '+' : ''}£${parsedAmount.toFixed(2)} free credits — ${desc}`);
 
         res.json({ message: 'Free credits recorded' });
     } catch (error) {
@@ -2596,8 +2602,30 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
             goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
             total_wins, squad_number, phone, balance, alias, position,
-            is_featured, social_tiktok, social_instagram, social_youtube, social_facebook
+            is_featured, social_tiktok, social_instagram, social_youtube, social_facebook,
+            email
         } = req.body;
+
+        // Email update — superadmin only, check uniqueness
+        if (email !== undefined && email !== null && email !== '') {
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                return res.status(400).json({ error: 'Invalid email format' });
+            }
+            const userRow = await pool.query('SELECT u.id FROM users u JOIN players p ON p.user_id = u.id WHERE p.id = $1', [playerId]);
+            if (userRow.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+            const userId = userRow.rows[0].id;
+            const emailCheck = await pool.query(
+                'SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != $2',
+                [email, userId]
+            );
+            if (emailCheck.rows.length > 0) {
+                return res.status(400).json({ error: 'Email already in use by another account' });
+            }
+            const oldEmailRow = await pool.query('SELECT email FROM users WHERE id = $1', [userId]);
+            await pool.query('UPDATE users SET email = $1 WHERE id = $2', [email.toLowerCase().trim(), userId]);
+            await auditLog(pool, req.user.userId, 'admin_email_changed', playerId,
+                `Email changed from ${oldEmailRow.rows[0]?.email} to ${email.toLowerCase().trim()}`);
+        }
         
         // Calculate overall rating
         const overall_rating = (defending_rating || 0) + (strength_rating || 0) + (fitness_rating || 0) + 
@@ -3114,6 +3142,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                   COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1) as registration_status,
@@ -7877,6 +7906,19 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         
         const game = gameResult.rows[0];
 
+        // Fetch discipline records for this game — used by team sheet judge emoji
+        const discResult = await pool.query(
+            `SELECT dr.player_id, dr.offense_type, dr.points, p.reliability_tier
+             FROM discipline_records dr
+             JOIN players p ON p.id = dr.player_id
+             WHERE dr.game_id = $1`,
+            [game.id]
+        );
+        const disciplineMap = {};
+        for (const d of discResult.rows) {
+            disciplineMap[d.player_id] = { offenseType: d.offense_type, points: d.points, tier: d.reliability_tier };
+        }
+
         // ── VENUE CLASH BRANCH ───────────────────────────────────────────────
         if ((game.is_venue_clash || game.venue_clash_team1_name) && !game.teams_confirmed) {
             const t1 = game.venue_clash_team1_name;
@@ -7910,6 +7952,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                 team1Name: t1, team2Name: t2,
                 redTeam: team1, blueTeam: team2,
                 flexible, undecided,
+                disciplineMap,
                 game: {
                     id: game.id, game_url: game.game_url,
                     team_selection_type: game.team_selection_type,
@@ -8005,7 +8048,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                 teams: tournamentTeams,
                 results: allResults.rows,
                 leagueTable,
-                motmNominees
+                motmNominees,
+                disciplineMap
             });
         }
         
@@ -8160,7 +8204,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             blueTeam,
             motmNominees,
             nextGame,
-            seriesScoreline
+            seriesScoreline,
+            disciplineMap
         });
         
     } catch (error) {
@@ -9402,9 +9447,9 @@ async function finaliseRefereeReviews(gameId) {
 // TF GAME AWARDS — helper functions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler'];
+const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler','donkey'];
 const POSITIVE_AWARDS = ['motm','best_engine','brick_wall'];
-const BANTER_AWARDS   = ['reckless_tackler','mr_hollywood','the_moaner','howler'];
+const BANTER_AWARDS   = ['reckless_tackler','mr_hollywood','the_moaner','howler','donkey'];
 const MIN_VOTES_REQUIRED = 3; // all awards except MOTM
 
 // Send email to a player for an award win — fire-and-forget, never throws
@@ -9428,6 +9473,7 @@ async function sendAwardEmail(playerId, awardType, extraData = {}) {
             mr_hollywood:   'award_hollywood',
             the_moaner:     'award_moaner',
             howler:         'award_howler',
+            donkey:         'award_donkey',
             mr_day:         'award_mr_day',
             on_fire:        'award_on_fire',
             back_from_dead: 'award_back_from_dead',
@@ -9458,7 +9504,7 @@ async function sendAwardEmail(playerId, awardType, extraData = {}) {
 // Check and grant Engine or Brick Wall badge after award confirmation
 async function checkAndGrantAwardBadge(playerId, awardType) {
     try {
-        const badgeNameMap = { best_engine: 'Engine', brick_wall: 'Brick Wall' };
+        const badgeNameMap = { best_engine: 'Engine', brick_wall: 'Brick Wall', donkey: 'Donkey' };
         const badgeName = badgeNameMap[awardType];
         if (!badgeName) return;
 
@@ -9484,8 +9530,9 @@ async function checkAndGrantAwardBadge(playerId, awardType) {
             'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
             [playerId, badgeId]
         );
-        const emailType = awardType === 'best_engine' ? 'engine_badge' : 'wall_badge';
-        setImmediate(() => sendAwardEmail(playerId, emailType, {}));
+        const badgeEmailMap = { best_engine: 'engine_badge', brick_wall: 'wall_badge', donkey: 'donkey_badge' };
+        const emailType = badgeEmailMap[awardType];
+        if (emailType) setImmediate(() => sendAwardEmail(playerId, emailType, {}));
         console.log(`✅ ${badgeName} badge auto-granted to player ${playerId}`);
     } catch (e) {
         console.warn(`checkAndGrantAwardBadge(${awardType}, ${playerId}) failed:`, e.message);
@@ -9596,8 +9643,8 @@ async function closeAwards(gameId) {
                             // Regenerate bio after MOTM win
                             setImmediate(() => regeneratePlayerBio(winner.playerId));
                         }
-                        // Badge checks for Best Engine and Brick Wall
-                        if (awardType === 'best_engine' || awardType === 'brick_wall') {
+                        // Badge checks for Best Engine, Brick Wall and Donkey
+                        if (awardType === 'best_engine' || awardType === 'brick_wall' || awardType === 'donkey') {
                             await checkAndGrantAwardBadge(winner.playerId, awardType);
                             // Regenerate bio after badge grant
                             setImmediate(() => regeneratePlayerBio(winner.playerId));
@@ -9661,6 +9708,7 @@ function buildAwardsText(player, awardsData) {
     if (parseFloat(awardsData.motmTotal) > 0) parts.push(`MOTM wins: ${awardsData.motmTotal}`);
     if (c.best_engine > 0) parts.push(`Best Engine wins: ${c.best_engine}`);
     if (c.brick_wall > 0) parts.push(`Brick Wall wins: ${c.brick_wall}`);
+    if (c.donkey > 0) parts.push(`Donkey Award wins: ${c.donkey}`);
     const badges = (player.badges || []).map(b => b.name).filter(Boolean);
     if (badges.length > 0) parts.push(`Badges: ${badges.join(', ')}`);
     return parts.length > 0 ? parts.join('\n') : 'No awards yet';
@@ -14103,7 +14151,7 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
         const hash = await bcrypt.hash(newPassword, 12); // SEC-035: consistent cost 12 across all password hashing
         // HIGH-2: Bump token_version — all previously issued JWTs are now invalid
         await pool.query(
-            'UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2',
+            'UPDATE users SET password_hash = $1, token_version = token_version + 1, force_password_change = FALSE WHERE id = $2',
             [hash, req.user.userId]
         );
 
@@ -14112,6 +14160,86 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Change password error:', error);
         res.status(500).json({ error: 'Failed to change password' });
+    }
+});
+
+// POST /api/auth/force-change-password — for players who must change on first sign-in
+// No current password required — admin has already reset it. Clears force_password_change flag.
+app.post('/api/auth/force-change-password', authenticateToken, async (req, res) => {
+    try {
+        const { newPassword } = req.body;
+        if (!newPassword || newPassword.length < 8) {
+            return res.status(400).json({ error: 'Password must be at least 8 characters' });
+        }
+
+        // Verify this user actually has the flag set (prevents misuse)
+        const userCheck = await pool.query(
+            'SELECT force_password_change FROM users WHERE id = $1',
+            [req.user.userId]
+        );
+        if (!userCheck.rows[0]?.force_password_change) {
+            return res.status(403).json({ error: 'No password change required' });
+        }
+
+        const hash = await bcrypt.hash(newPassword, 12);
+        await pool.query(
+            'UPDATE users SET password_hash = $1, force_password_change = FALSE, token_version = token_version + 1 WHERE id = $2',
+            [hash, req.user.userId]
+        );
+
+        // Issue a fresh cookie with updated token_version
+        const playerRow = await pool.query(
+            'SELECT p.id, p.is_clm_admin, p.is_organiser, u.role, u.token_version FROM players p JOIN users u ON u.id = p.user_id WHERE u.id = $1',
+            [req.user.userId]
+        );
+        const pr = playerRow.rows[0];
+        const newToken = jwt.sign(
+            { userId: req.user.userId, playerId: pr.id, email: req.user.email,
+              role: pr.role, isCLMAdmin: pr.is_clm_admin || false,
+              isOrganiser: pr.is_organiser || false, tokenVersion: pr.token_version },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+        res.cookie('tf_token', newToken, {
+            httpOnly: true, secure: true, sameSite: 'lax',
+            maxAge: 7 * 24 * 60 * 60 * 1000
+        });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'force_password_changed', req.user.playerId,
+            'Password changed after admin reset'));
+        res.json({ message: 'Password updated successfully' });
+    } catch (error) {
+        console.error('Force change password error:', error);
+        res.status(500).json({ error: 'Failed to update password' });
+    }
+});
+
+// POST /api/admin/players/:playerId/reset-password — superadmin only
+// Resets player password to Totalfooty1 and forces change on next sign-in
+app.post('/api/admin/players/:playerId/reset-password', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+
+        // Resolve user_id from player
+        const playerRow = await pool.query(
+            'SELECT p.id, u.id AS user_id, COALESCE(p.alias, p.full_name) AS display_name FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+            [playerId]
+        );
+        if (playerRow.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+        const { user_id, display_name } = playerRow.rows[0];
+
+        const hash = await bcrypt.hash('Totalfooty1', 12);
+        await pool.query(
+            'UPDATE users SET password_hash = $1, force_password_change = TRUE, token_version = token_version + 1 WHERE id = $2',
+            [hash, user_id]
+        );
+
+        await auditLog(pool, req.user.userId, 'admin_password_reset', playerId,
+            `Password reset to default by admin — force change on next login`);
+        res.json({ message: `Password reset for ${display_name}. They will be prompted to change it on next sign-in.` });
+    } catch (error) {
+        console.error('Admin reset password error:', error);
+        res.status(500).json({ error: 'Failed to reset password' });
     }
 });
 
