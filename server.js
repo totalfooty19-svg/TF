@@ -2572,17 +2572,23 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
 app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const { amount, description } = req.body;
+        console.log('[free-credits] body:', req.body, 'playerId:', req.params.id);
         const parsedAmount = parseFloat(amount);
         if (isNaN(parsedAmount) || parsedAmount === 0) return res.status(400).json({ error: 'Amount must be non-zero' });
         if (Math.abs(parsedAmount) > 500) return res.status(400).json({ error: 'Amount too large — max ±£500' });
 
-        // Record transaction and update balance so free credits can actually be spent
         const desc = description?.trim() || (parsedAmount < 0 ? 'Free credit removal' : 'Free credit grant');
+
+        // Ensure credits row exists, then add amount — matches pattern of working /credits endpoint
         await pool.query(
-            `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
-            [req.params.id, parsedAmount]
+            'INSERT INTO credits (player_id, balance) VALUES ($1, 0) ON CONFLICT (player_id) DO NOTHING',
+            [req.params.id]
         );
+        await pool.query(
+            'UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
+            [parsedAmount, req.params.id]
+        );
+
         await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
             desc, req.user.userId);
         await auditLog(pool, req.user.userId, 'free_credit_grant', req.params.id, `${parsedAmount >= 0 ? '+' : ''}£${parsedAmount.toFixed(2)} free credits — ${desc}`);
