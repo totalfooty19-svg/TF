@@ -624,13 +624,13 @@ const NOTIF_TEMPLATES = {
     award_hollywood:      d => ({ title: '🎬 Mr Hollywood',               body: `You won Mr Hollywood for ${d.day}. No end product, as always.` }),
     award_moaner:         d => ({ title: '😩 The Moaner',                 body: `You won The Moaner for ${d.day}. The team appreciated your encouragement.` }),
     award_howler:         d => ({ title: '🤦 Howler Award',               body: `You won The Howler for ${d.day}. Moment of the match, for the wrong reasons.` }),
-    award_donkey:         d => ({ title: '🫏 Donkey Award',               body: `You won the Donkey Award for ${d.day}. Below par — even for yourself.` }),
+    award_donkey:         d => ({ title: '🐴 Donkey Award',               body: `You won the Donkey Award for ${d.day}. Below par — even for yourself.` }),
     award_mr_day:         d => ({ title: `📅 Mr ${d.day}!`,              body: `7 consecutive ${d.day} appearances in a row. Legendary consistency.` }),
     award_on_fire:        d => ({ title: "🔥 You're On Fire!",           body: `4 wins in a row. Your team can't stop winning right now.` }),
     award_back_from_dead: d => ({ title: "🧟 Back from the Dead!",        body: `Welcome back! You've been away for a while. Good to have you back.` }),
     award_engine_badge:   _d => ({ title: '🔋 Engine Badge Earned!',      body: '5 Best Engine awards — the Engine Badge is now on your profile.' }),
     award_wall_badge:     _d => ({ title: '🧱 Brick Wall Badge Earned!',  body: '5 Brick Wall awards — the Brick Wall Badge is now on your profile.' }),
-    award_donkey_badge:   _d => ({ title: '🫏 Donkey Badge Earned!',      body: '5 Donkey Awards — the Donkey Badge is now on your profile. A bad smell that won\'t go away.' }),
+    award_donkey_badge:   _d => ({ title: '🐴 Donkey Badge Earned!',      body: '5 Donkey Awards — the Donkey Badge is now on your profile. A bad smell that won\'t go away.' }),
 };
 
 // sendNotification: send an Expo push notification to a player's registered devices.
