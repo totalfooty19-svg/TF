@@ -1493,7 +1493,8 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
         const playerResult = await pool.query(
             `SELECT p.id, p.full_name, p.alias, p.squad_number, p.referral_code, u.role,
              COALESCE(p.is_clm_admin, false) as is_clm_admin,
-             COALESCE(p.is_organiser, false) as is_organiser
+             COALESCE(p.is_organiser, false) as is_organiser,
+             u.force_password_change
              FROM players p
              JOIN users u ON u.id = p.user_id
              WHERE p.id = $1`,
@@ -1513,7 +1514,8 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
             referralCode: player.referral_code,
             role: player.role,
             isCLMAdmin: player.is_clm_admin || false,
-            isOrganiser: player.is_organiser || false
+            isOrganiser: player.is_organiser || false,
+            mustChangePassword: player.force_password_change === true
         });
     } catch (error) {
         console.error('Auth me error:', error);
@@ -14316,8 +14318,29 @@ app.post('/api/auth/reset-password', async (req, res) => {
         // Mark token as used
         await pool.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [resetToken.id]);
 
+        // Issue a fresh session cookie so the player is immediately logged in
+        const freshPlayer = await pool.query(
+            `SELECT p.id, p.is_clm_admin, p.is_organiser, u.id as user_id, u.email, u.role, u.token_version
+             FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
+            [resetToken.player_id]
+        );
+        if (freshPlayer.rows.length > 0) {
+            const fp = freshPlayer.rows[0];
+            const freshToken = jwt.sign(
+                { userId: fp.user_id, playerId: fp.id, email: fp.email,
+                  role: fp.role, isCLMAdmin: fp.is_clm_admin || false,
+                  isOrganiser: fp.is_organiser || false, tokenVersion: fp.token_version },
+                JWT_SECRET,
+                { expiresIn: '7d' }
+            );
+            res.cookie('tf_token', freshToken, {
+                httpOnly: true, secure: true, sameSite: 'lax',
+                maxAge: 7 * 24 * 60 * 60 * 1000
+            });
+        }
+
         setImmediate(() => auditLog(pool, resetToken.player_id, 'password_reset', resetToken.player_id, 'Password reset via email token'));
-        res.json({ message: 'Password updated successfully. Please log in again.' });
+        res.json({ message: 'Password updated successfully. You are now logged in.' });
     } catch (error) {
         console.error('Reset password error'); // SEC-037: No error details in log — no token/email leak
         res.status(500).json({ error: 'Failed to reset password' });
