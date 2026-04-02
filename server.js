@@ -1047,7 +1047,7 @@ app.post('/api/auth/register', async (req, res) => {
         }
 
         // Hash password
-        const passwordHash = await bcrypt.hash(password, 12); // SEC-014: bcrypt cost 12 (was 10)
+        const passwordHash = await bcrypt.hash(password, 10);
 
         // MED-2: All new accounts start as 'player' — superadmin must be set directly in DB
         const role = 'player';
@@ -14176,7 +14176,7 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
         const valid = await bcrypt.compare(currentPassword, userResult.rows[0].password_hash);
         if (!valid) return res.status(403).json({ error: 'Current password is incorrect' });
 
-        const hash = await bcrypt.hash(newPassword, 12); // SEC-035: consistent cost 12 across all password hashing
+        const hash = await bcrypt.hash(newPassword, 10);
         // HIGH-2: Bump token_version — all previously issued JWTs are now invalid
         await pool.query(
             'UPDATE users SET password_hash = $1, token_version = token_version + 1, force_password_change = FALSE WHERE id = $2',
@@ -14209,7 +14209,7 @@ app.post('/api/auth/force-change-password', authenticateToken, async (req, res) 
             return res.status(403).json({ error: 'No password change required' });
         }
 
-        const hash = await bcrypt.hash(newPassword, 12);
+        const hash = await bcrypt.hash(newPassword, 10);
         await pool.query(
             'UPDATE users SET password_hash = $1, force_password_change = FALSE, token_version = token_version + 1 WHERE id = $2',
             [hash, req.user.userId]
@@ -14256,7 +14256,7 @@ app.post('/api/admin/players/:playerId/reset-password', authenticateToken, requi
         if (playerRow.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
         const { user_id, display_name } = playerRow.rows[0];
 
-        const hash = await bcrypt.hash('Totalfooty1', 12);
+        const hash = await bcrypt.hash('Totalfooty1', 10);
         await pool.query(
             'UPDATE users SET password_hash = $1, force_password_change = TRUE, token_version = token_version + 1 WHERE id = $2',
             [hash, user_id]
@@ -14301,7 +14301,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
         if (new Date() > new Date(resetToken.expires_at)) return res.status(400).json({ error: 'This reset link has expired' });
 
         // Update password on users table
-        const passwordHash = await bcrypt.hash(newPassword, 12); // SEC-035: bcrypt cost 12 consistent with registration
+        const passwordHash = await bcrypt.hash(newPassword, 10);
 
         await pool.query(
             `UPDATE users SET password_hash = $1 WHERE id = (SELECT user_id FROM players WHERE id = $2)`,
