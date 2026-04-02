@@ -512,6 +512,20 @@ function effectiveMinRating(game) {
 // Backwards-compatible alias used by scheduler logging — returns overall threshold only
 function effectiveMinOvr(game) { return effectiveMinRating(game).minOvr; }
 
+// ── STAR CLASS ───────────────────────────────────────────────────────────────
+// starClassFromRating: maps a game's star_rating to an A–E class letter.
+//   A = 5★ (top-tier)  B = 4★  C = 3★  D = 2★  E = 1★
+//   Null / unknown defaults to D (assigned to all historic awards at migration).
+function starClassFromRating(starRating) {
+    const r = parseInt(starRating);
+    if (r === 5) return 'A';
+    if (r === 4) return 'B';
+    if (r === 3) return 'C';
+    if (r === 2) return 'D';
+    if (r === 1) return 'E';
+    return 'D';
+}
+
 // ── DYNAMIC STAR RATINGS ─────────────────────────────────────────────────────
 // reviewDynamicStarRating: recalculate star_rating for a game based on avg OVR.
 // Rules:
@@ -2579,17 +2593,12 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
 
         const desc = description?.trim() || (parsedAmount < 0 ? 'Free credit removal' : 'Free credit grant');
 
-        // UPDATE first; if no row existed yet, INSERT — credits table has no unique constraint on player_id
-        const upd = await pool.query(
-            'UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-            [parsedAmount, req.params.id]
+        // Record transaction and update balance so free credits can actually be spent
+        await pool.query(
+            `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
+             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+            [req.params.id, parsedAmount]
         );
-        if (upd.rowCount === 0) {
-            await pool.query(
-                'INSERT INTO credits (player_id, balance) VALUES ($1, $2)',
-                [req.params.id, parsedAmount]
-            );
-        }
 
         await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
             desc, req.user.userId);
@@ -7502,10 +7511,13 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         }
 
         // FIX-097: Combine both type queries into one — also grab series_id for FIX-086
-        const gameTypeCheck = await pool.query('SELECT team_selection_type, game_status, series_id FROM games WHERE id = $1', [gameId]);
+        const gameTypeCheck = await pool.query('SELECT team_selection_type, game_status, series_id, star_rating FROM games WHERE id = $1', [gameId]);
         const gameType = gameTypeCheck.rows[0]?.team_selection_type;
         const gameStatus = gameTypeCheck.rows[0]?.game_status;
         const seriesUuidFromCheck = gameTypeCheck.rows[0]?.series_id;
+        // S-class: vs_external and tournament games always award S regardless of star rating
+        const starClass = gameTypeCheck.rows[0]?.team_selection_type === 'vs_external'
+            ? 'S' : starClassFromRating(gameTypeCheck.rows[0]?.star_rating);
 
         // Block tournament games — must use /finalise-tournament instead
         if (gameType === 'tournament') {
@@ -7607,9 +7619,10 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             }
             
             if (winningPlayerIds.length > 0) {
+                const winsClassCol = `total_wins_${starClass.toLowerCase()}`;
                 await client.query(
                     `UPDATE players 
-                     SET total_wins = total_wins + 1
+                     SET total_wins = total_wins + 1, ${winsClassCol} = ${winsClassCol} + 1
                      WHERE id = ANY($1)`,
                     [winningPlayerIds]
                 );
@@ -7830,9 +7843,9 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                     }
 
                     // Run all three automated checks
-                    await checkMrDay(gameId, showedUpPlayerIds, seriesId, dayName);
-                    await checkOnFire(gameId, showedUpPlayerIds, winningPlayerIds);
-                    await checkBackFromDead(gameId, showedUpPlayerIds);
+                    await checkMrDay(gameId, showedUpPlayerIds, seriesId, dayName, starClass);
+                    await checkOnFire(gameId, showedUpPlayerIds, winningPlayerIds, starClass);
+                    await checkBackFromDead(gameId, showedUpPlayerIds, starClass);
                 } catch (e) {
                     console.error('Automated award checks failed (non-critical):', e.message);
                 }
@@ -9455,7 +9468,7 @@ async function finaliseRefereeReviews(gameId) {
 // TF GAME AWARDS — helper functions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler','donkey'];
+const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler','donkey','goalscorer','hattrick'];
 const POSITIVE_AWARDS = ['motm','best_engine','brick_wall'];
 const BANTER_AWARDS   = ['reckless_tackler','mr_hollywood','the_moaner','howler','donkey'];
 const MIN_VOTES_REQUIRED = 3; // all awards except MOTM
@@ -9552,7 +9565,8 @@ async function closeAwards(gameId) {
     try {
         // Get game info
         const gameResult = await pool.query(
-            `SELECT g.awards_open, g.awards_close_at, g.game_url,
+            `SELECT g.awards_open, g.awards_close_at, g.game_url, g.star_rating,
+                    g.team_selection_type,
                     TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'Day') as day_name,
                     v.name as venue_name
              FROM games g LEFT JOIN venues v ON v.id = g.venue_id
@@ -9564,6 +9578,9 @@ async function closeAwards(gameId) {
         const dayName = (game.day_name || '').trim();
         const venueName = game.venue_name || 'the match';
         const gameUrl = game.game_url || '';
+        // S-class: vs_external and tournament games always get S regardless of star rating
+        const starClass = (game.team_selection_type === 'vs_external' || game.team_selection_type === 'tournament')
+            ? 'S' : starClassFromRating(game.star_rating);
 
         // Mark awards closed
         await pool.query(
@@ -9609,15 +9626,16 @@ async function closeAwards(gameId) {
                 if (exists.rows.length > 0) continue;
 
                 await pool.query(
-                    `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, motm_value, vote_count)
-                     VALUES ($1, $2, $3, 'voted', $4, $5)`,
-                    [gameId, winner.playerId, awardType, motmValue, winner.votes]
+                    `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, motm_value, vote_count, star_class)
+                     VALUES ($1, $2, $3, 'voted', $4, $5, $6)`,
+                    [gameId, winner.playerId, awardType, motmValue, winner.votes, starClass]
                 );
 
                 // Update players.motm_wins for MOTM
                 if (awardType === 'motm') {
+                    const motmClassCol = `motm_wins_${starClass.toLowerCase()}`;
                     await pool.query(
-                        'UPDATE players SET motm_wins = motm_wins + $1 WHERE id = $2',
+                        `UPDATE players SET motm_wins = motm_wins + $1, ${motmClassCol} = ${motmClassCol} + $1 WHERE id = $2`,
                         [motmValue, winner.playerId]
                     );
                     // FIX-100: Also write winner back to games.motm_winner_id
@@ -9909,7 +9927,7 @@ async function regeneratePlayerBio(playerId) {
 }
 
 // Check Mr [Day] — 7 consecutive appearances in same series
-async function checkMrDay(gameId, playerIds, seriesId, dayName) {
+async function checkMrDay(gameId, playerIds, seriesId, dayName, starClass = 'D') {
     if (!seriesId || !playerIds.length || !dayName) return;
     const normalizedDay = dayName.trim().toLowerCase();
     const awardType = `mr_${normalizedDay}`; // e.g. mr_wednesday
@@ -9970,9 +9988,9 @@ async function checkMrDay(gameId, playerIds, seriesId, dayName) {
                 );
                 if (exists.rows.length === 0) {
                     await pool.query(
-                        `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, series_day)
-                         VALUES ($1, $2, $3, 'automated', $4)`,
-                        [gameId, playerId, awardType, normalizedDay]
+                        `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, series_day, star_class)
+                         VALUES ($1, $2, $3, 'automated', $4, $5)`,
+                        [gameId, playerId, awardType, normalizedDay, starClass]
                     );
                     // Mark as awarded for this series
                     awarded[seriesId] = true;
@@ -9999,7 +10017,7 @@ async function checkMrDay(gameId, playerIds, seriesId, dayName) {
 }
 
 // Check On Fire — 4 consecutive wins (one award per streak, live counter always shown)
-async function checkOnFire(gameId, playerIds, winningPlayerIds) {
+async function checkOnFire(gameId, playerIds, winningPlayerIds, starClass = 'D') {
     const winnerSet = new Set(winningPlayerIds);
 
     for (const playerId of playerIds) {
@@ -10024,9 +10042,9 @@ async function checkOnFire(gameId, playerIds, winningPlayerIds) {
                     );
                     if (exists.rows.length === 0) {
                         await pool.query(
-                            `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source)
-                             VALUES ($1, $2, 'on_fire', 'automated')`,
-                            [gameId, playerId]
+                            `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, star_class)
+                             VALUES ($1, $2, 'on_fire', 'automated', $3)`,
+                            [gameId, playerId, starClass]
                         );
                         onFireAwarded = true;
                         setImmediate(() => sendAwardEmail(playerId, 'on_fire', {}));
@@ -10050,7 +10068,7 @@ async function checkOnFire(gameId, playerIds, winningPlayerIds) {
 }
 
 // Check Back from the Dead — 3 months absence, fires on registration day
-async function checkBackFromDead(gameId, playerIds) {
+async function checkBackFromDead(gameId, playerIds, starClass = 'D') {
     const THREE_MONTHS_MS = 90 * 24 * 60 * 60 * 1000;
 
     for (const playerId of playerIds) {
@@ -10070,9 +10088,9 @@ async function checkBackFromDead(gameId, playerIds) {
                 );
                 if (exists.rows.length === 0) {
                     await pool.query(
-                        `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source)
-                         VALUES ($1, $2, 'back_from_dead', 'automated')`,
-                        [gameId, playerId]
+                        `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, star_class)
+                         VALUES ($1, $2, 'back_from_dead', 'automated', $3)`,
+                        [gameId, playerId, starClass]
                     );
                     setImmediate(() => sendAwardEmail(playerId, 'back_from_dead', {}));
                     console.log(`✅ Back from the Dead awarded to player ${playerId}`);
@@ -12272,7 +12290,7 @@ app.post('/api/players/me/notifications/mark-read', authenticateToken, async (re
 // IMPORTANT: DISC_TIER_THRESHOLDS below must match your calculate_player_tier DB function.
 // Adjust these constants if tier behaviour doesn't match what you expect.
 // These thresholds apply to the REVOLVING window (last 10 completed games + all manual entries).
-const DISC_TIER_THRESHOLDS = { black: 15, white: 10, bronze: 5, silver: 1 };
+const DISC_TIER_THRESHOLDS = { black: 15, white: 10, bronze: 4, silver: 1 };
 function tierFromRevolvingPoints(pts) {
     if (pts >= DISC_TIER_THRESHOLDS.black)  return 'black';
     if (pts >= DISC_TIER_THRESHOLDS.white)  return 'white';
