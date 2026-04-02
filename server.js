@@ -9469,7 +9469,7 @@ async function finaliseRefereeReviews(gameId) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler','donkey','goalscorer','hattrick'];
-const POSITIVE_AWARDS = ['motm','best_engine','brick_wall'];
+const POSITIVE_AWARDS = ['motm','best_engine','brick_wall','goalscorer','hattrick'];
 const BANTER_AWARDS   = ['reckless_tackler','mr_hollywood','the_moaner','howler','donkey'];
 const MIN_VOTES_REQUIRED = 3; // all awards except MOTM
 
