@@ -71,11 +71,11 @@ app.use('/api', (req, res, next) => {
 const rateLimit = require('express-rate-limit');
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 10,
+    max: 20,
     message: { error: 'Too many attempts, please try again later.' },
     standardHeaders: true,
     legacyHeaders: false,
-    skipSuccessfulRequests: false,
+    skipSuccessfulRequests: true, // FIX: only count failed attempts — successful logins do not burn quota
     skip: (req) => req.method === 'OPTIONS', // Never rate-limit preflight requests
 });
 // SEC-001: Registration rate limit — prevents bulk account farming
@@ -1382,14 +1382,15 @@ app.post('/api/auth/login', async (req, res) => {
         // MED-4: Successful login — clear failure record
         await pool.query('DELETE FROM login_failures WHERE user_id = $1', [user.id]);
 
+        // LOGIN-SLIM: Only fetch fields needed to boot the session and build navigation.
+        // Full player data (stats, credits, ratings, photo etc.) is fetched by loadDashboard
+        // via /api/players/me immediately after — no need to duplicate it here.
+        // This keeps the login response tiny (~300 bytes) so it passes through Cloudflare instantly.
         const playerResult = await pool.query(
-            `SELECT p.*, c.balance as credits,
+            `SELECT p.id, p.full_name, p.alias, p.is_clm_admin, p.is_organiser, u.token_version,
              (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
-              FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
-             p.referral_code,
-             u.token_version
-             FROM players p 
-             LEFT JOIN credits c ON c.player_id = p.id 
+              FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
+             FROM players p
              LEFT JOIN users u ON u.id = p.user_id
              WHERE p.user_id = $1`,
             [user.id]
@@ -1427,6 +1428,8 @@ app.post('/api/auth/login', async (req, res) => {
             maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in ms
         });
 
+        // LOGIN-SLIM: Minimal response — just enough to boot the session.
+        // loadDashboard fetches full player data via /api/players/me immediately after.
         res.json({
             mustChangePassword: user.force_password_change === true,
             user: {
@@ -1436,31 +1439,9 @@ app.post('/api/auth/login', async (req, res) => {
                 fullName: player.full_name,
                 alias: player.alias,
                 role: user.role,
-                isAdmin: user.role === 'admin' || user.role === 'superadmin',
-                isSuperAdmin: user.role === 'superadmin',
                 isCLMAdmin: player.is_clm_admin || false,
                 isOrganiser: player.is_organiser || false,
-                squadNumber: player.squad_number,
-                phone: player.phone,
-                photoUrl: player.photo_url,
-                tier: player.reliability_tier,
-                credits: parseFloat(player.credits || 0),
-                appearances: player.total_appearances || 0,
-                motmWins: player.motm_wins || 0,
-                wins: player.total_wins || 0,
-                badges: player.badges || [],
-                referralCode: player.referral_code,
-                stats: {
-                    overall: player.overall_rating || 0,
-                    defending: player.defending_rating || 0,
-                    strength: player.strength_rating || 0,
-                    fitness: player.fitness_rating || 0,
-                    pace: player.pace_rating || 0,
-                    decisions: player.decisions_rating || 0,
-                    assisting: player.assisting_rating || 0,
-                    shooting: player.shooting_rating || 0,
-                    goalkeeper: player.goalkeeper_rating || 0
-                }
+                badges: player.badges || []
             }
         });
 
