@@ -16559,6 +16559,672 @@ app.delete('/api/admin/coaching/sessions/:id', authenticateToken, requireSuperAd
 // ════════════════════════════════════════════════════════════
 
 
+
+// ============================================================
+// SERIES TROPHIES — METRIC_CONFIG, HELPERS & ENDPOINTS
+// ============================================================
+
+const METRIC_CONFIG = {
+    1:  { name: 'Win Percentage',     icon: '📊', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Win %',           supportingLabel: 'Wins' },
+    2:  { name: 'Man of the Match',   icon: '⭐', category: 'core',  awardType: 'motm',             validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'MOTM Count',      supportingLabel: 'MOTM %' },
+    3:  { name: 'Win Count',          icon: '✅', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Wins',            supportingLabel: 'Win %' },
+    4:  { name: 'MOTM Percentage',    icon: '⭐', category: 'core',  awardType: 'motm',             validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'MOTM %',          supportingLabel: 'MOTM Count' },
+    5:  { name: 'Appearances',        icon: '📅', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Appearances',     supportingLabel: null },
+    6:  { name: 'Brick Wall',         icon: '🧱', category: 'award', awardType: 'brick_wall',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Brick Wall',      supportingLabel: 'Brick Wall %' },
+    7:  { name: 'Best Engine',        icon: '🔋', category: 'award', awardType: 'best_engine',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Best Engine',     supportingLabel: 'Best Engine %' },
+    8:  { name: 'Reckless Tackler',   icon: '🚑', category: 'award', awardType: 'reckless_tackler', validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Reckless',        supportingLabel: 'Reckless %' },
+    9:  { name: 'Goal Scorer',        icon: '⚽', category: 'award', awardType: 'goalscorer',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Goals',           supportingLabel: 'Goal %' },
+    10: { name: 'Mr Hollywood',       icon: '🎬', category: 'award', awardType: 'mr_hollywood',     validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Hollywood',       supportingLabel: 'Hollywood %' },
+    11: { name: 'The Moaner',         icon: '😩', category: 'award', awardType: 'the_moaner',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Moans',           supportingLabel: 'Moan %' },
+    12: { name: 'Howler',             icon: '🤦', category: 'award', awardType: 'howler',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Howlers',         supportingLabel: 'Howler %' },
+    13: { name: 'Donkey',             icon: '🫏', category: 'award', awardType: 'donkey',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Donkey',          supportingLabel: 'Donkey %' },
+    14: { name: 'Dropouts',           icon: '🚪', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Dropouts',        supportingLabel: 'Dropout %' },
+    15: { name: 'Guest Signups',      icon: '👥', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Guest Signups',   supportingLabel: 'Per Game' },
+    16: { name: 'Discipline Points',  icon: '⚖️', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Disc. Points',    supportingLabel: 'Per Game' },
+    17: { name: 'Tournament Wins',    icon: '🏆', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Tournament Wins', supportingLabel: 'Win %' },
+    18: { name: 'External Game Wins', icon: '🆚', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'External Wins',   supportingLabel: 'Win %' },
+};
+
+function deriveTier(seriesType, avgStarRating) {
+    if (seriesType === 'tournament' || seriesType === 'vs_external') return 'S';
+    const stars = Math.round(parseFloat(avgStarRating) || 0);
+    if (stars >= 5) return 'A';
+    if (stars >= 4) return 'B';
+    if (stars >= 3) return 'C';
+    if (stars >= 2) return 'D';
+    return 'E';
+}
+
+async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
+    const id = parseInt(metricId);
+    const cfg = METRIC_CONFIG[id];
+    if (!cfg) return [];
+
+    // Reusable appearances CTE (confirmed players in completed games)
+    const appearancesCte = `
+        app_counts AS (
+            SELECT r.player_id, p.display_name, COUNT(*) AS appearances
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            JOIN games g ON g.id = r.game_id
+            WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
+            GROUP BY r.player_id, p.display_name
+        )`;
+
+    // ── METRIC 5: Appearances ──────────────────────────────────────────────
+    if (id === 5) {
+        if (calcType === 'most_consecutive') {
+            const r = await pool.query(`
+                WITH player_games AS (
+                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    JOIN games g ON g.id = r.game_id
+                    WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
+                ),
+                all_players AS (SELECT DISTINCT player_id, display_name FROM player_games),
+                all_games   AS (SELECT id AS game_id, game_date FROM games WHERE series_id = $1 AND game_status = 'completed'),
+                attendance  AS (
+                    SELECT ag.game_id, ag.game_date, ap.player_id, ap.display_name,
+                           CASE WHEN pg.player_id IS NOT NULL THEN 1 ELSE 0 END AS attended
+                    FROM all_games ag CROSS JOIN all_players ap
+                    LEFT JOIN player_games pg ON pg.player_id = ap.player_id AND pg.game_id = ag.game_id
+                ),
+                grp AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date) -
+                        ROW_NUMBER() OVER (PARTITION BY player_id, attended ORDER BY game_date) AS g
+                    FROM attendance
+                ),
+                max_str AS (
+                    SELECT player_id, display_name,
+                           MAX(CASE WHEN attended = 1 THEN cnt ELSE 0 END) AS primary_stat
+                    FROM (SELECT player_id, display_name, attended, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, display_name, attended, g) s
+                    GROUP BY player_id, display_name
+                ),
+                ${appearancesCte}
+                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                       ms.primary_stat, NULL::numeric AS supporting_stat
+                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+            return r.rows;
+        }
+        const dir = calcType === 'least' ? 'ASC' : 'DESC';
+        const r = await pool.query(`
+            WITH ${appearancesCte}
+            SELECT player_id, display_name, appearances, appearances AS primary_stat, NULL::numeric AS supporting_stat
+            FROM app_counts ORDER BY appearances ${dir} LIMIT 10`, [seriesId]);
+        return r.rows;
+    }
+
+    // ── METRICS 1, 3, 17, 18: Win-based ───────────────────────────────────
+    if ([1, 3, 17, 18].includes(id)) {
+        const typeFilter = id === 17 ? "AND g.team_selection_type = 'tournament'"
+                         : id === 18 ? "AND g.team_selection_type = 'vs_external'" : '';
+
+        if (calcType === 'most_consecutive') {
+            const r = await pool.query(`
+                WITH pgr AS (
+                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                           CASE WHEN LOWER(t.team_name) = LOWER(g.winning_team) THEN 1 ELSE 0 END AS won
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    JOIN games g ON g.id = r.game_id
+                    JOIN team_players tp ON tp.game_id = g.id AND tp.player_id = r.player_id
+                    JOIN teams t ON t.id = tp.team_id
+                    WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
+                    ${typeFilter}
+                ),
+                grp AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date) -
+                        ROW_NUMBER() OVER (PARTITION BY player_id, won ORDER BY game_date) AS g
+                    FROM pgr
+                ),
+                max_str AS (
+                    SELECT player_id, display_name,
+                           MAX(CASE WHEN won = 1 THEN cnt ELSE 0 END) AS primary_stat
+                    FROM (SELECT player_id, display_name, won, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, display_name, won, g) s
+                    GROUP BY player_id, display_name
+                ),
+                ${appearancesCte}
+                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                       ms.primary_stat, NULL::numeric AS supporting_stat
+                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+            return r.rows;
+        }
+
+        const dir = calcType === 'least' ? 'ASC' : 'DESC';
+        const tbDir = calcType === 'least' ? 'DESC' : 'ASC';
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pw AS (
+                SELECT r.player_id, COUNT(*) AS win_count
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                JOIN team_players tp ON tp.game_id = g.id AND tp.player_id = r.player_id
+                JOIN teams t ON t.id = tp.team_id
+                WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
+                AND LOWER(t.team_name) = LOWER(g.winning_team)
+                ${typeFilter}
+                GROUP BY r.player_id
+            )
+            SELECT ac.player_id, ac.display_name, ac.appearances,
+                   CASE WHEN ${id === 1 ? 'TRUE' : 'FALSE'}
+                        THEN ROUND(COALESCE(pw.win_count,0)*100.0/NULLIF(ac.appearances,0),1)
+                        ELSE COALESCE(pw.win_count,0)::numeric END AS primary_stat,
+                   CASE WHEN ${id === 1 ? 'TRUE' : 'FALSE'}
+                        THEN COALESCE(pw.win_count,0)::numeric
+                        ELSE ROUND(COALESCE(pw.win_count,0)*100.0/NULLIF(ac.appearances,0),1) END AS supporting_stat
+            FROM app_counts ac LEFT JOIN pw ON pw.player_id = ac.player_id
+            ORDER BY primary_stat ${dir}, ac.appearances ${tbDir} LIMIT 10`, [seriesId]);
+        return r.rows;
+    }
+
+    // ── METRICS 2 & 4: MOTM ───────────────────────────────────────────────
+    if (id === 2 || id === 4) {
+        if (calcType === 'most_consecutive') {
+            const r = await pool.query(`
+                WITH pgm AS (
+                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                           CASE WHEN ga.recipient_player_id IS NOT NULL THEN 1 ELSE 0 END AS got_motm
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    JOIN games g ON g.id = r.game_id
+                    LEFT JOIN game_awards ga ON ga.game_id = g.id
+                        AND ga.recipient_player_id = r.player_id AND ga.award_type = 'motm'
+                    WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
+                ),
+                grp AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date) -
+                        ROW_NUMBER() OVER (PARTITION BY player_id, got_motm ORDER BY game_date) AS g
+                    FROM pgm
+                ),
+                max_str AS (
+                    SELECT player_id, display_name,
+                           MAX(CASE WHEN got_motm = 1 THEN cnt ELSE 0 END) AS primary_stat
+                    FROM (SELECT player_id, display_name, got_motm, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, display_name, got_motm, g) s
+                    GROUP BY player_id, display_name
+                ),
+                ${appearancesCte}
+                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                       ms.primary_stat, NULL::numeric AS supporting_stat
+                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+            return r.rows;
+        }
+        const dir = calcType === 'least' ? 'ASC' : 'DESC';
+        const tbDir = calcType === 'least' ? 'DESC' : 'ASC';
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pm AS (
+                SELECT ga.recipient_player_id AS player_id, COUNT(*) AS motm_count
+                FROM game_awards ga JOIN games g ON g.id = ga.game_id
+                WHERE g.series_id = $1 AND g.game_status = 'completed' AND ga.award_type = 'motm'
+                GROUP BY ga.recipient_player_id
+            )
+            SELECT ac.player_id, ac.display_name, ac.appearances,
+                   CASE WHEN ${id === 2 ? 'TRUE' : 'FALSE'}
+                        THEN COALESCE(pm.motm_count,0)::numeric
+                        ELSE ROUND(COALESCE(pm.motm_count,0)*100.0/NULLIF(ac.appearances,0),1) END AS primary_stat,
+                   CASE WHEN ${id === 2 ? 'TRUE' : 'FALSE'}
+                        THEN ROUND(COALESCE(pm.motm_count,0)*100.0/NULLIF(ac.appearances,0),1)
+                        ELSE COALESCE(pm.motm_count,0)::numeric END AS supporting_stat
+            FROM app_counts ac LEFT JOIN pm ON pm.player_id = ac.player_id
+            ORDER BY primary_stat ${dir}, ac.appearances ${tbDir} LIMIT 10`, [seriesId]);
+        return r.rows;
+    }
+
+    // ── METRICS 6–13: Game Awards ──────────────────────────────────────────
+    if (id >= 6 && id <= 13) {
+        const awardType = cfg.awardType;
+
+        if (calcType === 'most_consecutive') {
+            const r = await pool.query(`
+                WITH pga AS (
+                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                           CASE WHEN ga.recipient_player_id IS NOT NULL THEN 1 ELSE 0 END AS got_award
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    JOIN games g ON g.id = r.game_id
+                    LEFT JOIN game_awards ga ON ga.game_id = g.id
+                        AND ga.recipient_player_id = r.player_id AND ga.award_type = $2
+                    WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
+                ),
+                grp AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date) -
+                        ROW_NUMBER() OVER (PARTITION BY player_id, got_award ORDER BY game_date) AS g
+                    FROM pga
+                ),
+                max_str AS (
+                    SELECT player_id, display_name,
+                           MAX(CASE WHEN got_award = 1 THEN cnt ELSE 0 END) AS primary_stat
+                    FROM (SELECT player_id, display_name, got_award, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, display_name, got_award, g) s
+                    GROUP BY player_id, display_name
+                ),
+                ${appearancesCte}
+                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                       ms.primary_stat, NULL::numeric AS supporting_stat
+                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`,
+                [seriesId, awardType]);
+            return r.rows;
+        }
+
+        const usePct = calcType === 'most_per_game' || calcType === 'least_per_game';
+        const dir = (calcType === 'least' || calcType === 'least_per_game') ? 'ASC' : 'DESC';
+        const tbDir = (calcType === 'least' || calcType === 'least_per_game') ? 'DESC' : 'ASC';
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pa AS (
+                SELECT ga.recipient_player_id AS player_id, COUNT(*) AS award_count
+                FROM game_awards ga JOIN games g ON g.id = ga.game_id
+                WHERE g.series_id = $1 AND g.game_status = 'completed' AND ga.award_type = $2
+                GROUP BY ga.recipient_player_id
+            )
+            SELECT ac.player_id, ac.display_name, ac.appearances,
+                   CASE WHEN ${usePct}
+                        THEN ROUND(COALESCE(pa.award_count,0)*100.0/NULLIF(ac.appearances,0),1)
+                        ELSE COALESCE(pa.award_count,0)::numeric END AS primary_stat,
+                   CASE WHEN ${usePct}
+                        THEN COALESCE(pa.award_count,0)::numeric
+                        ELSE ROUND(COALESCE(pa.award_count,0)*100.0/NULLIF(ac.appearances,0),1) END AS supporting_stat
+            FROM app_counts ac LEFT JOIN pa ON pa.player_id = ac.player_id
+            ORDER BY primary_stat ${dir}, ac.appearances ${tbDir} LIMIT 10`,
+            [seriesId, awardType]);
+        return r.rows;
+    }
+
+    // ── METRIC 14: Dropouts ───────────────────────────────────────────────
+    if (id === 14) {
+        if (calcType === 'most_consecutive') {
+            const r = await pool.query(`
+                WITH apg AS (
+                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                           CASE WHEN r.status = 'dropped_out' THEN 1 ELSE 0 END AS dropped
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    JOIN games g ON g.id = r.game_id
+                    WHERE g.series_id = $1 AND g.game_status = 'completed'
+                    AND r.status IN ('confirmed','dropped_out')
+                ),
+                grp AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date) -
+                        ROW_NUMBER() OVER (PARTITION BY player_id, dropped ORDER BY game_date) AS g
+                    FROM apg
+                ),
+                max_str AS (
+                    SELECT player_id, display_name,
+                           MAX(CASE WHEN dropped = 1 THEN cnt ELSE 0 END) AS primary_stat
+                    FROM (SELECT player_id, display_name, dropped, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, display_name, dropped, g) s
+                    GROUP BY player_id, display_name
+                ),
+                ${appearancesCte}
+                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                       ms.primary_stat, NULL::numeric AS supporting_stat
+                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+            return r.rows;
+        }
+        const usePct = calcType === 'most_per_game';
+        // Appearances = total signups (confirmed + dropped_out) for this metric.
+        // Dropout % = dropout_count / total_signups so the rate is meaningful.
+        const r = await pool.query(`
+            WITH signup_counts AS (
+                SELECT r.player_id, p.display_name,
+                       COUNT(*) AS appearances,
+                       COUNT(*) FILTER (WHERE r.status = 'dropped_out') AS dropout_count
+                FROM registrations r
+                JOIN players p ON p.id = r.player_id
+                JOIN games g ON g.id = r.game_id
+                WHERE g.series_id = $1 AND g.game_status = 'completed'
+                AND r.status IN ('confirmed','dropped_out')
+                GROUP BY r.player_id, p.display_name
+            )
+            SELECT player_id, display_name, appearances,
+                   CASE WHEN ${usePct}
+                        THEN ROUND(dropout_count*100.0/NULLIF(appearances,0),1)
+                        ELSE dropout_count::numeric END AS primary_stat,
+                   CASE WHEN ${usePct}
+                        THEN dropout_count::numeric
+                        ELSE ROUND(dropout_count*100.0/NULLIF(appearances,0),1) END AS supporting_stat
+            FROM signup_counts
+            WHERE dropout_count > 0
+            ORDER BY primary_stat DESC, appearances ASC LIMIT 10`, [seriesId]);
+        return r.rows;
+    }
+
+    // ── METRIC 15: Guest Signups ──────────────────────────────────────────
+    if (id === 15) {
+        if (calcType === 'most_consecutive') {
+            const r = await pool.query(`
+                WITH pgg AS (
+                    SELECT DISTINCT r.registered_by_player_id AS player_id, g.id AS game_id, g.game_date
+                    FROM registrations r JOIN games g ON g.id = r.game_id
+                    WHERE g.series_id = $1 AND g.game_status = 'completed'
+                    AND r.registered_by_player_id IS NOT NULL AND r.registered_by_player_id != r.player_id
+                ),
+                apsg AS (
+                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    JOIN games g ON g.id = r.game_id
+                    WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
+                ),
+                pghg AS (
+                    SELECT apsg.player_id, apsg.display_name, apsg.game_id, apsg.game_date,
+                           CASE WHEN pgg.game_id IS NOT NULL THEN 1 ELSE 0 END AS signed_guest
+                    FROM apsg LEFT JOIN pgg ON pgg.player_id = apsg.player_id AND pgg.game_id = apsg.game_id
+                ),
+                grp AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date) -
+                        ROW_NUMBER() OVER (PARTITION BY player_id, signed_guest ORDER BY game_date) AS g
+                    FROM pghg
+                ),
+                max_str AS (
+                    SELECT player_id, display_name,
+                           MAX(CASE WHEN signed_guest = 1 THEN cnt ELSE 0 END) AS primary_stat
+                    FROM (SELECT player_id, display_name, signed_guest, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, display_name, signed_guest, g) s
+                    GROUP BY player_id, display_name
+                ),
+                ${appearancesCte}
+                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                       ms.primary_stat, NULL::numeric AS supporting_stat
+                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+            return r.rows;
+        }
+        const usePct = calcType === 'most_per_game';
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            gs AS (
+                SELECT r.registered_by_player_id AS player_id, COUNT(*) AS signup_count
+                FROM registrations r JOIN games g ON g.id = r.game_id
+                WHERE g.series_id = $1 AND g.game_status = 'completed'
+                AND r.registered_by_player_id IS NOT NULL AND r.registered_by_player_id != r.player_id
+                GROUP BY r.registered_by_player_id
+            )
+            SELECT ac.player_id, ac.display_name, ac.appearances,
+                   CASE WHEN ${usePct}
+                        THEN ROUND(COALESCE(gs.signup_count,0)*1.0/NULLIF(ac.appearances,0),2)
+                        ELSE COALESCE(gs.signup_count,0)::numeric END AS primary_stat,
+                   CASE WHEN ${usePct}
+                        THEN COALESCE(gs.signup_count,0)::numeric
+                        ELSE ROUND(COALESCE(gs.signup_count,0)*1.0/NULLIF(ac.appearances,0),2) END AS supporting_stat
+            FROM app_counts ac LEFT JOIN gs ON gs.player_id = ac.player_id
+            ORDER BY primary_stat DESC, ac.appearances ASC LIMIT 10`, [seriesId]);
+        return r.rows;
+    }
+
+    // ── METRIC 16: Discipline Points ──────────────────────────────────────
+    if (id === 16) {
+        if (calcType === 'most_consecutive') {
+            const r = await pool.query(`
+                WITH pgd AS (
+                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                           CASE WHEN COALESCE(SUM(dr.points),0) > 0 THEN 1 ELSE 0 END AS got_disc
+                    FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    JOIN games g ON g.id = r.game_id
+                    LEFT JOIN discipline_records dr ON dr.player_id = r.player_id AND dr.game_id = g.id
+                    WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
+                    GROUP BY r.player_id, p.display_name, g.id, g.game_date
+                ),
+                grp AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date) -
+                        ROW_NUMBER() OVER (PARTITION BY player_id, got_disc ORDER BY game_date) AS g
+                    FROM pgd
+                ),
+                max_str AS (
+                    SELECT player_id, display_name,
+                           MAX(CASE WHEN got_disc = 1 THEN cnt ELSE 0 END) AS primary_stat
+                    FROM (SELECT player_id, display_name, got_disc, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, display_name, got_disc, g) s
+                    GROUP BY player_id, display_name
+                ),
+                ${appearancesCte}
+                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                       ms.primary_stat, NULL::numeric AS supporting_stat
+                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+            return r.rows;
+        }
+        const usePct = calcType === 'most_per_game';
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pdisc AS (
+                SELECT dr.player_id, SUM(dr.points) AS disc_total
+                FROM discipline_records dr JOIN games g ON g.id = dr.game_id
+                WHERE g.series_id = $1 AND g.game_status = 'completed'
+                GROUP BY dr.player_id
+            )
+            SELECT ac.player_id, ac.display_name, ac.appearances,
+                   CASE WHEN ${usePct}
+                        THEN ROUND(COALESCE(pdisc.disc_total,0)*1.0/NULLIF(ac.appearances,0),2)
+                        ELSE COALESCE(pdisc.disc_total,0)::numeric END AS primary_stat,
+                   CASE WHEN ${usePct}
+                        THEN COALESCE(pdisc.disc_total,0)::numeric
+                        ELSE ROUND(COALESCE(pdisc.disc_total,0)*1.0/NULLIF(ac.appearances,0),2) END AS supporting_stat
+            FROM app_counts ac LEFT JOIN pdisc ON pdisc.player_id = ac.player_id
+            ORDER BY primary_stat DESC, ac.appearances ASC LIMIT 10`, [seriesId]);
+        return r.rows;
+    }
+
+    return [];
+}
+
+// Helper: fetch series + leaderboards for a given series_id
+async function _getSeriesTrophyPayload(seriesId, includeIds) {
+    const seriesRow = await pool.query(`
+        SELECT gs.id, gs.series_name, gs.series_type, gs.series_status,
+               COALESCE(AVG(g.star_rating) FILTER (WHERE g.game_status = 'completed'), 0) AS avg_star_rating,
+               COUNT(g.id) FILTER (WHERE g.game_status = 'completed') AS completed_games
+        FROM game_series gs
+        LEFT JOIN games g ON g.series_id = gs.id
+        WHERE gs.id = $1
+        GROUP BY gs.id, gs.series_name, gs.series_type, gs.series_status`, [seriesId]);
+    if (!seriesRow.rows.length) return null;
+    const series = seriesRow.rows[0];
+    const completedGames = parseInt(series.completed_games) || 0;
+
+    const trophiesRow = await pool.query(`
+        SELECT id, metric_id, calculation_type, tier, created_at
+        FROM series_trophies WHERE series_id = $1 ORDER BY metric_id, calculation_type`, [seriesId]);
+
+    const trophies = [];
+    for (const t of trophiesRow.rows) {
+        const leaderboard = completedGames > 0
+            ? await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type)
+            : [];
+        const cfg = METRIC_CONFIG[parseInt(t.metric_id)];
+        const entry = {
+            metric_id: t.metric_id,
+            metric_name: cfg ? cfg.name : 'Unknown',
+            metric_icon: cfg ? cfg.icon : '🏆',
+            calculation_type: t.calculation_type,
+            tier: t.tier,
+            primary_label: cfg ? cfg.primaryLabel : 'Stat',
+            supporting_label: cfg ? cfg.supportingLabel : null,
+            leaderboard
+        };
+        if (includeIds) entry.id = t.id;
+        trophies.push(entry);
+    }
+
+    return {
+        series_id: series.id,
+        series_name: series.series_name,
+        series_type: series.series_type,
+        series_status: series.series_status,
+        completed_games: completedGames,
+        avg_star_rating: parseFloat(series.avg_star_rating),
+        locked: completedGames > 0,
+        trophies
+    };
+}
+
+// GET /api/public/series/:id/trophies — public, no auth
+app.get('/api/public/series/:id/trophies', async (req, res) => {
+    try {
+        const payload = await _getSeriesTrophyPayload(req.params.id, false);
+        if (!payload) return res.status(404).json({ error: 'Series not found' });
+        res.json(payload);
+    } catch (e) {
+        console.error('GET /api/public/series/:id/trophies error:', e.message);
+        res.status(500).json({ error: 'Failed to load series trophies' });
+    }
+});
+
+// GET /api/admin/series/:id/trophies — admin auth, includes trophy IDs for delete
+app.get('/api/admin/series/:id/trophies', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const payload = await _getSeriesTrophyPayload(req.params.id, true);
+        if (!payload) return res.status(404).json({ error: 'Series not found' });
+        res.json(payload);
+    } catch (e) {
+        console.error('GET /api/admin/series/:id/trophies error:', e.message);
+        res.status(500).json({ error: 'Failed to load series trophies' });
+    }
+});
+
+// POST /api/admin/series/:id/trophies — add trophy
+app.post('/api/admin/series/:id/trophies', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const seriesId = req.params.id;
+        const { metric_id, calculation_type } = req.body;
+
+        const mid = parseInt(metric_id);
+        if (!mid || !METRIC_CONFIG[mid]) return res.status(400).json({ error: 'Invalid metric_id' });
+        const cfg = METRIC_CONFIG[mid];
+        if (!cfg.validCalcTypes.includes(calculation_type)) {
+            return res.status(400).json({ error: `Invalid calculation_type. Valid: ${cfg.validCalcTypes.join(', ')}` });
+        }
+
+        const seriesRow = await pool.query(`
+            SELECT gs.id, gs.series_type, gs.series_status,
+                   COUNT(g.id) FILTER (WHERE g.game_status = 'completed') AS completed_games,
+                   COALESCE(AVG(g.star_rating) FILTER (WHERE g.game_status = 'completed'), 0) AS avg_star_rating
+            FROM game_series gs
+            LEFT JOIN games g ON g.series_id = gs.id
+            WHERE gs.id = $1
+            GROUP BY gs.id, gs.series_type, gs.series_status`, [seriesId]);
+        if (!seriesRow.rows.length) return res.status(404).json({ error: 'Series not found' });
+        const s = seriesRow.rows[0];
+
+        if (s.series_status === 'completed') {
+            return res.status(400).json({ error: 'Series is finalised — trophies cannot be added' });
+        }
+        if (parseInt(s.completed_games) > 0) {
+            return res.status(400).json({ error: 'Trophies locked — first game has already been played' });
+        }
+
+        const tier = deriveTier(s.series_type, s.avg_star_rating);
+
+        await pool.query(`
+            INSERT INTO series_trophies (series_id, metric_id, calculation_type, tier)
+            VALUES ($1, $2, $3, $4)`, [seriesId, mid, calculation_type, tier]);
+
+        res.json({ ok: true, tier, message: `Trophy added — Tier ${tier}` });
+    } catch (e) {
+        if (e.code === '23505') return res.status(400).json({ error: 'This trophy already exists for this series' });
+        console.error('POST /api/admin/series/:id/trophies error:', e.message);
+        res.status(500).json({ error: 'Failed to add trophy' });
+    }
+});
+
+// DELETE /api/admin/series/:id/trophies/:tid — remove trophy
+app.delete('/api/admin/series/:id/trophies/:tid', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id: seriesId, tid } = req.params;
+
+        const check = await pool.query(`
+            SELECT gs.series_status,
+                   COUNT(g.id) FILTER (WHERE g.game_status = 'completed') AS completed_games
+            FROM game_series gs
+            LEFT JOIN games g ON g.series_id = gs.id
+            WHERE gs.id = $1
+            GROUP BY gs.id, gs.series_status`, [seriesId]);
+        if (!check.rows.length) return res.status(404).json({ error: 'Series not found' });
+        if (check.rows[0].series_status === 'completed') {
+            return res.status(400).json({ error: 'Series is finalised — trophies cannot be removed' });
+        }
+        if (parseInt(check.rows[0].completed_games) > 0) {
+            return res.status(400).json({ error: 'Trophies locked — first game has already been played' });
+        }
+
+        const del = await pool.query(`
+            DELETE FROM series_trophies WHERE id = $1 AND series_id = $2 RETURNING id`, [tid, seriesId]);
+        if (!del.rows.length) return res.status(404).json({ error: 'Trophy not found' });
+
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('DELETE /api/admin/series/:id/trophies/:tid error:', e.message);
+        res.status(500).json({ error: 'Failed to remove trophy' });
+    }
+});
+
+// POST /api/admin/series/:id/finalize — lock results permanently
+app.post('/api/admin/series/:id/finalize', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const seriesId = req.params.id;
+
+        const seriesRow = await pool.query(
+            `SELECT series_status FROM game_series WHERE id = $1`, [seriesId]);
+        if (!seriesRow.rows.length) return res.status(404).json({ error: 'Series not found' });
+        if (seriesRow.rows[0].series_status === 'completed') {
+            return res.status(400).json({ error: 'Series already finalised' });
+        }
+
+        const trophiesRow = await pool.query(
+            `SELECT id, metric_id, calculation_type FROM series_trophies WHERE series_id = $1`, [seriesId]);
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            for (const t of trophiesRow.rows) {
+                const leaderboard = await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type);
+                await client.query('DELETE FROM series_trophy_results WHERE trophy_id = $1', [t.id]);
+                for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
+                    const row = leaderboard[i];
+                    await client.query(`
+                        INSERT INTO series_trophy_results (trophy_id, player_id, rank, primary_stat, supporting_stat)
+                        VALUES ($1, $2, $3, $4, $5)`,
+                        [t.id, row.player_id, i + 1, row.primary_stat, row.supporting_stat]);
+                }
+            }
+
+            await client.query(`
+                UPDATE game_series SET series_status = 'completed', finalized_at = NOW()
+                WHERE id = $1`, [seriesId]);
+
+            await client.query('COMMIT');
+            res.json({ ok: true, message: 'Series finalised — trophy winners locked permanently' });
+        } catch (e) {
+            await client.query('ROLLBACK');
+            throw e;
+        } finally {
+            client.release();
+        }
+    } catch (e) {
+        console.error('POST /api/admin/series/:id/finalize error:', e.message);
+        res.status(500).json({ error: 'Failed to finalise series' });
+    }
+});
+
+
 // FIX-043: Catch-all 404 handler (must be after ALL routes including coaching)
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
