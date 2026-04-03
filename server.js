@@ -3823,6 +3823,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 r.position_preference as positions,
                 r.position_preference as position_preference,
                 r.tournament_team_preference,
+                r.venue_clash_team_preference,
                 t.team_name,
                 ${isDraftMemory ? 'pft.fixed_team' : 'NULL::text AS fixed_team'},
                 array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
@@ -3843,7 +3844,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                      p.fitness_rating, p.pace_rating, p.decisions_rating,
                      p.assisting_rating, p.shooting_rating, p.overall_rating,
                      r.status, r.backup_type, r.is_comped,
-                     r.position_preference, r.tournament_team_preference, t.team_name
+                     r.position_preference, r.tournament_team_preference, r.venue_clash_team_preference, t.team_name
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY 
                 CASE r.status WHEN 'confirmed' THEN 1 WHEN 'backup' THEN 2 ELSE 3 END,
