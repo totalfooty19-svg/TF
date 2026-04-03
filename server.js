@@ -342,7 +342,7 @@ async function getRafEnabled() {
     } catch (e) { return false; }
 }
 
-// Trigger £2 activation bonus — called when admin tops up a referred player for the first time
+// Trigger £1 activation bonus — called when admin tops up a referred player for the first time
 async function triggerRafActivation(referredPlayerId) {
     try {
         const enabled = await getRafEnabled();
@@ -356,17 +356,17 @@ async function triggerRafActivation(referredPlayerId) {
         );
         // BUG-02: Atomic activation — UPDATE only fires if activation_paid IS FALSE, preventing double-pay race condition
         const activationClaim = await pool.query(
-            `UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+2.00
+            `UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+1.00
              WHERE referrer_id=$1 AND referred_id=$2 AND activation_paid=FALSE
              RETURNING referrer_id`,
             [referrerId, referredPlayerId]
         );
         if (activationClaim.rows.length === 0) return; // already paid — nothing to do
         await pool.query(
-            'UPDATE credits SET balance = balance + 2.00, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
+            'UPDATE credits SET balance = balance + 1.00, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
             [referrerId]
         );
-        await recordCreditTransaction(pool, referrerId, 2.00, 'raf_reward', `RAF activation bonus — referred player ${referredPlayerId} topped up`);
+        await recordCreditTransaction(pool, referrerId, 1.00, 'raf_reward', `RAF activation bonus — referred player ${referredPlayerId} topped up`);
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -378,15 +378,15 @@ async function triggerRafActivation(referredPlayerId) {
             await emailTransporter.sendMail({
                 from: '"TotalFooty" <totalfooty19@gmail.com>',
                 to: referrerEmail,
-                subject: '💰 Refer a Friend — £2 Activation Bonus Earned!',
+                subject: '💰 Refer a Friend — £1 Activation Bonus Earned!',
                 html: wrapEmailHtml(`
-                    <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">YOU'VE EARNED £2! 💰</h2>
+                    <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">YOU'VE EARNED £1! 💰</h2>
                     <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> — your referral — has just topped up their TF account.</p>
-                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Your <strong style="color:#00cc66;">£2 activation bonus</strong> has been added to your balance. You'll also earn <strong style="color:#fff;">50p for every game they sign up to</strong>, capped at £12 in game credits — so up to <strong style="color:#00cc66;">£14 total</strong> per referral!</p>
+                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Your <strong style="color:#00cc66;">£1 activation bonus</strong> has been added to your balance. You'll also earn <strong style="color:#fff;">£1 for every game they sign up to</strong>, capped at £13 in game credits — so up to <strong style="color:#00cc66;">£14 total</strong> per referral!</p>
                     <div style="background:#111;border:2px solid #333;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">MAXIMUM PER REFERRAL</div>
                         <div style="font-size:30px;font-weight:900;color:#00cc66;">£14.00</div>
-                        <div style="font-size:12px;color:#666;">£2 activation + 24 × 50p game credits</div>
+                        <div style="font-size:12px;color:#666;">£1 activation + 13 × £1 game credits</div>
                     </div>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY PROFILE →</a>
                 `)
@@ -394,12 +394,12 @@ async function triggerRafActivation(referredPlayerId) {
         }
         await notifyAdmin(`💰 RAF Activation — ${referredName} topped up`, [
             ['Referrer', referrerName], ['Referred Player', referredName],
-            ['Amount Credited', '£2.00'], ['Type', 'Activation Bonus']
+            ['Amount Credited', '£1.00'], ['Type', 'Activation Bonus']
         ]);
     } catch (e) { console.error('triggerRafActivation error (non-critical):', e.message); }
 }
 
-// Trigger 50p game credit — called on every confirmed self-registration by a referred player
+// Trigger £1 game credit — called on every confirmed self-registration by a referred player
 async function triggerRafGameCredit(referredPlayerId) {
     try {
         const enabled = await getRafEnabled();
@@ -419,22 +419,22 @@ async function triggerRafGameCredit(referredPlayerId) {
         const creditClaim = await pool.query(`
             UPDATE raf_rewards
             SET game_credits_paid = game_credits_paid + 1,
-                game_credits_total = game_credits_total + 0.50,
-                total_paid         = total_paid + 0.50,
-                cap_reached        = (game_credits_paid + 1 >= 24),
-                cap_reached_at     = CASE WHEN (game_credits_paid + 1 >= 24) AND cap_reached_at IS NULL THEN NOW() ELSE cap_reached_at END
+                game_credits_total = game_credits_total + 1.00,
+                total_paid         = total_paid + 1.00,
+                cap_reached        = (game_credits_paid + 1 >= 13),
+                cap_reached_at     = CASE WHEN (game_credits_paid + 1 >= 13) AND cap_reached_at IS NULL THEN NOW() ELSE cap_reached_at END
             WHERE referrer_id=$1 AND referred_id=$2
-              AND cap_reached = FALSE AND game_credits_paid < 24
-            RETURNING game_credits_paid AS new_count, (game_credits_paid >= 24) AS cap_reached
+              AND cap_reached = FALSE AND game_credits_paid < 13
+            RETURNING game_credits_paid AS new_count, (game_credits_paid >= 13) AS cap_reached
         `, [referrerId, referredPlayerId]);
         if (creditClaim.rows.length === 0) return; // cap already reached or row missing — nothing to do
         const newCount   = parseInt(creditClaim.rows[0].new_count);
         const capReached = creditClaim.rows[0].cap_reached;
         await pool.query(
-            'UPDATE credits SET balance = balance + 0.50, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
+            'UPDATE credits SET balance = balance + 1.00, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
             [referrerId]
         );
-        await recordCreditTransaction(pool, referrerId, 0.50, 'raf_reward', `RAF game credit (${newCount}/24) — referred player ${referredPlayerId}`);
+        await recordCreditTransaction(pool, referrerId, 1.00, 'raf_reward', `RAF game credit (${newCount}/13) — referred player ${referredPlayerId}`);
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -442,14 +442,14 @@ async function triggerRafGameCredit(referredPlayerId) {
         const referrerName  = refRow.rows[0]?.alias  || refRow.rows[0]?.full_name  || 'Referrer';
         const referrerEmail = refRow.rows[0]?.email;
         const referredName  = rfdRow.rows[0]?.alias  || rfdRow.rows[0]?.full_name  || 'Your referral';
-        await notifyAdmin(`💰 RAF Game Credit — ${referredName} signed up (${newCount}/24)`, [
+        await notifyAdmin(`💰 RAF Game Credit — ${referredName} signed up (${newCount}/13)`, [
             ['Referrer', referrerName], ['Referred Player', referredName],
-            ['Amount Credited', '£0.50'], ['Sign-ups Counted', `${newCount} / 24`],
-            ['Cap Reached', capReached ? 'YES — £12 game credits fully earned' : 'No']
+            ['Amount Credited', '£1.00'], ['Sign-ups Counted', `${newCount} / 13`],
+            ['Cap Reached', capReached ? 'YES — £13 game credits fully earned' : 'No']
         ]);
-        if (referrerEmail && (newCount === 10 || capReached)) {
-            const gameCreditsSoFar = (newCount * 0.50).toFixed(2);
-            // BUG3-FIX: fetch actual total_paid (activation may not have been paid)
+        if (referrerEmail && (newCount === 7 || capReached)) {
+            const gameCreditsSoFar = newCount.toFixed(2);
+            // Fetch actual total_paid (activation may not have been paid)
             const rrActual = await pool.query(
                 'SELECT total_paid, activation_paid FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
                 [referrerId, referredPlayerId]
@@ -461,24 +461,24 @@ async function triggerRafGameCredit(referredPlayerId) {
                 to: referrerEmail,
                 subject: capReached
                     ? `🏆 Refer a Friend — Maximum Earned from ${referredName}!`
-                    : `🎉 Refer a Friend — ${referredName} has played 10 games!`,
+                    : `🎉 Refer a Friend — ${referredName} has played 7 games!`,
                 html: wrapEmailHtml(capReached ? `
                     <h2 style="color:#FFD700;font-size:22px;font-weight:900;margin:0 0 16px;">MAXIMUM EARNED! 🏆</h2>
-                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has played <strong style="color:#FFD700;">24 games</strong> — you've earned the full reward from this referral.</p>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has played <strong style="color:#FFD700;">13 games</strong> — you've earned the full reward from this referral.</p>
                     <div style="background:#111;border:2px solid #FFD700;border-radius:10px;padding:20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#888;font-weight:700;letter-spacing:1px;margin-bottom:6px;">TOTAL EARNED FROM ${htmlEncode(referredName.toUpperCase())}</div>
                         <div style="font-size:36px;font-weight:900;color:#FFD700;">£${actualTotal}</div>
-                        <div style="font-size:12px;color:#888;">${activationWasPaid ? '£2 activation + ' : ''}£12 game credits (24 sign-ups)</div>
+                        <div style="font-size:12px;color:#888;">${activationWasPaid ? '£1 activation + ' : ''}£13 game credits (13 sign-ups)</div>
                     </div>
                     <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Know anyone else? Keep referring — every friend earns you up to £14!</p>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY REFERRALS →</a>
                 ` : `
-                    <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">🎉 10 GAME MILESTONE!</h2>
-                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has now played <strong style="color:#fff;">10 games</strong>. You've earned <strong style="color:#00cc66;">£${gameCreditsSoFar}</strong> in game credits from their sign-ups so far.</p>
+                    <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">🎉 HALFWAY THERE!</h2>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has now played <strong style="color:#fff;">7 games</strong>. You've earned <strong style="color:#00cc66;">£${gameCreditsSoFar}</strong> in game credits from their sign-ups so far.</p>
                     <div style="background:#111;border:2px solid #333;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">STILL TO EARN</div>
-                        <div style="font-size:28px;font-weight:900;color:#00cc66;">£${(12 - parseFloat(gameCreditsSoFar)).toFixed(2)}</div>
-                        <div style="font-size:12px;color:#666;">${24 - newCount} more sign-ups to go</div>
+                        <div style="font-size:28px;font-weight:900;color:#00cc66;">£${(13 - parseFloat(gameCreditsSoFar)).toFixed(2)}</div>
+                        <div style="font-size:12px;color:#666;">${13 - newCount} more sign-ups to go</div>
                     </div>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY PROFILE →</a>
                 `)
@@ -587,6 +587,67 @@ async function reviewDynamicStarRating(pool, gameId) {
 }
 
 // ── PUSH NOTIFICATIONS ───────────────────────────────────────────────────────
+
+// sendTeamsConfirmedEmails: notify all confirmed players of their team assignment
+async function sendTeamsConfirmedEmails(gameId) {
+    try {
+        // Fetch game info
+        const gRow = await pool.query(`
+            SELECT g.game_date, g.game_url, g.format,
+                   v.name AS venue_name
+            FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.id = $1`, [gameId]);
+        if (!gRow.rows.length) return;
+        const g = gRow.rows[0];
+        const d = new Date(g.game_date);
+        const day    = d.toLocaleDateString('en-GB',  { weekday:'long', day:'numeric', month:'long', timeZone:'Europe/London' });
+        const time   = d.toLocaleTimeString('en-GB',  { hour:'2-digit', minute:'2-digit', timeZone:'Europe/London' });
+        const venue  = g.venue_name || 'TBC';
+        const gameLink = `https://totalfooty.co.uk/game.html?url=${g.game_url}`;
+
+        // Fetch each player with their team colour + email
+        const players = await pool.query(`
+            SELECT p.alias, p.full_name, u.email, t.team_name
+            FROM team_players tp
+            JOIN teams t ON t.id = tp.team_id
+            JOIN players p ON p.id = tp.player_id
+            JOIN users u ON u.id = p.user_id
+            WHERE t.game_id = $1
+            ORDER BY t.team_name`, [gameId]);
+
+        for (const player of players.rows) {
+            const name      = player.alias || player.full_name;
+            const teamName  = player.team_name || 'TBC';
+            const isRed     = teamName.toLowerCase() === 'red';
+            const teamColor = isRed ? '#ff3366' : '#4488ff';
+            const teamLabel = isRed ? '🔴 RED TEAM' : '🔵 BLUE TEAM';
+
+            await emailTransporter.sendMail({
+                from: '"TotalFooty" <totalfooty19@gmail.com>',
+                to:   player.email,
+                subject: `🏟️ Teams are live — you're ${isRed ? 'Red' : 'Blue'} | TotalFooty`,
+                html: wrapEmailHtml(`
+                    <h2 style="color:#fff;font-size:22px;font-weight:900;margin:0 0 6px;">TEAMS ARE LIVE!</h2>
+                    <p style="color:#888;font-size:14px;margin:0 0 20px;">The squads are set for your upcoming game. Here's where you stand:</p>
+                    <div style="background:#111;border:2px solid ${teamColor};border-radius:10px;padding:16px 20px;margin:0 0 20px;text-align:center;">
+                        <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">YOUR TEAM</div>
+                        <div style="font-size:26px;font-weight:900;color:${teamColor};">${teamLabel}</div>
+                    </div>
+                    <table style="width:100%;border-collapse:collapse;font-size:14px;margin:0 0 24px;">
+                        <tr><td style="padding:6px 0;color:#888;width:100px;">Date</td><td style="font-weight:700;color:#fff;">${htmlEncode(day)}</td></tr>
+                        <tr><td style="padding:6px 0;color:#888;">Time</td><td style="font-weight:700;color:#fff;">${htmlEncode(time)}</td></tr>
+                        <tr><td style="padding:6px 0;color:#888;">Venue</td><td style="font-weight:700;color:#fff;">${htmlEncode(venue)}</td></tr>
+                    </table>
+                    <a href="${gameLink}" style="display:block;text-align:center;padding:14px;background:${teamColor};color:#fff;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;letter-spacing:1px;">VIEW GAME PAGE →</a>
+                `)
+            }).catch(e => console.error(`Teams email failed for ${player.email}:`, e.message));
+        }
+        console.log(`📧 Teams confirmed emails sent for game ${gameId} (${players.rows.length} players)`);
+    } catch (e) {
+        console.error('sendTeamsConfirmedEmails error (non-critical):', e.message);
+    }
+}
+
 // getGameDataForNotification: fetch minimal game info for push payloads
 async function getGameDataForNotification(gameId) {
     const result = await pool.query(
@@ -4053,7 +4114,9 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                         return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                     }
                     
-                    await applyGameFee(client, req.user.playerId, game.cost_per_player, `Confirmed backup for game ${gameId}`);
+                    // Capture realCharged so amount_paid correctly records the real-balance portion
+                    const { realCharged: backupCharged } = await applyGameFee(client, req.user.playerId, game.cost_per_player, `Confirmed backup for game ${gameId}`);
+                    regAmountPaid = backupCharged;
                 }
             }
         } else {
@@ -4094,7 +4157,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
              game.is_venue_clash ? (venueClashTeamPreference || null) : null,
-             isComped ? 0 : (status === 'confirmed' ? (regAmountPaid ?? game.cost_per_player) : 0),
+             isComped ? 0 : ((status === 'confirmed' || regBackupType === 'confirmed_backup') ? (regAmountPaid ?? game.cost_per_player) : 0),
              isComped]
         );
         
@@ -6202,6 +6265,8 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             } catch (e) {
                 console.error('Teams created notification failed (non-critical):', e.message);
             }
+            // Email all players their team assignment (generate path also confirms teams)
+            await sendTeamsConfirmedEmails(gameId);
         });
         
         // Calculate stats
@@ -6928,6 +6993,8 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             } catch (e) {
                 await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed', 'Teams manually confirmed');
             }
+            // Email all confirmed players their team assignment
+            await sendTeamsConfirmedEmails(gameId);
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -7043,6 +7110,8 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
             message: 'Teams confirmed',
             game: fullGameResult.rows[0]
         });
+        // Email all confirmed players their team assignment
+        setImmediate(() => sendTeamsConfirmedEmails(gameId));
     } catch (error) {
         console.error('Confirm teams error:', error);
         res.status(500).json({ error: 'Failed to confirm teams' });
@@ -7716,45 +7785,48 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 for (const backup of unpromotedBackups.rows) {
                     const refundTarget = backup.registered_by_player_id || backup.player_id;
                     const wasComped    = !!backup.is_comped;
-                    // amount_paid = real balance charged (after free credits applied)
-                    // freeUsed    = portion covered by free credits — must be restored too
-                    const refundAmt = parseFloat(backup.amount_paid ?? backup.cost_per_player ?? 0);
-                    const freeUsed  = Math.max(0, parseFloat(backup.cost_per_player || 0) - refundAmt);
+                    // Mirror exactly how the game was paid — same logic as the dropout refund:
+                    //   amount_paid = real balance charged at signup  → restore as 'refund'
+                    //   freeAmt     = free credits consumed at signup → restore as 'free_credit'
+                    // amount_paid is now correctly stored at registration time.
+                    // Null fallback: assume full real-balance payment if amount_paid missing.
+                    const paidAmt = parseFloat(backup.amount_paid ?? backup.cost_per_player ?? 0);
+                    const freeAmt = Math.max(0, parseFloat(backup.cost_per_player || 0) - paidAmt);
 
                     const refundClient = await pool.connect();
                     try {
                         await refundClient.query('BEGIN');
 
                         if (!wasComped) {
-                            // Restore real balance charge
-                            if (refundAmt > 0) {
+                            // Restore real-balance portion
+                            if (paidAmt > 0) {
                                 await refundClient.query(
                                     'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                                    [refundAmt, refundTarget]
+                                    [paidAmt, refundTarget]
                                 );
                                 await recordCreditTransaction(
-                                    refundClient, refundTarget, refundAmt, 'refund',
-                                    `Confirmed backup unused — game ${gameId} completed without promotion`
+                                    refundClient, refundTarget, paidAmt, 'refund',
+                                    `Confirmed backup unused — real balance refund, game ${gameId}`
                                 );
                             }
-                            // Restore free credits consumed at signup
-                            if (freeUsed > 0) {
+                            // Restore free-credit portion back to FC pool
+                            if (freeAmt > 0) {
                                 await refundClient.query(
                                     'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                                    [freeUsed, refundTarget]
+                                    [freeAmt, refundTarget]
                                 );
                                 await recordCreditTransaction(
-                                    refundClient, refundTarget, freeUsed, 'free_credit',
-                                    `Free credit restored — confirmed backup unused for game ${gameId}`
+                                    refundClient, refundTarget, freeAmt, 'free_credit',
+                                    `Confirmed backup unused — free credit restored, game ${gameId}`
                                 );
                             }
                         }
 
-                        const totalRestored = refundAmt + freeUsed;
+                        const totalRestored = wasComped ? 0 : paidAmt + freeAmt;
                         const notifMsg = wasComped
                             ? `The game has now ended. You were on the confirmed backup list but weren't needed — no charge was made.`
                             : totalRestored > 0
-                                ? `The game has now ended. You were on the confirmed backup list but weren't needed — £${refundAmt.toFixed(2)} refunded${freeUsed > 0 ? ` and £${freeUsed.toFixed(2)} free credit restored` : ''} to your balance.`
+                                ? `The game has now ended. You were on the confirmed backup list but weren't needed — £${totalRestored.toFixed(2)} refunded to your balance.`
                                 : `The game has now ended. You were on the confirmed backup list but weren't needed — no charge was made.`;
 
                         await refundClient.query(
@@ -7766,10 +7838,10 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                         await refundClient.query('COMMIT');
 
                         await auditLog(pool, null, 'confirmed_backup_refund', backup.player_id,
-                            `Game ${gameId} completed — ${wasComped ? 'comped, no charge' : `refunded £${refundAmt.toFixed(2)}`}`
+                            `Game ${gameId} completed — ${wasComped ? 'comped, no charge' : `refunded £${totalRestored.toFixed(2)}`}`
                         ).catch(() => {});
 
-                        console.log(`✅ FIX-099: Confirmed backup refund — player ${backup.player_id} ${wasComped ? '(comped, no charge)' : `refunded £${refundAmt.toFixed(2)}`} for game ${gameId}`);
+                        console.log(`✅ FIX-099: Confirmed backup refund — player ${backup.player_id} ${wasComped ? '(comped, no charge)' : `refunded £${totalRestored.toFixed(2)}`} for game ${gameId}`);
 
                     } catch (e) {
                         await refundClient.query('ROLLBACK').catch(() => {});
