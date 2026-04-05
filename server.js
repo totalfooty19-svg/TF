@@ -5756,12 +5756,12 @@ app.put('/api/admin/games/:gameId/player/:playerId/preferences', authenticateTok
         const { gameId, playerId } = req.params;
         const { positions, pairs, avoids, fixed_team } = req.body;
 
-        // Find the registration
+        // Find the registration — accept confirmed and backup players
         const regResult = await client.query(
             `SELECT r.id, g.team_selection_type, g.series_id, g.teams_generated
              FROM registrations r
              JOIN games g ON g.id = r.game_id
-             WHERE r.game_id = $1 AND r.player_id = $2 AND r.status = 'confirmed'`,
+             WHERE r.game_id = $1 AND r.player_id = $2 AND r.status IN ('confirmed', 'backup')`,
             [gameId, playerId]
         );
         if (!regResult.rows.length) return res.status(404).json({ error: 'Registration not found' });
@@ -9150,9 +9150,15 @@ app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireCLMAdmin, 
 app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
-        
+
+        const gameInfo = await pool.query(
+            'SELECT team_selection_type, series_id FROM games WHERE id = $1', [gameId]
+        );
+        const isDraftMemory = gameInfo.rows[0]?.team_selection_type === 'draft_memory' && gameInfo.rows[0]?.series_id;
+        const seriesId = isDraftMemory ? gameInfo.rows[0].series_id : null;
+
         const result = await pool.query(`
-            SELECT 
+            SELECT
                 r.id as registration_id,
                 p.id as player_id,
                 p.full_name,
@@ -9162,12 +9168,22 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
                 p.goalkeeper_rating,
                 r.status,
                 r.position_preference,
-                r.tournament_team_preference
+                r.tournament_team_preference,
+                ${isDraftMemory ? 'pft.fixed_team,' : 'NULL::text AS fixed_team,'}
+                array_agg(DISTINCT rp_pair.target_player_id)  FILTER (WHERE rp_pair.preference_type  = 'pair')  AS pairs,
+                array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') AS avoids
             FROM registrations r
             JOIN players p ON p.id = r.player_id
+            ${isDraftMemory ? 'LEFT JOIN player_fixed_teams pft ON pft.player_id = p.id AND pft.series_id = $2' : ''}
+            LEFT JOIN registration_preferences rp_pair  ON rp_pair.registration_id  = r.id AND rp_pair.preference_type  = 'pair'
+            LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1
+            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number,
+                     p.overall_rating, p.goalkeeper_rating, r.status,
+                     r.position_preference, r.tournament_team_preference
+                     ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY p.squad_number ASC NULLS LAST
-        `, [gameId]);
+        `, isDraftMemory ? [gameId, seriesId] : [gameId]);
         
         // Also fetch guests for this game
         const guestsResult = await pool.query(
