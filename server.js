@@ -2520,7 +2520,15 @@ async (req, res) => {
 app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper } = req.body;
-        
+
+        // Capture before state for audit diff
+        const beforeRow = await pool.query(
+            `SELECT overall_rating, defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating, goalkeeper_rating
+             FROM players WHERE id = $1`, [req.params.id]
+        );
+        const b = beforeRow.rows[0] || {};
+
         await pool.query(
             `UPDATE players SET 
              overall_rating = $1, defending_rating = $2, strength_rating = $3,
@@ -2530,14 +2538,25 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, as
              WHERE id = $10`,
             [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, req.params.id]
         );
-        
+
         res.json({ message: 'Stats updated' });
 
         setImmediate(async () => {
             await statHistory(pool, req.params.id, req.user.playerId,
                 { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper });
-            await auditLog(pool, req.user.playerId, 'stats_updated', req.params.id,
-                `OVR:${overall} DEF:${defending} STR:${strength} FIT:${fitness} PAC:${pace} DEC:${decisions} AST:${assisting} SHT:${shooting} GK:${goalkeeper}`);
+            // Include before→after in detail so player audit can render the diff
+            const detail = [
+                `OVR:${b.overall_rating ?? '?'}→${overall}`,
+                `DEF:${b.defending_rating ?? '?'}→${defending}`,
+                `STR:${b.strength_rating ?? '?'}→${strength}`,
+                `FIT:${b.fitness_rating ?? '?'}→${fitness}`,
+                `PAC:${b.pace_rating ?? '?'}→${pace}`,
+                `DEC:${b.decisions_rating ?? '?'}→${decisions}`,
+                `AST:${b.assisting_rating ?? '?'}→${assisting}`,
+                `SHT:${b.shooting_rating ?? '?'}→${shooting}`,
+                `GK:${b.goalkeeper_rating ?? '?'}→${goalkeeper}`,
+            ].join(' ');
+            await auditLog(pool, req.user.playerId, 'stats_updated', req.params.id, detail);
         });
     } catch (error) {
         console.error('Update stats error:', error);
@@ -3189,7 +3208,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const hasMisfitsBadge = misfitsBadgeResult.rows.length > 0;
         
         // Tier-based visibility (exact requirements)
-        let hoursAhead = 72; // silver default (72 hours = 3 days)
+        let hoursAhead = 168; // silver default (168 hours = 7 days)
         if (tier === 'gold') hoursAhead = 28 * 24; // 28 days
         if (tier === 'bronze') hoursAhead = 24; // 24 hours
         if (tier === 'white' || tier === 'black') hoursAhead = 0; // banned - no games visible
@@ -4771,7 +4790,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
 
         // Tier timing window — apply the FRIEND's tier, as if they registered themselves
         const friendTier = friend.reliability_tier || 'silver';
-        let hoursAhead = 72;
+        let hoursAhead = 168; // silver (7 days)
         if (friendTier === 'gold') hoursAhead = 28 * 24;
         if (friendTier === 'bronze') hoursAhead = 24;
 
@@ -5725,6 +5744,89 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         await client.query('ROLLBACK').catch(() => {});
         console.error('Drop out error:', error);
         res.status(500).json({ error: 'Failed to drop out' });
+    } finally {
+        client.release();
+    }
+});
+
+// PUT /api/admin/games/:gameId/player/:playerId/preferences — admin edits any player's prefs
+app.put('/api/admin/games/:gameId/player/:playerId/preferences', authenticateToken, requireGameManager, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { gameId, playerId } = req.params;
+        const { positions, pairs, avoids, fixed_team } = req.body;
+
+        // Find the registration
+        const regResult = await client.query(
+            `SELECT r.id, g.team_selection_type, g.series_id, g.teams_generated
+             FROM registrations r
+             JOIN games g ON g.id = r.game_id
+             WHERE r.game_id = $1 AND r.player_id = $2 AND r.status = 'confirmed'`,
+            [gameId, playerId]
+        );
+        if (!regResult.rows.length) return res.status(404).json({ error: 'Registration not found' });
+        const reg = regResult.rows[0];
+        const registrationId = reg.id;
+
+        await client.query('BEGIN');
+
+        // Update position preference
+        if (positions !== undefined) {
+            await client.query(
+                'UPDATE registrations SET position_preference = $1 WHERE id = $2',
+                [positions || null, registrationId]
+            );
+        }
+
+        // Update pair/avoid preferences
+        if (pairs !== undefined || avoids !== undefined) {
+            await client.query('DELETE FROM registration_preferences WHERE registration_id = $1', [registrationId]);
+            const safePairs  = Array.isArray(pairs)  ? pairs.filter(id => id !== playerId)  : [];
+            const safeAvoids = Array.isArray(avoids) ? avoids.filter(id => id !== playerId) : [];
+            for (const id of safePairs) {
+                await client.query(
+                    `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
+                     VALUES ($1, $2, 'pair') ON CONFLICT DO NOTHING`,
+                    [registrationId, id]
+                );
+            }
+            for (const id of safeAvoids) {
+                await client.query(
+                    `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type)
+                     VALUES ($1, $2, 'avoid') ON CONFLICT DO NOTHING`,
+                    [registrationId, id]
+                );
+            }
+        }
+
+        // Update fixed_team (draft_memory only)
+        if (fixed_team !== undefined && reg.team_selection_type === 'draft_memory' && reg.series_id) {
+            if (fixed_team === 'red' || fixed_team === 'blue') {
+                await client.query(
+                    `INSERT INTO player_fixed_teams (player_id, series_id, fixed_team)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (player_id, series_id) DO UPDATE SET fixed_team = $3`,
+                    [playerId, reg.series_id, fixed_team]
+                );
+            } else {
+                await client.query(
+                    'DELETE FROM player_fixed_teams WHERE player_id = $1 AND series_id = $2',
+                    [playerId, reg.series_id]
+                );
+            }
+        }
+
+        await client.query('COMMIT');
+
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'preferences_updated',
+            `Admin updated prefs for player ${playerId}: pos=${positions ?? 'unchanged'} pairs=${(pairs||[]).length} avoids=${(avoids||[]).length}${fixed_team !== undefined ? ' team=' + fixed_team : ''}`
+        ).catch(() => {}));
+
+        res.json({ ok: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Admin update player prefs error:', e.message);
+        res.status(500).json({ error: 'Failed to update preferences' });
     } finally {
         client.release();
     }
@@ -7497,6 +7599,23 @@ app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameM
     const clamp = (v, min, max) => Math.max(min, Math.min(max, Math.round(v)));
     const errors = [];
 
+    // STAT-AUDIT: Capture current stats BEFORE updating so we can store the diff
+    const validIds = playerStats
+        .filter(r => r.playerId && !String(r.playerId).startsWith('guest_') && confirmedSet.has(r.playerId))
+        .map(r => r.playerId);
+    const beforeMap = {};
+    if (validIds.length > 0) {
+        const beforeRes = await pool.query(
+            `SELECT id, overall_rating, goalkeeper_rating, defending_rating, strength_rating,
+                    fitness_rating, pace_rating, decisions_rating, assisting_rating, shooting_rating
+             FROM players WHERE id = ANY($1)`,
+            [validIds]
+        );
+        for (const r of beforeRes.rows) beforeMap[r.id] = r;
+    }
+
+    const statChanges = [];
+
     for (const row of playerStats) {
         // Skip guests (player_id starts with 'guest_')
         if (!row.playerId || String(row.playerId).startsWith('guest_')) continue;
@@ -7529,6 +7648,47 @@ app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameM
              WHERE id = $10`,
             [gk, def, str, fit, pac, dec, ass, sho, ovr, row.playerId]
         );
+
+        const b = beforeMap[row.playerId] || {};
+        statChanges.push({
+            playerId: row.playerId,
+            oldOverall: b.overall_rating    ?? null, newOverall: ovr,
+            oldGk:      b.goalkeeper_rating ?? null, newGk:      gk,
+            oldDef:     b.defending_rating  ?? null, newDef:     def,
+            oldStr:     b.strength_rating   ?? null, newStr:     str,
+            oldFit:     b.fitness_rating    ?? null, newFit:     fit,
+            oldPac:     b.pace_rating       ?? null, newPac:     pac,
+            oldDec:     b.decisions_rating  ?? null, newDec:     dec,
+            oldAss:     b.assisting_rating  ?? null, newAss:     ass,
+            oldSho:     b.shooting_rating   ?? null, newSho:     sho,
+        });
+    }
+
+    // STAT-AUDIT: Upsert into game_stat_changes.
+    // ON CONFLICT preserves old_* from first run (original baseline); updates new_* to latest values.
+    if (statChanges.length > 0) {
+        for (const c of statChanges) {
+            await pool.query(
+                `INSERT INTO game_stat_changes
+                    (game_id, player_id, changed_by,
+                     old_overall, new_overall, old_gk, new_gk,
+                     old_def, new_def, old_str, new_str, old_fit, new_fit,
+                     old_pac, new_pac, old_dec, new_dec, old_ass, new_ass, old_sho, new_sho)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                 ON CONFLICT (game_id, player_id) DO UPDATE SET
+                     changed_by  = EXCLUDED.changed_by,
+                     new_overall = EXCLUDED.new_overall, new_gk  = EXCLUDED.new_gk,
+                     new_def     = EXCLUDED.new_def,     new_str = EXCLUDED.new_str,
+                     new_fit     = EXCLUDED.new_fit,     new_pac = EXCLUDED.new_pac,
+                     new_dec     = EXCLUDED.new_dec,     new_ass = EXCLUDED.new_ass,
+                     new_sho     = EXCLUDED.new_sho,     created_at = NOW()`,
+                [gameId, c.playerId, req.user.playerId,
+                 c.oldOverall, c.newOverall, c.oldGk, c.newGk,
+                 c.oldDef, c.newDef, c.oldStr, c.newStr, c.oldFit, c.newFit,
+                 c.oldPac, c.newPac, c.oldDec, c.newDec, c.oldAss, c.newAss,
+                 c.oldSho, c.newSho]
+            ).catch(e => console.warn('game_stat_changes upsert failed (non-critical):', e.message));
+        }
     }
 
     if (errors.length > 0) {
@@ -9527,7 +9687,8 @@ async function finaliseRefereeReviews(gameId) {
 const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler','donkey','goalscorer','hattrick'];
 const POSITIVE_AWARDS = ['motm','best_engine','brick_wall','goalscorer','hattrick'];
 const BANTER_AWARDS   = ['reckless_tackler','mr_hollywood','the_moaner','howler','donkey'];
-const MIN_VOTES_REQUIRED = 3; // all awards except MOTM
+const MIN_VOTES_REQUIRED = 3; // default for all awards except MOTM
+const AWARD_MIN_VOTES = { goalscorer: 2 }; // per-award overrides
 
 // Send email to a player for an award win — fire-and-forget, never throws
 async function sendAwardEmail(playerId, awardType, extraData = {}) {
@@ -9667,7 +9828,8 @@ async function closeAwards(gameId) {
             if (nominees.length === 0) continue;
 
             const maxVotes = nominees[0].votes;
-            if (awardType !== 'motm' && maxVotes < MIN_VOTES_REQUIRED) continue;
+            const minVotes = AWARD_MIN_VOTES[awardType] ?? MIN_VOTES_REQUIRED;
+            if (awardType !== 'motm' && maxVotes < minVotes) continue;
 
             const winners = nominees.filter(n => n.votes === maxVotes);
 
@@ -11921,6 +12083,28 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             ORDER BY COALESCE(gav.created_at, g.game_date) DESC
         `, [id]);
 
+        // 10. Game-linked stat changes for this player (from bulk post-game/wizard updates)
+        const gameStatChanges = await pool.query(`
+            SELECT gsc.created_at, gsc.game_id,
+                   gsc.old_overall, gsc.new_overall,
+                   gsc.old_gk,  gsc.new_gk,
+                   gsc.old_def, gsc.new_def,
+                   gsc.old_str, gsc.new_str,
+                   gsc.old_fit, gsc.new_fit,
+                   gsc.old_pac, gsc.new_pac,
+                   gsc.old_dec, gsc.new_dec,
+                   gsc.old_ass, gsc.new_ass,
+                   gsc.old_sho, gsc.new_sho,
+                   g.game_date, g.game_url, v.name AS venue_name,
+                   cb.alias AS changed_by_alias, cb.full_name AS changed_by_name
+            FROM game_stat_changes gsc
+            JOIN games g ON g.id = gsc.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN players cb ON cb.id = gsc.changed_by
+            WHERE gsc.player_id = $1
+            ORDER BY gsc.created_at DESC
+        `, [id]).catch(() => ({ rows: [] }));
+
         res.json({
             balance: balance.rows,
             stats: stats.rows,
@@ -11932,7 +12116,8 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             awardVotesReceived: awardVotesReceived.rows,
             adminActions: adminActions.rows,
             loginEvents: loginEvents.rows,
-            disciplineRecords: disciplineRecords.rows
+            disciplineRecords: disciplineRecords.rows,
+            gameStatChanges: gameStatChanges.rows
         });
     } catch (error) {
         console.error('Player audit error:', error);
@@ -12013,12 +12198,34 @@ app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req
             ORDER BY gav.award_type ASC, COALESCE(gav.created_at, g.game_date) ASC
         `, [id]).catch(() => ({ rows: [] }));
 
+        // 6. Stat changes — per-player before/after from game_stat_changes table
+        const statChanges = await pool.query(`
+            SELECT gsc.player_id, gsc.created_at,
+                   gsc.old_overall, gsc.new_overall,
+                   gsc.old_gk,  gsc.new_gk,
+                   gsc.old_def, gsc.new_def,
+                   gsc.old_str, gsc.new_str,
+                   gsc.old_fit, gsc.new_fit,
+                   gsc.old_pac, gsc.new_pac,
+                   gsc.old_dec, gsc.new_dec,
+                   gsc.old_ass, gsc.new_ass,
+                   gsc.old_sho, gsc.new_sho,
+                   p.alias, p.full_name, p.squad_number,
+                   cb.alias AS changed_by_alias, cb.full_name AS changed_by_name
+            FROM game_stat_changes gsc
+            JOIN players p ON p.id = gsc.player_id
+            LEFT JOIN players cb ON cb.id = gsc.changed_by
+            WHERE gsc.game_id = $1
+            ORDER BY COALESCE(p.alias, p.full_name)
+        `, [id]).catch(() => ({ rows: [] })); // graceful if table not yet migrated
+
         res.json({
             gameLogs: gameLogs.rows,
             registrationEvents: regEvents.rows,
             currentRegistrations: currentRegs.rows,
             urlViews: urlViews.rows,
-            awardVotes: awardVotes.rows
+            awardVotes: awardVotes.rows,
+            statChanges: statChanges.rows
         });
     } catch (error) {
         console.error('Game audit error:', error);
