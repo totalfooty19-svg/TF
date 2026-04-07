@@ -208,12 +208,22 @@ function addWeeksLondon(isoDateStr, weeks) {
 }
 async function auditLog(pool, adminId, action, targetId, detail = '') {
     try {
-        await pool.query(
-            `INSERT INTO audit_logs (admin_id, action, target_id, detail, created_at)
-             VALUES ($1, $2, $3, $4, NOW())
-             ON CONFLICT DO NOTHING`,
-            [adminId, action, targetId, detail]
-        );
+        if (adminId) {
+            await pool.query(
+                `INSERT INTO audit_logs (admin_id, action, target_id, detail, created_at)
+                 VALUES ($1, $2, $3, $4, NOW())
+                 ON CONFLICT DO NOTHING`,
+                [adminId, action, targetId, detail]
+            );
+        } else {
+            // System-generated action — omit admin_id to avoid FK violation
+            await pool.query(
+                `INSERT INTO audit_logs (action, target_id, detail, created_at)
+                 VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT DO NOTHING`,
+                [action, targetId, detail]
+            );
+        }
     } catch (e) {
         console.warn('audit_log insert failed (non-critical):', e.message);
     }
@@ -1634,12 +1644,10 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                        AND LOWER(g2.winning_team) = LOWER(t2.team_name))::int AS tournament_wins,
                     (SELECT COUNT(*) FROM registrations r3
                      JOIN games g3 ON g3.id = r3.game_id
-                     JOIN team_players tp3 ON tp3.player_id = r3.player_id
-                     JOIN teams t3 ON t3.id = tp3.team_id AND t3.game_id = g3.id
                      WHERE r3.player_id = p.id AND r3.status = 'confirmed'
                        AND g3.game_status = 'completed'
                        AND g3.team_selection_type = 'vs_external'
-                       AND LOWER(g3.winning_team) = LOWER(t3.team_name))::int AS external_game_wins
+                       AND g3.winning_team = 'red')::int AS external_game_wins
                 FROM players p
                 LEFT JOIN credits c ON c.player_id = p.id
                 LEFT JOIN users u ON u.id = p.user_id
@@ -1715,13 +1723,14 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                     COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_date >= NOW() - INTERVAL '3 months') AS wins_3m,
                     COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_date >= DATE_TRUNC('year', NOW()))   AS wins_year,
                     COUNT(DISTINCT r.game_id) FILTER (WHERE g.team_selection_type = 'tournament') AS tournament_wins,
-                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.team_selection_type = 'vs_external') AS external_game_wins
+                    0 AS external_game_wins
                 FROM registrations r
                 JOIN games g ON g.id = r.game_id
                 JOIN team_players tp ON tp.player_id = r.player_id
                 JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                 WHERE r.status = 'confirmed' AND g.game_status = 'completed'
                   AND LOWER(g.winning_team) = LOWER(t.team_name)
+                  AND g.team_selection_type != 'vs_external'
                 GROUP BY r.player_id
             )
             SELECT 
@@ -2145,11 +2154,9 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
         const extResult = await pool.query(`
             SELECT COUNT(*) AS cnt FROM registrations r
             JOIN games g ON g.id = r.game_id
-            JOIN team_players tp ON tp.player_id = r.player_id
-            JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
             WHERE r.player_id = $1 AND r.status = 'confirmed'
               AND g.game_status = 'completed' AND g.team_selection_type = 'vs_external'
-              AND LOWER(g.winning_team) = LOWER(t.team_name)
+              AND g.winning_team = 'red'
         `, [player.id]);
 
         const tournament_wins   = parseInt(tourneyResult.rows[0].cnt) || 0;
@@ -4345,13 +4352,11 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         const playerId = req.user.playerId;
 
         if (!guestName || guestName.trim().length < 2) {
-            client.release();
             return res.status(400).json({ error: "Please provide the guest's name (at least 2 characters)" });
         }
 
         // FIX-080: Guest name max length
         if (guestName.trim().length > 50) {
-            client.release();
             return res.status(400).json({ error: 'Guest name must be 50 characters or fewer' });
         }
 
@@ -4540,12 +4545,10 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
         const isAdminRemovingGuest = req.user.role === 'admin' || req.user.role === 'superadmin';
         if (gameCheck.rows[0]?.player_editing_locked && !isAdminRemovingGuest) {
             await client.query('ROLLBACK');
-            client.release();
             return res.status(423).json({ error: 'Game is currently being edited by an admin.' });
         }
         if (gameCheck.rows[0]?.teams_generated) {
             await client.query('ROLLBACK');
-            client.release();
             return res.status(400).json({ error: 'Cannot remove guest - teams already generated.' });
         }
 
@@ -5034,27 +5037,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     }).catch(e => console.error('Friend registration email to friend failed (non-critical):', e.message));
                 }
 
-                // Email to registering player
-                if (regEmail) {
-                    await emailTransporter.sendMail({
-                        from: '"TotalFooty" <totalfooty19@gmail.com>',
-                        to: regEmail,
-                        subject: `✅ You signed up ${(friendName || '').replace(/[\r\n]/g, '')} — TotalFooty`,
-                        html: `<div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
-                            <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
-                            <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:20px;">FRIEND REGISTERED</h2>
-                            <p style="color:#888;font-size:14px;margin:0 0 20px;">You signed up <strong style="color:#fff;">${friendName}</strong> for a game.</p>
-                            <table style="width:100%;border-collapse:collapse;font-size:15px;color:#ccc;margin-bottom:20px;">
-                                <tr><td style="padding:6px 0;color:#888;width:80px;">Date</td><td style="font-weight:900;">${gameDate}</td></tr>
-                                <tr><td style="padding:6px 0;color:#888;">Venue</td><td style="font-weight:900;">${venue}</td></tr>
-                                <tr><td style="padding:6px 0;color:#888;">Status</td><td style="font-weight:900;color:${status === 'confirmed' ? '#00ff41' : '#FFA500'};">${status === 'confirmed' ? '✅ Confirmed' : '⏳ Backup'}</td></tr>
-                                ${status === 'confirmed' || regBackupType === 'confirmed_backup' ? `<tr><td style="padding:6px 0;color:#888;">Deducted</td><td style="font-weight:900;color:#ff3366;">-£${parseFloat(game.cost_per_player).toFixed(2)}</td></tr>` : ''}
-                            </table>
-                            <a href="${gameUrl}" style="display:inline-block;background:#fff;color:#000;padding:14px 28px;border-radius:4px;font-weight:bold;font-size:13px;letter-spacing:2px;text-decoration:none;">VIEW GAME</a>
-                            <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
-                        </div>`
-                    }).catch(e => console.error('Friend registration email to registering player failed (non-critical):', e.message));
-                }
+                // Email 3 (receipt to registering player) removed — unnecessary
 
                 // Audit: add-friend registration
                 try {
@@ -5731,27 +5714,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     _notifRows.push(['Guests removed', `${guestRefunded.count} (${guestRefunded.names})`]);
                 }
                 await notifyAdmin(`🚪 Drop Out — ${_pName}`, _notifRows);
-                // FIX: email confirmation to the player who dropped out
-                if (_pEmail) {
-                    const _refundLine = (!wasComped && (wasConfirmed || wasConfirmedBackup) && cost > 0)
-                        ? `<tr><td style="padding:6px 0;color:#888;width:140px;">Refund</td><td style="font-weight:700;color:#00ff41;">+£${cost.toFixed(2)} credit</td></tr>`
-                        : '';
-                    await emailTransporter.sendMail({
-                        from: '"TotalFooty" <totalfooty19@gmail.com>',
-                        to:   _pEmail,
-                        subject: `🚪 You've dropped out — TotalFooty`,
-                        html: wrapEmailHtml(
-                            `<p style="color:#888;font-size:14px;margin:0 0 16px;">You've been removed from the following game.</p>` +
-                            `<table style="width:100%;border-collapse:collapse;font-size:14px;">` +
-                            `<tr><td style="padding:6px 0;color:#888;width:140px;">Game</td><td style="font-weight:700;color:#fff;">${htmlEncode(gameData.day || 'TBC')}</td></tr>` +
-                            `<tr><td style="padding:6px 0;color:#888;">Time</td><td style="font-weight:700;color:#fff;">${htmlEncode(gameData.time || 'TBC')}</td></tr>` +
-                            `<tr><td style="padding:6px 0;color:#888;">Venue</td><td style="font-weight:700;color:#fff;">${htmlEncode(gameData.venue || 'TBC')}</td></tr>` +
-                            _refundLine +
-                            `</table>` +
-                            `<p style="color:#888;font-size:13px;margin-top:20px;">If this was a mistake, sign up again from the game page.</p>`
-                        ),
-                    }).catch(e => console.error('Dropout player email failed (non-critical):', e.message));
-                }
+                // Email 4 (drop out confirmation to player) removed — player knows they dropped out
             } catch (e) { /* non-critical */ }
             // DYNSTAR: review star rating on every confirmed dropout
             if (wasConfirmed) await reviewDynamicStarRating(pool, gameId);
@@ -6722,7 +6685,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -6780,9 +6743,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     requires_organiser = COALESCE($11, requires_organiser),
                     external_opponent = $13,
                     tf_kit_color  = COALESCE($14, tf_kit_color),
-                    opp_kit_color = COALESCE($15, opp_kit_color)
+                    opp_kit_color = COALESCE($15, opp_kit_color),
+                    position_type = COALESCE($16, position_type)
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null]);
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null, position_type || null]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -6798,9 +6762,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     requires_organiser = COALESCE($10, requires_organiser),
                     external_opponent = $11,
                     tf_kit_color  = COALESCE($12, tf_kit_color),
-                    opp_kit_color = COALESCE($13, opp_kit_color)
+                    opp_kit_color = COALESCE($13, opp_kit_color),
+                    position_type = COALESCE($14, position_type)
                 WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null]);
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null, position_type || null]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
@@ -8268,7 +8233,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                     JOIN players p ON p.id = tp.player_id
                     JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
-                    ORDER BY CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END, COALESCE(p.alias, p.full_name)
+                    ORDER BY CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    p.squad_number ASC NULLS LAST, p.motm_wins DESC NULLS LAST, p.total_appearances DESC NULLS LAST
                 `, [team.id, game.id]);
                 
                 // Include guests on this team
@@ -8342,24 +8308,30 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         // Get players for each team
         const [redTeamResult, blueTeamResult] = await Promise.all([
             pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
+                       p.motm_wins, p.total_appearances
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
                 JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                 WHERE tp.team_id = $1
-                ORDER BY 
-                    CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END,
-                    COALESCE(p.alias, p.full_name)
+                ORDER BY
+                    CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    p.squad_number ASC NULLS LAST,
+                    p.motm_wins DESC NULLS LAST,
+                    p.total_appearances DESC NULLS LAST
             `, [redTeamId, game.id]),
             pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
+                       p.motm_wins, p.total_appearances
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
                 JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                 WHERE tp.team_id = $1
-                ORDER BY 
-                    CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END,
-                    COALESCE(p.alias, p.full_name)
+                ORDER BY
+                    CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    p.squad_number ASC NULLS LAST,
+                    p.motm_wins DESC NULLS LAST,
+                    p.total_appearances DESC NULLS LAST
             `, [blueTeamId, game.id])
         ]);
         
@@ -10122,7 +10094,10 @@ async function regeneratePlayerBioForce(playerId, force = false) {
             }
             const awardsData = { counts, motmTotal: Math.round(motmTotal * 100) / 100, currentWinStreak: streakRes.rows[0]?.current_win_streak || 0 };
             const recentForm = formRes.rows.map(r => ({
-                won: r.winning_team && r.team_name && r.winning_team.toLowerCase() === r.team_name.toLowerCase(),
+                won: r.winning_team === 'draw' ? false
+                    : r.team_name
+                        ? r.winning_team && r.winning_team.toLowerCase() === r.team_name.toLowerCase()
+                        : r.winning_team === 'red', // no team_name = external game, red = TF wins
                 drew: r.winning_team === 'draw',
             }));
 
@@ -10186,8 +10161,10 @@ async function regeneratePlayerBio(playerId) {
         };
 
         const recentForm = formRes.rows.map(r => ({
-            won: r.winning_team && r.team_name &&
-                 r.winning_team.toLowerCase() === r.team_name.toLowerCase(),
+            won: r.winning_team === 'draw' ? false
+                : r.team_name
+                    ? r.winning_team && r.winning_team.toLowerCase() === r.team_name.toLowerCase()
+                    : r.winning_team === 'red', // no team_name = external game, red = TF wins
             drew: r.winning_team === 'draw',
         }));
 
@@ -11511,14 +11488,17 @@ app.get('/api/public/game/:gameUrl/tournament', async (req, res) => {
         const teams = {};
         for (const team of teamsResult.rows) {
             const playersResult = await pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
+                       p.motm_wins, p.total_appearances
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
                 JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                 WHERE tp.team_id = $1
-                ORDER BY 
-                    CASE WHEN r.position_preference = 'goalkeeper' THEN 0 ELSE 1 END,
-                    COALESCE(p.alias, p.full_name)
+                ORDER BY
+                    CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    p.squad_number ASC NULLS LAST,
+                    p.motm_wins DESC NULLS LAST,
+                    p.total_appearances DESC NULLS LAST
             `, [team.id, game.id]);
             
             // Include guests
@@ -16945,12 +16925,12 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
     // Reusable appearances CTE (confirmed players in completed games)
     const appearancesCte = `
         app_counts AS (
-            SELECT r.player_id, p.display_name, COUNT(*) AS appearances
+            SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, COUNT(*) AS appearances
             FROM registrations r
             JOIN players p ON p.id = r.player_id
             JOIN games g ON g.id = r.game_id
             WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
-            GROUP BY r.player_id, p.display_name
+            GROUP BY r.player_id, COALESCE(p.alias, p.full_name)
         )`;
 
     // ── METRIC 5: Appearances ──────────────────────────────────────────────
@@ -16958,16 +16938,16 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         if (calcType === 'most_consecutive') {
             const r = await pool.query(`
                 WITH player_games AS (
-                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date
+                    SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, g.id AS game_id, g.game_date
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     JOIN games g ON g.id = r.game_id
                     WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
                 ),
-                all_players AS (SELECT DISTINCT player_id, display_name FROM player_games),
+                all_players AS (SELECT DISTINCT player_id, player_name FROM player_games),
                 all_games   AS (SELECT id AS game_id, game_date FROM games WHERE series_id = $1 AND game_status = 'completed'),
                 attendance  AS (
-                    SELECT ag.game_id, ag.game_date, ap.player_id, ap.display_name,
+                    SELECT ag.game_id, ag.game_date, ap.player_id, ap.player_name,
                            CASE WHEN pg.player_id IS NOT NULL THEN 1 ELSE 0 END AS attended
                     FROM all_games ag CROSS JOIN all_players ap
                     LEFT JOIN player_games pg ON pg.player_id = ap.player_id AND pg.game_id = ag.game_id
@@ -16979,14 +16959,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     FROM attendance
                 ),
                 max_str AS (
-                    SELECT player_id, display_name,
+                    SELECT player_id, player_name,
                            MAX(CASE WHEN attended = 1 THEN cnt ELSE 0 END) AS primary_stat
-                    FROM (SELECT player_id, display_name, attended, g, COUNT(*) AS cnt FROM grp
-                          GROUP BY player_id, display_name, attended, g) s
-                    GROUP BY player_id, display_name
+                    FROM (SELECT player_id, player_name, attended, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, player_name, attended, g) s
+                    GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
                 FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
                 WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
@@ -16995,7 +16975,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         const dir = calcType === 'least' ? 'ASC' : 'DESC';
         const r = await pool.query(`
             WITH ${appearancesCte}
-            SELECT player_id, display_name, appearances, appearances AS primary_stat, NULL::numeric AS supporting_stat
+            SELECT player_id, player_name, appearances, appearances AS primary_stat, NULL::numeric AS supporting_stat
             FROM app_counts ORDER BY appearances ${dir} LIMIT 10`, [seriesId]);
         return r.rows;
     }
@@ -17008,7 +16988,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         if (calcType === 'most_consecutive') {
             const r = await pool.query(`
                 WITH pgr AS (
-                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                    SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, g.id AS game_id, g.game_date,
                            CASE WHEN LOWER(t.team_name) = LOWER(g.winning_team) THEN 1 ELSE 0 END AS won
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
@@ -17025,14 +17005,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     FROM pgr
                 ),
                 max_str AS (
-                    SELECT player_id, display_name,
+                    SELECT player_id, player_name,
                            MAX(CASE WHEN won = 1 THEN cnt ELSE 0 END) AS primary_stat
-                    FROM (SELECT player_id, display_name, won, g, COUNT(*) AS cnt FROM grp
-                          GROUP BY player_id, display_name, won, g) s
-                    GROUP BY player_id, display_name
+                    FROM (SELECT player_id, player_name, won, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, player_name, won, g) s
+                    GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
                 FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
                 WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
@@ -17054,7 +17034,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                 ${typeFilter}
                 GROUP BY r.player_id
             )
-            SELECT ac.player_id, ac.display_name, ac.appearances,
+            SELECT ac.player_id, ac.player_name, ac.appearances,
                    CASE WHEN ${id === 1 ? 'TRUE' : 'FALSE'}
                         THEN ROUND(COALESCE(pw.win_count,0)*100.0/NULLIF(ac.appearances,0),1)
                         ELSE COALESCE(pw.win_count,0)::numeric END AS primary_stat,
@@ -17071,7 +17051,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         if (calcType === 'most_consecutive') {
             const r = await pool.query(`
                 WITH pgm AS (
-                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                    SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, g.id AS game_id, g.game_date,
                            CASE WHEN ga.recipient_player_id IS NOT NULL THEN 1 ELSE 0 END AS got_motm
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
@@ -17087,14 +17067,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     FROM pgm
                 ),
                 max_str AS (
-                    SELECT player_id, display_name,
+                    SELECT player_id, player_name,
                            MAX(CASE WHEN got_motm = 1 THEN cnt ELSE 0 END) AS primary_stat
-                    FROM (SELECT player_id, display_name, got_motm, g, COUNT(*) AS cnt FROM grp
-                          GROUP BY player_id, display_name, got_motm, g) s
-                    GROUP BY player_id, display_name
+                    FROM (SELECT player_id, player_name, got_motm, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, player_name, got_motm, g) s
+                    GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
                 FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
                 WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
@@ -17110,7 +17090,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                 WHERE g.series_id = $1 AND g.game_status = 'completed' AND ga.award_type = 'motm'
                 GROUP BY ga.recipient_player_id
             )
-            SELECT ac.player_id, ac.display_name, ac.appearances,
+            SELECT ac.player_id, ac.player_name, ac.appearances,
                    CASE WHEN ${id === 2 ? 'TRUE' : 'FALSE'}
                         THEN COALESCE(pm.motm_count,0)::numeric
                         ELSE ROUND(COALESCE(pm.motm_count,0)*100.0/NULLIF(ac.appearances,0),1) END AS primary_stat,
@@ -17129,7 +17109,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         if (calcType === 'most_consecutive') {
             const r = await pool.query(`
                 WITH pga AS (
-                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                    SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, g.id AS game_id, g.game_date,
                            CASE WHEN ga.recipient_player_id IS NOT NULL THEN 1 ELSE 0 END AS got_award
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
@@ -17145,14 +17125,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     FROM pga
                 ),
                 max_str AS (
-                    SELECT player_id, display_name,
+                    SELECT player_id, player_name,
                            MAX(CASE WHEN got_award = 1 THEN cnt ELSE 0 END) AS primary_stat
-                    FROM (SELECT player_id, display_name, got_award, g, COUNT(*) AS cnt FROM grp
-                          GROUP BY player_id, display_name, got_award, g) s
-                    GROUP BY player_id, display_name
+                    FROM (SELECT player_id, player_name, got_award, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, player_name, got_award, g) s
+                    GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
                 FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
                 WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`,
@@ -17171,7 +17151,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                 WHERE g.series_id = $1 AND g.game_status = 'completed' AND ga.award_type = $2
                 GROUP BY ga.recipient_player_id
             )
-            SELECT ac.player_id, ac.display_name, ac.appearances,
+            SELECT ac.player_id, ac.player_name, ac.appearances,
                    CASE WHEN ${usePct}
                         THEN ROUND(COALESCE(pa.award_count,0)*100.0/NULLIF(ac.appearances,0),1)
                         ELSE COALESCE(pa.award_count,0)::numeric END AS primary_stat,
@@ -17189,7 +17169,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         if (calcType === 'most_consecutive') {
             const r = await pool.query(`
                 WITH apg AS (
-                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                    SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, g.id AS game_id, g.game_date,
                            CASE WHEN r.status = 'dropped_out' THEN 1 ELSE 0 END AS dropped
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
@@ -17204,14 +17184,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     FROM apg
                 ),
                 max_str AS (
-                    SELECT player_id, display_name,
+                    SELECT player_id, player_name,
                            MAX(CASE WHEN dropped = 1 THEN cnt ELSE 0 END) AS primary_stat
-                    FROM (SELECT player_id, display_name, dropped, g, COUNT(*) AS cnt FROM grp
-                          GROUP BY player_id, display_name, dropped, g) s
-                    GROUP BY player_id, display_name
+                    FROM (SELECT player_id, player_name, dropped, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, player_name, dropped, g) s
+                    GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
                 FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
                 WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
@@ -17222,7 +17202,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         // Dropout % = dropout_count / total_signups so the rate is meaningful.
         const r = await pool.query(`
             WITH signup_counts AS (
-                SELECT r.player_id, p.display_name,
+                SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name,
                        COUNT(*) AS appearances,
                        COUNT(*) FILTER (WHERE r.status = 'dropped_out') AS dropout_count
                 FROM registrations r
@@ -17230,9 +17210,9 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                 JOIN games g ON g.id = r.game_id
                 WHERE g.series_id = $1 AND g.game_status = 'completed'
                 AND r.status IN ('confirmed','dropped_out')
-                GROUP BY r.player_id, p.display_name
+                GROUP BY r.player_id, COALESCE(p.alias, p.full_name)
             )
-            SELECT player_id, display_name, appearances,
+            SELECT player_id, player_name, appearances,
                    CASE WHEN ${usePct}
                         THEN ROUND(dropout_count*100.0/NULLIF(appearances,0),1)
                         ELSE dropout_count::numeric END AS primary_stat,
@@ -17256,14 +17236,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     AND r.registered_by_player_id IS NOT NULL AND r.registered_by_player_id != r.player_id
                 ),
                 apsg AS (
-                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date
+                    SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, g.id AS game_id, g.game_date
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     JOIN games g ON g.id = r.game_id
                     WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
                 ),
                 pghg AS (
-                    SELECT apsg.player_id, apsg.display_name, apsg.game_id, apsg.game_date,
+                    SELECT apsg.player_id, apsg.player_name, apsg.game_id, apsg.game_date,
                            CASE WHEN pgg.game_id IS NOT NULL THEN 1 ELSE 0 END AS signed_guest
                     FROM apsg LEFT JOIN pgg ON pgg.player_id = apsg.player_id AND pgg.game_id = apsg.game_id
                 ),
@@ -17274,14 +17254,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     FROM pghg
                 ),
                 max_str AS (
-                    SELECT player_id, display_name,
+                    SELECT player_id, player_name,
                            MAX(CASE WHEN signed_guest = 1 THEN cnt ELSE 0 END) AS primary_stat
-                    FROM (SELECT player_id, display_name, signed_guest, g, COUNT(*) AS cnt FROM grp
-                          GROUP BY player_id, display_name, signed_guest, g) s
-                    GROUP BY player_id, display_name
+                    FROM (SELECT player_id, player_name, signed_guest, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, player_name, signed_guest, g) s
+                    GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
                 FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
                 WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
@@ -17297,7 +17277,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                 AND r.registered_by_player_id IS NOT NULL AND r.registered_by_player_id != r.player_id
                 GROUP BY r.registered_by_player_id
             )
-            SELECT ac.player_id, ac.display_name, ac.appearances,
+            SELECT ac.player_id, ac.player_name, ac.appearances,
                    CASE WHEN ${usePct}
                         THEN ROUND(COALESCE(gs.signup_count,0)*1.0/NULLIF(ac.appearances,0),2)
                         ELSE COALESCE(gs.signup_count,0)::numeric END AS primary_stat,
@@ -17314,14 +17294,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         if (calcType === 'most_consecutive') {
             const r = await pool.query(`
                 WITH pgd AS (
-                    SELECT r.player_id, p.display_name, g.id AS game_id, g.game_date,
+                    SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, g.id AS game_id, g.game_date,
                            CASE WHEN COALESCE(SUM(dr.points),0) > 0 THEN 1 ELSE 0 END AS got_disc
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     JOIN games g ON g.id = r.game_id
                     LEFT JOIN discipline_records dr ON dr.player_id = r.player_id AND dr.game_id = g.id
                     WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
-                    GROUP BY r.player_id, p.display_name, g.id, g.game_date
+                    GROUP BY r.player_id, COALESCE(p.alias, p.full_name), g.id, g.game_date
                 ),
                 grp AS (
                     SELECT *,
@@ -17330,14 +17310,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     FROM pgd
                 ),
                 max_str AS (
-                    SELECT player_id, display_name,
+                    SELECT player_id, player_name,
                            MAX(CASE WHEN got_disc = 1 THEN cnt ELSE 0 END) AS primary_stat
-                    FROM (SELECT player_id, display_name, got_disc, g, COUNT(*) AS cnt FROM grp
-                          GROUP BY player_id, display_name, got_disc, g) s
-                    GROUP BY player_id, display_name
+                    FROM (SELECT player_id, player_name, got_disc, g, COUNT(*) AS cnt FROM grp
+                          GROUP BY player_id, player_name, got_disc, g) s
+                    GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.display_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
                 FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
                 WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
@@ -17352,7 +17332,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                 WHERE g.series_id = $1 AND g.game_status = 'completed'
                 GROUP BY dr.player_id
             )
-            SELECT ac.player_id, ac.display_name, ac.appearances,
+            SELECT ac.player_id, ac.player_name, ac.appearances,
                    CASE WHEN ${usePct}
                         THEN ROUND(COALESCE(pdisc.disc_total,0)*1.0/NULLIF(ac.appearances,0),2)
                         ELSE COALESCE(pdisc.disc_total,0)::numeric END AS primary_stat,
