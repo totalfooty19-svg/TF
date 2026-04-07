@@ -853,6 +853,16 @@ const topupLimiter = rateLimit({
     legacyHeaders: false,
 });
 
+// Rate limit Wonderful payment initiation — max 5 per player per 10 minutes
+const wonderfulInitiateLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 5,
+    message: { error: 'Too many payment requests. Please wait a few minutes.' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
 // Rate limit game chat — prevents flood/spam (20 messages per minute per player)
 const gameChatLimiter = rateLimit({
     windowMs: 60 * 1000,
@@ -890,7 +900,9 @@ if (!JWT_SECRET) {
 // FIX-034: Superadmin email from env var — never hardcoded in source
 const SUPERADMIN_EMAIL = process.env.SUPERADMIN_EMAIL;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-if (!SUPERADMIN_EMAIL) console.warn('WARNING: SUPERADMIN_EMAIL not set — auto-assign disabled');
+const WONDERFUL_API_KEY = process.env.WONDERFUL_API_KEY; // Wonderful open-banking payments
+if (!SUPERADMIN_EMAIL)    console.warn('WARNING: SUPERADMIN_EMAIL not set — auto-assign disabled');
+if (!WONDERFUL_API_KEY)   console.warn('WARNING: WONDERFUL_API_KEY not set — Wonderful payments disabled');
 
 // ==========================================
 // MIDDLEWARE
@@ -1725,6 +1737,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 COALESCE(p.is_external_ref, false) AS is_external_ref,
                 p.social_tiktok, p.social_instagram, p.social_youtube, p.social_facebook,
                 COALESCE(p.position, 'outfield') AS position,
+                p.referral_code,
                 (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
                  FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
                 COALESCE(ps.apps_3m, 0)   AS apps_3m,
@@ -4482,6 +4495,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             const _hostName = _hostRow.rows[0]?.alias || _hostRow.rows[0]?.full_name || req.user.playerId;
             await gameAuditLog(pool, req.params.id, null, 'guest_added',
                 `Guest: ${guestName.trim()} | Host: ${_hostName} (${req.user.playerId}) | OVR: ${guestRating} | Paid: £${cost.toFixed(2)}`);
+            await reviewDynamicStarRating(pool, req.params.id); // DYNSTAR: guest add triggers rating review
             try {
                 const hostRow = await pool.query(
                     'SELECT p.full_name, p.alias FROM players p WHERE p.id = $1', [req.user.playerId]
@@ -5075,6 +5089,8 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             }
             // DYNSTAR: review star rating on every confirmed friend sign-up
             if (status === 'confirmed') await reviewDynamicStarRating(pool, gameId);
+            // RAF: trigger 50p game credit for referrer if the friend being registered was referred
+            if (status === 'confirmed') await triggerRafGameCredit(friendPlayerId);
         });
 
     } catch (error) {
@@ -8143,17 +8159,46 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         
         const game = gameResult.rows[0];
 
-        // Fetch discipline records for this game — used by team sheet judge emoji
+        // Fetch discipline records for this game — used by player list judge emoji
         const discResult = await pool.query(
-            `SELECT dr.player_id, dr.offense_type, dr.points, p.reliability_tier
+            `SELECT dr.player_id, dr.offense_type, dr.points,
+                    p.reliability_tier AS current_tier, p.alias, p.full_name
              FROM discipline_records dr
              JOIN players p ON p.id = dr.player_id
-             WHERE dr.game_id = $1`,
+             WHERE dr.game_id = $1 AND dr.points > 0`,
             [game.id]
         );
         const disciplineMap = {};
-        for (const d of discResult.rows) {
-            disciplineMap[d.player_id] = { offenseType: d.offense_type, points: d.points, tier: d.reliability_tier };
+        const tierFromPoints = pts => {
+            if (pts >= 15) return 'black';
+            if (pts >= 10) return 'white';
+            if (pts >= 4)  return 'bronze';
+            if (pts >= 1)  return 'silver';
+            return 'gold';
+        };
+        if (discResult.rows.length > 0) {
+            // Get prior discipline points per player (excluding this game) to detect tier changes
+            const playerIds = discResult.rows.map(r => r.player_id);
+            const priorResult = await pool.query(
+                `SELECT dr2.player_id, COALESCE(SUM(dr2.points), 0) AS prior_pts
+                 FROM discipline_records dr2
+                 WHERE dr2.player_id = ANY($1::uuid[]) AND dr2.game_id != $2
+                 GROUP BY dr2.player_id`,
+                [playerIds, game.id]
+            );
+            const priorMap = {};
+            for (const r of priorResult.rows) priorMap[r.player_id] = parseInt(r.prior_pts) || 0;
+            for (const d of discResult.rows) {
+                const tierBefore = tierFromPoints(priorMap[d.player_id] || 0);
+                const tierAfter  = d.current_tier;
+                disciplineMap[d.player_id] = {
+                    offenseType: d.offense_type,
+                    points:      d.points,
+                    tierAfter,
+                    tierBefore:  tierBefore !== tierAfter ? tierBefore : null,
+                    name:        d.alias || d.full_name,
+                };
+            }
         }
 
         // ── VENUE CLASH BRANCH ───────────────────────────────────────────────
@@ -9327,6 +9372,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         setImmediate(() => {
             registrationEvent(pool, gameId, playerId, 'admin_added', `Added by admin ${req.user.playerId}`);
             gameAuditLog(pool, gameId, req.user.playerId, 'admin_player_added', `Player ID: ${playerId} | Position: ${position}`);
+            reviewDynamicStarRating(pool, gameId); // DYNSTAR: admin add triggers rating review
         });
     } catch (error) {
         console.error('Add player error:', error);
@@ -9432,6 +9478,11 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             discountClient.release();
         }
         res.json({ message: 'Player added with custom charge' });
+        setImmediate(() => {
+            registrationEvent(pool, gameId, playerId, 'admin_added', `Added by admin (discount) ${req.user.playerId}`);
+            gameAuditLog(pool, gameId, req.user.playerId, 'admin_player_added', `Player ID: ${playerId} | Custom charge: £${customAmount}`);
+            reviewDynamicStarRating(pool, gameId); // DYNSTAR: discounted admin add
+        });
     } catch (error) {
         console.error('Add player with discount error:', error);
         res.status(500).json({ error: 'Failed to add player with discount' });
@@ -13624,7 +13675,7 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
     const GROUP_ACTIONS = {
         players:    ['player_created','player_updated','player_deleted','account_updated','stats_updated','tier_recalculated','badges_updated','badge_auto_awarded','badge_auto_removed'],
         games:      ['game_created','game_confirmed','game_completed','game_locked','game_unlocked','teams_generated','teams_confirmed','teams_deleted','type_converted'],
-        finance:    ['balance_adjustment'],
+        finance:    ['balance_adjustment','wonderful_initiated','wonderful_credited'],
         registrations: ['admin_player_added','admin_player_removed','guest_added','guest_removed'],
         referees:   ['ref_applied','ref_confirmed','ref_withdrawn','ref_unconfirmed','ref_review_received','ref_review_updated','ref_review_comment','ref_score_updated','ref_score_finalised','referee_invite_created'],
         moderation: ['dm_reported','discipline_added','player_unbanned'],
@@ -17523,6 +17574,272 @@ app.post('/api/admin/series/:id/finalize', authenticateToken, requireAdmin, asyn
 
 // FIX-043: Catch-all 404 handler (must be after ALL routes including coaching)
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WONDERFUL PAYMENTS — Open Banking top-up integration
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Helper: call Wonderful REST API
+async function wonderfulRequest(method, path, body = null) {
+    const opts = {
+        method,
+        headers: {
+            'Authorization': `Bearer ${WONDERFUL_API_KEY}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        },
+    };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(`https://wonderful.co.uk${path}`, opts);
+    const json = await res.json();
+    if (!res.ok) throw Object.assign(new Error(json.message || 'Wonderful API error'), { status: res.status, body: json });
+    return json;
+}
+
+// POST /api/payments/wonderful/initiate
+// Authenticated — creates a Wonderful payment request and returns the pay_link
+app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiateLimiter, async (req, res) => {
+    if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'Online payments are temporarily unavailable' });
+    try {
+        const { amount_pounds, game_id } = req.body;
+        const playerId = req.user.playerId;
+
+        // Validate amount: £1–£200 in whole pounds
+        const pounds = parseFloat(amount_pounds);
+        if (!pounds || pounds < 1 || pounds > 200 || pounds !== Math.floor(pounds)) {
+            return res.status(400).json({ error: 'Amount must be a whole number between £1 and £200' });
+        }
+        const amountPence = Math.round(pounds * 100);
+
+        // Fetch player email for Wonderful
+        const playerRow = await pool.query(
+            `SELECT p.id, u.email, p.alias, p.full_name
+             FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
+            [playerId]
+        );
+        if (!playerRow.rows.length) return res.status(404).json({ error: 'Player not found' });
+        const player = playerRow.rows[0];
+
+        // Unique merchant reference
+        const merchantRef = `TF-${playerId.slice(0, 8)}-${Date.now()}`;
+
+        // Create payment with Wonderful
+        const wonderfulRes = await wonderfulRequest('POST', '/api/public/v1/payments', {
+            customer_email_address:  player.email,
+            merchant_payment_reference: merchantRef,
+            amount:      amountPence,
+            redirect_url: `https://totalfooty.co.uk/?wonderful_payment_id=${merchantRef}`,
+            webhook_url: `https://totalfooty-api.onrender.com/api/webhooks/wonderful`,
+        });
+
+        const wpId   = wonderfulRes.data?.id;
+        const payLink = wonderfulRes.data?.pay_link || wonderfulRes.data?.payment_url;
+        if (!payLink) throw new Error('Wonderful returned no pay_link');
+
+        // Store pending payment in DB
+        await pool.query(
+            `INSERT INTO wonderful_payments
+                (wonderful_payment_id, merchant_reference, player_id, amount_pence, status, game_id, pay_link)
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6)`,
+            [wpId, merchantRef, playerId, amountPence, game_id || null, payLink]
+        );
+
+        await auditLog(pool, playerId, 'wonderful_initiated', playerId,
+            `Wonderful payment initiated: £${pounds} ref=${merchantRef}`);
+
+        res.json({ pay_link: payLink, merchant_reference: merchantRef });
+    } catch (e) {
+        console.error('Wonderful initiate error:', e.message, e.body || '');
+        res.status(500).json({ error: 'Failed to create payment. Please try again.' });
+    }
+});
+
+// POST /api/webhooks/wonderful
+// Public — Wonderful calls this when payment status changes
+// Security: we NEVER trust payload alone — always re-verify via GET
+app.post('/api/webhooks/wonderful', async (req, res) => {
+    // Respond immediately so Wonderful doesn't retry
+    res.json({ received: true });
+
+    try {
+        const wpId = req.body?.id || req.body?.payment_id || req.body?.data?.id;
+        if (!wpId) return;
+
+        // Fetch the payment record from our DB by wonderful_payment_id
+        const pmtRow = await pool.query(
+            `SELECT * FROM wonderful_payments WHERE wonderful_payment_id = $1`,
+            [wpId]
+        );
+
+        // Also try by merchant_reference if not found by wpId
+        let pmt = pmtRow.rows[0];
+        if (!pmt) {
+            const ref = req.body?.merchant_payment_reference || req.body?.data?.merchant_payment_reference;
+            if (ref) {
+                const byRef = await pool.query(
+                    `SELECT * FROM wonderful_payments WHERE merchant_reference = $1`, [ref]
+                );
+                pmt = byRef.rows[0];
+            }
+        }
+        if (!pmt) return console.warn('Wonderful webhook: no matching payment record', wpId);
+        if (pmt.status === 'credited') return; // idempotent — already processed
+
+        // SECURITY: independently verify status with Wonderful API
+        if (!WONDERFUL_API_KEY) return;
+        // Resolve the Wonderful payment ID — prefer webhook body, fall back to DB row
+        const verifyId = wpId || pmt.wonderful_payment_id;
+        if (!verifyId) {
+            return console.error('Wonderful webhook: cannot verify — no wonderful_payment_id available');
+        }
+        let verified;
+        try {
+            const verifyRes = await wonderfulRequest('GET', `/api/public/v1/payments/${verifyId}`);
+            verified = verifyRes.data?.status;
+        } catch (e) {
+            return console.error('Wonderful webhook: verify GET failed', e.message);
+        }
+
+        if (verified !== 'paid') {
+            // Update status but don't credit
+            await pool.query(
+                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3`,
+                [verified || 'pending', wpId, pmt.id]
+            );
+            return;
+        }
+
+        // Idempotency: mark as credited atomically
+        const claim = await pool.query(
+            `UPDATE wonderful_payments
+             SET status = 'credited', confirmed_at = NOW(), credited_at = NOW(),
+                 wonderful_payment_id = COALESCE(wonderful_payment_id, $1)
+             WHERE id = $2 AND status != 'credited'
+             RETURNING *`,
+            [wpId, pmt.id]
+        );
+        if (!claim.rows.length) return; // another webhook beat us to it
+
+        const pounds = pmt.amount_pence / 100;
+
+        // Credit the player's balance
+        await pool.query(
+            `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
+             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+            [pmt.player_id, pounds]
+        );
+        await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
+            `Wonderful bank payment — ref ${pmt.merchant_reference}`, null);
+
+        await auditLog(pool, pmt.player_id, 'wonderful_credited', pmt.player_id,
+            `£${pounds} credited via Wonderful. Ref: ${pmt.merchant_reference}`);
+
+        // Send confirmation email to player
+        setImmediate(async () => {
+            try {
+                const pRow = await pool.query(
+                    `SELECT p.alias, p.full_name, u.email
+                     FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
+                    [pmt.player_id]
+                );
+                if (!pRow.rows[0]?.email) return;
+                const name = pRow.rows[0].alias || pRow.rows[0].full_name;
+                const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [pmt.player_id]);
+                const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to:   pRow.rows[0].email,
+                    subject: `✅ £${pounds.toFixed(2)} added to your TotalFooty balance`,
+                    html: wrapEmailHtml(`
+                        <p style="font-size:16px;font-weight:700;">Hi ${htmlEncode(name)},</p>
+                        <p style="color:#888;">Your payment has been confirmed and your credits have been added.</p>
+                        <div style="text-align:center;padding:28px 0;">
+                            <div style="font-size:48px;font-weight:900;color:#00cc66;">£${pounds.toFixed(2)}</div>
+                            <div style="font-size:14px;color:#888;margin-top:8px;">added to your balance</div>
+                            <div style="font-size:20px;font-weight:900;margin-top:16px;">New balance: £${newBal}</div>
+                        </div>
+                        <p style="text-align:center;">
+                            <a href="https://totalfooty.co.uk" style="display:inline-block;padding:14px 32px;background:#00cc66;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">SIGN UP FOR A GAME →</a>
+                        </p>
+                        <p style="color:#666;font-size:12px;text-align:center;margin-top:16px;">Payment ref: ${htmlEncode(pmt.merchant_reference)}</p>
+                    `)
+                });
+            } catch (e) {
+                console.error('Wonderful credit email failed (non-critical):', e.message);
+            }
+        });
+
+        // If payment was linked to a specific game, auto-register the player
+        if (pmt.game_id) {
+            setImmediate(async () => {
+                try {
+                    const gameRow = await pool.query(
+                        `SELECT g.id, g.cost_per_player, g.game_status, g.team_selection_type,
+                                g.max_players, g.requires_organiser,
+                                (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') AS confirmed_count
+                         FROM games g WHERE g.id = $1`,
+                        [pmt.game_id]
+                    );
+                    const game = gameRow.rows[0];
+                    if (!game || game.game_status !== 'available' || parseInt(game.confirmed_count) >= parseInt(game.max_players)) return;
+                    // Check not already registered
+                    const already = await pool.query(
+                        `SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2`, [pmt.game_id, pmt.player_id]
+                    );
+                    if (already.rows.length) return;
+                    // Deduct game fee and register
+                    const client = await pool.connect();
+                    try {
+                        await client.query('BEGIN');
+                        const { realCharged } = await applyGameFee(client, pmt.player_id, game.cost_per_player, `Registration for game ${pmt.game_id} (via Wonderful)`);
+                        await client.query(
+                            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, registered_at)
+                             VALUES ($1, $2, 'confirmed', 'No Preference', $3, NOW())`,
+                            [pmt.game_id, pmt.player_id, realCharged]
+                        );
+                        await client.query('COMMIT');
+                        await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
+                            `Auto-registered after Wonderful payment ${pmt.merchant_reference}`);
+                    } catch (e) {
+                        await client.query('ROLLBACK').catch(() => {});
+                        console.error('Wonderful auto-register failed (non-critical):', e.message);
+                    } finally {
+                        client.release();
+                    }
+                } catch (e) {
+                    console.error('Wonderful game auto-register error (non-critical):', e.message);
+                }
+            });
+        }
+    } catch (e) {
+        console.error('Wonderful webhook processing error:', e.message);
+    }
+});
+
+// GET /api/payments/wonderful/status/:ref — player polls for confirmation after redirect
+// Used by the success screen to show confirmed/pending state
+app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, res) => {
+    try {
+        const { ref } = req.params;
+        const row = await pool.query(
+            `SELECT status, amount_pence, game_id, credited_at
+             FROM wonderful_payments
+             WHERE merchant_reference = $1 AND player_id = $2`,
+            [ref, req.user.playerId]
+        );
+        if (!row.rows.length) return res.status(404).json({ error: 'Payment not found' });
+        const p = row.rows[0];
+        res.json({
+            status:      p.status,
+            amount:      (p.amount_pence / 100).toFixed(2),
+            game_id:     p.game_id,
+            credited_at: p.credited_at,
+        });
+    } catch (e) {
+        console.error('Wonderful status error:', e.message);
+        res.status(500).json({ error: 'Failed to check payment status' });
+    }
+});
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT} — build: coaching-delete-v2`);
