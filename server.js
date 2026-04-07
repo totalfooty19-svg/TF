@@ -17573,13 +17573,10 @@ app.post('/api/admin/series/:id/finalize', authenticateToken, requireAdmin, asyn
 
 // Helper: call Wonderful REST API
 async function wonderfulRequest(method, path, body = null) {
-    // DIAG: log key shape to confirm env var loaded correctly — remove after confirmed
-    const keyVal = WONDERFUL_API_KEY || '';
-    console.log(`Wonderful key diag: length=${keyVal.length} first4="${keyVal.slice(0,4)}" last4="${keyVal.slice(-4)}" hasSpaces=${keyVal !== keyVal.trim()}`);
     const opts = {
         method,
         headers: {
-            'Authorization': `Bearer ${keyVal.trim()}`,
+            'Authorization': `Bearer ${WONDERFUL_API_KEY}`,
             'Content-Type': 'application/json',
             'Accept': 'application/json',
         },
