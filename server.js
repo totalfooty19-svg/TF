@@ -17582,7 +17582,7 @@ async function wonderfulRequest(method, path, body = null) {
         },
     };
     if (body) opts.body = JSON.stringify(body);
-    const res = await fetch(`https://wonderful.co.uk${path}`, opts);
+    const res = await fetch(`https://api.wonderful.one${path}`, opts);
     const json = await res.json();
     if (!res.ok) throw Object.assign(new Error(json.message || 'Wonderful API error'), { status: res.status, body: json });
     return json;
@@ -17613,20 +17613,22 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         const player = playerRow.rows[0];
         if (!player.email) return res.status(400).json({ error: 'No email address on account — contact support to top up.' });
 
-        // Unique merchant reference
-        const merchantRef = `TF-${playerId.slice(0, 8)}-${Date.now()}`;
+        // Unique merchant reference — max 18 chars, only letters/numbers/dashes
+        const tsShort = Date.now().toString(36).toUpperCase(); // base-36 timestamp ~8 chars
+        const merchantRef = `TF-${playerId.slice(0, 5)}-${tsShort}`.slice(0, 18);
 
-        // Create payment with Wonderful
-        const wonderfulRes = await wonderfulRequest('POST', '/api/public/v1/payments', {
+        // Create payment with Wonderful v2 API
+        const wonderfulRes = await wonderfulRequest('POST', '/v2/quick-pay', {
             customer_email_address:  player.email,
             merchant_payment_reference: merchantRef,
+            payment_description: `TotalFooty credit top-up £${pounds}`,
             amount:      amountPence,
             redirect_url: `https://totalfooty.co.uk/?wonderful_payment_id=${merchantRef}`,
             webhook_url: `https://totalfooty-api.onrender.com/api/webhooks/wonderful`,
         });
 
         const wpId   = wonderfulRes.data?.id;
-        const payLink = wonderfulRes.data?.pay_link || wonderfulRes.data?.payment_url;
+        const payLink = wonderfulRes.data?.pay_link;
         if (!payLink) throw new Error('Wonderful returned no pay_link');
 
         // Store pending payment in DB
@@ -17687,13 +17689,14 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         }
         let verified;
         try {
-            const verifyRes = await wonderfulRequest('GET', `/api/public/v1/payments/${verifyId}`);
+            const verifyRes = await wonderfulRequest('GET', `/v2/payments/${verifyId}`);
             verified = verifyRes.data?.status;
         } catch (e) {
             return console.error('Wonderful webhook: verify GET failed', e.message);
         }
 
-        if (verified !== 'paid') {
+        // v2 API: payment status can be 'paid' or 'accepted' for successful payments
+        if (verified !== 'paid' && verified !== 'accepted') {
             // Update status but don't credit
             await pool.query(
                 `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3`,
