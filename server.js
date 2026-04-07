@@ -1991,7 +1991,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
             LEFT JOIN credits c ON c.player_id = p.id
             LEFT JOIN users u ON u.id = p.user_id
             ORDER BY p.squad_number NULLS LAST, p.full_name
-            LIMIT 200
+            LIMIT 1500
         `);
 
         // All badges for the badge matrix headers
@@ -3229,7 +3229,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
         
         const result = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region,
                    g.teams_generated,
                    gs.series_name,
                    g.format as game_format,
@@ -3416,7 +3416,7 @@ app.get('/api/games/needing-refs', authenticateToken, async (req, res) => {
 app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         const gameResult = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region,
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
@@ -8150,7 +8150,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             SELECT g.*, v.name as venue_name, v.address as venue_address
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.game_url = $1 AND (g.teams_confirmed = TRUE OR g.is_venue_clash = TRUE OR g.venue_clash_team1_name IS NOT NULL)
+            WHERE g.game_url = $1 AND (g.teams_confirmed = TRUE OR g.game_status = 'completed' OR g.is_venue_clash = TRUE OR g.venue_clash_team1_name IS NOT NULL)
         `, [gameUrl]);
         
         if (gameResult.rows.length === 0) {
@@ -8965,7 +8965,7 @@ app.get('/api/public/games', async (req, res) => {
             ORDER BY
                 CASE WHEN g.game_status IN ('available','confirmed') THEN 0 ELSE 1 END,
                 g.game_date ASC
-            LIMIT 50
+            LIMIT 300
         `);
         const venuePhotoMap = {
             'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
@@ -10044,11 +10044,6 @@ async function generatePlayerBio(player, awardsData, recentForm) {
             `Name: ${player.alias || player.full_name}`,
             `Position: ${isGK ? 'Goalkeeper' : 'Outfield'}`,
             player.squad_number != null ? `Squad number: #${player.squad_number}` : null,
-            `Overall rating: ${player.overall_rating}/100`,
-            `Attributes: Defending ${player.defending_rating}/20, Strength ${player.strength_rating}/20,`,
-            ` Fitness ${player.fitness_rating}/20, Pace ${player.pace_rating}/20,`,
-            ` Decisions ${player.decisions_rating}/20, Assisting ${player.assisting_rating}/20, Shooting ${player.shooting_rating}/20`,
-            isGK ? `GK rating: ${player.goalkeeper_rating}/100` : null,
             ``,
             `Stats:`,
             `- Appearances: ${player.total_appearances}`,
@@ -17572,9 +17567,6 @@ app.post('/api/admin/series/:id/finalize', authenticateToken, requireAdmin, asyn
 });
 
 
-// FIX-043: Catch-all 404 handler (must be after ALL routes including coaching)
-app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
-
 // ══════════════════════════════════════════════════════════════════════════════
 // WONDERFUL PAYMENTS — Open Banking top-up integration
 // ══════════════════════════════════════════════════════════════════════════════
@@ -17611,14 +17603,15 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         }
         const amountPence = Math.round(pounds * 100);
 
-        // Fetch player email for Wonderful
+        // Fetch player email for Wonderful — LEFT JOIN so legacy accounts without user_id still resolve
         const playerRow = await pool.query(
-            `SELECT p.id, u.email, p.alias, p.full_name
-             FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
+            `SELECT p.id, COALESCE(u.email, '') AS email, p.alias, p.full_name
+             FROM players p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
             [playerId]
         );
         if (!playerRow.rows.length) return res.status(404).json({ error: 'Player not found' });
         const player = playerRow.rows[0];
+        if (!player.email) return res.status(400).json({ error: 'No email address on account — contact support to top up.' });
 
         // Unique merchant reference
         const merchantRef = `TF-${playerId.slice(0, 8)}-${Date.now()}`;
@@ -17840,6 +17833,9 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
         res.status(500).json({ error: 'Failed to check payment status' });
     }
 });
+
+// FIX-043: Catch-all 404 — MUST be last, after all routes including Wonderful
+app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT} — build: coaching-delete-v2`);
