@@ -9183,6 +9183,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
                 p.squad_number,
                 p.overall_rating,
                 p.goalkeeper_rating,
+                p.referral_code,
                 r.status,
                 r.position_preference,
                 r.tournament_team_preference,
@@ -9196,7 +9197,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1
             GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number,
-                     p.overall_rating, p.goalkeeper_rating, r.status,
+                     p.overall_rating, p.goalkeeper_rating, p.referral_code, r.status,
                      r.position_preference, r.tournament_team_preference
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY p.squad_number ASC NULLS LAST
@@ -10684,6 +10685,49 @@ app.post('/api/admin/players/:id/regenerate-bio', authenticateToken, requireAdmi
     } catch (e) {
         console.error('Admin regen bio error:', e.message);
         res.status(500).json({ error: 'Failed to start bio regeneration' });
+    }
+});
+
+// GET /api/players/me/discipline/recent — last 10 games' discipline records for current player
+// Used by the post-signup confirmation screen
+app.get('/api/players/me/discipline/recent', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+        // Fetch discipline records from last 10 completed games the player participated in
+        const result = await pool.query(
+            `SELECT dr.offense_type, dr.points, dr.created_at,
+                    g.game_date, v.name as venue_name
+             FROM discipline_records dr
+             LEFT JOIN games g ON g.id = dr.game_id
+             LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE dr.player_id = $1
+               AND dr.game_id IS NOT NULL
+               AND dr.points > 0
+             ORDER BY dr.created_at DESC
+             LIMIT 10`,
+            [playerId]
+        );
+        // Current revolving points total — last 10 completed games the player confirmed for + manual entries
+        const ptsRow = await pool.query(
+            `SELECT COALESCE(SUM(dr.points),0) as total
+             FROM discipline_records dr
+             WHERE dr.player_id = $1
+               AND (dr.game_id IS NULL OR dr.game_id IN (
+                 SELECT r.game_id FROM registrations r
+                 JOIN games g2 ON g2.id = r.game_id
+                 WHERE r.player_id = $1 AND r.status = 'confirmed'
+                 AND g2.game_status = 'completed'
+                 ORDER BY g2.game_date DESC LIMIT 10
+               ))`,
+            [playerId]
+        );
+        res.json({
+            records: result.rows,
+            revolving_points: parseInt(ptsRow.rows[0]?.total || 0)
+        });
+    } catch (e) {
+        console.error('Discipline recent error:', e.message);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
@@ -17814,6 +17858,74 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
     } catch (e) {
         console.error('Wonderful status error:', e.message);
         res.status(500).json({ error: 'Failed to check payment status' });
+    }
+});
+
+// POST /api/admin/payments/wonderful/manual-credit
+// Superadmin only — manually credit a player for a Wonderful payment that the webhook missed
+// Typical cause: Render cold start meant webhook was received but processing failed silently
+app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { merchant_reference } = req.body;
+    if (!merchant_reference) return res.status(400).json({ error: 'merchant_reference required' });
+    try {
+        // Look up payment by merchant reference
+        const pmtRow = await pool.query(
+            `SELECT * FROM wonderful_payments WHERE merchant_reference = $1`,
+            [merchant_reference]
+        );
+        if (!pmtRow.rows.length) return res.status(404).json({ error: 'Payment not found for that reference' });
+        const pmt = pmtRow.rows[0];
+
+        if (pmt.status === 'credited') {
+            return res.status(409).json({ error: 'Already credited', payment: pmt });
+        }
+
+        // Verify with Wonderful API before crediting
+        if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'WONDERFUL_API_KEY not set' });
+        const verifyId = pmt.wonderful_payment_id;
+        if (!verifyId) return res.status(400).json({ error: 'No wonderful_payment_id on record — cannot verify. Check Wonderful dashboard manually.' });
+
+        let verified;
+        try {
+            const verifyRes = await wonderfulRequest('GET', `/v2/payments/${verifyId}`);
+            verified = verifyRes.data?.status;
+        } catch (e) {
+            return res.status(502).json({ error: 'Wonderful API verify failed: ' + e.message });
+        }
+
+        if (verified !== 'paid' && verified !== 'accepted') {
+            return res.status(400).json({ error: `Wonderful payment status is '${verified}' — not creditable`, verified_status: verified });
+        }
+
+        // Idempotency claim
+        const claim = await pool.query(
+            `UPDATE wonderful_payments
+             SET status = 'credited', confirmed_at = NOW(), credited_at = NOW()
+             WHERE id = $1 AND status != 'credited'
+             RETURNING *`,
+            [pmt.id]
+        );
+        if (!claim.rows.length) return res.status(409).json({ error: 'Race condition — already credited' });
+
+        const pounds = pmt.amount_pence / 100;
+
+        await pool.query(
+            `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
+             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+            [pmt.player_id, pounds]
+        );
+        await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
+            `Manual credit by superadmin — Wonderful ref ${pmt.merchant_reference}`, null);
+        await auditLog(pool, pmt.player_id, 'wonderful_credited', req.user.playerId,
+            `MANUAL CREDIT: £${pounds} via Wonderful. Ref: ${pmt.merchant_reference}`);
+
+        const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [pmt.player_id]);
+        const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
+
+        res.json({ success: true, amount: pounds.toFixed(2), player_id: pmt.player_id, new_balance: newBal });
+    } catch (e) {
+        console.error('Manual Wonderful credit error:', e.message);
+        res.status(500).json({ error: 'Server error: ' + e.message });
     }
 });
 
