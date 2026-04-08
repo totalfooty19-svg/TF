@@ -1078,7 +1078,7 @@ const requireGameManager = async (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam, ageRange } = req.body;
+        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam, ageRange, region, interests } = req.body;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -1115,6 +1115,16 @@ app.post('/api/auth/register', async (req, res) => {
         const stats = SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
 
         // Validate age range — required for insurance purposes
+        // Validate region
+        const VALID_REGIONS = ['Coventry', 'Birmingham', 'Leamington', 'Nuneaton', 'Manchester'];
+        const validatedRegion = (region && VALID_REGIONS.includes(region)) ? region : null;
+
+        // Validate interests
+        const VALID_INTERESTS = ['playing', 'reffing', 'coaching'];
+        const validatedInterests = Array.isArray(interests)
+            ? interests.filter(i => VALID_INTERESTS.includes(i))
+            : [];
+
         const VALID_AGE_RANGES = ['16_18', '18_plus'];
         if (!ageRange || ageRange === 'under_16') {
             return res.status(400).json({ error: 'You must be at least 16 years old to register with TotalFooty.' });
@@ -1153,9 +1163,9 @@ app.post('/api/auth/register', async (req, res) => {
             `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
                 goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
                 pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
-                skill_level, age_range)
+                skill_level, age_range, region_code, coachable)
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
-                     $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING id`,
+                     $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) RETURNING id`,
             [
                 userId,               // $1
                 fullName.trim(),      // $2
@@ -1174,7 +1184,9 @@ app.post('/api/auth/register', async (req, res) => {
                 stats.sht,            // $15 shooting_rating
                 stats.overall,        // $16 overall_rating
                 validatedSkillLevel,  // $17 skill_level (null if skipped)
-                ageRange              // $18 age_range
+                ageRange,             // $18 age_range
+                validatedRegion,      // $19 region_code (null if not selected)
+                validatedInterests.includes('coaching')  // $20 coachable
             ]
         );
         const playerId = playerResult.rows[0].id;
@@ -1211,15 +1223,50 @@ app.post('/api/auth/register', async (req, res) => {
             console.error('Referrals table insert (non-critical):', refErr.message);
         }
         
-        // Auto-assign player_number >= 1000 for new players (squad players get synced when admin assigns squad_number)
+        // Auto-assign player_number — region-prefixed for Birmingham (B) and Manchester (M)
         try {
-            const maxNumResult = await pool.query(
-                'SELECT COALESCE(MAX(player_number), 999) as max_num FROM players WHERE player_number >= 1000'
-            );
-            const newPlayerNumber = parseInt(maxNumResult.rows[0].max_num) + 1;
-            await pool.query('UPDATE players SET player_number = $1 WHERE id = $2', [newPlayerNumber, playerId]);
+            const regionPrefix = validatedRegion === 'Birmingham' ? 'B'
+                               : validatedRegion === 'Manchester' ? 'M'
+                               : null;
+            if (regionPrefix) {
+                // Region-prefixed IDs: stored as text e.g. 'B1000'
+                const maxRes = await pool.query(
+                    `SELECT COALESCE(MAX(CAST(SUBSTRING(player_number_text, 2) AS INTEGER)), 999) as max_num
+                     FROM players WHERE player_number_text LIKE $1`,
+                    [regionPrefix + '%']
+                );
+                const newNum = parseInt(maxRes.rows[0].max_num) + 1;
+                await pool.query(
+                    'UPDATE players SET player_number_text = $1 WHERE id = $2',
+                    [regionPrefix + newNum, playerId]
+                );
+            } else {
+                // Standard numeric player_number
+                const maxNumResult = await pool.query(
+                    'SELECT COALESCE(MAX(player_number), 999) as max_num FROM players WHERE player_number >= 1000'
+                );
+                const newPlayerNumber = parseInt(maxNumResult.rows[0].max_num) + 1;
+                await pool.query('UPDATE players SET player_number = $1 WHERE id = $2', [newPlayerNumber, playerId]);
+            }
         } catch (pnErr) {
             console.error('Player number assign (non-critical):', pnErr.message);
+        }
+
+        // Grant Referee badge if user expressed interest in reffing during signup
+        if (validatedInterests.includes('reffing')) {
+            try {
+                const refBadge = await pool.query("SELECT id FROM badges WHERE name = 'Referee'");
+                if (refBadge.rows.length > 0) {
+                    await pool.query(
+                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                        [playerId, refBadge.rows[0].id]
+                    );
+                    await auditLog(pool, null, 'badge_auto_awarded', playerId,
+                        'badge: Referee (expressed interest at signup)');
+                }
+            } catch (refInterestErr) {
+                console.error('Referee badge (interest, non-critical):', refInterestErr.message);
+            }
         }
 
         // Handle ?referee_invite=CODE — one-time invite that grants Referee badge
@@ -7194,8 +7241,33 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
             message: 'Teams confirmed',
             game: fullGameResult.rows[0]
         });
-        // Email all confirmed players their team assignment
-        setImmediate(() => sendTeamsConfirmedEmails(gameId));
+
+        // Audit: capture full team composition as one entry
+        setImmediate(async () => {
+            try {
+                const nonGuestRed  = redTeam.filter(id => !String(id).startsWith('guest_'));
+                const nonGuestBlue = blueTeam.filter(id => !String(id).startsWith('guest_'));
+                const allNonGuests = [...nonGuestRed, ...nonGuestBlue];
+                const nameMap = {};
+                if (allNonGuests.length > 0) {
+                    const nameRes = await pool.query(
+                        `SELECT p.id, COALESCE(p.alias, p.full_name) AS name
+                         FROM players p WHERE p.id = ANY($1)`,
+                        [allNonGuests]
+                    );
+                    nameRes.rows.forEach(r => { nameMap[r.id] = r.name; });
+                }
+                const redNames   = nonGuestRed.map(id => nameMap[id] || id);
+                const blueNames  = nonGuestBlue.map(id => nameMap[id] || id);
+                const redGuests  = redTeam.filter(id => String(id).startsWith('guest_')).map(id => `Guest(${id.replace('guest_','')})`);
+                const blueGuests = blueTeam.filter(id => String(id).startsWith('guest_')).map(id => `Guest(${id.replace('guest_','')})`);
+                const detail = `RED: ${[...redNames,...redGuests].join(', ')} | BLUE: ${[...blueNames,...blueGuests].join(', ')}`;
+                await gameAuditLog(pool, gameId, null, 'teams_confirmed', detail);
+            } catch (e) {
+                console.warn('Audit team composition failed (non-critical):', e.message);
+            }
+            sendTeamsConfirmedEmails(gameId);
+        });
     } catch (error) {
         console.error('Confirm teams error:', error);
         res.status(500).json({ error: 'Failed to confirm teams' });
@@ -7686,7 +7758,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        const { winningTeam, disciplineRecords, beefEntries, motmNominees, teamBalanceScore } = req.body;
+        const { winningTeam, disciplineRecords, beefEntries, motmNominees, teamBalanceScore, swappedPlayerIds } = req.body;
 
         // Validate teamBalanceScore
         let validatedBalanceScore = null;
@@ -7812,6 +7884,17 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 winningPlayerIds = winningPlayersResult.rows.map(r => r.player_id);
             }
             
+            // Add swapped players who should receive a win (deduped, non-guest only)
+            if (!isExternal && Array.isArray(swappedPlayerIds) && swappedPlayerIds.length > 0) {
+                const winSet = new Set(winningPlayerIds);
+                for (const sid of swappedPlayerIds) {
+                    if (sid && !String(sid).startsWith('guest_') && !winSet.has(sid)) {
+                        winningPlayerIds.push(sid);
+                        winSet.add(sid);
+                    }
+                }
+            }
+
             if (winningPlayerIds.length > 0) {
                 const winsClassCol = `total_wins_${starClass.toLowerCase()}`;
                 await client.query(
@@ -8270,14 +8353,20 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                 votingFinalized = game.motm_winner_id !== null;
                 const motmResult = await pool.query(`
                     SELECT n.player_id, p.full_name, p.alias, p.squad_number,
+                           p.motm_wins, p.total_appearances,
                            COUNT(v.id) as votes, (n.player_id = g.motm_winner_id) as is_winner
                     FROM motm_nominees n
                     JOIN players p ON p.id = n.player_id
                     JOIN games g ON g.id = n.game_id
                     LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
                     WHERE n.game_id = $1
-                    GROUP BY n.player_id, p.full_name, p.alias, p.squad_number, g.motm_winner_id
-                    ORDER BY votes DESC
+                    GROUP BY n.player_id, p.full_name, p.alias, p.squad_number,
+                             p.motm_wins, p.total_appearances, g.motm_winner_id
+                    ORDER BY
+                        CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                        p.squad_number ASC NULLS LAST,
+                        p.motm_wins DESC NULLS LAST,
+                        p.total_appearances DESC NULLS LAST
                 `, [game.id]);
                 motmNominees = motmResult.rows;
             }
@@ -8388,6 +8477,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                     p.full_name,
                     p.alias,
                     p.squad_number,
+                    p.motm_wins,
+                    p.total_appearances,
                     COUNT(v.id) as votes,
                     (n.player_id = g.motm_winner_id) as is_winner
                 FROM motm_nominees n
@@ -8395,8 +8486,13 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                 JOIN games g ON g.id = n.game_id
                 LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
                 WHERE n.game_id = $1
-                GROUP BY n.player_id, p.full_name, p.alias, p.squad_number, g.motm_winner_id
-                ORDER BY votes DESC, p.full_name ASC
+                GROUP BY n.player_id, p.full_name, p.alias, p.squad_number,
+                         p.motm_wins, p.total_appearances, g.motm_winner_id
+                ORDER BY
+                    CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    p.squad_number ASC NULLS LAST,
+                    p.motm_wins DESC NULLS LAST,
+                    p.total_appearances DESC NULLS LAST
             `, [game.id]);
             
             motmNominees = motmResult.rows;
@@ -9979,7 +10075,7 @@ async function closeAwards(gameId) {
 const BIO_SYSTEM_PROMPT = `You are the TotalFooty bio writer for a grassroots football community across Coventry and Nuneaton.
 Write a player bio that reads like a Football Manager scouting report crossed with WhatsApp group banter. Tone: factual, specific, readable, confident.
 Do not be sycophantic. Do not use filler phrases like 'a true asset to the team'.
-Do not mention specific scores or opponents. Do not invent facts.
+Do not mention specific scores or opponents. Do not invent facts. Do not mention or infer any player's overall rating, skill rating, or numerical skill level — these are not public knowledge.
 Keep it to 3-4 sentences maximum. Use the player's alias (not full name).
 Reference specific stats where they add colour — not just to pad the bio.
 If the player is a goalkeeper, focus on GK stats. If outfield, focus on their strongest attributes and role. If they have notable awards, weave them in naturally.
@@ -10003,10 +10099,11 @@ async function generatePlayerBio(player, awardsData, recentForm) {
     if ((player.total_appearances || 0) < 5) return null;
 
     try {
-        const winPct  = player.total_appearances > 0
-            ? ((player.total_wins / player.total_appearances) * 100).toFixed(1) : '0.0';
-        const motmPct = player.total_appearances > 0
-            ? ((player.motm_wins / player.total_appearances) * 100).toFixed(1) : '0.0';
+        const tfApps = awardsData?.tfApps || 0;
+        const tfWins = awardsData?.tfWins || 0;
+        const winPct  = tfApps > 0 ? ((tfWins / tfApps) * 100).toFixed(1) : '0.0';
+        const motmPct = tfApps > 0
+            ? ((player.motm_wins / tfApps) * 100).toFixed(1) : '0.0';
         const awardsText = buildAwardsText(player, awardsData);
         const formStr = recentForm.map(g => g.won ? 'W' : g.drew ? 'D' : 'L').join(' ');
         const year = new Date(player.created_at).getFullYear();
@@ -10018,13 +10115,13 @@ async function generatePlayerBio(player, awardsData, recentForm) {
             `Position: ${isGK ? 'Goalkeeper' : 'Outfield'}`,
             player.squad_number != null ? `Squad number: #${player.squad_number}` : null,
             ``,
-            `Stats:`,
-            `- Appearances: ${player.total_appearances}`,
-            `- Win rate: ${winPct}% (${player.total_wins} wins)`,
+            `Stats (TotalFooty games only, excluding external friendlies):`,
+            `- TF Appearances: ${tfApps}`,
+            `- Win rate: ${winPct}% (${tfWins} wins from ${tfApps} games)`,
             `- MOTM wins: ${player.motm_wins} (MOTM rate: ${motmPct}%)`,
             `- Member since: ${year}`,
             `- Reliability tier: ${player.reliability_tier || 'new'}`,
-            recentForm.length > 0 ? `- Recent form (last 5): ${formStr}` : null,
+            recentForm.length > 0 ? `- Recent form (last 5 TF games): ${formStr}` : null,
             awardsData?.currentWinStreak >= 2 ? `- Current win streak: ${awardsData.currentWinStreak} games` : null,
             ``,
             `Awards:`,
@@ -10081,10 +10178,26 @@ async function regeneratePlayerBioForce(playerId, force = false) {
             if (!playerRes.rows[0]) return;
             const player = { ...playerRes.rows[0], total_appearances: Math.max(playerRes.rows[0].total_appearances || 0, 5) };
 
-            const [awardsRes, formRes, streakRes] = await Promise.all([
+            const [awardsRes, formRes, streakRes, tfStatsRes] = await Promise.all([
                 pool.query(`SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1`, [playerId]),
-                pool.query(`SELECT g.winning_team, t.team_name FROM registrations r JOIN games g ON g.id = r.game_id LEFT JOIN team_players tp ON tp.player_id = r.player_id LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id WHERE r.player_id = $1 AND g.game_status = 'completed' ORDER BY g.game_date DESC LIMIT 5`, [playerId]),
-                pool.query(`SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]).catch(() => ({ rows: [] }))
+                pool.query(`SELECT g.winning_team, t.team_name FROM registrations r JOIN games g ON g.id = r.game_id LEFT JOIN team_players tp ON tp.player_id = r.player_id LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id WHERE r.player_id = $1 AND g.game_status = 'completed' AND g.team_selection_type != 'vs_external' ORDER BY g.game_date DESC LIMIT 5`, [playerId]),
+                pool.query(`SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]).catch(() => ({ rows: [] })),
+                pool.query(
+                `SELECT
+                    COUNT(*) FILTER (WHERE r.status = 'confirmed') AS tf_apps,
+                    COUNT(*) FILTER (WHERE r.status = 'confirmed'
+                        AND g.winning_team IS NOT NULL AND g.winning_team != 'draw'
+                        AND EXISTS (
+                            SELECT 1 FROM team_players tp2
+                            JOIN teams t2 ON t2.id = tp2.team_id AND t2.game_id = g.id
+                            WHERE tp2.player_id = r.player_id
+                            AND LOWER(t2.team_name) = LOWER(g.winning_team)
+                        )) AS tf_wins
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = $1 AND g.game_status = 'completed'
+                 AND g.team_selection_type != 'vs_external'`, [playerId]
+            )
             ]);
 
             const counts = {};
@@ -10093,7 +10206,9 @@ async function regeneratePlayerBioForce(playerId, force = false) {
                 counts[row.award_type] = (counts[row.award_type] || 0) + 1;
                 if (row.award_type === 'motm') motmTotal += parseFloat(row.motm_value || 1);
             }
-            const awardsData = { counts, motmTotal: Math.round(motmTotal * 100) / 100, currentWinStreak: streakRes.rows[0]?.current_win_streak || 0 };
+            const tfApps = parseInt(tfStatsRes.rows[0]?.tf_apps || 0);
+            const tfWins = parseInt(tfStatsRes.rows[0]?.tf_wins || 0);
+            const awardsData = { counts, motmTotal: Math.round(motmTotal * 100) / 100, currentWinStreak: streakRes.rows[0]?.current_win_streak || 0, tfApps, tfWins };
             const recentForm = formRes.rows.map(r => ({
                 won: r.winning_team === 'draw' ? false
                     : r.team_name
@@ -10130,7 +10245,7 @@ async function regeneratePlayerBio(playerId) {
         const player = playerRes.rows[0];
         if ((player.total_appearances || 0) < 5) return;
 
-        const [awardsRes, formRes, streakRes] = await Promise.all([
+        const [awardsRes, formRes, streakRes, tfStatsRes] = await Promise.all([
             pool.query(
                 `SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1`,
                 [playerId]
@@ -10142,11 +10257,28 @@ async function regeneratePlayerBio(playerId) {
                  LEFT JOIN team_players tp ON tp.player_id = r.player_id
                  LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                  WHERE r.player_id = $1 AND g.game_status = 'completed'
+                 AND g.team_selection_type != 'vs_external'
                  ORDER BY g.game_date DESC LIMIT 5`, [playerId]
             ),
             pool.query(
                 `SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]
-            ).catch(() => ({ rows: [] }))
+            ).catch(() => ({ rows: [] })),
+            pool.query(
+                `SELECT
+                    COUNT(*) FILTER (WHERE r.status = 'confirmed') AS tf_apps,
+                    COUNT(*) FILTER (WHERE r.status = 'confirmed'
+                        AND g.winning_team IS NOT NULL AND g.winning_team != 'draw'
+                        AND EXISTS (
+                            SELECT 1 FROM team_players tp2
+                            JOIN teams t2 ON t2.id = tp2.team_id AND t2.game_id = g.id
+                            WHERE tp2.player_id = r.player_id
+                            AND LOWER(t2.team_name) = LOWER(g.winning_team)
+                        )) AS tf_wins
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.player_id = $1 AND g.game_status = 'completed'
+                 AND g.team_selection_type != 'vs_external'`, [playerId]
+            )
         ]);
 
         const counts = {};
@@ -10155,10 +10287,14 @@ async function regeneratePlayerBio(playerId) {
             counts[row.award_type] = (counts[row.award_type] || 0) + 1;
             if (row.award_type === 'motm') motmTotal += parseFloat(row.motm_value || 1);
         }
+        const tfApps = parseInt(tfStatsRes.rows[0]?.tf_apps || 0);
+        const tfWins = parseInt(tfStatsRes.rows[0]?.tf_wins || 0);
         const awardsData = {
             counts,
             motmTotal: Math.round(motmTotal * 100) / 100,
             currentWinStreak: streakRes.rows[0]?.current_win_streak || 0,
+            tfApps,
+            tfWins,
         };
 
         const recentForm = formRes.rows.map(r => ({
@@ -17561,7 +17697,9 @@ app.post('/api/admin/series/:id/finalize', authenticateToken, requireAdmin, asyn
             await client.query('BEGIN');
 
             for (const t of trophiesRow.rows) {
+                console.log(`[finalize] Computing metric_id=${t.metric_id} calc=${t.calculation_type}`);
                 const leaderboard = await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type);
+                console.log(`[finalize] Leaderboard rows: ${leaderboard.length}`);
                 await client.query('DELETE FROM series_trophy_results WHERE trophy_id = $1', [t.id]);
                 for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
                     const row = leaderboard[i];
@@ -17933,7 +18071,7 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: coaching-delete-v2`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web39-fix2`);
     
     // Keep database AND backend warm (ping every 5 minutes)
     setInterval(async () => {
