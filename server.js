@@ -3215,66 +3215,6 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
     }
 });
 
-// POST /api/admin/players/:playerId/generate-referral-code
-// Generates a referral code for a player who doesn't have one yet.
-// Superadmin only — used from Manage Players edit modal for legacy accounts.
-app.post('/api/admin/players/:playerId/generate-referral-code', authenticateToken, requireSuperAdmin, async (req, res) => {
-    try {
-        const { playerId } = req.params;
-
-        // Check player exists and whether they already have a code
-        const playerCheck = await pool.query(
-            'SELECT id, alias, full_name, referral_code FROM players WHERE id = $1',
-            [playerId]
-        );
-        if (playerCheck.rows.length === 0) {
-            return res.status(404).json({ error: 'Player not found' });
-        }
-
-        const player = playerCheck.rows[0];
-
-        // Idempotent — if they already have a code just return it
-        if (player.referral_code) {
-            return res.json({
-                referralCode: player.referral_code,
-                referralLink: `https://totalfooty.co.uk/?ref=${player.referral_code}`,
-                generated: false,
-                message: 'Player already has a referral code'
-            });
-        }
-
-        // Generate new code
-        const referralCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
-
-        // Write to players table + referrals table (backward compat)
-        await pool.query(
-            'UPDATE players SET referral_code = $1 WHERE id = $2',
-            [referralCode, playerId]
-        );
-        try {
-            await pool.query(
-                'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                [playerId, referralCode]
-            );
-        } catch (refErr) {
-            console.error('Referrals table insert (non-critical):', refErr.message);
-        }
-
-        auditLog(pool, req.user.playerId, 'referral_code_generated', playerId,
-            `Referral code generated for ${player.alias || player.full_name}: ${referralCode}`);
-
-        res.json({
-            referralCode,
-            referralLink: `https://totalfooty.co.uk/?ref=${referralCode}`,
-            generated: true,
-            message: `Referral code generated for ${player.alias || player.full_name}`
-        });
-    } catch (error) {
-        console.error('Generate referral code error:', error);
-        res.status(500).json({ error: 'Failed to generate referral code' });
-    }
-});
-
 
 // ==========================================
 // VENUES API
@@ -17879,35 +17819,55 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
     res.json({ received: true });
 
     try {
-        const wpId = req.body?.id || req.body?.payment_id || req.body?.data?.id;
-        if (!wpId) return;
+        // Log full body for debugging — harmless, no sensitive data
+        console.log('[Wonderful webhook] body:', JSON.stringify(req.body));
 
-        // Fetch the payment record from our DB by wonderful_payment_id
-        const pmtRow = await pool.query(
-            `SELECT * FROM wonderful_payments WHERE wonderful_payment_id = $1`,
-            [wpId]
-        );
+        // Extract Wonderful's payment ID — cover all known field name variants
+        const wpId = req.body?.id
+            || req.body?.payment_id
+            || req.body?.paymentId
+            || req.body?.data?.id
+            || req.body?.data?.payment_id
+            || null;
 
-        // Also try by merchant_reference if not found by wpId
-        let pmt = pmtRow.rows[0];
-        if (!pmt) {
-            const ref = req.body?.merchant_payment_reference || req.body?.data?.merchant_payment_reference;
-            if (ref) {
-                const byRef = await pool.query(
-                    `SELECT * FROM wonderful_payments WHERE merchant_reference = $1`, [ref]
-                );
-                pmt = byRef.rows[0];
-            }
+        // Extract merchant reference — cover all known variants
+        const webhookRef = req.body?.merchant_payment_reference
+            || req.body?.merchant_reference
+            || req.body?.data?.merchant_payment_reference
+            || req.body?.data?.merchant_reference
+            || null;
+
+        // Must have at least one identifier to proceed
+        if (!wpId && !webhookRef) {
+            return console.warn('[Wonderful webhook] no payment ID or merchant reference in body — cannot process');
         }
-        if (!pmt) return console.warn('Wonderful webhook: no matching payment record', wpId);
-        if (pmt.status === 'credited') return; // idempotent — already processed
 
-        // SECURITY: independently verify status with Wonderful API
+        // Fetch payment record — try wonderful_payment_id first, then merchant_reference
+        let pmt = null;
+        if (wpId) {
+            const byId = await pool.query(
+                `SELECT * FROM wonderful_payments WHERE wonderful_payment_id = $1`, [wpId]
+            );
+            pmt = byId.rows[0] || null;
+        }
+        if (!pmt && webhookRef) {
+            const byRef = await pool.query(
+                `SELECT * FROM wonderful_payments WHERE merchant_reference = $1`, [webhookRef]
+            );
+            pmt = byRef.rows[0] || null;
+        }
+        if (!pmt) {
+            return console.warn('[Wonderful webhook] no matching payment record — wpId:', wpId, 'ref:', webhookRef);
+        }
+        if (pmt.status === 'credited') {
+            return console.log('[Wonderful webhook] already credited, skipping:', pmt.merchant_reference);
+        }
+
+        // SECURITY: independently verify status with Wonderful API — never trust webhook payload alone
         if (!WONDERFUL_API_KEY) return;
-        // Resolve the Wonderful payment ID — prefer webhook body, fall back to DB row
         const verifyId = wpId || pmt.wonderful_payment_id;
         if (!verifyId) {
-            return console.error('Wonderful webhook: cannot verify — no wonderful_payment_id available');
+            return console.error('[Wonderful webhook] cannot verify — no wonderful_payment_id. merchant_ref:', pmt.merchant_reference);
         }
         let verified;
         try {
@@ -17951,6 +17911,9 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
 
         await auditLog(pool, pmt.player_id, 'wonderful_credited', pmt.player_id,
             `£${pounds} credited via Wonderful. Ref: ${pmt.merchant_reference}`);
+
+        // Trigger RAF activation bonus if this is the referred player's first top-up
+        setImmediate(() => triggerRafActivation(pmt.player_id).catch(() => {}));
 
         // Send confirmation email to player
         setImmediate(async () => {
@@ -18040,13 +18003,63 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
     try {
         const { ref } = req.params;
         const row = await pool.query(
-            `SELECT status, amount_pence, game_id, credited_at
+            `SELECT status, amount_pence, game_id, credited_at, wonderful_payment_id
              FROM wonderful_payments
              WHERE merchant_reference = $1 AND player_id = $2`,
             [ref, req.user.playerId]
         );
         if (!row.rows.length) return res.status(404).json({ error: 'Payment not found' });
         const p = row.rows[0];
+
+        // COLD-START RECOVERY: if our DB says pending but Wonderful confirms paid,
+        // credit the player now. This handles webhook misses due to Render cold starts.
+        if (p.status === 'pending' && p.wonderful_payment_id && WONDERFUL_API_KEY) {
+            try {
+                const verifyRes = await wonderfulRequest('GET', `/v2/payments/${p.wonderful_payment_id}`);
+                const verifiedStatus = verifyRes.data?.status;
+                if (verifiedStatus === 'paid' || verifiedStatus === 'accepted') {
+                    console.log('[Wonderful status poll] cold-start recovery — crediting via status poll for ref:', ref);
+                    // Atomic claim — prevents double-credit if webhook also fires
+                    const client = await pool.connect();
+                    try {
+                        await client.query('BEGIN');
+                        const claim = await client.query(
+                            `UPDATE wonderful_payments
+                             SET status = 'credited', confirmed_at = NOW(), credited_at = NOW()
+                             WHERE merchant_reference = $1 AND player_id = $2 AND status != 'credited'
+                             RETURNING *`,
+                            [ref, req.user.playerId]
+                        );
+                        if (claim.rows.length > 0) {
+                            const pounds = p.amount_pence / 100;
+                            await client.query(
+                                `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
+                                 ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+                                [req.user.playerId, pounds]
+                            );
+                            await recordCreditTransaction(pool, req.user.playerId, pounds, 'wonderful_topup',
+                                `Wonderful bank payment (status-poll recovery) — ref ${ref}`, null);
+                            await auditLog(pool, req.user.playerId, 'wonderful_credited', req.user.playerId,
+                                `£${pounds} credited via status-poll recovery. Ref: ${ref}`);
+                            await client.query('COMMIT');
+                            // Trigger RAF activation if this is the player's first top-up
+                            setImmediate(() => triggerRafActivation(req.user.playerId).catch(() => {}));
+                            return res.json({ status: 'credited', amount: pounds.toFixed(2), game_id: p.game_id, credited_at: new Date() });
+                        }
+                        await client.query('ROLLBACK');
+                    } catch (creditErr) {
+                        await client.query('ROLLBACK').catch(() => {});
+                        console.error('[Wonderful status poll] recovery credit failed:', creditErr.message);
+                    } finally {
+                        client.release();
+                    }
+                }
+            } catch (verifyErr) {
+                // Verify failed — return current DB status, don't error the poll
+                console.warn('[Wonderful status poll] verify failed:', verifyErr.message);
+            }
+        }
+
         res.json({
             status:      p.status,
             amount:      (p.amount_pence / 100).toFixed(2),
