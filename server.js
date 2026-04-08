@@ -17750,6 +17750,41 @@ async function wonderfulRequest(method, path, body = null) {
     return json;
 }
 
+// Shared helper — send top-up confirmation email after any successful Wonderful credit
+async function sendWonderfulCreditEmail(playerId, pounds, ref) {
+    try {
+        const pRow = await pool.query(
+            `SELECT p.alias, p.full_name, u.email
+             FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
+            [playerId]
+        );
+        if (!pRow.rows[0]?.email) return;
+        const name = pRow.rows[0].alias || pRow.rows[0].full_name;
+        const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
+        const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
+        await emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to:   pRow.rows[0].email,
+            subject: `✅ £${pounds.toFixed(2)} added to your TotalFooty balance`,
+            html: wrapEmailHtml(`
+                <p style="font-size:16px;font-weight:700;">Hi ${htmlEncode(name)},</p>
+                <p style="color:#888;">Your payment has been confirmed and your credits have been added.</p>
+                <div style="text-align:center;padding:28px 0;">
+                    <div style="font-size:48px;font-weight:900;color:#00cc66;">£${pounds.toFixed(2)}</div>
+                    <div style="font-size:14px;color:#888;margin-top:8px;">added to your balance</div>
+                    <div style="font-size:20px;font-weight:900;margin-top:16px;">New balance: £${newBal}</div>
+                </div>
+                <p style="text-align:center;">
+                    <a href="https://totalfooty.co.uk" style="display:inline-block;padding:14px 32px;background:#00cc66;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">SIGN UP FOR A GAME →</a>
+                </p>
+                <p style="color:#666;font-size:12px;text-align:center;margin-top:16px;">Payment ref: ${htmlEncode(ref)}</p>
+            `)
+        });
+    } catch (e) {
+        console.error('Wonderful credit email failed (non-critical):', e.message);
+    }
+}
+
 // POST /api/payments/wonderful/initiate
 // Authenticated — creates a Wonderful payment request and returns the pay_link
 app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiateLimiter, async (req, res) => {
@@ -17802,7 +17837,7 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         );
 
         await auditLog(pool, playerId, 'wonderful_initiated', playerId,
-            `Wonderful payment initiated: £${pounds} ref=${merchantRef}`);
+            `Wonderful payment initiated: £${pounds.toFixed(2)} · Ref: ${merchantRef}`);
 
         res.json({ pay_link: payLink, merchant_reference: merchantRef });
     } catch (e) {
@@ -17900,55 +17935,30 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
 
         const pounds = pmt.amount_pence / 100;
 
-        // Credit the player's balance
-        await pool.query(
+        // Read balance BEFORE credit for audit trail
+        const balBeforeRow = await pool.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
+        const balBefore = parseFloat(balBeforeRow.rows[0]?.balance || 0);
+
+        // Credit the player's balance — RETURNING gives us confirmed new balance
+        const creditResult = await pool.query(
             `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2
+             RETURNING balance`,
             [pmt.player_id, pounds]
         );
+        const balAfter = parseFloat(creditResult.rows[0]?.balance || (balBefore + pounds));
+
         await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
             `Wonderful bank payment — ref ${pmt.merchant_reference}`, null);
 
         await auditLog(pool, pmt.player_id, 'wonderful_credited', pmt.player_id,
-            `£${pounds} credited via Wonderful. Ref: ${pmt.merchant_reference}`);
+            `£${pounds.toFixed(2)} credited via Wonderful · Balance: £${balBefore.toFixed(2)} → £${balAfter.toFixed(2)} · Ref: ${pmt.merchant_reference}`);
 
         // Trigger RAF activation bonus if this is the referred player's first top-up
         setImmediate(() => triggerRafActivation(pmt.player_id).catch(() => {}));
 
         // Send confirmation email to player
-        setImmediate(async () => {
-            try {
-                const pRow = await pool.query(
-                    `SELECT p.alias, p.full_name, u.email
-                     FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
-                    [pmt.player_id]
-                );
-                if (!pRow.rows[0]?.email) return;
-                const name = pRow.rows[0].alias || pRow.rows[0].full_name;
-                const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [pmt.player_id]);
-                const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
-                await emailTransporter.sendMail({
-                    from: '"TotalFooty" <totalfooty19@gmail.com>',
-                    to:   pRow.rows[0].email,
-                    subject: `✅ £${pounds.toFixed(2)} added to your TotalFooty balance`,
-                    html: wrapEmailHtml(`
-                        <p style="font-size:16px;font-weight:700;">Hi ${htmlEncode(name)},</p>
-                        <p style="color:#888;">Your payment has been confirmed and your credits have been added.</p>
-                        <div style="text-align:center;padding:28px 0;">
-                            <div style="font-size:48px;font-weight:900;color:#00cc66;">£${pounds.toFixed(2)}</div>
-                            <div style="font-size:14px;color:#888;margin-top:8px;">added to your balance</div>
-                            <div style="font-size:20px;font-weight:900;margin-top:16px;">New balance: £${newBal}</div>
-                        </div>
-                        <p style="text-align:center;">
-                            <a href="https://totalfooty.co.uk" style="display:inline-block;padding:14px 32px;background:#00cc66;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">SIGN UP FOR A GAME →</a>
-                        </p>
-                        <p style="color:#666;font-size:12px;text-align:center;margin-top:16px;">Payment ref: ${htmlEncode(pmt.merchant_reference)}</p>
-                    `)
-                });
-            } catch (e) {
-                console.error('Wonderful credit email failed (non-critical):', e.message);
-            }
-        });
+        setImmediate(() => sendWonderfulCreditEmail(pmt.player_id, pounds, pmt.merchant_reference));
 
         // If payment was linked to a specific game, auto-register the player
         if (pmt.game_id) {
@@ -18032,18 +18042,24 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
                         );
                         if (claim.rows.length > 0) {
                             const pounds = p.amount_pence / 100;
-                            await client.query(
+                            const balBeforeRow2 = await client.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [req.user.playerId]);
+                            const balBefore2 = parseFloat(balBeforeRow2.rows[0]?.balance || 0);
+                            const creditResult2 = await client.query(
                                 `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-                                 ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+                                 ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2
+                                 RETURNING balance`,
                                 [req.user.playerId, pounds]
                             );
+                            const balAfter2 = parseFloat(creditResult2.rows[0]?.balance || (balBefore2 + pounds));
+                            await client.query('COMMIT');
+                            // Post-commit logging — uses pool (outside transaction intentionally)
                             await recordCreditTransaction(pool, req.user.playerId, pounds, 'wonderful_topup',
                                 `Wonderful bank payment (status-poll recovery) — ref ${ref}`, null);
                             await auditLog(pool, req.user.playerId, 'wonderful_credited', req.user.playerId,
-                                `£${pounds} credited via status-poll recovery. Ref: ${ref}`);
-                            await client.query('COMMIT');
+                                `£${pounds.toFixed(2)} credited via Wonderful (recovery) · Balance: £${balBefore2.toFixed(2)} → £${balAfter2.toFixed(2)} · Ref: ${ref}`);
                             // Trigger RAF activation if this is the player's first top-up
                             setImmediate(() => triggerRafActivation(req.user.playerId).catch(() => {}));
+                            setImmediate(() => sendWonderfulCreditEmail(req.user.playerId, pounds, ref));
                             return res.json({ status: 'credited', amount: pounds.toFixed(2), game_id: p.game_id, credited_at: new Date() });
                         }
                         await client.query('ROLLBACK');
@@ -18120,18 +18136,25 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
 
         const pounds = pmt.amount_pence / 100;
 
-        await pool.query(
+        const balBeforeRow3 = await pool.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
+        const balBefore3 = parseFloat(balBeforeRow3.rows[0]?.balance || 0);
+        const creditResult3 = await pool.query(
             `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2
+             RETURNING balance`,
             [pmt.player_id, pounds]
         );
+        const balAfter3 = parseFloat(creditResult3.rows[0]?.balance || (balBefore3 + pounds));
         await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
             `Manual credit by superadmin — Wonderful ref ${pmt.merchant_reference}`, null);
         await auditLog(pool, pmt.player_id, 'wonderful_credited', req.user.playerId,
-            `MANUAL CREDIT: £${pounds} via Wonderful. Ref: ${pmt.merchant_reference}`);
+            `MANUAL CREDIT: £${pounds.toFixed(2)} via Wonderful · Balance: £${balBefore3.toFixed(2)} → £${balAfter3.toFixed(2)} · Ref: ${pmt.merchant_reference}`);
 
         const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [pmt.player_id]);
         const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
+
+        // Send confirmation email to player
+        setImmediate(() => sendWonderfulCreditEmail(pmt.player_id, pounds, pmt.merchant_reference));
 
         res.json({ success: true, amount: pounds.toFixed(2), player_id: pmt.player_id, new_balance: newBal });
     } catch (e) {
