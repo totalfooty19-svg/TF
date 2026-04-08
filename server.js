@@ -3215,6 +3215,66 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
     }
 });
 
+// POST /api/admin/players/:playerId/generate-referral-code
+// Generates a referral code for a player who doesn't have one yet.
+// Superadmin only — used from Manage Players edit modal for legacy accounts.
+app.post('/api/admin/players/:playerId/generate-referral-code', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+
+        // Check player exists and whether they already have a code
+        const playerCheck = await pool.query(
+            'SELECT id, alias, full_name, referral_code FROM players WHERE id = $1',
+            [playerId]
+        );
+        if (playerCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+
+        const player = playerCheck.rows[0];
+
+        // Idempotent — if they already have a code just return it
+        if (player.referral_code) {
+            return res.json({
+                referralCode: player.referral_code,
+                referralLink: `https://totalfooty.co.uk/?ref=${player.referral_code}`,
+                generated: false,
+                message: 'Player already has a referral code'
+            });
+        }
+
+        // Generate new code
+        const referralCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
+
+        // Write to players table + referrals table (backward compat)
+        await pool.query(
+            'UPDATE players SET referral_code = $1 WHERE id = $2',
+            [referralCode, playerId]
+        );
+        try {
+            await pool.query(
+                'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                [playerId, referralCode]
+            );
+        } catch (refErr) {
+            console.error('Referrals table insert (non-critical):', refErr.message);
+        }
+
+        auditLog(pool, req.user.playerId, 'referral_code_generated', playerId,
+            `Referral code generated for ${player.alias || player.full_name}: ${referralCode}`);
+
+        res.json({
+            referralCode,
+            referralLink: `https://totalfooty.co.uk/?ref=${referralCode}`,
+            generated: true,
+            message: `Referral code generated for ${player.alias || player.full_name}`
+        });
+    } catch (error) {
+        console.error('Generate referral code error:', error);
+        res.status(500).json({ error: 'Failed to generate referral code' });
+    }
+});
+
 
 // ==========================================
 // VENUES API
