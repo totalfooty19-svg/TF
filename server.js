@@ -134,6 +134,14 @@ const ALLOWED_ORIGINS = ['https://totalfooty.co.uk', 'https://www.totalfooty.co.
 const csrfProtect = (req, res, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
     const raw = req.headers['origin'] || req.headers['referer'] || '';
+    // MOBILE-AUTH: React Native does not send an Origin header.
+    // A request with no origin AND a valid Bearer token is a mobile API call — allow it.
+    // A request with no origin AND no token is blocked as before.
+    if (!raw) {
+        const authHeader = req.headers['authorization'] || '';
+        if (authHeader.startsWith('Bearer ')) return next();
+        return res.status(403).json({ error: 'Request origin not permitted' });
+    }
     let originToCheck = raw;
     try { originToCheck = new URL(raw).origin; } catch (_) { /* not a valid URL — block it */ }
     if (!ALLOWED_ORIGINS.includes(originToCheck)) {
@@ -692,11 +700,13 @@ const NOTIF_TEMPLATES = {
     dropout_confirmed: d => ({ title: 'Dropped Out ✅',          body: `You've been removed from ${d.day} at ${d.venue}.` }),
     backup_promoted:   d => ({ title: "You're In! 🟢",           body: `A spot opened — you're confirmed for ${d.day} at ${d.venue}!` }),
     teams_created:     d => ({ title: 'Teams Are Live! 🏟️',     body: `Teams set for ${d.day} at ${d.venue}. Check the app!` }),
+    teams_confirmed:   d => ({ title: '🏟️  The teamsheets are in!', body: `${d.time} at ${d.venue}. Tap to view the lineup.` }),
     game_cancelled:    d => ({ title: 'Game Cancelled ❌',       body: `The game on ${d.day} at ${d.venue} has been cancelled. Refund issued.` }),
     cost_changed:      d => ({ title: 'Price Updated 💰',        body: `Game cost changed: was £${d.oldCost}, now £${d.newCost}.` }),
     game_reminder:     d => ({ title: 'Game Tomorrow! ⚽',       body: `You're playing ${d.day} at ${d.time}, ${d.venue}.` }),
     motm_voting_open:  d => ({ title: 'Vote for MOTM 🏆',       body: `Voting is open for ${d.day}. Cast your vote now!` }),
     motm_winner:       d => ({ title: 'MOTM Winner 🌟',          body: `${d.winnerName} has won Man of the Match for ${d.day}!` }),
+    spot_available:    d => ({ title: '🔥 Spot just opened!', body: `${d.time} at ${d.venue} — first to claim it gets in!` }),
     signup:            _d => ({ title: 'Welcome to TotalFooty! ⚽', body: "Your account is ready. Find a game and sign up!" }),
     badge_awarded:     _d => ({ title: 'New Badge! 🏅',          body: "You've earned a new badge. Check your profile!" }),
     balance_updated:   _d => ({ title: 'Balance Updated 💳',    body: 'Your TotalFooty credit balance has been updated.' }),
@@ -738,7 +748,7 @@ async function sendNotification(type, playerId, data = {}) {
 
         const messages = tokenResult.rows.map(row => ({
             to: row.fcm_token, sound: 'default', title, body,
-            data: { type, gameId: data.gameId || null },
+            data: { type, gameId: data.gameId || null, senderId: data.senderId || null, senderName: data.senderName || null },
         }));
 
         const response = await fetch('https://exp.host/--/api/v2/push/send', {
@@ -923,8 +933,11 @@ if (!WONDERFUL_API_KEY)   console.warn('WARNING: WONDERFUL_API_KEY not set — W
 // ==========================================
 
 const authenticateToken = async (req, res, next) => {
-    // CRIT-2: Read JWT from httpOnly cookie — not Authorization header
-    const token = req.cookies?.tf_token;
+    // CRIT-2: Primary auth via httpOnly cookie (web). Fallback to Bearer token (mobile app).
+    const cookieToken = req.cookies?.tf_token;
+    const authHeader  = req.headers['authorization'] || '';
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const token = cookieToken || bearerToken;
     if (!token) return res.status(401).json({ error: 'Access denied' });
     
     jwt.verify(token, JWT_SECRET, async (err, user) => {
@@ -966,8 +979,11 @@ const requireAdmin = (req, res, next) => {
 // SEC-026: Optional auth — attaches user if token present but never blocks unauthenticated requests.
 // Used for endpoints where general content is public but personalised content requires auth.
 const optionalAuth = async (req, res, next) => {
-    // CRIT-2: Read JWT from httpOnly cookie — not Authorization header
-    const token = req.cookies?.tf_token;
+    // CRIT-2: Primary auth via httpOnly cookie (web). Fallback to Bearer token (mobile app).
+    const cookieToken = req.cookies?.tf_token;
+    const authHeader  = req.headers['authorization'] || '';
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const token = cookieToken || bearerToken;
     if (!token) return next();
     jwt.verify(token, JWT_SECRET, async (err, user) => {
         if (!err) {
@@ -1082,7 +1098,11 @@ const requireGameManager = async (req, res, next) => {
 
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { fullName, alias, email, password, phone, ref, skillLevel, roleParam, ageRange, region, interests } = req.body;
+        const { fullName, alias, email, password, phone, skillLevel, roleParam, ageRange, region, interests } = req.body;
+        // MOBILE-COMPAT: mobile app sends 'referralCode' and 'refereeInvite' (camelCase);
+        // web sends 'ref' and 'referee_invite' (snake_case). Accept both.
+        const ref = req.body.ref || req.body.referralCode || null;
+        const referee_invite_code = req.body.referee_invite || req.body.refereeInvite || null;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -1274,7 +1294,7 @@ app.post('/api/auth/register', async (req, res) => {
         }
 
         // Handle ?referee_invite=CODE — one-time invite that grants Referee badge
-        const referee_invite = req.body.referee_invite;
+        const referee_invite = referee_invite_code;
         if (referee_invite) {
             try {
                 const inviteResult = await pool.query(
@@ -1564,7 +1584,10 @@ app.post('/api/auth/login', async (req, res) => {
 
         // LOGIN-SLIM: Minimal response — just enough to boot the session.
         // loadDashboard fetches full player data via /api/players/me immediately after.
+        // MOBILE-AUTH: Also return token in response body for mobile clients that cannot
+        // use httpOnly cookies (React Native). Web clients use the cookie and ignore this field.
         res.json({
+            token,
             mustChangePassword: user.force_password_change === true,
             user: {
                 id: player.id,
@@ -1671,6 +1694,14 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.player_number, 
                     p.photo_url, 
                     p.reliability_tier, 
+                    COALESCE(p.position, 'outfield') AS position_preference,
+                    p.referral_code,
+                    CASE WHEN p.total_appearances > 0 
+                         THEN ROUND(CAST(p.total_wins AS NUMERIC) / p.total_appearances * 100, 1) 
+                         ELSE 0 END AS win_percent,
+                    CASE WHEN p.total_appearances > 0 
+                         THEN ROUND(CAST(p.motm_wins AS NUMERIC) / p.total_appearances * 100, 1) 
+                         ELSE 0 END AS motm_percent,
                     p.total_appearances, 
                     p.motm_wins, 
                     p.total_wins,
@@ -2275,7 +2306,19 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
         // Get completed games
         const completedResult = await pool.query(`
             SELECT g.id, g.game_date, g.game_url, g.winning_team,
-                   v.name as venue_name
+                   g.score_team_a, g.score_team_b,
+                   v.name as venue_name,
+                   -- Did this player win?
+                   CASE WHEN g.winning_team IS NOT NULL AND g.winning_team != '' AND EXISTS (
+                     SELECT 1 FROM team_players tp
+                     JOIN teams t ON t.id = tp.team_id
+                     WHERE tp.player_id = $1 AND t.game_id = g.id
+                       AND LOWER(t.team_name) = LOWER(g.winning_team)
+                   ) THEN true ELSE false END AS won,
+                   -- Was this player MOTM?
+                   (g.motm_winner_id = $1) AS is_motm,
+                   -- Position played
+                   r.position_preference AS position_played
             FROM registrations r
             JOIN games g ON g.id = r.game_id
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -3376,10 +3419,27 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             SELECT g.*, v.name as venue_name,
                    COALESCE(rc.confirmed_count, 0) + COALESCE(gc.guest_count, 0) AS current_players,
                    p.full_name as motm_winner_name,
-                   p.alias as motm_winner_alias
+                   p.alias as motm_winner_alias,
+                   gs.series_name,
+                   -- Player's result for this game
+                   CASE
+                     WHEN g.winning_team IS NULL OR g.winning_team = '' THEN 'draw'
+                     WHEN EXISTS (
+                       SELECT 1 FROM team_players tp2
+                       JOIN teams t2 ON t2.id = tp2.team_id
+                       WHERE tp2.player_id = $3 AND t2.game_id = g.id
+                         AND LOWER(t2.team_name) = LOWER(g.winning_team)
+                     ) THEN 'win'
+                     ELSE 'loss'
+                   END AS my_result,
+                   -- Awards this player won in this game
+                   (SELECT json_agg(json_build_object('award_type', ga.award_type))
+                    FROM game_awards ga
+                    WHERE ga.game_id = g.id AND ga.recipient_player_id = $3) AS my_awards
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN players p ON p.id = g.motm_winner_id
+            LEFT JOIN game_series gs ON gs.id = g.series_id
             LEFT JOIN (
                 SELECT game_id, COUNT(*) AS confirmed_count
                 FROM registrations WHERE status = 'confirmed'
@@ -3390,9 +3450,13 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
                 FROM game_guests GROUP BY game_id
             ) gc ON gc.game_id = g.id
             WHERE g.game_status = 'completed'
+              AND EXISTS (
+                SELECT 1 FROM registrations r2
+                WHERE r2.game_id = g.id AND r2.player_id = $3 AND r2.status = 'confirmed'
+              )
             ORDER BY g.game_date DESC
             LIMIT $1 OFFSET $2
-        `, [limit, offset]);
+        `, [limit, offset, req.user.playerId]);
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -4766,6 +4830,96 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
 // A confirmed player signs up another registered player for the same game.
 // Credits are deducted from the registering player. Friend's tier window applies.
 // If the registering player holds the exclusivity badge, the friend is exempt from that check.
+
+// POST /api/games/:id/claim-spot — first-come-first-served spot claim for normal backups
+// Atomic: only one player can claim the open spot. Returns 409 if spot already taken.
+app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        const playerId = req.user.playerId;
+
+        await client.query('BEGIN');
+
+        // Verify player is a normal_backup for this game
+        const regCheck = await client.query(
+            `SELECT id, position_preference FROM registrations
+             WHERE game_id = $1 AND player_id = $2 AND status = 'backup' AND backup_type = 'normal_backup'
+             FOR UPDATE`,
+            [gameId, playerId]
+        );
+        if (regCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'You are not on the normal backup list for this game' });
+        }
+
+        // Check if there is actually a confirmed spot available (atomic)
+        const game = await client.query(
+            `SELECT g.cost_per_player, g.max_players,
+                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
+             FROM games g WHERE g.id = $1`,
+            [gameId]
+        );
+        if (!game.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        const { cost_per_player, max_players, current_players } = game.rows[0];
+        if (parseInt(current_players) >= parseInt(max_players)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: `Sorry — that spot was just claimed. You're still on backup.` });
+        }
+
+        // Check credits
+        const cost = parseFloat(cost_per_player || 0);
+        const creditRes = await client.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
+        const balance = parseFloat(creditRes.rows[0]?.balance || 0);
+        if (balance < cost) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                error: `Insufficient credits. You need £${cost.toFixed(2)} but have £${balance.toFixed(2)}.`,
+                code: 'INSUFFICIENT_CREDITS'
+            });
+        }
+
+        // Claim the spot — promote to confirmed
+        await client.query(
+            `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
+            [regCheck.rows[0].id]
+        );
+
+        // Charge credits
+        if (cost > 0) {
+            await applyGameFee(client, playerId, cost, `Claimed open spot — game ${gameId}`);
+        }
+
+        // In-app notification confirmation
+        await client.query(
+            `INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, 'backup_promoted', $2, $3)`,
+            [playerId, `You claimed the open spot! £${cost.toFixed(2)} deducted. See you on the pitch!`, gameId]
+        );
+
+        await client.query('COMMIT');
+
+        // Push to confirmed player
+        const gameData = await getGameDataForNotification(gameId);
+        sendNotification('backup_promoted', playerId, gameData).catch(() => {});
+
+        // Audit
+        setImmediate(() => gameAuditLog(pool, gameId, playerId, 'spot_claimed',
+            `Player claimed open spot via race mechanic`).catch(() => {}));
+
+        res.json({ success: true, message: `Spot claimed! You're in.` });
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('Claim spot error:', e.message);
+        res.status(500).json({ error: 'Failed to claim spot' });
+    } finally {
+        client.release();
+    }
+});
+
 app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -5576,25 +5730,26 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 }
             }
             
-            // Also try normal_backup if no confirmed_backup found — but check credits first (FIX-064)
+            // Normal backups: do NOT auto-promote. 
+            // Instead notify ALL normal backups simultaneously — it's a race to claim.
+            // (confirmed_backup already paid for guaranteed auto-promotion above)
             if (!promotedPlayer) {
                 const normalBackups = await client.query(`
-                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
-                    FROM registrations r
-                    JOIN players p ON p.id = r.player_id
+                    SELECT r.player_id FROM registrations r
                     WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'normal_backup'
-                    ORDER BY r.registered_at ASC
                 `, [gameId]);
 
-                for (const candidate of normalBackups.rows) {
-                    const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
-                    if (isGK && currentGKs >= maxGKSlots) continue;
-                    // FIX-064: Check balance before promoting — skip if insufficient
-                    const backupCredit = await client.query('SELECT balance FROM credits WHERE player_id = $1', [candidate.player_id]);
-                    const backupBalance = parseFloat(backupCredit.rows[0]?.balance || 0);
-                    if (backupBalance < cost) continue; // Skip — insufficient funds
-                    promotedPlayer = candidate;
-                    break;
+                if (normalBackups.rows.length > 0) {
+                    const gameData = await getGameDataForNotification(gameId);
+                    for (const row of normalBackups.rows) {
+                        sendNotification('spot_available', row.player_id, gameData).catch(() => {});
+                        client.query(
+                            `INSERT INTO notifications (player_id, type, message, game_id)
+                             VALUES ($1, 'spot_available', $2, $3)
+                             ON CONFLICT DO NOTHING`,
+                            [row.player_id, `A spot has opened at ${gameData.venue} on ${gameData.day} — first to claim it gets in!`, gameId]
+                        ).catch(() => {});
+                    }
                 }
             }
             
@@ -6521,6 +6676,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
         const cancelGameRow = cancelGameInfo.rows[0] || {};
         const cancelDate = cancelGameRow.game_date ? new Date(cancelGameRow.game_date).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }) : '';
         const cancelGameData = {
+            gameId: gameId,  // gameId is in scope from the endpoint parameter
             day: cancelDate,
             time: cancelGameRow.game_date ? new Date(cancelGameRow.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '',
             venue: cancelGameRow.venue_name || 'TBC',
@@ -7249,6 +7405,16 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
             WHERE g.id = $1
         `, [gameId]);
         
+        // Notify all confirmed players that teams are set
+        const allPlayers = await pool.query(
+            `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        const gameData = await getGameDataForNotification(gameId);
+        for (const row of allPlayers.rows) {
+            sendNotification('teams_confirmed', row.player_id, gameData).catch(() => {});
+        }
+
         res.json({ 
             message: 'Teams confirmed',
             game: fullGameResult.rows[0]
@@ -8856,9 +9022,11 @@ app.get('/api/public/game/:gameUrl/series', async (req, res) => {
         if (series_id) {
             seriesResult = await pool.query(`
                 SELECT g.id, g.game_url, g.game_date, g.game_status, g.max_players,
+                       gs.series_name,
                        ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
                         + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
                 FROM games g
+                LEFT JOIN game_series gs ON gs.id = g.series_id
                 WHERE g.series_id = $1
                 ORDER BY g.game_date ASC
             `, [series_id]);
@@ -8883,10 +9051,15 @@ app.get('/api/public/game/:gameUrl/series', async (req, res) => {
         const prev = currentIndex > 0 ? games[currentIndex - 1] : null;
         const next = currentIndex < games.length - 1 ? games[currentIndex + 1] : null;
 
+        const seriesName = games.length > 0 ? (games[0].series_name || null) : null;
         res.json({
             series: {
+                series_id,
+                series_name: seriesName,
                 games,
                 currentIndex,
+                game_number: currentIndex + 1,
+                total_games: games.length,
                 prev: prev ? { game_url: prev.game_url, game_date: prev.game_date, game_status: prev.game_status } : null,
                 next: next ? { game_url: next.game_url, game_date: next.game_date, game_status: next.game_status } : null,
                 total: games.length
@@ -8916,7 +9089,7 @@ app.get('/api/public/game/:gameUrl/next', async (req, res) => {
 
         // Find the next game in series that is in the future and not cancelled
         const nextResult = await pool.query(`
-            SELECT g.game_url, g.game_date, g.max_players,
+            SELECT g.id, g.game_url, g.game_date, g.max_players,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
             FROM games g
@@ -9673,6 +9846,20 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                 }
             }
             
+            // If no confirmed_backup found, broadcast to all normal backups (race mechanic)
+            if (!promotedPlayer) {
+                const normalBackups = await pool.query(
+                    `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'backup' AND backup_type = 'normal_backup'`,
+                    [gameId]
+                );
+                if (normalBackups.rows.length > 0) {
+                    const gameData = await getGameDataForNotification(gameId);
+                    for (const row of normalBackups.rows) {
+                        sendNotification('spot_available', row.player_id, gameData).catch(() => {});
+                    }
+                }
+            }
+
             if (promotedPlayer) {
                 // BUG-01b: Use transaction so status update + credit deduction are atomic
                 const promoClient = await pool.connect();
@@ -9832,8 +10019,8 @@ async function finaliseRefereeReviews(gameId) {
 // TF GAME AWARDS — helper functions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler','donkey','goalscorer','hattrick'];
-const POSITIVE_AWARDS = ['motm','best_engine','brick_wall','goalscorer','hattrick'];
+const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler','donkey','goalscorer'];
+const POSITIVE_AWARDS = ['motm','best_engine','brick_wall','goalscorer'];
 const BANTER_AWARDS   = ['reckless_tackler','mr_hollywood','the_moaner','howler','donkey'];
 const MIN_VOTES_REQUIRED = 3; // default for all awards except MOTM
 const AWARD_MIN_VOTES = { goalscorer: 2 }; // per-award overrides
@@ -10030,6 +10217,7 @@ async function closeAwards(gameId) {
                             );
                             const winnerName = pResult.rows[0]?.alias || pResult.rows[0]?.full_name || 'Player';
                             await sendNotification('motm_winner', winner.playerId, {
+                                gameId: gameId,
                                 day: dayName, venue: venueName, winnerName
                             });
                             // Regenerate bio after MOTM win
@@ -10535,8 +10723,10 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
         // Get all votes for this game
         const votesResult = await pool.query(
             `SELECT gav.award_type, gav.nominee_player_id, gav.voter_player_id,
-                    COUNT(*) OVER (PARTITION BY gav.award_type, gav.nominee_player_id) as vote_count
+                    COUNT(*) OVER (PARTITION BY gav.award_type, gav.nominee_player_id) as vote_count,
+                    COALESCE(p.alias, p.full_name) AS nominee_name
              FROM game_award_votes gav
+             LEFT JOIN players p ON p.id = gav.nominee_player_id
              WHERE gav.game_id = $1`,
             [gameId]
         );
@@ -10576,6 +10766,14 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
             voteCounts[row.award_type][row.nominee_player_id] = parseInt(row.vote_count);
         }
 
+        // Build player name map from votes for display in the app (saves separate fetch)
+        const playerNames = {};
+        for (const row of votesResult.rows) {
+            if (row.nominee_player_id && row.nominee_name) {
+                playerNames[row.nominee_player_id] = row.nominee_name;
+            }
+        }
+
         res.json({
             awardsOpen: game.awards_open,
             awardsCloseAt: game.awards_close_at,
@@ -10583,6 +10781,7 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
             votedCount: parseInt(participantsResult.rows[0].voted_count),
             totalPlayers: parseInt(totalRegisteredResult.rows[0].total),
             voteCounts,
+            playerNames,
             myVotes: myVotes.map(v => ({ awardType: v.award_type, nomineeId: v.nominee_player_id })),
             confirmedAwards: awardsResult.rows,
         });
@@ -13152,6 +13351,7 @@ app.post('/api/dm/:playerId', authenticateToken, dmSendLimiter, async (req, res)
         sendNotification('new_dm', playerId, {
             preview: `${senderName}: ${preview}`,
             senderName,
+            senderId,   // so app can navigate to the correct DM thread
         }).catch(() => {});
 
         res.status(201).json(newMsg);
@@ -15296,8 +15496,8 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
 // ══════════════════════════════════════════════════════════════
 app.get('/api/coaching/coach/:id/profile', optionalAuth, publicEndpointLimiter, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) {
-        return res.status(400).json({ error: 'Invalid coach ID' });
+    if (!id) {
+        return res.status(400).json({ error: 'Coach ID required' });
     }
     try {
         const cResult = await pool.query(`
@@ -15547,7 +15747,7 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 app.get('/api/coaching/sessions/:id/edit-data', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
     try {
         const sRes = await pool.query(
             `SELECT cs.*, p.full_name AS coach_name
@@ -15605,7 +15805,7 @@ app.get('/api/coaching/sessions/:id/edit-data', authenticateToken, async (req, r
 // ══════════════════════════════════════════════════════════════
 app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     const { activity_type, group_type, duration_hours, venue_ids,
             session_date, session_notes, assigned_coach_player_id } = req.body;
@@ -15758,7 +15958,7 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     try {
         const sessionResult = await pool.query(
@@ -15831,7 +16031,7 @@ app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationL
 // ══════════════════════════════════════════════════════════════
 app.delete('/api/coaching/sessions/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     try {
         const regResult = await pool.query(
@@ -16197,7 +16397,7 @@ app.put('/api/coaching/sessions/:id/finalise',  authenticateToken, handleFinalis
 // ══════════════════════════════════════════════════════════════
 app.post('/api/coaching/sessions/:id/complete', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     const sessionResult = await pool.query(
         `SELECT id, coach_player_id, status, activity_type FROM coaching_sessions WHERE id=$1`, [id]
@@ -16249,7 +16449,7 @@ app.post('/api/coaching/sessions/:id/complete', authenticateToken, async (req, r
 app.post('/api/coaching/sessions/:id/feedback', authenticateToken, registrationLimiter, async (req, res) => {
     const { id } = req.params;
     const { rating, comment } = req.body;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
     if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'rating must be 1–5' });
     if (comment && comment.length > 1000) return res.status(400).json({ error: 'comment too long' });
 
@@ -16861,7 +17061,7 @@ app.post('/api/admin/ref/applications/:id/review', authenticateToken, requireSup
 // ══════════════════════════════════════════════════════════════
 app.post('/api/coaching/sessions/:id/cancel-request', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     const sessionResult = await pool.query(
         `SELECT id, coach_player_id, status, activity_type, session_date, cancel_requested
@@ -16912,7 +17112,7 @@ app.post('/api/coaching/sessions/:id/cancel-request', authenticateToken, async (
 // ══════════════════════════════════════════════════════════════
 app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, requireSuperAdmin, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     const sessionResult = await pool.query(
         `SELECT id, coach_player_id, status, cancel_requested, activity_type, session_date
@@ -16965,7 +17165,7 @@ app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, r
 // ══════════════════════════════════════════════════════════════
 app.post('/api/admin/coaching/sessions/:id/cancel-reject', authenticateToken, requireSuperAdmin, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     const sessionResult = await pool.query(
         `SELECT id, coach_player_id, status, cancel_requested, activity_type, session_date
@@ -17006,7 +17206,7 @@ app.post('/api/admin/coaching/sessions/:id/cancel-reject', authenticateToken, re
 // ════════════════════════════════════════════════════════════
 app.delete('/api/admin/coaching/sessions/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
     const { id } = req.params;
-    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     const client = await pool.connect();
     try {
@@ -17585,7 +17785,6 @@ async function _getSeriesTrophyPayload(seriesId, includeIds) {
             metric_name: cfg ? cfg.name : 'Unknown',
             metric_icon: cfg ? cfg.icon : '🏆',
             calculation_type: t.calculation_type,
-            tier: t.tier,
             primary_label: cfg ? cfg.primaryLabel : 'Stat',
             supporting_label: cfg ? cfg.supportingLabel : null,
             leaderboard
@@ -18254,47 +18453,8 @@ app.listen(PORT, () => {
         }
     }, 5 * 60 * 1000); // 5 minutes (more aggressive)
 
-    // Game reminder — fires 4 hours before each game, checks every 5 minutes
-    // SEC-040: DB-level reminder_sent flag prevents double-send on process restart
-    let reminderRunning = false;
-    setInterval(async () => {
-        if (reminderRunning) return; // Skip if previous tick still running
-        reminderRunning = true;
-        try {
-            // Find games starting in the next 4h that haven't had a reminder sent yet
-            // FIX-025: Use reminder_sent column instead of fragile LIKE match on log content
-            // NOTE: Requires: ALTER TABLE games ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE;
-            const upcoming = await pool.query(`
-                SELECT g.id
-                FROM games g
-                WHERE g.game_date BETWEEN NOW() + INTERVAL '3 hours 55 minutes'
-                  AND NOW() + INTERVAL '4 hours 5 minutes'
-                  AND g.game_status NOT IN ('cancelled', 'completed')
-                  AND g.reminder_sent = FALSE
-            `);
-            for (const row of upcoming.rows) {
-                // Atomic claim — prevents double-send if two processes run simultaneously
-                const claimed = await pool.query(
-                    `UPDATE games SET reminder_sent = TRUE WHERE id = $1 AND reminder_sent = FALSE RETURNING id`,
-                    [row.id]
-                );
-                if (claimed.rowCount === 0) continue; // Another instance already claimed it
-                const gameData = await getGameDataForNotification(row.id);
-                const confirmed = await pool.query(
-                    `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
-                    [row.id]
-                );
-                for (const reg of confirmed.rows) {
-                    await sendNotification('game_reminder', reg.player_id, gameData).catch(() => {});
-                }
-                console.log(`⏰ Reminders sent for game ${row.id} (${confirmed.rows.length} players)`);
-            }
-        } catch (error) {
-            console.error('✗ Game reminder scheduler error:', error.message);
-        } finally {
-            reminderRunning = false;
-        }
-    }, 5 * 60 * 1000); // Check every 5 minutes
+    // Game reminder scheduler DISABLED — teams_confirmed notification replaces this
+    // (sendNotification('teams_confirmed') fires on admin confirm-teams action)
 
     // Daily sweep: remove expired 'New' (baby) badge from players > 30 days old
     // This catches players who registered but never played (autoAllocateBadges never ran for them)
