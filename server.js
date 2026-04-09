@@ -17902,6 +17902,7 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
             || null;
 
         // Must have at least one identifier to proceed
+        console.log('[Wonderful webhook] extracted wpId:', wpId, 'webhookRef:', webhookRef);
         if (!wpId && !webhookRef) {
             return console.warn('[Wonderful webhook] no payment ID or merchant reference in body — cannot process');
         }
@@ -17942,6 +17943,7 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         }
 
         // v2 API: payment status can be 'paid' or 'accepted' for successful payments
+        console.log('[Wonderful webhook] verify status:', verified, '| wpId:', wpId, '| ref:', pmt.merchant_reference);
         if (verified !== 'paid' && verified !== 'accepted') {
             // Update status but don't credit
             await pool.query(
@@ -18052,10 +18054,12 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
 
         // COLD-START RECOVERY: if our DB says pending but Wonderful confirms paid,
         // credit the player now. This handles webhook misses due to Render cold starts.
+        console.log('[Wonderful status-poll] ref:', ref, 'db_status:', p.status, 'wp_id:', p.wonderful_payment_id || 'NULL');
         if (p.status === 'pending' && p.wonderful_payment_id && WONDERFUL_API_KEY) {
             try {
                 const verifyRes = await wonderfulRequest('GET', `/v2/payments/${p.wonderful_payment_id}`);
                 const verifiedStatus = verifyRes.data?.status;
+                console.log('[Wonderful status-poll] verify result:', verifiedStatus, 'full data keys:', Object.keys(verifyRes.data || {}));
                 if (verifiedStatus === 'paid' || verifiedStatus === 'accepted') {
                     console.log('[Wonderful status poll] cold-start recovery — crediting via status poll for ref:', ref);
                     // Atomic claim — prevents double-credit if webhook also fires
