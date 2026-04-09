@@ -18117,6 +18117,25 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
     }
 });
 
+// GET /api/admin/payments/wonderful/pending — list all non-credited payments for admin review
+app.get('/api/admin/payments/wonderful/pending', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const rows = await pool.query(`
+            SELECT wp.id, wp.merchant_reference, wp.wonderful_payment_id,
+                   wp.amount_pence, wp.status, wp.created_at, wp.credited_at,
+                   p.alias, p.full_name, p.id as player_id
+            FROM wonderful_payments wp
+            JOIN players p ON p.id = wp.player_id
+            ORDER BY wp.created_at DESC
+            LIMIT 100
+        `);
+        res.json({ payments: rows.rows });
+    } catch (e) {
+        console.error('GET wonderful pending error:', e.message);
+        res.status(500).json({ error: 'Failed to fetch payments' });
+    }
+});
+
 // POST /api/admin/payments/wonderful/manual-credit
 // Superadmin only — manually credit a player for a Wonderful payment that the webhook missed
 // Typical cause: Render cold start meant webhook was received but processing failed silently
@@ -18182,8 +18201,9 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
         const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [pmt.player_id]);
         const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
 
-        // Send confirmation email to player
+        // Send confirmation email + trigger RAF activation
         setImmediate(() => sendWonderfulCreditEmail(pmt.player_id, pounds, pmt.merchant_reference));
+        setImmediate(() => triggerRafActivation(pmt.player_id).catch(() => {}));
 
         res.json({ success: true, amount: pounds.toFixed(2), player_id: pmt.player_id, new_balance: newBal });
     } catch (e) {
