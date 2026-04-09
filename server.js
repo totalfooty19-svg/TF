@@ -6895,7 +6895,7 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser } = req.body;
+        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser, format, position_type, refs_required, ref_pay } = req.body;
 
         if (!venue_id || !max_players || cost_per_player === undefined) {
             return res.status(400).json({ error: 'Missing required fields' });
@@ -6933,13 +6933,13 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
                 const utcDate = new Date(new Date(londonLocal).getTime() - offset);
 
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser) WHERE id=$7',
-                    [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay) WHERE id=$7',
+                    [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null]
                 );
             } else {
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser) WHERE id=$6',
-                    [venue_id, max_players, cost_per_player, star_rating || null, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay) WHERE id=$6',
+                    [venue_id, max_players, cost_per_player, star_rating || null, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null]
                 );
             }
         }
