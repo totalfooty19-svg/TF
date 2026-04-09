@@ -17890,15 +17890,19 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         const wpId = req.body?.id
             || req.body?.payment_id
             || req.body?.paymentId
+            || req.body?.order_id
             || req.body?.data?.id
             || req.body?.data?.payment_id
+            || req.body?.data?.order_id
             || null;
 
         // Extract merchant reference — cover all known variants
         const webhookRef = req.body?.merchant_payment_reference
             || req.body?.merchant_reference
+            || req.body?.reference
             || req.body?.data?.merchant_payment_reference
             || req.body?.data?.merchant_reference
+            || req.body?.data?.reference
             || null;
 
         // Must have at least one identifier to proceed
@@ -17908,12 +17912,37 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         }
 
         // Fetch payment record — try wonderful_payment_id first, then merchant_reference
+        // Wonderful sends order_id in webhook which may differ from payment id — resolve via API if needed
         let pmt = null;
         if (wpId) {
             const byId = await pool.query(
                 `SELECT * FROM wonderful_payments WHERE wonderful_payment_id = $1`, [wpId]
             );
             pmt = byId.rows[0] || null;
+
+            // order_id may not match wonderful_payment_id — try resolving via Wonderful API
+            if (!pmt && WONDERFUL_API_KEY) {
+                try {
+                    // Try fetching payment list filtered by order_id, or search all pending
+                    const searchRes = await pool.query(
+                        `SELECT * FROM wonderful_payments WHERE status = 'pending' ORDER BY created_at DESC LIMIT 20`
+                    );
+                    // Find by verifying each pending payment until we match order_id
+                    for (const candidate of searchRes.rows) {
+                        if (!candidate.wonderful_payment_id) continue;
+                        try {
+                            const vRes = await wonderfulRequest('GET', `/v2/payments/${candidate.wonderful_payment_id}`);
+                            if (vRes.data?.order_id === wpId || String(vRes.data?.id) === String(wpId)) {
+                                pmt = candidate;
+                                console.log('[Wonderful webhook] resolved order_id', wpId, '→ wonderful_payment_id', candidate.wonderful_payment_id);
+                                break;
+                            }
+                        } catch (_) { continue; }
+                    }
+                } catch (e) {
+                    console.warn('[Wonderful webhook] order_id resolution failed:', e.message);
+                }
+            }
         }
         if (!pmt && webhookRef) {
             const byRef = await pool.query(
@@ -17972,12 +18001,10 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
 
         // Credit the player's balance — RETURNING gives us confirmed new balance
         const creditResult = await pool.query(
-            `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2
-             RETURNING balance`,
-            [pmt.player_id, pounds]
+            `UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`,
+            [pounds, pmt.player_id]
         );
-        const balAfter = parseFloat(creditResult.rows[0]?.balance || (balBefore + pounds));
+        const balAfter = balBefore + pounds;
 
         await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
             `Wonderful bank payment — ref ${pmt.merchant_reference}`, null);
@@ -18077,13 +18104,11 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
                             const pounds = p.amount_pence / 100;
                             const balBeforeRow2 = await client.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [req.user.playerId]);
                             const balBefore2 = parseFloat(balBeforeRow2.rows[0]?.balance || 0);
-                            const creditResult2 = await client.query(
-                                `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-                                 ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2
-                                 RETURNING balance`,
-                                [req.user.playerId, pounds]
+                            await client.query(
+                                `UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`,
+                                [pounds, req.user.playerId]
                             );
-                            const balAfter2 = parseFloat(creditResult2.rows[0]?.balance || (balBefore2 + pounds));
+                            const balAfter2 = balBefore2 + pounds;
                             await client.query('COMMIT');
                             // Post-commit logging — uses pool (outside transaction intentionally)
                             await recordCreditTransaction(pool, req.user.playerId, pounds, 'wonderful_topup',
@@ -18191,12 +18216,10 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
         const balBeforeRow3 = await pool.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
         const balBefore3 = parseFloat(balBeforeRow3.rows[0]?.balance || 0);
         const creditResult3 = await pool.query(
-            `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2
-             RETURNING balance`,
-            [pmt.player_id, pounds]
+            `UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`,
+            [pounds, pmt.player_id]
         );
-        const balAfter3 = parseFloat(creditResult3.rows[0]?.balance || (balBefore3 + pounds));
+        const balAfter3 = balBefore3 + pounds;
         await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
             `Manual credit by superadmin — Wonderful ref ${pmt.merchant_reference}`, null);
         await auditLog(pool, pmt.player_id, 'wonderful_credited', req.user.playerId,
