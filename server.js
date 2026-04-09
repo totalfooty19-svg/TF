@@ -141,7 +141,11 @@ const csrfProtect = (req, res, next) => {
     }
     next();
 };
-app.use('/api', csrfProtect);
+// Exempt external webhooks from CSRF — they POST from third-party servers, not our origin
+app.use('/api', (req, res, next) => {
+    if (req.path.startsWith('/webhooks/')) return next();
+    return csrfProtect(req, res, next);
+});
 
 // SEC-008: Audit log — tamper-evident record of privileged actions
 
@@ -392,11 +396,11 @@ async function triggerRafActivation(referredPlayerId) {
                 html: wrapEmailHtml(`
                     <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">YOU'VE EARNED £1! 💰</h2>
                     <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> — your referral — has just topped up their TF account.</p>
-                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Your <strong style="color:#00cc66;">£1 activation bonus</strong> has been added to your balance. You'll also earn <strong style="color:#fff;">£1 for every game they sign up to</strong>, capped at £13 in game credits — so up to <strong style="color:#00cc66;">£14 total</strong> per referral!</p>
+                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Your <strong style="color:#00cc66;">£1 activation bonus</strong> has been added to your balance. You'll also earn <strong style="color:#fff;">50p for every game they sign up to</strong>, capped at £13 in game credits (26 games) — so up to <strong style="color:#00cc66;">£14 total</strong> per referral!</p>
                     <div style="background:#111;border:2px solid #333;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">MAXIMUM PER REFERRAL</div>
                         <div style="font-size:30px;font-weight:900;color:#00cc66;">£14.00</div>
-                        <div style="font-size:12px;color:#666;">£1 activation + 13 × £1 game credits</div>
+                        <div style="font-size:12px;color:#666;">£1 activation + 26 × 50p game credits</div>
                     </div>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY PROFILE →</a>
                 `)
@@ -409,7 +413,7 @@ async function triggerRafActivation(referredPlayerId) {
     } catch (e) { console.error('triggerRafActivation error (non-critical):', e.message); }
 }
 
-// Trigger £1 game credit — called on every confirmed self-registration by a referred player
+// Trigger 50p game credit — called on every confirmed self-registration by a referred player
 async function triggerRafGameCredit(referredPlayerId) {
     try {
         const enabled = await getRafEnabled();
@@ -429,22 +433,22 @@ async function triggerRafGameCredit(referredPlayerId) {
         const creditClaim = await pool.query(`
             UPDATE raf_rewards
             SET game_credits_paid = game_credits_paid + 1,
-                game_credits_total = game_credits_total + 1.00,
-                total_paid         = total_paid + 1.00,
-                cap_reached        = (game_credits_paid + 1 >= 13),
-                cap_reached_at     = CASE WHEN (game_credits_paid + 1 >= 13) AND cap_reached_at IS NULL THEN NOW() ELSE cap_reached_at END
+                game_credits_total = game_credits_total + 0.50,
+                total_paid         = total_paid + 0.50,
+                cap_reached        = (game_credits_paid + 1 >= 26),
+                cap_reached_at     = CASE WHEN (game_credits_paid + 1 >= 26) AND cap_reached_at IS NULL THEN NOW() ELSE cap_reached_at END
             WHERE referrer_id=$1 AND referred_id=$2
-              AND cap_reached = FALSE AND game_credits_paid < 13
-            RETURNING game_credits_paid AS new_count, (game_credits_paid >= 13) AS cap_reached
+              AND cap_reached = FALSE AND game_credits_paid < 26
+            RETURNING game_credits_paid AS new_count, (game_credits_paid >= 26) AS cap_reached
         `, [referrerId, referredPlayerId]);
         if (creditClaim.rows.length === 0) return; // cap already reached or row missing — nothing to do
         const newCount   = parseInt(creditClaim.rows[0].new_count);
         const capReached = creditClaim.rows[0].cap_reached;
         await pool.query(
-            'UPDATE credits SET balance = balance + 1.00, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
+            'UPDATE credits SET balance = balance + 0.50, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
             [referrerId]
         );
-        await recordCreditTransaction(pool, referrerId, 1.00, 'raf_reward', `RAF game credit (${newCount}/13) — referred player ${referredPlayerId}`);
+        await recordCreditTransaction(pool, referrerId, 0.50, 'raf_reward', `RAF game credit (${newCount}/26) — referred player ${referredPlayerId}`);
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -452,13 +456,13 @@ async function triggerRafGameCredit(referredPlayerId) {
         const referrerName  = refRow.rows[0]?.alias  || refRow.rows[0]?.full_name  || 'Referrer';
         const referrerEmail = refRow.rows[0]?.email;
         const referredName  = rfdRow.rows[0]?.alias  || rfdRow.rows[0]?.full_name  || 'Your referral';
-        await notifyAdmin(`💰 RAF Game Credit — ${referredName} signed up (${newCount}/13)`, [
+        await notifyAdmin(`💰 RAF Game Credit — ${referredName} signed up (${newCount}/26)`, [
             ['Referrer', referrerName], ['Referred Player', referredName],
-            ['Amount Credited', '£1.00'], ['Sign-ups Counted', `${newCount} / 13`],
-            ['Cap Reached', capReached ? 'YES — £13 game credits fully earned' : 'No']
+            ['Amount Credited', '£0.50'], ['Sign-ups Counted', `${newCount} / 26`],
+            ['Cap Reached', capReached ? 'YES — £13 game credits fully earned (26 sign-ups)' : 'No']
         ]);
-        if (referrerEmail && (newCount === 7 || capReached)) {
-            const gameCreditsSoFar = newCount.toFixed(2);
+        if (referrerEmail && (newCount === 13 || capReached)) {
+            const gameCreditsSoFar = (newCount * 0.50).toFixed(2); // 50p per sign-up
             // Fetch actual total_paid (activation may not have been paid)
             const rrActual = await pool.query(
                 'SELECT total_paid, activation_paid FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
@@ -471,24 +475,24 @@ async function triggerRafGameCredit(referredPlayerId) {
                 to: referrerEmail,
                 subject: capReached
                     ? `🏆 Refer a Friend — Maximum Earned from ${referredName}!`
-                    : `🎉 Refer a Friend — ${referredName} has played 7 games!`,
+                    : `🎉 Refer a Friend — ${referredName} has played 13 games!`,
                 html: wrapEmailHtml(capReached ? `
                     <h2 style="color:#FFD700;font-size:22px;font-weight:900;margin:0 0 16px;">MAXIMUM EARNED! 🏆</h2>
-                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has played <strong style="color:#FFD700;">13 games</strong> — you've earned the full reward from this referral.</p>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has played <strong style="color:#FFD700;">26 games</strong> — you've earned the full reward from this referral.</p>
                     <div style="background:#111;border:2px solid #FFD700;border-radius:10px;padding:20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#888;font-weight:700;letter-spacing:1px;margin-bottom:6px;">TOTAL EARNED FROM ${htmlEncode(referredName.toUpperCase())}</div>
                         <div style="font-size:36px;font-weight:900;color:#FFD700;">£${actualTotal}</div>
-                        <div style="font-size:12px;color:#888;">${activationWasPaid ? '£1 activation + ' : ''}£13 game credits (13 sign-ups)</div>
+                        <div style="font-size:12px;color:#888;">${activationWasPaid ? '£1 activation + ' : ''}£13 game credits (26 × 50p)</div>
                     </div>
                     <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Know anyone else? Keep referring — every friend earns you up to £14!</p>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY REFERRALS →</a>
                 ` : `
                     <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">🎉 HALFWAY THERE!</h2>
-                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has now played <strong style="color:#fff;">7 games</strong>. You've earned <strong style="color:#00cc66;">£${gameCreditsSoFar}</strong> in game credits from their sign-ups so far.</p>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has now played <strong style="color:#fff;">13 games</strong>. You've earned <strong style="color:#00cc66;">£${gameCreditsSoFar}</strong> in game credits from their sign-ups so far.</p>
                     <div style="background:#111;border:2px solid #333;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">STILL TO EARN</div>
                         <div style="font-size:28px;font-weight:900;color:#00cc66;">£${(13 - parseFloat(gameCreditsSoFar)).toFixed(2)}</div>
-                        <div style="font-size:12px;color:#666;">${13 - newCount} more sign-ups to go</div>
+                        <div style="font-size:12px;color:#666;">${26 - newCount} more sign-ups to go</div>
                     </div>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY PROFILE →</a>
                 `)
@@ -6377,8 +6381,10 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             }
         }
         
-        // Mark teams as generated
-        await pool.query('UPDATE games SET teams_generated = TRUE WHERE id = $1', [gameId]);
+        // Mark teams as generated and confirmed — auto-generate confirms immediately
+        await pool.query(`UPDATE games SET teams_generated = TRUE, teams_confirmed = TRUE,
+            game_status = CASE WHEN game_status = 'completed' THEN game_status ELSE 'confirmed' END
+            WHERE id = $1`, [gameId]);
 
         // Non-critical: notify all confirmed players that teams are live
         setImmediate(async () => {
@@ -6732,7 +6738,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name } = req.body;
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -6791,9 +6797,12 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     external_opponent = $13,
                     tf_kit_color  = COALESCE($14, tf_kit_color),
                     opp_kit_color = COALESCE($15, opp_kit_color),
-                    position_type = COALESCE($16, position_type)
+                    position_type = COALESCE($16, position_type),
+                    format = COALESCE($17, format),
+                    exclusivity = COALESCE($18, exclusivity),
+                    tournament_name = COALESCE($19, tournament_name)
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null, position_type || null]);
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -6810,9 +6819,12 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     external_opponent = $11,
                     tf_kit_color  = COALESCE($12, tf_kit_color),
                     opp_kit_color = COALESCE($13, opp_kit_color),
-                    position_type = COALESCE($14, position_type)
+                    position_type = COALESCE($14, position_type),
+                    format = COALESCE($15, format),
+                    exclusivity = COALESCE($16, exclusivity),
+                    tournament_name = COALESCE($17, tournament_name)
                 WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null, position_type || null]);
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
@@ -8967,11 +8979,11 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                      p.total_appearances, p.motm_wins, p.total_wins, p.reliability_tier,
                      r.position_preference, r.registered_at
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
-            ORDER BY 
-                CASE WHEN ${isDraftMemory ? 'pft.fixed_team' : 'NULL'} = 'red' THEN 0
-                     WHEN ${isDraftMemory ? 'pft.fixed_team' : 'NULL'} = 'blue' THEN 2
-                     ELSE 1 END,
-                r.registered_at ASC
+            ORDER BY
+                CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                p.squad_number ASC NULLS LAST,
+                p.motm_wins DESC NULLS LAST,
+                p.total_appearances DESC NULLS LAST
             LIMIT 50
         `, isDraftMemory ? [gameId, series_id] : [gameId]);
         
@@ -10535,7 +10547,12 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
                     p.alias, p.full_name
              FROM game_awards ga
              JOIN players p ON p.id = ga.recipient_player_id
-             WHERE ga.game_id = $1`,
+             WHERE ga.game_id = $1
+             ORDER BY ga.award_type,
+                      CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                      p.squad_number ASC NULLS LAST,
+                      p.motm_wins DESC NULLS LAST,
+                      p.total_appearances DESC NULLS LAST`,
             [gameId]
         );
 
@@ -10692,7 +10709,11 @@ app.get('/api/public/game/:gameUrl/awards', async (req, res) => {
              FROM game_awards ga
              JOIN players p ON p.id = ga.recipient_player_id
              WHERE ga.game_id = $1
-             ORDER BY ga.created_at ASC`,
+             ORDER BY ga.award_type,
+                      CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                      p.squad_number ASC NULLS LAST,
+                      p.motm_wins DESC NULLS LAST,
+                      p.total_appearances DESC NULLS LAST`,
             [game.id]
         );
 
@@ -11201,18 +11222,18 @@ app.post('/api/admin/raf/backfill', authenticateToken, requireSuperAdmin, async 
                 );
                 const totalConfirmed = parseInt(regCount.rows[0].cnt || 0);
                 const alreadyCredited = parseInt(row.game_credits_paid || 0);
-                const toCredit = Math.min(totalConfirmed, 24) - alreadyCredited;
+                const toCredit = Math.min(totalConfirmed, 26) - alreadyCredited;
 
                 if (toCredit > 0) {
                     const creditAmt = toCredit * 0.50;
                     const newCount = alreadyCredited + toCredit;
-                    const capReached = newCount >= 24;
+                    const capReached = newCount >= 26;
                     await pool.query(
                         'UPDATE credits SET balance=balance+$1, last_updated=CURRENT_TIMESTAMP WHERE player_id=$2',
                         [creditAmt, referrerId]
                     );
                     await recordCreditTransaction(pool, referrerId, creditAmt, 'raf_reward',
-                        `RAF backfill: ${toCredit} game credit(s) for referred player ${referredId} (${alreadyCredited+1}-${newCount}/24)`);
+                        `RAF backfill: ${toCredit} game credit(s) for referred player ${referredId} (${alreadyCredited+1}-${newCount}/26)`);
                     await pool.query(
                         `UPDATE raf_rewards
                          SET game_credits_paid=$1, game_credits_total=game_credits_total+$2,
@@ -11281,7 +11302,11 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                  FROM registrations r
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
                  AND r.is_comped = FALSE AND r.amount_paid IS NOT NULL
-                 AND r.amount_paid > 0 AND r.amount_paid < g.cost_per_player), 0) as discount_gap
+                 AND r.amount_paid > 0 AND r.amount_paid < g.cost_per_player), 0) as discount_gap,
+                ROUND((SELECT AVG(p.overall_rating)
+                 FROM registrations r JOIN players p ON p.id = r.player_id
+                 WHERE r.game_id = g.id AND r.status = 'confirmed'
+                 AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 ORDER BY g.game_date DESC`;
             params = [];
@@ -11311,7 +11336,11 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                  FROM registrations r
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
                  AND r.is_comped = FALSE AND r.amount_paid IS NOT NULL
-                 AND r.amount_paid > 0 AND r.amount_paid < g.cost_per_player), 0) as discount_gap
+                 AND r.amount_paid > 0 AND r.amount_paid < g.cost_per_player), 0) as discount_gap,
+                ROUND((SELECT AVG(p.overall_rating)
+                 FROM registrations r JOIN players p ON p.id = r.player_id
+                 WHERE r.game_id = g.id AND r.status = 'confirmed'
+                 AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
@@ -17173,8 +17202,8 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     JOIN games g ON g.id = r.game_id
-                    JOIN team_players tp ON tp.game_id = g.id AND tp.player_id = r.player_id
-                    JOIN teams t ON t.id = tp.team_id
+                    JOIN team_players tp ON tp.player_id = r.player_id
+                    JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                     WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
                     ${typeFilter}
                 ),
@@ -17207,8 +17236,8 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                 SELECT r.player_id, COUNT(*) AS win_count
                 FROM registrations r
                 JOIN games g ON g.id = r.game_id
-                JOIN team_players tp ON tp.game_id = g.id AND tp.player_id = r.player_id
-                JOIN teams t ON t.id = tp.team_id
+                JOIN team_players tp ON tp.player_id = r.player_id
+                JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
                 WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
                 AND LOWER(t.team_name) = LOWER(g.winning_team)
                 ${typeFilter}
