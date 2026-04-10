@@ -149,9 +149,11 @@ const csrfProtect = (req, res, next) => {
     }
     next();
 };
-// Exempt external webhooks from CSRF — they POST from third-party servers, not our origin
+// Exempt external webhooks and mobile auth endpoints from CSRF
 app.use('/api', (req, res, next) => {
     if (req.path.startsWith('/webhooks/')) return next();
+    // MOBILE-AUTH: login/register/forgot-password have no Bearer token yet — exempt from CSRF
+    if (['/auth/login', '/auth/register', '/auth/forgot-password', '/auth/force-change-password'].some(p => req.path.startsWith(p))) return next();
     return csrfProtect(req, res, next);
 });
 
