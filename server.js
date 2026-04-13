@@ -3332,7 +3332,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
         
         const result = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location,
                    g.teams_generated,
                    gs.series_name,
                    g.format as game_format,
@@ -3540,7 +3540,7 @@ app.get('/api/games/needing-refs', authenticateToken, async (req, res) => {
 app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         const gameResult = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location,
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
