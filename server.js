@@ -3548,13 +3548,18 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
         };
         
         // Format the response
-        const games = result.rows.map(game => ({
-            ...game,
-            motm_winner_name: game.motm_winner_alias || game.motm_winner_name,
-            venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null,
-            game_time: new Date(game.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
-            game_day: new Date(game.game_date).toLocaleDateString('en-US', { weekday: 'long' })
-        }));
+        const games = result.rows.map(game => {
+            const { price: _ep, tier: _pt } = getEffectivePrice(game);
+            return {
+                ...game,
+                motm_winner_name: game.motm_winner_alias || game.motm_winner_name,
+                venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null,
+                game_time: new Date(game.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+                game_day: new Date(game.game_date).toLocaleDateString('en-US', { weekday: 'long' }),
+                effective_price: _ep,
+                pricing_tier:    _pt,
+            };
+        });
         
         res.json(games);
     } catch (error) {
@@ -3620,6 +3625,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
+            LEFT JOIN opponents opp_pub ON opp_pub.id = g.opponent_id
             WHERE g.id = $1
         `, [req.params.id, req.user.playerId]);
         
@@ -3751,6 +3757,15 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         
         // FIX-03: server-side boolean so frontend never needs to re-derive from team_selection_type string
         game.show_pair_avoid = !['draft_memory', 'vs_external'].includes((game.team_selection_type || '').trim().toLowerCase()) && !game.is_venue_clash && !game.venue_clash_team1_name;
+
+        // Attach effective pricing so frontend signup modal always has the right cost
+        const _ep = getEffectivePrice(game);
+        game.effective_price = _ep.price;
+        game.pricing_tier    = _ep.tier;
+        // Ensure numeric types for fields the modal uses
+        game.max_players      = parseInt(game.max_players) || 0;
+        game.current_players  = parseInt(game.current_players) || 0;
+        game.cost_per_player  = parseFloat(game.cost_per_player) || 0;
 
         res.json(game);
     } catch (error) {
@@ -12061,6 +12076,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
                  AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+                LEFT JOIN opponents opp_mgr ON opp_mgr.id = g.opponent_id
                 ORDER BY g.game_date DESC`;
             params = [];
         } else {
