@@ -357,6 +357,22 @@ async function applyGameFee(db, playerId, cost, description) {
     return { realCharged };
 }
 
+// ── EARLY BIRD PRICING HELPER ────────────────────────────────────────────────
+// Returns the effective price and tier name for a game based on days to kickoff.
+// Tiers: 'super' (7+ days) | 'early' (3-7 days) | 'standard' (<3 days or no discount set)
+function getEffectivePrice(game) {
+    const now      = Date.now();
+    const kickoff  = new Date(game.game_date).getTime();
+    const daysLeft = (kickoff - now) / (1000 * 60 * 60 * 24);
+    const standard = parseFloat(game.cost_per_player || 0);
+    const early    = game.early_bird_price != null ? parseFloat(game.early_bird_price) : null;
+    const superEB  = game.super_early_bird_price != null ? parseFloat(game.super_early_bird_price) : null;
+
+    if (daysLeft >= 7 && superEB !== null) return { price: superEB, tier: 'super' };
+    if (daysLeft >= 3 && early  !== null) return { price: early,  tier: 'early' };
+    return { price: standard, tier: 'standard' };
+}
+
 // ── RAF (REFER A FRIEND) HELPERS ─────────────────────────────────────────────
 
 async function getRafEnabled() {
@@ -639,6 +655,13 @@ async function sendTeamsConfirmedEmails(gameId) {
             WHERE t.game_id = $1
             ORDER BY t.team_name`, [gameId]);
 
+        // Fetch game type + external opponent for context-aware email
+        const gameTypeRow = await pool.query(
+            `SELECT team_selection_type, external_opponent, tf_kit_color FROM games WHERE id = $1`, [gameId]
+        ).catch(() => ({ rows: [] }));
+        const isExternalGame = gameTypeRow.rows[0]?.team_selection_type === 'vs_external';
+        const opponent = gameTypeRow.rows[0]?.external_opponent || 'opponent';
+
         for (const player of players.rows) {
             const name      = player.alias || player.full_name;
             const teamName  = player.team_name || 'TBC';
@@ -646,17 +669,30 @@ async function sendTeamsConfirmedEmails(gameId) {
             const teamColor = isRed ? '#ff3366' : '#4488ff';
             const teamLabel = isRed ? '🔴 RED TEAM' : '🔵 BLUE TEAM';
 
+            const emailSubject = isExternalGame
+                ? ('⚽ Squad confirmed — TotalFooty vs ' + opponent + ' | TotalFooty')
+                : ("🏟️ Teams are live — you're " + (isRed ? 'Red' : 'Blue') + ' | TotalFooty');
+
+            const emailHeading    = isExternalGame ? 'SQUAD CONFIRMED!' : 'TEAMS ARE LIVE!';
+            const emailIntro      = isExternalGame
+                ? ("You're in the squad for the game against " + htmlEncode(opponent) + ".")
+                : "The squads are set for your upcoming game. Here's where you stand:";
+            const squadBlock = isExternalGame
+                ? ('<div style="background:#111;border:2px solid #FFA500;border-radius:10px;padding:16px 20px;margin:0 0 20px;text-align:center;">'
+                  + '<div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">YOU ARE IN THE SQUAD</div>'
+                  + '<div style="font-size:22px;font-weight:900;color:#FFA500;">TOTAL FOOTY vs ' + htmlEncode(opponent) + '</div></div>')
+                : ('<div style="background:#111;border:2px solid ' + teamColor + ';border-radius:10px;padding:16px 20px;margin:0 0 20px;text-align:center;">'
+                  + '<div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">YOUR TEAM</div>'
+                  + '<div style="font-size:26px;font-weight:900;color:' + teamColor + ';">' + teamLabel + '</div></div>');
+
             await emailTransporter.sendMail({
                 from: '"TotalFooty" <totalfooty19@gmail.com>',
                 to:   player.email,
-                subject: `🏟️ Teams are live — you're ${isRed ? 'Red' : 'Blue'} | TotalFooty`,
+                subject: emailSubject,
                 html: wrapEmailHtml(`
-                    <h2 style="color:#fff;font-size:22px;font-weight:900;margin:0 0 6px;">TEAMS ARE LIVE!</h2>
-                    <p style="color:#888;font-size:14px;margin:0 0 20px;">The squads are set for your upcoming game. Here's where you stand:</p>
-                    <div style="background:#111;border:2px solid ${teamColor};border-radius:10px;padding:16px 20px;margin:0 0 20px;text-align:center;">
-                        <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">YOUR TEAM</div>
-                        <div style="font-size:26px;font-weight:900;color:${teamColor};">${teamLabel}</div>
-                    </div>
+                    <h2 style="color:#fff;font-size:22px;font-weight:900;margin:0 0 6px;">${emailHeading}</h2>
+                    <p style="color:#888;font-size:14px;margin:0 0 20px;">${emailIntro}</p>
+                    ${squadBlock}
                     <table style="width:100%;border-collapse:collapse;font-size:14px;margin:0 0 24px;">
                         <tr><td style="padding:6px 0;color:#888;width:100px;">Date</td><td style="font-weight:700;color:#fff;">${htmlEncode(day)}</td></tr>
                         <tr><td style="padding:6px 0;color:#888;">Time</td><td style="font-weight:700;color:#fff;">${htmlEncode(time)}</td></tr>
@@ -716,6 +752,7 @@ const NOTIF_TEMPLATES = {
     referee_confirmed: d => ({ title: "You're confirmed to ref! 👮", body: `You're officiating on ${d.day} at ${d.venue}.` }),
     ref_review_open:   d => ({ title: 'Rate the referee 🌟',       body: `How was the ref on ${d.day}? Leave your rating.` }),
     account_reinstated: _d => ({ title: 'Account Reinstated ✅',   body: 'Your account has been reinstated. Welcome back.' }),
+    ban_lifted:         _d => ({ title: '✅ Signup Ban Lifted',        body: 'Your 1-week ban has been served. You are back on Bronze tier — keep it clean!' }),
     new_dm:            d => ({ title: 'New message 💬',            body: d.preview || 'You have a new message.' }),
     // TF Game Awards
     award_motm:           d => ({ title: '⭐ Man of the Match!',          body: `You won MOTM for ${d.day} at ${d.venue}!` }),
@@ -1469,6 +1506,9 @@ app.post('/api/auth/register', async (req, res) => {
                             <tr><td style="padding:6px 0;color:#888;">Alias</td><td>${htmlEncode(playerAlias)}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Email</td><td>${htmlEncode(email)}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Mobile</td><td>${htmlEncode(phone.trim())}</td></tr>
+                            <tr><td style="padding:6px 0;color:#888;">Age Range</td><td>${ageRange === '16_18' ? '16–18' : '18+'}</td></tr>
+                            ${validatedRegion ? `<tr><td style="padding:6px 0;color:#888;">Region</td><td style="font-weight:900;">${htmlEncode(validatedRegion)}</td></tr>` : ''}
+                            ${validatedInterests.length > 0 ? `<tr><td style="padding:6px 0;color:#888;">Interests</td><td>${validatedInterests.map(i => i.charAt(0).toUpperCase()+i.slice(1)).join(', ')}</td></tr>` : ''}
                             ${ref ? `<tr><td style="padding:6px 0;color:#888;">Referral</td><td>${htmlEncode(ref)}</td></tr>` : ''}
                             ${validatedSkillLevel ? `<tr><td style="padding:6px 0;color:#888;">Skill Level</td><td style="font-weight:900;">${htmlEncode(validatedSkillLevel)}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Starting OVR</td><td>${stats.overall}</td></tr>` : ''}
@@ -1731,7 +1771,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                      WHERE r3.player_id = p.id AND r3.status = 'confirmed'
                        AND g3.game_status = 'completed'
                        AND g3.team_selection_type = 'vs_external'
-                       AND g3.winning_team = 'red')::int AS external_game_wins
+                       AND LOWER(g3.winning_team) = 'red')::int AS external_game_wins
                 FROM players p
                 LEFT JOIN credits c ON c.player_id = p.id
                 LEFT JOIN users u ON u.id = p.user_id
@@ -1806,8 +1846,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                     r.player_id,
                     COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_date >= NOW() - INTERVAL '3 months') AS wins_3m,
                     COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_date >= DATE_TRUNC('year', NOW()))   AS wins_year,
-                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.team_selection_type = 'tournament') AS tournament_wins,
-                    0 AS external_game_wins
+                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.team_selection_type = 'tournament') AS tournament_wins
                 FROM registrations r
                 JOIN games g ON g.id = r.game_id
                 JOIN team_players tp ON tp.player_id = r.player_id
@@ -1815,6 +1854,15 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 WHERE r.status = 'confirmed' AND g.game_status = 'completed'
                   AND LOWER(g.winning_team) = LOWER(t.team_name)
                   AND g.team_selection_type != 'vs_external'
+                GROUP BY r.player_id
+            ),
+            ext_wins AS (
+                SELECT r.player_id, COUNT(DISTINCT r.game_id) AS external_game_wins
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                WHERE r.status = 'confirmed' AND g.game_status = 'completed'
+                  AND g.team_selection_type = 'vs_external'
+                  AND LOWER(g.winning_team) = 'red'
                 GROUP BY r.player_id
             )
             SELECT 
@@ -1840,7 +1888,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 COALESCE(ms.motm_year, 0) AS motm_year,
                 COALESCE(ws.wins_year, 0) AS wins_year,
                 COALESCE(ws.tournament_wins, 0)   AS tournament_wins,
-                COALESCE(ws.external_game_wins, 0) AS external_game_wins,
+                COALESCE(ew.external_game_wins, 0) AS external_game_wins,
                 CASE WHEN p.total_appearances > 0
                      THEN ROUND(p.total_wins::numeric / p.total_appearances * 100, 1)
                      ELSE 0 END AS win_percent,
@@ -1853,6 +1901,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
             LEFT JOIN player_stats ps ON ps.player_id = p.id
             LEFT JOIN motm_stats ms ON ms.player_id = p.id
             LEFT JOIN win_stats ws ON ws.player_id = p.id
+            LEFT JOIN ext_wins ew ON ew.player_id = p.id
             ORDER BY p.squad_number NULLS LAST, p.full_name
             LIMIT 500
         `);
@@ -2240,14 +2289,22 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
             JOIN games g ON g.id = r.game_id
             WHERE r.player_id = $1 AND r.status = 'confirmed'
               AND g.game_status = 'completed' AND g.team_selection_type = 'vs_external'
-              AND g.winning_team = 'red'
+              AND LOWER(g.winning_team) = 'red'
         `, [player.id]);
 
         const tournament_wins   = parseInt(tourneyResult.rows[0].cnt) || 0;
         const external_game_wins = parseInt(extResult.rows[0].cnt) || 0;
 
+        // Award counts — fetched for all viewers
+        const awardsRes = await pool.query(
+            `SELECT award_type, COUNT(*) AS cnt FROM game_awards WHERE recipient_player_id = $1 GROUP BY award_type`,
+            [player.id]
+        );
+        const award_counts = {};
+        for (const row of awardsRes.rows) award_counts[row.award_type] = parseInt(row.cnt);
+
         if (isOwnProfile || isAdmin) {
-            res.json({ ...player, win_percent, motm_percent, tournament_wins, external_game_wins });
+            res.json({ ...player, win_percent, motm_percent, tournament_wins, external_game_wins, award_counts });
         } else {
             // Public view — limited data per visibility matrix
             res.json({
@@ -2265,9 +2322,9 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
                 motm_percent,
                 tournament_wins,
                 external_game_wins,
+                award_counts,
                 badges:           player.badges,
                 ai_bio:           player.ai_bio || null,
-                // Socials are public — players opt in by adding them
                 social_tiktok:    player.social_tiktok,
                 social_instagram: player.social_instagram,
                 social_youtube:   player.social_youtube,
@@ -3343,11 +3400,13 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1) as registration_status,
                    (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $1) as my_backup_type,
-                   motm_p.alias as motm_winner_alias, motm_p.full_name as motm_winner_name
+                   motm_p.alias as motm_winner_alias, motm_p.full_name as motm_winner_name,
+                   opp_list.logo_url AS opponent_logo_url, opp_list.star_rating AS opponent_star_rating
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
             LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+            LEFT JOIN opponents opp_list ON opp_list.id = g.opponent_id
             WHERE (
                 (g.game_status = 'available' AND g.game_date >= CURRENT_TIMESTAMP)
                 OR (g.game_status = 'confirmed')
@@ -3387,6 +3446,10 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             if (game.venue_name && venuePhotoMap[game.venue_name]) {
                 game.venue_photo = venuePhotoMap[game.venue_name];
             }
+            // Attach effective price tier for frontend bird display
+            const { price: _ep, tier: _pt } = getEffectivePrice(game);
+            game.effective_price = _ep;
+            game.pricing_tier    = _pt;
             return game;
         });
         
@@ -3414,7 +3477,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
 app.get('/api/games/completed', authenticateToken, async (req, res) => {
     try {
         // FIX-074: Add pagination and replace correlated subqueries with JOIN aggregation
-        const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+        const limit = Math.min(parseInt(req.query.limit) || 500, 1000);
         const offset = Math.max(parseInt(req.query.offset) || 0, 0);
 
         const result = await pool.query(`
@@ -3423,9 +3486,13 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
                    p.full_name as motm_winner_name,
                    p.alias as motm_winner_alias,
                    gs.series_name,
+                   opp_comp.logo_url AS opponent_logo_url, opp_comp.star_rating AS opponent_star_rating,
                    -- Player's result for this game
                    CASE
                      WHEN g.winning_team IS NULL OR g.winning_team = '' THEN 'draw'
+                     -- vs_external: all confirmed TF players win when winning_team = red
+                     WHEN g.team_selection_type = 'vs_external' AND LOWER(g.winning_team) = 'red' THEN 'win'
+                     WHEN g.team_selection_type = 'vs_external' AND LOWER(g.winning_team) = 'blue' THEN 'loss'
                      WHEN EXISTS (
                        SELECT 1 FROM team_players tp2
                        JOIN teams t2 ON t2.id = tp2.team_id
@@ -3442,6 +3509,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN players p ON p.id = g.motm_winner_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
+            LEFT JOIN opponents opp_comp ON opp_comp.id = g.opponent_id
             LEFT JOIN (
                 SELECT game_id, COUNT(*) AS confirmed_count
                 FROM registrations WHERE status = 'confirmed'
@@ -3540,7 +3608,8 @@ app.get('/api/games/needing-refs', authenticateToken, async (req, res) => {
 app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         const gameResult = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location, g.early_bird_price, g.super_early_bird_price,
+                   opp_pub.logo_url AS opponent_logo_url, opp_pub.star_rating AS opponent_star_rating,
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
@@ -3690,6 +3759,58 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// ─── OPPONENTS ───────────────────────────────────────────────────────────────
+app.get('/api/opponents', authenticateToken, requireCLMAdmin, async (req, res) => {
+    try { const r = await pool.query('SELECT id,name,logo_url,star_rating,social_instagram,social_twitter,social_website FROM opponents ORDER BY name ASC'); res.json(r.rows); }
+    catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+app.get('/api/public/opponents', async (req, res) => {
+    try { const r = await pool.query('SELECT id,name,logo_url,star_rating FROM opponents ORDER BY name ASC'); res.json(r.rows); }
+    catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+app.post('/api/opponents', authenticateToken, requireCLMAdmin, async (req, res) => {
+    try {
+        const { name, logo_url, star_rating, social_instagram, social_twitter, social_website } = req.body;
+        if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+        if (name.length > 80) return res.status(400).json({ error: 'Name max 80 chars' });
+        if (/[<>"'&]/.test(name)) return res.status(400).json({ error: 'Invalid characters' });
+        if (logo_url && logo_url.length > 2_000_000) return res.status(400).json({ error: 'Logo too large' });
+        const stars = star_rating ? Math.min(5, Math.max(1, parseInt(star_rating))) : null;
+        const r = await pool.query(
+            'INSERT INTO opponents (name,logo_url,star_rating,social_instagram,social_twitter,social_website) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+            [name.trim(), logo_url||null, stars, social_instagram||null, social_twitter||null, social_website||null]);
+        res.json(r.rows[0]);
+    } catch (e) {
+        if (e.code==='23505') return res.status(409).json({ error: 'Opponent name already exists' });
+        console.error('POST /api/opponents:', e.message); res.status(500).json({ error: 'Failed' });
+    }
+});
+app.put('/api/opponents/:id', authenticateToken, requireCLMAdmin, async (req, res) => {
+    try {
+        const { name, logo_url, star_rating, social_instagram, social_twitter, social_website } = req.body;
+        if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
+        if (/[<>"'&]/.test(name)) return res.status(400).json({ error: 'Invalid characters' });
+        if (logo_url && logo_url.length > 2_000_000) return res.status(400).json({ error: 'Logo too large' });
+        const stars = star_rating ? Math.min(5, Math.max(1, parseInt(star_rating))) : null;
+        const r = await pool.query(
+            'UPDATE opponents SET name=$1,logo_url=$2,star_rating=$3,social_instagram=$4,social_twitter=$5,social_website=$6 WHERE id=$7 RETURNING *',
+            [name.trim(), logo_url||null, stars, social_instagram||null, social_twitter||null, social_website||null, req.params.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+        res.json(r.rows[0]);
+    } catch (e) {
+        if (e.code==='23505') return res.status(409).json({ error: 'Opponent name already exists' });
+        console.error('PUT /api/opponents/:id:', e.message); res.status(500).json({ error: 'Failed' });
+    }
+});
+app.delete('/api/opponents/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        await pool.query('UPDATE games SET opponent_id=NULL WHERE opponent_id=$1', [req.params.id]);
+        await pool.query('DELETE FROM opponents WHERE id=$1', [req.params.id]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { 
@@ -3697,8 +3818,19 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             exclusivity, positionType, teamSelectionType, externalOpponent, tfKitColor, oppKitColor,
             tournamentTeamCount, tournamentName, starRating,
             isVenueClash, venueClashTeam1Name, venueClashTeam2Name,
-            maxReferees, refereeFee, requiresOrganiser
+            maxReferees, refereeFee, requiresOrganiser,
+            earlyBirdPrice, superEarlyBirdPrice,
+            opponentId
         } = req.body;
+        const parsedEarlyBird      = earlyBirdPrice      != null && earlyBirdPrice      !== '' ? parseFloat(earlyBirdPrice)      : null;
+        const parsedSuperEarlyBird = superEarlyBirdPrice != null && superEarlyBirdPrice !== '' ? parseFloat(superEarlyBirdPrice) : null;
+        let resolvedOpponentName = externalOpponent || null;
+        let resolvedOpponentId   = opponentId || null;
+        if (opponentId) {
+            const oppRow = await pool.query('SELECT name FROM opponents WHERE id = $1', [opponentId]);
+            if (oppRow.rows.length) resolvedOpponentName = oppRow.rows[0].name;
+            else resolvedOpponentId = null;
+        }
 
         // FIX-023: Validate required game creation inputs
         if (!venueId) return res.status(400).json({ error: 'Venue is required' });
@@ -3782,13 +3914,14 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
                             tournament_team_count, tournament_name, star_rating, star_rating_locked,
                             is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                            refs_required, ref_pay, requires_organiser
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                            refs_required, ref_pay, requires_organiser,
+                            early_bird_price, super_early_bird_price, opponent_id
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
                             gameExclusivity, positionType || 'outfield_gk', gameUrl, 
-                            seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
+                            seriesUuid, selType, resolvedOpponentName, tfKitColor || null, oppKitColor || null,
                             selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                             selType === 'tournament' ? (tournamentName || null) : null,
                             starRating || null,
@@ -3798,7 +3931,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             vcEnabled ? venueClashTeam2Name.trim() : null,
                             parseInt(maxReferees) || 0,
                             parseFloat(refereeFee) || 0.00,
-                            requiresOrganiser === true || requiresOrganiser === 'true' || false
+                            requiresOrganiser === true || requiresOrganiser === 'true' || false,
+                            parsedEarlyBird,
+                            parsedSuperEarlyBird,
+                            resolvedOpponentId
                         ]
                     );
                     
@@ -3846,13 +3982,14 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
                     tournament_team_count, tournament_name, star_rating, star_rating_locked,
                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                    refs_required, ref_pay, requires_organiser
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                    refs_required, ref_pay, requires_organiser,
+                    early_bird_price, super_early_bird_price, opponent_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
                     gameExclusivity, positionType || 'outfield_gk', gameUrl,
-                    seriesUuid, selType, externalOpponent || null, tfKitColor || null, oppKitColor || null,
+                    seriesUuid, selType, resolvedOpponentName, tfKitColor || null, oppKitColor || null,
                     selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                     selType === 'tournament' ? (tournamentName || null) : null,
                     starRating || null,
@@ -3862,7 +3999,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     vcEnabled ? venueClashTeam2Name.trim() : null,
                     parseInt(maxReferees) || 0,
                     parseFloat(refereeFee) || 0.00,
-                    requiresOrganiser === true || requiresOrganiser === 'true' || false
+                    requiresOrganiser === true || requiresOrganiser === 'true' || false,
+                    parsedEarlyBird,
+                    parsedSuperEarlyBird,
+                    resolvedOpponentId
                 ]
             );
             
@@ -3978,6 +4118,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 r.is_comped,
                 r.position_preference as positions,
                 r.position_preference as position_preference,
+                r.position_areas,
                 r.tournament_team_preference,
                 r.venue_clash_team_preference,
                 t.team_name,
@@ -4053,9 +4194,15 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
 app.post('/api/games/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
     const client = await pool.connect();
     try {
-        const { position, positions, pairs, avoids, backupType, tournamentTeamPreference, venueClashTeamPreference } = req.body;
+        const { position, positions, pairs, avoids, backupType, tournamentTeamPreference, venueClashTeamPreference, positionAreas } = req.body;
         const gameId = req.params.id;
         const positionValue = positions || position || 'outfield';
+
+        // Sanitise position_areas — whitelist only
+        const _ALLOWED_AREAS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF','defence','midfield','attack']);
+        const sanitisedPositionAreas = positionAreas
+            ? positionAreas.split(',').map(s => s.trim()).filter(s => _ALLOWED_AREAS.has(s)).join(',') || null
+            : null;
         
         await client.query('BEGIN');
         
@@ -4065,7 +4212,8 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                    player_editing_locked, team_selection_type, position_type, tournament_team_count,
                    series_id, game_status, game_date, star_rating, min_rating_enabled,
                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                   requires_organiser
+                   requires_organiser,
+                   early_bird_price, super_early_bird_price
             FROM games
             WHERE id = $1
             FOR UPDATE
@@ -4077,6 +4225,12 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         }
         
         const game = gameLock.rows[0];
+
+        // Determine effective price based on early bird tiers
+        const { price: effectiveCost, tier: pricingTier } = getEffectivePrice(game);
+        // Override game.cost_per_player with effective price for this registration
+        game._effective_cost = effectiveCost;
+        game._pricing_tier   = pricingTier;
 
         // FIX-006: Reject registration for cancelled or completed games
         if (!['available', 'confirmed'].includes(game.game_status)) {
@@ -4156,6 +4310,25 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             }
         }
         
+        // Block White/Black tier players from registering
+        const tierCheckResult = await client.query(
+            'SELECT reliability_tier FROM players WHERE id = $1',
+            [req.user.playerId]
+        );
+        const playerTier = tierCheckResult.rows[0]?.reliability_tier;
+        if (playerTier === 'white') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+                error: 'You are currently serving a 1-week signup ban. Your tier will be restored to Bronze once the ban period ends.'
+            });
+        }
+        if (playerTier === 'black') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+                error: 'Your account has been suspended from signing up for games. Please contact an admin.'
+            });
+        }
+
         // Check if already registered
         const existingReg = await client.query(
             'SELECT id, status, backup_type FROM registrations WHERE game_id = $1 AND player_id = $2',
@@ -4266,13 +4439,13 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                         [req.user.playerId]
                     );
                     
-                    if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
+                    if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(effectiveCost * 100)) {
                         await client.query('ROLLBACK');
                         return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                     }
                     
                     // Capture realCharged so amount_paid correctly records the real-balance portion
-                    const { realCharged: backupCharged } = await applyGameFee(client, req.user.playerId, game.cost_per_player, `Confirmed backup for game ${gameId}`);
+                    const { realCharged: backupCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Confirmed backup for game ${gameId} (${pricingTier} pricing)`);
                     regAmountPaid = backupCharged;
                 }
             }
@@ -4287,12 +4460,12 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     [req.user.playerId]
                 );
                 
-                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
+                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(effectiveCost * 100)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits' });
                 }
                 
-                const { realCharged: selfRegCharged } = await applyGameFee(client, req.user.playerId, game.cost_per_player, `Registration for game ${gameId}`);
+                const { realCharged: selfRegCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Registration for game ${gameId} (${pricingTier} pricing)`);
                 regAmountPaid = selfRegCharged;
             }
         }
@@ -4309,13 +4482,14 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
 
         // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, venue_clash_team_preference, amount_paid, is_comped)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, venue_clash_team_preference, amount_paid, is_comped, position_areas)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
              game.is_venue_clash ? (venueClashTeamPreference || null) : null,
-             isComped ? 0 : ((status === 'confirmed' || regBackupType === 'confirmed_backup') ? (regAmountPaid ?? game.cost_per_player) : 0),
-             isComped]
+             isComped ? 0 : ((status === 'confirmed' || regBackupType === 'confirmed_backup') ? (regAmountPaid ?? effectiveCost) : 0),
+             isComped,
+             sanitisedPositionAreas]
         );
         
         const registrationId = regResult.rows[0].id;
@@ -4843,6 +5017,20 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
 
         await client.query('BEGIN');
 
+        // Block banned players from claiming spots
+        const claimTierCheck = await client.query(
+            'SELECT reliability_tier FROM players WHERE id = $1', [playerId]
+        );
+        const claimTier = claimTierCheck.rows[0]?.reliability_tier;
+        if (claimTier === 'white') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'You are currently serving a 1-week signup ban and cannot claim spots.' });
+        }
+        if (claimTier === 'black') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'Your account has been suspended. Please contact an admin.' });
+        }
+
         // Verify player is a normal_backup for this game
         const regCheck = await client.query(
             `SELECT id, position_preference FROM registrations
@@ -5132,7 +5320,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                 }
-                await applyGameFee(client, registeringPlayerId, game.cost_per_player, `Confirmed backup for ${friendName} in game ${gameId}`);
+                await applyGameFee(client, registeringPlayerId, getEffectivePrice(game).price, `Confirmed backup for ${friendName} in game ${gameId} (${getEffectivePrice(game).tier} pricing)`);
             }
         } else {
             status = 'confirmed';
@@ -5141,7 +5329,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
-            await applyGameFee(client, registeringPlayerId, game.cost_per_player, `Registration for ${friendName} in game ${gameId}`);
+            await applyGameFee(client, registeringPlayerId, getEffectivePrice(game).price, `Registration for ${friendName} in game ${gameId} (${getEffectivePrice(game).tier} pricing)`);
         }
 
         // Insert registration under friend's player_id, recording who paid
@@ -6131,10 +6319,13 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
     try {
         const { gameId } = req.params;
         
-        // Block tournament games — must use manual draft
+        // Block tournament and vs_external games — both use non-algorithm assignment
         const tournCheck = await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId]);
         if (tournCheck.rows[0]?.team_selection_type === 'tournament') {
             return res.status(400).json({ error: 'Tournament games must use manual team draft, not auto-generate' });
+        }
+        if (tournCheck.rows[0]?.team_selection_type === 'vs_external') {
+            return res.status(400).json({ error: 'External games do not use team generation — use Confirm Game to assign the full squad to the TF team.' });
         }
         
         // Get all confirmed registrations with player stats
@@ -6156,6 +6347,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 p.shooting_rating,
                 p.is_organiser,
                 r.position_preference,
+                r.position_areas,
                 array_agg(DISTINCT rp_pair.target_player_id) FILTER (WHERE rp_pair.preference_type = 'pair') as pairs,
                 array_agg(DISTINCT rp_avoid.target_player_id) FILTER (WHERE rp_avoid.preference_type = 'avoid') as avoids
             FROM registrations r
@@ -6163,7 +6355,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1 AND r.status = 'confirmed'
-            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.strength_rating, p.fitness_rating, p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating, p.is_organiser, r.position_preference
+            GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.strength_rating, p.fitness_rating, p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating, p.is_organiser, r.position_preference, r.position_areas
             ORDER BY p.overall_rating DESC
         `, [gameId]);
         
@@ -6488,6 +6680,49 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             }
         }
         
+        // ===================================================
+        // PHASE 3C: Zone Balance (soft preference)
+        // ===================================================
+        const ZONE_MAP_3C = {
+            GK:'defence', LB:'defence', RB:'defence', CB:'defence',
+            DM:'midfield', CM:'midfield', AM:'midfield', LM:'midfield', RM:'midfield',
+            CF:'attack',
+            defence:'defence', midfield:'midfield', attack:'attack'
+        };
+        const playerZones3C = p => {
+            if (!p.position_areas) return [];
+            return [...new Set(p.position_areas.split(',').map(s => ZONE_MAP_3C[s.trim()]).filter(Boolean))];
+        };
+        const zoneImbalance3C = (red, blue) =>
+            ['defence','midfield','attack'].reduce((sum, z) => {
+                const rc = red.filter(p => playerZones3C(p).includes(z)).length;
+                const bc = blue.filter(p => playerZones3C(p).includes(z)).length;
+                return sum + Math.abs(rc - bc);
+            }, 0);
+        const hasZoneData = [...redTeam, ...blueTeam].some(p => p.position_areas);
+        if (hasZoneData) {
+            const lockedOvr3C = Math.abs(ovrSum(redTeam) - ovrSum(blueTeam));
+            for (let pass = 0; pass < 3; pass++) {
+                const currZone = zoneImbalance3C(redTeam, blueTeam);
+                if (currZone === 0) break;
+                let best = null, bestZone = currZone;
+                for (let i = 0; i < redTeam.length; i++) {
+                    for (let j = 0; j < blueTeam.length; j++) {
+                        if (!swapAllowed(redTeam[i], blueTeam[j])) continue;
+                        const nr = redTeam.map((p, idx) => idx === i ? blueTeam[j] : p);
+                        const nb = blueTeam.map((p, idx) => idx === j ? redTeam[i] : p);
+                        const newOvr  = Math.abs(ovrSum(nr) - ovrSum(nb));
+                        const newZone = zoneImbalance3C(nr, nb);
+                        if (newOvr <= lockedOvr3C && newZone < bestZone) {
+                            bestZone = newZone; best = { i, j };
+                        }
+                    }
+                }
+                if (best) [redTeam[best.i], blueTeam[best.j]] = [blueTeam[best.j], redTeam[best.i]];
+                else break;
+            }
+        }
+
         // Delete existing teams if any (for re-generation)
         await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
         await pool.query("UPDATE game_guests SET team_name = NULL WHERE game_id = $1", [gameId]);
@@ -6896,7 +7131,15 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name, early_bird_price, super_early_bird_price, opponent_id: edit_opp_id } = req.body;
+        const parsedEB  = early_bird_price       != null && early_bird_price       !== '' ? parseFloat(early_bird_price)       : null;
+        const parsedSEB = super_early_bird_price != null && super_early_bird_price !== '' ? parseFloat(super_early_bird_price) : null;
+        let resolvedEditOppName = external_opponent !== undefined ? (external_opponent || null) : null;
+        let resolvedEditOppId   = edit_opp_id !== undefined ? (edit_opp_id || null) : null;
+        if (edit_opp_id) {
+            const oppRow = await pool.query('SELECT name FROM opponents WHERE id = $1', [edit_opp_id]);
+            if (oppRow.rows.length) resolvedEditOppName = oppRow.rows[0].name;
+        }
         
         // Validate inputs
         if (!venue_id || !max_players || cost_per_player === undefined) {
@@ -6958,9 +7201,12 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     position_type = COALESCE($16, position_type),
                     format = COALESCE($17, format),
                     exclusivity = COALESCE($18, exclusivity),
-                    tournament_name = COALESCE($19, tournament_name)
+                    tournament_name = COALESCE($19, tournament_name),
+                    early_bird_price = $20,
+                    super_early_bird_price = $21,
+                    opponent_id = $22
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null]);
+            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -6980,9 +7226,12 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     position_type = COALESCE($14, position_type),
                     format = COALESCE($15, format),
                     exclusivity = COALESCE($16, exclusivity),
-                    tournament_name = COALESCE($17, tournament_name)
+                    tournament_name = COALESCE($17, tournament_name),
+                    early_bird_price = $18,
+                    super_early_bird_price = $19,
+                    opponent_id = $20
                 WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, external_opponent !== undefined ? (external_opponent || null) : null, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null]);
+            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
@@ -7053,7 +7302,17 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser, format, position_type, refs_required, ref_pay } = req.body;
+        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser, format, position_type, refs_required, ref_pay, early_bird_price: eb_s, super_early_bird_price: seb_s, opponent_id: series_opp_id } = req.body;
+        const parsedEB_s  = eb_s  != null && eb_s  !== '' ? parseFloat(eb_s)  : null;
+        const parsedSEB_s = seb_s != null && seb_s !== '' ? parseFloat(seb_s) : null;
+        // Resolve opponent for series
+        let resolvedSeriesOppName = null;
+        let resolvedSeriesOppId   = series_opp_id || null;
+        if (series_opp_id) {
+            const oppRow = await client.query('SELECT name FROM opponents WHERE id = $1', [series_opp_id]);
+            if (oppRow.rows.length) resolvedSeriesOppName = oppRow.rows[0].name;
+            else resolvedSeriesOppId = null;
+        }
 
         if (!venue_id || !max_players || cost_per_player === undefined) {
             return res.status(400).json({ error: 'Missing required fields' });
@@ -7091,13 +7350,13 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
                 const utcDate = new Date(new Date(londonLocal).getTime() - offset);
 
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay) WHERE id=$7',
-                    [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay), early_bird_price=$13, super_early_bird_price=$14, opponent_id=COALESCE($15, opponent_id), external_opponent=COALESCE($16, external_opponent) WHERE id=$7',
+                    [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName]
                 );
             } else {
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay) WHERE id=$6',
-                    [venue_id, max_players, cost_per_player, star_rating || null, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay), early_bird_price=$12, super_early_bird_price=$13, opponent_id=COALESCE($14, opponent_id), external_opponent=COALESCE($15, external_opponent) WHERE id=$6',
+                    [venue_id, max_players, cost_per_player, star_rating || null, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName]
                 );
             }
         }
@@ -7308,19 +7567,91 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
 
 // Confirm game (mark as confirmed without needing team generation)
 app.post('/api/admin/games/:gameId/confirm-game', authenticateToken, requireGameManager, async (req, res) => {
+    const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        
-        await pool.query(
-            "UPDATE games SET game_status = 'confirmed', teams_confirmed = true WHERE id = $1",
+
+        await client.query('BEGIN');
+
+        // Clear any previously generated teams for this game
+        await client.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)', [gameId]);
+        await client.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+
+        // Create the single TF squad team (Red)
+        const teamRes = await client.query(
+            `INSERT INTO teams (game_id, team_name) VALUES ($1, 'Red') RETURNING id`,
             [gameId]
         );
-        
+        const redTeamId = teamRes.rows[0].id;
+
+        // Add all confirmed registrations to the Red team
+        const players = await client.query(
+            `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        for (const { player_id } of players.rows) {
+            await client.query(
+                'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                [redTeamId, player_id]
+            );
+        }
+
+        // Assign all guests to Red team
+        await client.query(
+            `UPDATE game_guests SET team_name = 'Red' WHERE game_id = $1`,
+            [gameId]
+        );
+
+        // Confirm the game
+        await client.query(
+            `UPDATE games SET game_status = 'confirmed', teams_generated = true, teams_confirmed = true WHERE id = $1`,
+            [gameId]
+        );
+
+        await client.query('COMMIT');
+
         res.json({ message: 'Game confirmed' });
-        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_confirmed', 'Status set to confirmed'));
+
+        // Post-commit: notifications + emails + audit
+        setImmediate(async () => {
+            try {
+                const gameData = await getGameDataForNotification(gameId);
+                for (const { player_id } of players.rows) {
+                    sendNotification('teams_confirmed', player_id, gameData).catch(() => {});
+                }
+                await sendTeamsConfirmedEmails(gameId);
+            } catch (e) { /* non-critical */ }
+            await gameAuditLog(pool, gameId, req.user.playerId, 'game_confirmed',
+                `External game confirmed — ${players.rows.length} player(s) auto-assigned to TF squad`);
+        });
     } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Confirm game error:', error);
         res.status(500).json({ error: 'Failed to confirm game' });
+    } finally {
+        client.release();
+    }
+});
+
+// PATCH /api/games/:id/my-position-areas — update zone/position preference after signup
+app.patch('/api/games/:id/my-position-areas', authenticateToken, async (req, res) => {
+    try {
+        const { id: gameId } = req.params;
+        const { positionAreas } = req.body;
+        const ALLOWED = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF','defence','midfield','attack']);
+        const sanitised = positionAreas
+            ? positionAreas.split(',').map(s => s.trim()).filter(s => ALLOWED.has(s)).join(',') || null
+            : null;
+        const result = await pool.query(
+            `UPDATE registrations SET position_areas = $1
+             WHERE game_id = $2 AND player_id = $3 AND status IN ('confirmed','backup') RETURNING id`,
+            [sanitised, gameId, req.user.playerId]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Registration not found' });
+        res.json({ success: true, positionAreas: sanitised });
+    } catch (e) {
+        console.error('Update position_areas error:', e.message);
+        res.status(500).json({ error: 'Failed to update position areas' });
     }
 });
 
@@ -7522,6 +7853,7 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             const redTeamId = teamsResult.rows.find(t => t.team_name === 'Red')?.id;
             const blueTeamId = teamsResult.rows.find(t => t.team_name === 'Blue')?.id;
             
+            const NULL_UUID = '00000000-0000-0000-0000-000000000000';
             const [redTeamResult, blueTeamResult] = await Promise.all([
                 pool.query(`
                     SELECT p.id, p.full_name, p.alias, p.squad_number,
@@ -7534,7 +7866,7 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
                     JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [redTeamId, gameId]),
+                `, [redTeamId || NULL_UUID, gameId]),
                 pool.query(`
                     SELECT p.id, p.full_name, p.alias, p.squad_number,
                            p.overall_rating, p.defending_rating, p.strength_rating,
@@ -7546,7 +7878,7 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
                     JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
                     WHERE tp.team_id = $1
                     ORDER BY p.full_name
-                `, [blueTeamId, gameId])
+                `, [blueTeamId || NULL_UUID, gameId])
             ]);
             
             // Fix 06: fetch pairs/avoids so fine-tune modal can show pref icons
@@ -7791,10 +8123,7 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                             );
                             const newTier = tierResult.rows[0]?.new_tier;
                             if (newTier) {
-                                await pool.query(
-                                    'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-                                    [newTier, pid]
-                                );
+                                await applyTierChange(pool, pid, newTier);
                             }
                         } catch (tierError) {
                             console.error('Tier recalc failed for player', pid, ':', tierError.message);
@@ -7928,8 +8257,45 @@ app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameM
         console.warn(`player-stats: skipped non-participants: ${errors.join(', ')}`);
     }
 
-    setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'player_stats_updated',
-        `Bulk stat update: ${playerStats.length} players`));
+    // Per-player individual audit entries for actual stat changes
+    setImmediate(async () => {
+        try {
+            // Fetch player names for readable entries
+            const changedIds = statChanges.filter(c => c.newOverall !== c.oldOverall).map(c => c.playerId);
+            const nameMap2 = {};
+            if (changedIds.length > 0) {
+                const nr = await pool.query(
+                    `SELECT id, COALESCE(alias, full_name) AS name FROM players WHERE id = ANY($1)`,
+                    [changedIds]
+                );
+                nr.rows.forEach(r => { nameMap2[r.id] = r.name; });
+            }
+
+            for (const c of statChanges) {
+                // Only log if OVR actually changed
+                if (c.newOverall === c.oldOverall) continue;
+                const diff = (c.newOverall ?? 0) - (c.oldOverall ?? 0);
+                const sign = diff >= 0 ? '+' : '';
+                const detail = `OVR ${c.oldOverall ?? '?'} → ${c.newOverall} (${sign}${diff}) — game ${gameId}`;
+                await auditLog(pool, req.user.playerId, 'stats_updated', c.playerId, detail).catch(() => {});
+            }
+
+            // Game-level summary
+            const changed = statChanges.filter(c => c.newOverall !== c.oldOverall);
+            const unchanged = statChanges.length - changed.length;
+            const summary = changed.length > 0
+                ? `OVR changes: ${changed.map(c => {
+                    const name = nameMap2[c.playerId] || c.playerId;
+                    const diff = (c.newOverall ?? 0) - (c.oldOverall ?? 0);
+                    return name + ' ' + (diff >= 0 ? '+' : '') + diff;
+                  }).join(', ')}${unchanged > 0 ? ` | ${unchanged} unchanged` : ''}`
+                : `${statChanges.length} players — no OVR changes`;
+
+            await gameAuditLog(pool, gameId, req.user.playerId, 'player_stats_updated', summary);
+        } catch (e) {
+            console.error('Stats audit failed (non-critical):', e.message);
+        }
+    });
 
     res.json({ message: 'Player stats updated', updated: playerStats.length - errors.length });
 });
@@ -8323,10 +8689,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                         );
                         const newTier = tierResult.rows[0]?.new_tier;
                         if (newTier) {
-                            await pool.query(
-                                'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-                                [newTier, dpId]
-                            );
+                            await applyTierChange(pool, dpId, newTier);
                         }
                     } catch (tierError) {
                         console.error('Tier recalc failed for player', dpId, ':', tierError.message);
@@ -8342,16 +8705,133 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             awardsOpen: shouldHaveMotm,
             awardsCloseAt: shouldHaveMotm ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null,
         });
+        // Capture all data needed for audit BEFORE setImmediate (values in closure)
+        const _auditDisciplineRecords = [...(disciplineRecords || []).filter(d => d.points > 0)];
+        const _auditShowedUp          = [...showedUpPlayerIds];
+        const _auditNoShows           = [...noShowPlayerIds];
+        const _auditBeef              = [...(beefEntries || [])];
+        const _auditWinningTeam       = winningTeam;
+        const _auditGameId            = gameId;
+        const _auditAdminId           = req.user.playerId;
+        // winningPlayerIds may be empty for draws/external-loss — capture from outer scope
+        // We need to re-derive after swaps, so pass allPlayerIds + winning team for non-external
+        const _auditIsExternal        = isExternal;
+        const _auditSwappedIds        = [...(swappedPlayerIds || [])];
+
         setImmediate(async () => {
-            await gameAuditLog(pool, gameId, req.user.playerId, 'game_completed',
-                `Winner: ${winningTeam || 'N/A'} | MOTM nominees: ${nomineesInserted}`);
             try {
-                const gameData = await getGameDataForNotification(gameId);
+                // Fetch player names for readable audit entries
+                const allIds = [...new Set([
+                    ..._auditShowedUp,
+                    ..._auditNoShows,
+                    ..._auditDisciplineRecords.map(d => d.playerId),
+                ])].filter(Boolean);
+
+                const nameMap = {};
+                if (allIds.length > 0) {
+                    const nameRes = await pool.query(
+                        `SELECT id, COALESCE(alias, full_name) AS name FROM players WHERE id = ANY($1)`,
+                        [allIds]
+                    );
+                    nameRes.rows.forEach(r => { nameMap[r.id] = r.name; });
+                }
+
+                const n = id => nameMap[id] || id;
+
+                // Derive winning player IDs again for audit (mirrors complete game logic)
+                let _auditWinnerIds = [];
+                if (_auditWinningTeam && _auditWinningTeam !== 'draw') {
+                    if (_auditIsExternal && _auditWinningTeam === 'red') {
+                        _auditWinnerIds = _auditShowedUp;
+                    } else if (!_auditIsExternal) {
+                        const wtName = _auditWinningTeam === 'red' ? 'Red' : 'Blue';
+                        const wr = await pool.query(
+                            `SELECT tp.player_id FROM team_players tp
+                             JOIN teams t ON t.id = tp.team_id
+                             WHERE t.game_id = $1 AND t.team_name = $2`,
+                            [_auditGameId, wtName]
+                        );
+                        _auditWinnerIds = wr.rows.map(r => r.player_id);
+                        // Include swapped players
+                        const winSet = new Set(_auditWinnerIds);
+                        for (const sid of _auditSwappedIds) {
+                            if (sid && !String(sid).startsWith('guest_') && !winSet.has(sid)) {
+                                _auditWinnerIds.push(sid);
+                                winSet.add(sid);
+                            }
+                        }
+                    }
+                }
+
+                // ── Game-level audit entry (one comprehensive line) ────────────────
+                const discSummary = _auditDisciplineRecords.length > 0
+                    ? _auditDisciplineRecords.map(d => {
+                        const offenseLabels = {
+                            'on_time': 'On Time', 'not_ready': 'Not Ready',
+                            'late_drop': 'Late Drop Out', '5_10_late': '5-10 Min Late',
+                            '10_late': '10+ Min Late', 'no_show': 'No Show'
+                        };
+                        return `${n(d.playerId)}: ${offenseLabels[d.offense] || d.offense} (+${d.points}pt)`;
+                    }).join(', ')
+                    : 'None';
+
+                const winsSummary = _auditWinnerIds.length > 0
+                    ? _auditWinnerIds.map(id => n(id)).join(', ')
+                    : (_auditWinningTeam === 'draw' ? 'Draw — no wins' : 'None');
+
+                const noShowSummary = _auditNoShows.length > 0
+                    ? _auditNoShows.map(id => n(id)).join(', ')
+                    : 'None';
+
+                const beefSummary = _auditBeef.length > 0
+                    ? _auditBeef.map(b => `${n(b.player1)} ↔ ${n(b.player2)} (lvl ${b.level})`).join(', ')
+                    : 'None';
+
+                const gameAuditDetail = [
+                    `Result: ${_auditWinningTeam || 'N/A'}`,
+                    `Appearances: ${_auditShowedUp.length}`,
+                    `Wins awarded: ${winsSummary}`,
+                    `No-shows: ${noShowSummary}`,
+                    `Discipline: ${discSummary}`,
+                    `Beef: ${beefSummary}`,
+                ].join(' | ');
+
+                await gameAuditLog(pool, _auditGameId, _auditAdminId, 'game_completed', gameAuditDetail);
+
+                // ── Individual player audit entries ────────────────────────────────
+
+                // Discipline records
+                for (const d of _auditDisciplineRecords) {
+                    const offenseLabels = {
+                        'on_time': 'On Time', 'not_ready': 'Not Ready',
+                        'late_drop': 'Late Drop Out', '5_10_late': '5-10 Min Late',
+                        '10_late': '10+ Min Late', 'no_show': 'No Show'
+                    };
+                    await auditLog(pool, null, 'discipline_recorded', d.playerId,
+                        `${offenseLabels[d.offense] || d.offense} (+${d.points}pt) — game ${_auditGameId}`
+                    ).catch(() => {});
+                }
+
+                // Wins
+                for (const pid of _auditWinnerIds) {
+                    await auditLog(pool, null, 'win_awarded', pid,
+                        `Win recorded (${_auditWinningTeam} wins) — game ${_auditGameId}`
+                    ).catch(() => {});
+                }
+
+            } catch (e) {
+                console.error('Post-complete audit failed (non-critical):', e.message);
+            }
+
+            // Admin notification
+            try {
+                const gameData = await getGameDataForNotification(_auditGameId);
                 await notifyAdmin('✅ Game Completed', [
                     ['Game', (gameData.day || '') + ' ' + (gameData.time || '')],
                     ['Venue', gameData.venue || ''],
-                    ['Winner', winningTeam || 'N/A'],
-                    ['MOTM nominees', String(nomineesInserted)],
+                    ['Winner', _auditWinningTeam || 'N/A'],
+                    ['Appearances', String(_auditShowedUp.length)],
+                    ['Discipline', String(_auditDisciplineRecords.length) + ' record(s)'],
                 ]);
             } catch (e) { /* non-critical */ }
         });
@@ -8398,7 +8878,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         );
         const disciplineMap = {};
         const tierFromPoints = pts => {
-            if (pts >= 15) return 'black';
+            if (pts >= 25) return 'black';
             if (pts >= 10) return 'white';
             if (pts >= 4)  return 'bronze';
             if (pts >= 1)  return 'silver';
@@ -8575,6 +9055,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         const blueTeamId = teamsResult.rows.find(t => t.team_name === 'Blue')?.id;
         
         // Get players for each team
+        const NULL_UUID = '00000000-0000-0000-0000-000000000000';
         const [redTeamResult, blueTeamResult] = await Promise.all([
             pool.query(`
                 SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
@@ -8588,7 +9069,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                     p.squad_number ASC NULLS LAST,
                     p.motm_wins DESC NULLS LAST,
                     p.total_appearances DESC NULLS LAST
-            `, [redTeamId, game.id]),
+            `, [redTeamId || NULL_UUID, game.id]),
             pool.query(`
                 SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
                        p.motm_wins, p.total_appearances
@@ -8601,7 +9082,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                     p.squad_number ASC NULLS LAST,
                     p.motm_wins DESC NULLS LAST,
                     p.total_appearances DESC NULLS LAST
-            `, [blueTeamId, game.id])
+            `, [blueTeamId || NULL_UUID, game.id])
         ]);
         
         // Map to format expected by frontend
@@ -8901,6 +9382,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) as confirmed_organiser_count
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN opponents opp_pub ON opp_pub.id = g.opponent_id
             WHERE g.game_url = $1
         `, [gameUrl]);
         
@@ -8968,7 +9450,14 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             format: game.format,
             max_players: game.max_players,
             current_players: game.current_players,
-            cost_per_player: game.cost_per_player,
+            cost_per_player:        game.cost_per_player,
+            early_bird_price:       game.early_bird_price || null,
+            super_early_bird_price: game.super_early_bird_price || null,
+            effective_price:        getEffectivePrice(game).price,
+            pricing_tier:           getEffectivePrice(game).tier,
+            opponent_id:            game.opponent_id || null,
+            opponent_logo_url:      game.opponent_logo_url || null,
+            opponent_star_rating:   game.opponent_star_rating || null,
             game_status: game.game_status,
             exclusivity: game.exclusivity,
             teams_confirmed: game.teams_confirmed,
@@ -9206,6 +9695,7 @@ app.get('/api/public/games', async (req, res) => {
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    g.external_opponent, g.tf_kit_color, g.opp_kit_color,
                    g.exclusivity, g.star_rating, g.cost_per_player,
+                   g.early_bird_price, g.super_early_bird_price,
                    v.name AS venue_name, v.address AS venue_address, v.region AS venue_region,
                    gs.series_name,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
@@ -9241,6 +9731,9 @@ app.get('/api/public/games', async (req, res) => {
         };
         const rows = result.rows.map(game => {
             game.venue_photo = (game.venue_name && venuePhotoMap[game.venue_name]) || null;
+            const ep = getEffectivePrice(game);
+            game.effective_price = ep.price;
+            game.pricing_tier    = ep.tier;
             return game;
         });
         res.json(rows);
@@ -9321,7 +9814,6 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
         // Get player by ID or squad number
         let playerResult;
         if (isNaN(playerId)) {
-            // UUID
             playerResult = await pool.query(
                 `SELECT id, full_name, alias, squad_number, photo_url, reliability_tier,
                         total_appearances, total_wins, motm_wins, ai_bio
@@ -9329,7 +9821,6 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
                 [playerId]
             );
         } else {
-            // Squad number
             playerResult = await pool.query(
                 `SELECT id, full_name, alias, squad_number, photo_url, reliability_tier,
                         total_appearances, total_wins, motm_wins, ai_bio
@@ -9341,27 +9832,55 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
         if (playerResult.rows.length === 0) {
             return res.status(404).json({ error: 'Player not found' });
         }
-        
         const player = playerResult.rows[0];
-        
-        // Get badges
-        const badgesResult = await pool.query(`
-            SELECT b.name, b.icon, b.color, b.description
-            FROM player_badges pb
-            JOIN badges b ON b.id = pb.badge_id
-            WHERE pb.player_id = $1
-            ORDER BY b.name
-        `, [player.id]);
-        
-        // Calculate win ratio
-        const appearances = player.total_appearances || 0;
-        const wins = player.total_wins || 0;
-        const winRatio = appearances > 0 ? ((wins / appearances) * 100).toFixed(1) : '0.0';
-        
-        // Calculate MOTM ratio
-        const motmWins = parseFloat(player.motm_wins || 0);
-        const motmRatio = appearances > 0 ? ((motmWins / appearances) * 100).toFixed(1) : '0.0';
-        
+
+        // Parallel fetches for badges, awards, and contextual wins
+        const [badgesResult, awardsResult, extWinsResult, tournWinsResult] = await Promise.all([
+            pool.query(`
+                SELECT b.name, b.icon, b.color, b.description
+                FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 ORDER BY b.name`, [player.id]),
+            // All TF Game Award counts
+            pool.query(`
+                SELECT award_type, COUNT(*) AS cnt
+                FROM game_awards WHERE recipient_player_id = $1
+                GROUP BY award_type`, [player.id]),
+            // External game wins — no team_players needed (all confirmed TF players win when winning_team=red)
+            pool.query(`
+                SELECT COUNT(*) AS cnt
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                WHERE r.player_id = $1 AND r.status = 'confirmed'
+                  AND g.game_status = 'completed'
+                  AND g.team_selection_type = 'vs_external'
+                  AND LOWER(g.winning_team) = 'red'`, [player.id]),
+            // Tournament wins
+            pool.query(`
+                SELECT COUNT(*) AS cnt
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                JOIN team_players tp ON tp.player_id = r.player_id
+                JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                WHERE r.player_id = $1 AND r.status = 'confirmed'
+                  AND g.game_status = 'completed'
+                  AND g.team_selection_type = 'tournament'
+                  AND LOWER(t.team_name) = LOWER(g.winning_team)`, [player.id]),
+        ]);
+
+        // Build award counts map
+        const awardCounts = {};
+        for (const row of awardsResult.rows) {
+            awardCounts[row.award_type] = parseInt(row.cnt);
+        }
+
+        const appearances  = player.total_appearances || 0;
+        const wins         = player.total_wins || 0;
+        const motmWins     = parseFloat(player.motm_wins || 0);
+        const winRatio     = appearances > 0 ? ((wins / appearances) * 100).toFixed(1) : '0.0';
+        const motmRatio    = appearances > 0 ? ((motmWins / appearances) * 100).toFixed(1) : '0.0';
+        const externalWins = parseInt(extWinsResult.rows[0]?.cnt || 0);
+        const tournamentWins = parseInt(tournWinsResult.rows[0]?.cnt || 0);
+
         res.json({
             player: {
                 id: player.id,
@@ -9371,9 +9890,12 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
                 reliability_tier: player.reliability_tier,
                 total_appearances: appearances,
                 total_wins: wins,
-                motm_wins: motmWins,
                 win_ratio: winRatio,
+                motm_wins: motmWins,
                 motm_ratio: motmRatio,
+                external_wins: externalWins,
+                tournament_wins: tournamentWins,
+                award_counts: awardCounts,
                 ai_bio: player.ai_bio || null
             },
             badges: badgesResult.rows
@@ -9382,6 +9904,32 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
     } catch (error) {
         console.error('Player profile error:', error);
         res.status(500).json({ error: 'Failed to load player profile' });
+    }
+});
+
+// GET /api/players/:playerId/admin-contact — email/phone/full_name for admins & organisers
+app.get('/api/players/:playerId/admin-contact', authenticateToken, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const requester = req.user;
+        const isAdmin = requester.role === 'admin' || requester.role === 'superadmin';
+        // Organisers can access — they run games and need to contact players
+        const isOrganiser = await pool.query(
+            'SELECT is_organiser FROM players WHERE id = $1', [requester.playerId]
+        );
+        if (!isAdmin && !isOrganiser.rows[0]?.is_organiser) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+        const result = await pool.query(
+            `SELECT p.full_name, p.phone, u.email
+             FROM players p JOIN users u ON u.id = p.user_id
+             WHERE p.id = $1`, [playerId]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Player not found' });
+        res.json(result.rows[0]);
+    } catch (e) {
+        console.error('Admin contact error:', e.message);
+        res.status(500).json({ error: 'Failed to load contact info' });
     }
 });
 
@@ -10168,7 +10716,11 @@ async function closeAwards(gameId) {
             const minVotes = AWARD_MIN_VOTES[awardType] ?? MIN_VOTES_REQUIRED;
             if (awardType !== 'motm' && maxVotes < minVotes) continue;
 
-            const winners = nominees.filter(n => n.votes === maxVotes);
+            // MOTM: only tied top-vote-getters win (fractional split)
+            // All other awards: everyone who meets the minimum vote quota wins
+            const winners = awardType === 'motm'
+                ? nominees.filter(n => n.votes === maxVotes)
+                : nominees.filter(n => n.votes >= minVotes);
 
             for (const winner of winners) {
                 const motmValue = awardType === 'motm' ? (1.0 / winners.length) : 1.00;
@@ -11489,7 +12041,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
         
         let query, params;
         if (isFullAdmin) {
-            query = `SELECT g.*, v.name as venue_name,
+            query = `SELECT g.*, opp_mgr.logo_url AS opponent_logo_url, v.name as venue_name,
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 motm_p.alias as motm_winner_alias,
@@ -11523,7 +12075,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                     WHERE r.game_id = g.id AND r.player_id = $1 AND r.status = 'confirmed'
                 )`);
             }
-            query = `SELECT g.*, v.name as venue_name,
+            query = `SELECT g.*, opp_clm.logo_url AS opponent_logo_url, v.name as venue_name,
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 motm_p.alias as motm_winner_alias,
@@ -11543,6 +12095,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
                  AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+                LEFT JOIN opponents opp_clm ON opp_clm.id = g.opponent_id
                 WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
             params = player.is_organiser ? [playerId] : [];
@@ -11550,7 +12103,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
         
         const result = await pool.query(query, params);
         res.json({
-            games: result.rows,
+            games: result.rows.map(g => { const { price: ep, tier: pt } = getEffectivePrice(g); return { ...g, effective_price: ep, pricing_tier: pt }; }), // opponent_logo_url already in g via SELECT
             managerRole: isFullAdmin ? 'admin' : (player.is_clm_admin && player.is_organiser) ? 'clm_organiser' : player.is_clm_admin ? 'clm_admin' : 'organiser',
             permissions: {
                 canCreate: isFullAdmin || player.is_clm_admin,
@@ -12142,10 +12695,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
                         );
                         const newTier = tierResult.rows[0]?.new_tier;
                         if (newTier) {
-                            await pool.query(
-                                'UPDATE players SET reliability_tier = $1 WHERE id = $2',
-                                [newTier, dpId]
-                            );
+                            await applyTierChange(pool, dpId, newTier);
                         }
                     } catch (tierError) {
                         console.error('Tier recalc failed for player', dpId, ':', tierError.message);
@@ -13005,13 +13555,30 @@ app.post('/api/players/me/notifications/mark-read', authenticateToken, async (re
 // IMPORTANT: DISC_TIER_THRESHOLDS below must match your calculate_player_tier DB function.
 // Adjust these constants if tier behaviour doesn't match what you expect.
 // These thresholds apply to the REVOLVING window (last 10 completed games + all manual entries).
-const DISC_TIER_THRESHOLDS = { black: 15, white: 10, bronze: 4, silver: 1 };
+const DISC_TIER_THRESHOLDS = { black: 25, white: 10, bronze: 4, silver: 1 };
 function tierFromRevolvingPoints(pts) {
     if (pts >= DISC_TIER_THRESHOLDS.black)  return 'black';
     if (pts >= DISC_TIER_THRESHOLDS.white)  return 'white';
     if (pts >= DISC_TIER_THRESHOLDS.bronze) return 'bronze';
     if (pts >= DISC_TIER_THRESHOLDS.silver) return 'silver';
     return 'gold';
+}
+
+// Writes tier to DB and manages white_ban_started_at:
+// becoming white → stamps NOW() (if not already set)
+// leaving white  → clears to NULL; other transitions → leave column alone
+async function applyTierChange(db, playerId, newTier) {
+    await db.query(
+        `UPDATE players
+         SET reliability_tier     = $1,
+             white_ban_started_at = CASE
+               WHEN $1 = 'white' AND white_ban_started_at IS NULL THEN NOW()
+               WHEN $1 != 'white' THEN NULL
+               ELSE white_ban_started_at
+             END
+         WHERE id = $2`,
+        [newTier, playerId]
+    );
 }
 
 app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, async (req, res) => {
@@ -13050,7 +13617,7 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
         `, [id]);
         const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
         const newTier = tierFromRevolvingPoints(revolvingPts);
-        await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, id]);
+        await applyTierChange(client, id, newTier);
 
         await client.query('COMMIT');
         res.json({ success: true, newTier, pointsAdded: pts, revolvingTotal: revolvingPts });
@@ -13105,7 +13672,7 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
         const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
         const newTier = tierFromRevolvingPoints(revolvingPts);
 
-        await client.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, playerId]);
+        await applyTierChange(client, playerId, newTier);
         await client.query('COMMIT');
 
         res.json({ success: true, newTier, revolvingTotal: revolvingPts, removedPoints: record.points });
@@ -13143,7 +13710,7 @@ app.post('/api/admin/players/:id/recalc-tier', authenticateToken, requireAdmin, 
         `, [id]);
         const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
         const newTier = tierFromRevolvingPoints(revolvingPts);
-        await pool.query('UPDATE players SET reliability_tier = $1 WHERE id = $2', [newTier, id]);
+        await applyTierChange(pool, id, newTier);
         res.json({ success: true, newTier, revolvingTotal: revolvingPts });
         setImmediate(() => auditLog(pool, req.user.playerId, 'tier_recalculated', id,
             `Tier recalculated | revolving pts: ${revolvingPts} | new tier: ${newTier}`));
@@ -13164,9 +13731,9 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, a
         // Clear all existing discipline records — clean slate, zero points
         await client.query('DELETE FROM discipline_records WHERE player_id = $1', [id]);
 
-        // Force gold tier — player returns with a clean record
+        // Force gold tier — player returns with a clean record, clear ban timestamp
         await client.query(
-            'UPDATE players SET reliability_tier = $1 WHERE id = $2',
+            'UPDATE players SET reliability_tier = $1, white_ban_started_at = NULL WHERE id = $2',
             ['gold', id]
         );
 
@@ -18157,19 +18724,46 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         if (pmt.status === 'credited') {
             return console.log('[Wonderful webhook] already credited, skipping:', pmt.merchant_reference);
         }
+        // For async banks (HSBC, Nationwide etc.) status may be 'processing' — allow crediting
 
         // SECURITY: independently verify status with Wonderful API — never trust webhook payload alone
         if (!WONDERFUL_API_KEY) return;
-        const verifyId = wpId || pmt.wonderful_payment_id;
-        if (!verifyId) {
-            return console.error('[Wonderful webhook] cannot verify — no wonderful_payment_id. merchant_ref:', pmt.merchant_reference);
-        }
+        // Resolve the best ID to use for verify
+        let verifyId = wpId || pmt.wonderful_payment_id;
         let verified;
         try {
-            const verifyRes = await wonderfulRequest('GET', `/v2/payments/${verifyId}`);
-            verified = verifyRes.data?.status;
-        } catch (e) {
-            return console.error('Wonderful webhook: verify GET failed', e.message);
+            if (verifyId) {
+                const verifyRes = await wonderfulRequest('GET', `/v2/payments/${verifyId}`);
+                verified = verifyRes.data?.status;
+            }
+        } catch (verifyErr) {
+            console.warn('[Wonderful webhook] direct verify failed, trying list search:', verifyErr.message);
+            verified = null;
+        }
+        // Fallback: if verify failed or no verifyId, search by merchant_reference
+        if (!verified && WONDERFUL_API_KEY) {
+            try {
+                const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
+                const found = (listRes.data?.payments || listRes.data || []).find(p2 =>
+                    p2.merchant_payment_reference === pmt.merchant_reference ||
+                    p2.merchant_reference === pmt.merchant_reference
+                );
+                if (found) {
+                    verified = found.status;
+                    verifyId = found.id;
+                    console.log('[Wonderful webhook] resolved via list — wpId:', verifyId, 'status:', verified);
+                    // Store resolved ID in DB
+                    await pool.query(
+                        `UPDATE wonderful_payments SET wonderful_payment_id = COALESCE(wonderful_payment_id, $1) WHERE id = $2`,
+                        [verifyId, pmt.id]
+                    );
+                }
+            } catch (listErr) {
+                console.warn('[Wonderful webhook] list search failed:', listErr.message);
+            }
+        }
+        if (!verified) {
+            return console.error('[Wonderful webhook] could not verify payment status — ref:', pmt.merchant_reference);
         }
 
         // v2 API: payment status can be 'paid' or 'accepted' for successful payments
@@ -18177,22 +18771,23 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         if (verified !== 'paid' && verified !== 'accepted') {
             // Update status but don't credit
             await pool.query(
-                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3`,
-                [verified || 'pending', wpId, pmt.id]
+                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status != 'credited'`,
+                [verified || 'pending', verifyId || wpId, pmt.id]
             );
             return;
         }
 
-        // Idempotency: mark as credited atomically
+        // Idempotency: mark as credited atomically — works from any pre-credit status
+        // (pending, processing, accepted — all valid pre-credit states for async banks)
         const claim = await pool.query(
             `UPDATE wonderful_payments
              SET status = 'credited', confirmed_at = NOW(), credited_at = NOW(),
                  wonderful_payment_id = COALESCE(wonderful_payment_id, $1)
              WHERE id = $2 AND status != 'credited'
              RETURNING *`,
-            [wpId, pmt.id]
+            [verifyId || wpId, pmt.id]
         );
-        if (!claim.rows.length) return; // another webhook beat us to it
+        if (!claim.rows.length) return console.log('[Wonderful webhook] idempotency check — already credited, skipping');
 
         const pounds = pmt.amount_pence / 100;
 
@@ -18283,11 +18878,38 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
         // COLD-START RECOVERY: if our DB says pending but Wonderful confirms paid,
         // credit the player now. This handles webhook misses due to Render cold starts.
         console.log('[Wonderful status-poll] ref:', ref, 'db_status:', p.status, 'wp_id:', p.wonderful_payment_id || 'NULL');
-        if (p.status === 'pending' && p.wonderful_payment_id && WONDERFUL_API_KEY) {
+        if (p.status === 'pending' && WONDERFUL_API_KEY) {
             try {
-                const verifyRes = await wonderfulRequest('GET', `/v2/payments/${p.wonderful_payment_id}`);
-                const verifiedStatus = verifyRes.data?.status;
-                console.log('[Wonderful status-poll] verify result:', verifiedStatus, 'full data keys:', Object.keys(verifyRes.data || {}));
+                // If no wonderful_payment_id stored, search Wonderful's API by merchant_reference
+                let verifyStatus = null;
+                let resolvedWpId = p.wonderful_payment_id;
+                if (resolvedWpId) {
+                    const verifyRes = await wonderfulRequest('GET', `/v2/payments/${resolvedWpId}`);
+                    verifyStatus = verifyRes.data?.status;
+                    console.log('[Wonderful status-poll] verify result:', verifyStatus);
+                } else {
+                    // No stored payment ID — search by listing recent payments
+                    try {
+                        const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
+                        const found = (listRes.data?.payments || listRes.data || []).find(p2 =>
+                            p2.merchant_payment_reference === ref || p2.merchant_reference === ref
+                        );
+                        if (found) {
+                            resolvedWpId = found.id;
+                            verifyStatus = found.status;
+                            // Update DB with real payment ID for future lookups
+                            await pool.query(
+                                `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE merchant_reference = $2 AND wonderful_payment_id IS NULL`,
+                                [resolvedWpId, ref]
+                            );
+                            console.log('[Wonderful status-poll] resolved via list search — wpId:', resolvedWpId, 'status:', verifyStatus);
+                        }
+                    } catch (listErr) {
+                        console.warn('[Wonderful status-poll] list search failed:', listErr.message);
+                    }
+                }
+                const verifiedStatus = verifyStatus;
+                console.log('[Wonderful status-poll] final verifiedStatus:', verifiedStatus, 'for ref:', ref);
                 if (verifiedStatus === 'paid' || verifiedStatus === 'accepted') {
                     console.log('[Wonderful status poll] cold-start recovery — crediting via status poll for ref:', ref);
                     // Atomic claim — prevents double-credit if webhook also fires
@@ -18344,6 +18966,62 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
     } catch (e) {
         console.error('Wonderful status error:', e.message);
         res.status(500).json({ error: 'Failed to check payment status' });
+    }
+});
+
+// POST /api/admin/payments/wonderful/reconcile/:ref — manually trigger credit for a specific payment
+app.post('/api/admin/payments/wonderful/reconcile/:ref', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { ref } = req.params;
+        const row = await pool.query(`SELECT * FROM wonderful_payments WHERE merchant_reference = $1`, [ref]);
+        if (!row.rows.length) return res.status(404).json({ error: 'Payment not found' });
+        const pmt = row.rows[0];
+        if (pmt.status === 'credited') return res.json({ message: 'Already credited', status: 'credited' });
+
+        // Verify with Wonderful API
+        let verifyStatus = null;
+        let resolvedWpId = pmt.wonderful_payment_id;
+        if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'Wonderful API not configured' });
+
+        if (resolvedWpId) {
+            const vr = await wonderfulRequest('GET', `/v2/payments/${resolvedWpId}`);
+            verifyStatus = vr.data?.status;
+        } else {
+            const lr = await wonderfulRequest('GET', '/v2/payments?limit=50');
+            const found = (lr.data?.payments || lr.data || []).find(p2 =>
+                p2.merchant_payment_reference === ref || p2.merchant_reference === ref
+            );
+            if (found) { verifyStatus = found.status; resolvedWpId = found.id; }
+        }
+
+        if (verifyStatus !== 'paid' && verifyStatus !== 'accepted') {
+            return res.json({ message: `Wonderful status: ${verifyStatus || 'unknown'} — not creditable`, status: verifyStatus });
+        }
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const claim = await client.query(
+                `UPDATE wonderful_payments SET status='credited', confirmed_at=NOW(), credited_at=NOW(),
+                 wonderful_payment_id=COALESCE(wonderful_payment_id,$1) WHERE id=$2 AND status!='credited' RETURNING *`,
+                [resolvedWpId, pmt.id]
+            );
+            if (!claim.rows.length) { await client.query('ROLLBACK'); return res.json({ message: 'Already credited during reconcile' }); }
+            const pounds = pmt.amount_pence / 100;
+            await client.query(`UPDATE credits SET balance=balance+$1, last_updated=CURRENT_TIMESTAMP WHERE player_id=$2`, [pounds, pmt.player_id]);
+            await client.query('COMMIT');
+            await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup', `Wonderful reconcile — ref ${ref}`, null);
+            await auditLog(pool, pmt.player_id, 'wonderful_credited', req.user.playerId, `Manual reconcile: £${pounds.toFixed(2)} credited — ref ${ref}`);
+            setImmediate(() => sendWonderfulCreditEmail(pmt.player_id, pounds, ref));
+            res.json({ message: `Credited £${pounds.toFixed(2)} to player`, status: 'credited', pounds });
+        } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            console.error('Reconcile credit failed:', e.message);
+            res.status(500).json({ error: 'Reconcile failed: ' + e.message });
+        } finally { client.release(); }
+    } catch (e) {
+        console.error('Reconcile endpoint error:', e.message);
+        res.status(500).json({ error: 'Failed to reconcile' });
     }
 });
 
@@ -18726,5 +19404,72 @@ app.listen(PORT, () => {
             coachingReminderRunning = false;
         }
     }, 5 * 60 * 1000); // Check every 5 minutes
+
+    // ── White-ban expiry scheduler — runs hourly ──────────────────────────────
+    // After 7 days on White, inserts a negative 'ban_served' discipline record
+    // to reduce revolving points to 9 (Bronze ceiling), restores tier to Bronze,
+    // clears white_ban_started_at, and notifies the player.
+    setInterval(async () => {
+        try {
+            const expired = await pool.query(`
+                SELECT id FROM players
+                WHERE reliability_tier = 'white'
+                  AND white_ban_started_at IS NOT NULL
+                  AND white_ban_started_at <= NOW() - INTERVAL '7 days'
+            `);
+
+            for (const { id: pid } of expired.rows) {
+                try {
+                    const revRes = await pool.query(`
+                        SELECT COALESCE(SUM(dr.points), 0) AS pts
+                        FROM discipline_records dr
+                        WHERE dr.player_id = $1
+                          AND (dr.game_id IS NULL OR dr.game_id IN (
+                              SELECT r.game_id FROM registrations r
+                              JOIN games g ON g.id = r.game_id
+                              WHERE r.player_id = $1
+                                AND r.status = 'confirmed'
+                                AND g.game_status = 'completed'
+                              ORDER BY g.game_date DESC LIMIT 10
+                          ))
+                    `, [pid]);
+
+                    const currentPts = parseInt(revRes.rows[0].pts) || 0;
+                    const TARGET_PTS = 9; // Bronze ceiling
+
+                    if (currentPts > TARGET_PTS) {
+                        await pool.query(
+                            `INSERT INTO discipline_records
+                                (player_id, game_id, points, offense_type, recorded_by)
+                             VALUES ($1, NULL, $2, 'ban_served', NULL)`,
+                            [pid, -(currentPts - TARGET_PTS)]
+                        );
+                    }
+
+                    await pool.query(
+                        'UPDATE players SET reliability_tier = $1, white_ban_started_at = NULL WHERE id = $2',
+                        ['bronze', pid]
+                    );
+
+                    await pool.query(
+                        `INSERT INTO notifications (player_id, type, message)
+                         VALUES ($1, 'ban_lifted', '\u2705 Your 1-week ban has been served. You have been restored to Bronze tier — keep it clean!')`,
+                        [pid]
+                    );
+
+                    sendNotification('ban_lifted', pid, {}).catch(() => {});
+
+                    await auditLog(pool, null, 'ban_served', pid,
+                        `White ban expired — revolving pts adjusted from ${currentPts} to ${Math.min(currentPts, TARGET_PTS)} — tier: bronze`);
+
+                    console.log(`✓ Ban lifted: player ${pid} (${currentPts} pts → ${TARGET_PTS} pts)`);
+                } catch (playerErr) {
+                    console.error(`Ban expiry failed for player ${pid}:`, playerErr.message);
+                }
+            }
+        } catch (e) {
+            console.error('White-ban expiry scheduler error:', e.message);
+        }
+    }, 60 * 60 * 1000); // Every hour
 
 });
