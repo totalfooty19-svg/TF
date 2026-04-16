@@ -3480,6 +3480,13 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
         const limit = Math.min(parseInt(req.query.limit) || 500, 1000);
         const offset = Math.max(parseInt(req.query.offset) || 0, 0);
 
+        // Admins/superadmins see ALL completed games; regular players see only their own
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        const playerFilter = isAdmin ? '' : `AND EXISTS (
+                SELECT 1 FROM registrations r2
+                WHERE r2.game_id = g.id AND r2.player_id = $3 AND r2.status = 'confirmed'
+              )`;
+
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name,
                    COALESCE(rc.confirmed_count, 0) + COALESCE(gc.guest_count, 0) AS current_players,
@@ -3487,8 +3494,12 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
                    p.alias as motm_winner_alias,
                    gs.series_name,
                    opp_comp.logo_url AS opponent_logo_url, opp_comp.star_rating AS opponent_star_rating,
-                   -- Player's result for this game
+                   -- Player's result for this game (NULL if not a participant — avoids showing LOSS for admin-only view)
                    CASE
+                     WHEN NOT EXISTS (
+                       SELECT 1 FROM registrations r_part
+                       WHERE r_part.game_id = g.id AND r_part.player_id = $3 AND r_part.status = 'confirmed'
+                     ) THEN NULL
                      WHEN g.winning_team IS NULL OR g.winning_team = '' THEN 'draw'
                      -- vs_external: all confirmed TF players win when winning_team = red
                      WHEN g.team_selection_type = 'vs_external' AND LOWER(g.winning_team) = 'red' THEN 'win'
@@ -3520,10 +3531,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
                 FROM game_guests GROUP BY game_id
             ) gc ON gc.game_id = g.id
             WHERE g.game_status = 'completed'
-              AND EXISTS (
-                SELECT 1 FROM registrations r2
-                WHERE r2.game_id = g.id AND r2.player_id = $3 AND r2.status = 'confirmed'
-              )
+              ${playerFilter}
             ORDER BY g.game_date DESC
             LIMIT $1 OFFSET $2
         `, [limit, offset, req.user.playerId]);
@@ -3614,7 +3622,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         const gameResult = await pool.query(`
             SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location, g.early_bird_price, g.super_early_bird_price,
-                   opp_pub.logo_url AS opponent_logo_url, opp_pub.star_rating AS opponent_star_rating,
+                   opp_pub.logo_url AS opponent_logo_url, opp_pub.star_rating AS opponent_star_rating, opp_pub.social_instagram AS opponent_social_instagram, opp_pub.social_twitter AS opponent_social_twitter, opp_pub.social_website AS opponent_social_website,
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
@@ -4128,6 +4136,11 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 p.assisting_rating,
                 p.shooting_rating,
                 p.overall_rating,
+                p.photo_url,
+                p.total_appearances,
+                p.total_wins,
+                p.motm_wins,
+                p.reliability_tier,
                 r.status,
                 r.backup_type,
                 r.is_comped,
@@ -4156,7 +4169,8 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                      p.fitness_rating, p.pace_rating, p.decisions_rating,
                      p.assisting_rating, p.shooting_rating, p.overall_rating,
                      r.status, r.backup_type, r.is_comped,
-                     r.position_preference, r.tournament_team_preference, r.venue_clash_team_preference, t.team_name
+                     r.position_preference, r.position_areas, r.tournament_team_preference, r.venue_clash_team_preference, t.team_name,
+                     p.photo_url, p.total_appearances, p.total_wins, p.motm_wins, p.reliability_tier
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY 
                 CASE r.status WHEN 'confirmed' THEN 1 WHEN 'backup' THEN 2 ELSE 3 END,
@@ -7475,7 +7489,17 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             res.json({ message: 'Tournament teams saved successfully' });
             return;
         } else if ((game.team_selection_type === 'fixed_draft' || game.team_selection_type === 'draft_memory' || game.team_selection_type === 'vs_external') && game.series_id) {
-            // Save fixed team assignments for the series
+            // Clear ALL existing series assignments for confirmed players in this game first.
+            // This ensures players left unassigned (in the pool) don't retain stale team memory
+            // from a previous draft — they'll appear unassigned next time the draft opens.
+            const confirmedIds = validPlayersResult.rows.map(r => r.player_id);
+            if (confirmedIds.length > 0) {
+                await client.query(
+                    `DELETE FROM player_fixed_teams WHERE series_id = $1 AND player_id = ANY($2::uuid[])`,
+                    [game.series_id, confirmedIds]
+                );
+            }
+            // Now write only the players who were actually assigned
             for (const playerId of redTeam) {
                 await client.query(`
                     INSERT INTO player_fixed_teams (player_id, series_id, fixed_team)
@@ -7527,12 +7551,22 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             );
         }
         
-        // Mark teams as generated and confirmed
-        await client.query(
-            'UPDATE games SET teams_generated = true, teams_confirmed = true, game_status = $1 WHERE id = $2',
-            ['confirmed', gameId]
-        );
-        
+        // For draft_memory: non-final save — game stays available, players can still sign up
+        // For all other types (fixed_draft, vs_external, standard): fully confirm
+        const isDraftMemorySave = game.team_selection_type === 'draft_memory';
+        if (isDraftMemorySave) {
+            // Reset game_status to 'available' in case this is a re-draft of a previously confirmed game
+            await client.query(
+                `UPDATE games SET teams_generated = true, teams_confirmed = false, game_status = 'available' WHERE id = $1`,
+                [gameId]
+            );
+        } else {
+            await client.query(
+                'UPDATE games SET teams_generated = true, teams_confirmed = true, game_status = $1 WHERE id = $2',
+                ['confirmed', gameId]
+            );
+        }
+
         // Get full game details for response
         const fullGameResult = await client.query(`
             SELECT g.*, v.name as venue_name
@@ -7544,32 +7578,18 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
         await client.query('COMMIT');
         
         res.json({ 
-            message: 'Teams saved successfully',
+            message: isDraftMemorySave ? 'Draft saved — game still open for sign-ups' : 'Teams saved successfully',
+            draft_saved: isDraftMemorySave,
             game: fullGameResult.rows[0]
         });
         setImmediate(async () => {
-            // Record avg overall rating per team at confirmation time
-            try {
-                const teamStats = await pool.query(`
-                    SELECT t.team_name,
-                           COUNT(tp.player_id) as player_count,
-                           ROUND(AVG(p.overall_rating)::numeric, 1) as avg_ovr
-                    FROM teams t
-                    JOIN team_players tp ON tp.team_id = t.id
-                    JOIN players p ON p.id = tp.player_id
-                    WHERE t.game_id = $1
-                    GROUP BY t.team_name ORDER BY t.team_name
-                `, [gameId]);
-                const teamSummary = teamStats.rows.map(r =>
-                    r.team_name + ': ' + r.player_count + 'p avg ' + r.avg_ovr
-                ).join(' | ');
-                await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed',
-                    'Teams confirmed | ' + (teamSummary || 'no team stats'));
-            } catch (e) {
-                await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed', 'Teams manually confirmed');
+            await gameAuditLog(pool, gameId, req.user.playerId,
+                isDraftMemorySave ? 'draft_saved' : 'teams_confirmed',
+                isDraftMemorySave ? 'Draft saved (non-final)' : 'Teams manually confirmed');
+            if (!isDraftMemorySave) {
+                // Email all confirmed players their team assignment
+                await sendTeamsConfirmedEmails(gameId);
             }
-            // Email all confirmed players their team assignment
-            await sendTeamsConfirmedEmails(gameId);
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -7577,6 +7597,47 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
         res.status(500).json({ error: 'Failed to save manual teams' });
     } finally {
         client.release();
+    }
+});
+
+// POST /api/admin/games/:gameId/confirm-draft — lock a draft_memory game after draft is finalised
+// Teams already exist in team_players from save-manual-teams; this just sets game_status + sends notifications
+app.post('/api/admin/games/:gameId/confirm-draft', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const gameRow = await pool.query(
+            `SELECT team_selection_type, teams_generated, game_status FROM games WHERE id = $1`, [gameId]
+        );
+        if (!gameRow.rows.length) return res.status(404).json({ error: 'Game not found' });
+        const g = gameRow.rows[0];
+        if (g.team_selection_type !== 'draft_memory') {
+            return res.status(400).json({ error: 'Only draft_memory games use confirm-draft' });
+        }
+        if (!g.teams_generated) {
+            return res.status(400).json({ error: 'No draft saved yet — save a draft first' });
+        }
+        await pool.query(
+            `UPDATE games SET teams_confirmed = true, game_status = 'confirmed' WHERE id = $1`,
+            [gameId]
+        );
+        res.json({ success: true, message: 'Teams confirmed — game locked' });
+        // Post-commit side-effects
+        setImmediate(async () => {
+            try {
+                await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed', 'Draft confirmed and game locked');
+                const confirmedPlayers = await pool.query(
+                    `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`, [gameId]
+                );
+                const gameData = await getGameDataForNotification(gameId);
+                for (const { player_id } of confirmedPlayers.rows) {
+                    sendNotification('teams_confirmed', player_id, gameData).catch(() => {});
+                }
+                await sendTeamsConfirmedEmails(gameId);
+            } catch (e) { console.error('confirm-draft post-commit error:', e.message); }
+        });
+    } catch (e) {
+        console.error('confirm-draft error:', e.message);
+        res.status(500).json({ error: 'Failed to confirm draft' });
     }
 });
 
@@ -9385,6 +9446,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.winning_team, g.motm_voting_ends, g.motm_winner_id, g.tournament_name,
                    g.tournament_team_count, g.tournament_results_finalised, g.series_id,
                    g.regularity, g.star_rating, g.min_rating_enabled,
+                   g.position_type,
+                   g.teams_generated,
                    g.refs_required, g.ref_pay, g.ref_review_ends,
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    g.requires_organiser, g.lineup_enabled,
@@ -9393,6 +9456,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
                    v.pitch_pin as venue_pitch_pin, v.boot_type as venue_boot_type,
                    v.pitch_name as venue_pitch_name, v.special_instructions as venue_special_instructions, v.region as venue_region,
+                   opp_pub.logo_url AS opponent_logo_url, opp_pub.star_rating AS opponent_star_rating,
+                   opp_pub.social_instagram AS opponent_social_instagram, opp_pub.social_twitter AS opponent_social_twitter, opp_pub.social_website AS opponent_social_website,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) as confirmed_organiser_count
             FROM games g
@@ -9471,10 +9536,14 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             effective_price:        getEffectivePrice(game).price,
             pricing_tier:           getEffectivePrice(game).tier,
             opponent_id:            game.opponent_id || null,
-            opponent_logo_url:      game.opponent_logo_url || null,
-            opponent_star_rating:   game.opponent_star_rating || null,
+            opponent_logo_url:          game.opponent_logo_url || null,
+            opponent_star_rating:       game.opponent_star_rating || null,
+            opponent_social_instagram:  game.opponent_social_instagram || null,
+            opponent_social_twitter:    game.opponent_social_twitter || null,
+            opponent_social_website:    game.opponent_social_website || null,
             game_status: game.game_status,
             exclusivity: game.exclusivity,
+            teams_generated: game.teams_generated || false,
             teams_confirmed: game.teams_confirmed,
             team_selection_type: game.team_selection_type,
             external_opponent: game.external_opponent,
@@ -9500,7 +9569,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             venue_clash_team2_name: game.venue_clash_team2_name || null,
             requires_organiser: game.requires_organiser || false,
             confirmed_organiser_count: parseInt(game.confirmed_organiser_count) || 0,
-            lineup_enabled: game.lineup_enabled || false
+            lineup_enabled: game.lineup_enabled || false,
+            position_type: game.position_type || 'outfield_gk'
         });
         
     } catch (error) {
@@ -18793,31 +18863,47 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
             return;
         }
 
-        // Idempotency: mark as credited atomically — works from any pre-credit status
-        // (pending, processing, accepted — all valid pre-credit states for async banks)
-        const claim = await pool.query(
-            `UPDATE wonderful_payments
-             SET status = 'credited', confirmed_at = NOW(), credited_at = NOW(),
-                 wonderful_payment_id = COALESCE(wonderful_payment_id, $1)
-             WHERE id = $2 AND status != 'credited'
-             RETURNING *`,
-            [verifyId || wpId, pmt.id]
-        );
-        if (!claim.rows.length) return console.log('[Wonderful webhook] idempotency check — already credited, skipping');
+        // Idempotency: claim + credit atomically in a transaction.
+        // If the credits UPDATE fails for any reason, the whole transaction rolls back
+        // so wonderful_payments.status is NOT marked 'credited' — allowing retry.
+        const webhookClient = await pool.connect();
+        let pounds, balBefore, balAfter;
+        try {
+            await webhookClient.query('BEGIN');
+            const claim = await webhookClient.query(
+                `UPDATE wonderful_payments
+                 SET status = 'credited', confirmed_at = NOW(), credited_at = NOW(),
+                     wonderful_payment_id = COALESCE(wonderful_payment_id, $1)
+                 WHERE id = $2 AND status != 'credited'
+                 RETURNING *`,
+                [verifyId || wpId, pmt.id]
+            );
+            if (!claim.rows.length) {
+                await webhookClient.query('ROLLBACK');
+                console.log('[Wonderful webhook] idempotency check — already credited, skipping');
+                return;
+            }
+            pounds = pmt.amount_pence / 100;
+            const balBeforeRow = await webhookClient.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
+            balBefore = parseFloat(balBeforeRow.rows[0]?.balance || 0);
+            await webhookClient.query(
+                `INSERT INTO credits (player_id, balance, last_updated)
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (player_id) DO UPDATE
+                 SET balance = credits.balance + $2, last_updated = NOW()`,
+                [pmt.player_id, pounds]
+            );
+            balAfter = balBefore + pounds;
+            await webhookClient.query('COMMIT');
+        } catch (txErr) {
+            await webhookClient.query('ROLLBACK').catch(() => {});
+            console.error('[Wonderful webhook] transaction failed — rolled back, payment NOT marked credited:', txErr.message);
+            return;
+        } finally {
+            webhookClient.release();
+        }
 
-        const pounds = pmt.amount_pence / 100;
-
-        // Read balance BEFORE credit for audit trail
-        const balBeforeRow = await pool.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
-        const balBefore = parseFloat(balBeforeRow.rows[0]?.balance || 0);
-
-        // Credit the player's balance — RETURNING gives us confirmed new balance
-        const creditResult = await pool.query(
-            `UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`,
-            [pounds, pmt.player_id]
-        );
-        const balAfter = balBefore + pounds;
-
+        // Post-commit: logging and side-effects (outside transaction intentionally)
         await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
             `Wonderful bank payment — ref ${pmt.merchant_reference}`, null);
 
@@ -18894,7 +18980,7 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
         // COLD-START RECOVERY: if our DB says pending but Wonderful confirms paid,
         // credit the player now. This handles webhook misses due to Render cold starts.
         console.log('[Wonderful status-poll] ref:', ref, 'db_status:', p.status, 'wp_id:', p.wonderful_payment_id || 'NULL');
-        if (p.status === 'pending' && WONDERFUL_API_KEY) {
+        if (p.status !== 'credited' && WONDERFUL_API_KEY) {
             try {
                 // If no wonderful_payment_id stored, search Wonderful's API by merchant_reference
                 let verifyStatus = null;
@@ -18944,8 +19030,11 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
                             const balBeforeRow2 = await client.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [req.user.playerId]);
                             const balBefore2 = parseFloat(balBeforeRow2.rows[0]?.balance || 0);
                             await client.query(
-                                `UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`,
-                                [pounds, req.user.playerId]
+                                `INSERT INTO credits (player_id, balance, last_updated)
+                                 VALUES ($1, $2, NOW())
+                                 ON CONFLICT (player_id) DO UPDATE
+                                 SET balance = credits.balance + $2, last_updated = NOW()`,
+                                [req.user.playerId, pounds]
                             );
                             const balAfter2 = balBefore2 + pounds;
                             await client.query('COMMIT');
@@ -19024,7 +19113,13 @@ app.post('/api/admin/payments/wonderful/reconcile/:ref', authenticateToken, requ
             );
             if (!claim.rows.length) { await client.query('ROLLBACK'); return res.json({ message: 'Already credited during reconcile' }); }
             const pounds = pmt.amount_pence / 100;
-            await client.query(`UPDATE credits SET balance=balance+$1, last_updated=CURRENT_TIMESTAMP WHERE player_id=$2`, [pounds, pmt.player_id]);
+            await client.query(
+                `INSERT INTO credits (player_id, balance, last_updated)
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (player_id) DO UPDATE
+                 SET balance = credits.balance + $2, last_updated = NOW()`,
+                [pmt.player_id, pounds]
+            );
             await client.query('COMMIT');
             await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup', `Wonderful reconcile — ref ${ref}`, null);
             await auditLog(pool, pmt.player_id, 'wonderful_credited', req.user.playerId, `Manual reconcile: £${pounds.toFixed(2)} credited — ref ${ref}`);
@@ -19096,25 +19191,41 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
             return res.status(400).json({ error: `Wonderful payment status is '${verified}' — not creditable`, verified_status: verified });
         }
 
-        // Idempotency claim
-        const claim = await pool.query(
-            `UPDATE wonderful_payments
-             SET status = 'credited', confirmed_at = NOW(), credited_at = NOW()
-             WHERE id = $1 AND status != 'credited'
-             RETURNING *`,
-            [pmt.id]
-        );
-        if (!claim.rows.length) return res.status(409).json({ error: 'Race condition — already credited' });
+        // Idempotency claim + credit atomically — rolled back if either step fails
+        const mcClient = await pool.connect();
+        let pounds, balBefore3, balAfter3;
+        try {
+            await mcClient.query('BEGIN');
+            const claim = await mcClient.query(
+                `UPDATE wonderful_payments
+                 SET status = 'credited', confirmed_at = NOW(), credited_at = NOW()
+                 WHERE id = $1 AND status != 'credited'
+                 RETURNING *`,
+                [pmt.id]
+            );
+            if (!claim.rows.length) {
+                await mcClient.query('ROLLBACK');
+                return res.status(409).json({ error: 'Race condition — already credited' });
+            }
+            pounds = pmt.amount_pence / 100;
+            const balBeforeRow3 = await mcClient.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
+            balBefore3 = parseFloat(balBeforeRow3.rows[0]?.balance || 0);
+            await mcClient.query(
+                `INSERT INTO credits (player_id, balance, last_updated)
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (player_id) DO UPDATE
+                 SET balance = credits.balance + $2, last_updated = NOW()`,
+                [pmt.player_id, pounds]
+            );
+            balAfter3 = balBefore3 + pounds;
+            await mcClient.query('COMMIT');
+        } catch (txErr) {
+            await mcClient.query('ROLLBACK').catch(() => {});
+            return res.status(500).json({ error: 'Credit transaction failed: ' + txErr.message });
+        } finally {
+            mcClient.release();
+        }
 
-        const pounds = pmt.amount_pence / 100;
-
-        const balBeforeRow3 = await pool.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
-        const balBefore3 = parseFloat(balBeforeRow3.rows[0]?.balance || 0);
-        const creditResult3 = await pool.query(
-            `UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`,
-            [pounds, pmt.player_id]
-        );
-        const balAfter3 = balBefore3 + pounds;
         await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
             `Manual credit by superadmin — Wonderful ref ${pmt.merchant_reference}`, null);
         await auditLog(pool, pmt.player_id, 'wonderful_credited', req.user.playerId,
@@ -19131,6 +19242,29 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
     } catch (e) {
         console.error('Manual Wonderful credit error:', e.message);
         res.status(500).json({ error: 'Server error: ' + e.message });
+    }
+});
+
+// PUT /api/admin/series/:seriesId/scoreline — superadmin override of series win/draw counts
+app.put('/api/admin/series/:seriesId/scoreline', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { seriesId } = req.params;
+        const { red_wins, blue_wins, draws } = req.body;
+        const r = parseInt(red_wins)  || 0;
+        const b = parseInt(blue_wins) || 0;
+        const d = parseInt(draws)     || 0;
+        if (r < 0 || b < 0 || d < 0) return res.status(400).json({ error: 'Values must be non-negative' });
+        const result = await pool.query(
+            'UPDATE game_series SET red_wins=$1, blue_wins=$2, draws=$3 WHERE id=$4 RETURNING series_name',
+            [r, b, d, seriesId]
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'Series not found' });
+        await auditLog(pool, req.user.playerId, 'series_scoreline_overridden', seriesId,
+            `Scoreline set to TF ${r} – ${b} Opp (${d} draws) — series: ${result.rows[0].series_name}`);
+        res.json({ success: true, series_name: result.rows[0].series_name, red_wins: r, blue_wins: b, draws: d });
+    } catch (e) {
+        console.error('Series scoreline override error:', e.message);
+        res.status(500).json({ error: 'Failed to update scoreline' });
     }
 });
 
