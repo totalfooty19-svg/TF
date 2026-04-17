@@ -5041,7 +5041,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
 
         // Lock game row and check capacity
         const gameLock = await client.query(
-            'SELECT max_players, cost_per_player, player_editing_locked, teams_generated, game_status FROM games WHERE id = $1 FOR UPDATE',
+            'SELECT max_players, cost_per_player, player_editing_locked, teams_generated, team_selection_type, game_status FROM games WHERE id = $1 FOR UPDATE',
             [gameId]
         );
         if (gameLock.rows.length === 0) {
@@ -5067,8 +5067,12 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             return res.status(423).json({ error: 'Game is currently being edited by an admin. Please try again shortly.' });
         }
 
-        // FIX-018: Block guest addition after teams have been generated
-        if (game.teams_generated) {
+        // FIX-018: Block guest addition after teams have been generated.
+        // EXCEPTION: draft_memory games flip teams_generated=true on each draft
+        // save but remain open (teams_confirmed=false, game_status='available')
+        // until the draft is finalised — guests should still be addable while
+        // the draft is in progress.
+        if (game.teams_generated && game.team_selection_type !== 'draft_memory') {
             await client.query('ROLLBACK');
             client.release();
             return res.status(400).json({ error: 'Cannot add a guest after teams have been generated' });
@@ -5196,7 +5200,7 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
 
         // Check game isn't locked or teams generated
         const gameCheck = await client.query(
-            'SELECT player_editing_locked, teams_generated FROM games WHERE id = $1 FOR UPDATE',
+            'SELECT player_editing_locked, teams_generated, team_selection_type FROM games WHERE id = $1 FOR UPDATE',
             [gameId]
         );
         // Admins bypass the lock — they shouldn't be blocked by their own edit session
@@ -5205,7 +5209,7 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
             await client.query('ROLLBACK');
             return res.status(423).json({ error: 'Game is currently being edited by an admin.' });
         }
-        if (gameCheck.rows[0]?.teams_generated) {
+        if (gameCheck.rows[0]?.teams_generated && gameCheck.rows[0]?.team_selection_type !== 'draft_memory') {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Cannot remove guest - teams already generated.' });
         }
@@ -5300,7 +5304,7 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
         const regResult = await client.query(
             `SELECT r.id, r.player_id, r.status, r.amount_paid, r.amount_paid_free, r.registered_by_player_id,
                     p.alias, p.full_name,
-                    g.game_status, g.teams_generated, g.player_editing_locked
+                    g.game_status, g.teams_generated, g.team_selection_type, g.player_editing_locked
              FROM registrations r
              JOIN players p ON p.id = r.player_id
              JOIN games g ON g.id = $1
@@ -5331,7 +5335,10 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
         }
 
         // Block if teams generated (same rule as admin endpoint for safety)
-        if (reg.teams_generated) {
+        // EXCEPTION: draft_memory games flip teams_generated=true on each draft save
+        // but stay open (teams_confirmed=false, game_status='available') — so a friend
+        // you just registered can still be un-registered while the draft is in progress.
+        if (reg.teams_generated && reg.team_selection_type !== 'draft_memory') {
             await client.query('ROLLBACK');
             client.release();
             return res.status(400).json({ error: 'Cannot remove a player after teams have been generated. Ask an admin.' });
