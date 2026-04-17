@@ -4272,9 +4272,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             tournament_team_count, tournament_name, star_rating, star_rating_locked,
                             is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                             refs_required, ref_pay, requires_organiser,
-                            early_bird_price, super_early_bird_price, opponent_id,
-                            lineup_enabled
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, TRUE)
+                            early_bird_price, super_early_bird_price, opponent_id
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -4341,9 +4340,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     tournament_team_count, tournament_name, star_rating, star_rating_locked,
                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                     refs_required, ref_pay, requires_organiser,
-                    early_bird_price, super_early_bird_price, opponent_id,
-                            lineup_enabled
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, TRUE)
+                    early_bird_price, super_early_bird_price, opponent_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
