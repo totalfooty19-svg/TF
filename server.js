@@ -4272,8 +4272,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             tournament_team_count, tournament_name, star_rating, star_rating_locked,
                             is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                             refs_required, ref_pay, requires_organiser,
-                            early_bird_price, super_early_bird_price, opponent_id
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                            early_bird_price, super_early_bird_price, opponent_id,
+                            lineup_enabled
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, TRUE)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -4340,8 +4341,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     tournament_team_count, tournament_name, star_rating, star_rating_locked,
                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                     refs_required, ref_pay, requires_organiser,
-                    early_bird_price, super_early_bird_price, opponent_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                    early_bird_price, super_early_bird_price, opponent_id,
+                            lineup_enabled
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, TRUE)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -5977,9 +5979,17 @@ app.get('/api/games/:id/lineup', authenticateToken, async (req, res) => {
     try {
         const gameId = req.params.id;
         let canEdit = false;
+        let bypassRegistrationCheck = false;
         if (req.user.role === 'admin' || req.user.role === 'superadmin') {
             canEdit = true;
+            bypassRegistrationCheck = true;
         } else {
+            // web47: series lineup editors — nominated via the series settings modal —
+            // can view and edit the line-up even without being registered for this game.
+            const editorCheck = await _isSeriesLineupEditor(gameId, req.user.playerId);
+            if (editorCheck) { canEdit = true; bypassRegistrationCheck = true; }
+        }
+        if (!bypassRegistrationCheck) {
             const regCheck = await pool.query(
                 `SELECT r.id, p.is_organiser FROM registrations r
                  JOIN players p ON p.id = r.player_id
@@ -6038,17 +6048,18 @@ app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, async (req, 
         if (!Array.isArray(positions) || !Array.isArray(subs)) {
             return res.status(400).json({ error: 'positions and subs must be arrays' });
         }
-        // Allow: admin/superadmin, confirmed organiser, or designated captain
+        // Allow: admin/superadmin, confirmed organiser, designated captain, or series lineup editor
         if (req.user.role !== 'admin' && req.user.role !== 'superadmin') {
-            const [orgCheck, capCheck] = await Promise.all([
+            const [orgCheck, capCheck, editorCheck] = await Promise.all([
                 pool.query(
                     `SELECT 1 FROM registrations r JOIN players p ON p.id = r.player_id
                      WHERE r.game_id = $1 AND r.player_id = $2 AND r.status = 'confirmed' AND p.is_organiser = true`,
                     [gameId, req.user.playerId]
                 ),
-                pool.query('SELECT 1 FROM game_captains WHERE game_id = $1 AND player_id = $2', [gameId, req.user.playerId])
+                pool.query('SELECT 1 FROM game_captains WHERE game_id = $1 AND player_id = $2', [gameId, req.user.playerId]),
+                _isSeriesLineupEditor(gameId, req.user.playerId)
             ]);
-            if (orgCheck.rows.length === 0 && capCheck.rows.length === 0) {
+            if (orgCheck.rows.length === 0 && capCheck.rows.length === 0 && !editorCheck) {
                 return res.status(403).json({ error: 'Not authorised to edit lineup' });
             }
         }
@@ -6073,9 +6084,22 @@ app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, async (req, 
 // ── LINEUP BUILDER SETTINGS ───────────────────────────────────────────────────
 
 // GET /api/admin/games/:id/lineup-settings — get lineup_enabled + current captains
-app.get('/api/admin/games/:id/lineup-settings', authenticateToken, requireGameManager, async (req, res) => {
+app.get('/api/admin/games/:id/lineup-settings', authenticateToken, async (req, res) => {
     try {
         const gameId = req.params.id;
+        // Permission: admins/superadmins + organisers + designated series lineup editors.
+        // NOTE: req.user.role comes from JWT (admin/superadmin only — not organiser).
+        // We fetch is_organiser from DB because the token doesn't always carry it.
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        let isMgr = isAdmin;
+        if (!isMgr) {
+            const pr = await pool.query('SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]);
+            isMgr = pr.rows[0]?.is_organiser === true;
+        }
+        if (!isMgr) {
+            const ok = await _isSeriesLineupEditor(gameId, req.user.playerId);
+            if (!ok) return res.status(403).json({ error: 'Not authorised' });
+        }
         const [gameRes, captainsRes, playersRes] = await Promise.all([
             pool.query('SELECT lineup_enabled, team_selection_type, external_opponent FROM games WHERE id = $1', [gameId]),
             pool.query(
@@ -6109,9 +6133,20 @@ app.get('/api/admin/games/:id/lineup-settings', authenticateToken, requireGameMa
 });
 
 // PUT /api/admin/games/:id/lineup-settings — update lineup_enabled + captains
-app.put('/api/admin/games/:id/lineup-settings', authenticateToken, requireGameManager, async (req, res) => {
+app.put('/api/admin/games/:id/lineup-settings', authenticateToken, async (req, res) => {
     try {
         const gameId = req.params.id;
+        // Permission: admins/superadmins + organisers + designated series lineup editors.
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        let isMgr = isAdmin;
+        if (!isMgr) {
+            const pr = await pool.query('SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]);
+            isMgr = pr.rows[0]?.is_organiser === true;
+        }
+        if (!isMgr) {
+            const ok = await _isSeriesLineupEditor(gameId, req.user.playerId);
+            if (!ok) return res.status(403).json({ error: 'Not authorised' });
+        }
         const { lineupEnabled, captainIds } = req.body;
         if (typeof lineupEnabled !== 'boolean') return res.status(400).json({ error: 'lineupEnabled must be boolean' });
         if (!Array.isArray(captainIds)) return res.status(400).json({ error: 'captainIds must be an array' });
@@ -6144,6 +6179,102 @@ app.put('/api/admin/games/:id/lineup-settings', authenticateToken, requireGameMa
         res.status(500).json({ error: 'Failed to update lineup settings' });
     }
 });
+
+// ── Helper: is a player a designated lineup editor for this game's series? ────
+// Widens lineup-settings access beyond admins/game managers so the GAFFA can
+// delegate line-up editing duties across a whole series without handing out admin.
+async function _isSeriesLineupEditor(gameId, playerId) {
+    try {
+        if (!gameId || !playerId) return false;
+        const r = await pool.query(`
+            SELECT 1 FROM series_lineup_editors sle
+            JOIN games g ON g.series_id = sle.series_id
+            WHERE g.id = $1 AND sle.player_id = $2
+            LIMIT 1`,
+            [gameId, playerId]
+        );
+        return r.rows.length > 0;
+    } catch (e) {
+        console.warn('[lineup-editor check] failed:', e.message);
+        return false;
+    }
+}
+
+// GET /api/admin/series/:seriesId/lineup-editors — list nominated editors
+app.get('/api/admin/series/:seriesId/lineup-editors', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { seriesId } = req.params;
+        const r = await pool.query(`
+            SELECT sle.player_id, p.alias, p.full_name, p.squad_number, sle.added_at, sle.added_by
+            FROM series_lineup_editors sle
+            JOIN players p ON p.id = sle.player_id
+            WHERE sle.series_id = $1
+            ORDER BY p.alias NULLS LAST, p.full_name`,
+            [seriesId]
+        );
+        res.json({ editors: r.rows });
+    } catch (e) {
+        console.error('Get series lineup editors error:', e.message);
+        res.status(500).json({ error: 'Failed to load lineup editors' });
+    }
+});
+
+// PUT /api/admin/series/:seriesId/lineup-editors — replace-all set of editors
+// Body: { player_ids: ['uuid1', 'uuid2', ...] }
+app.put('/api/admin/series/:seriesId/lineup-editors', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { seriesId } = req.params;
+        const incoming = Array.isArray(req.body?.player_ids) ? req.body.player_ids : [];
+        const sc = await client.query('SELECT id FROM game_series WHERE id = $1', [seriesId]);
+        if (!sc.rows.length) { return res.status(404).json({ error: 'Series not found' }); }
+
+        await client.query('BEGIN');
+        await client.query('DELETE FROM series_lineup_editors WHERE series_id = $1', [seriesId]);
+        for (const pid of incoming) {
+            if (typeof pid !== 'string' || pid.length > 40) continue;
+            await client.query(
+                `INSERT INTO series_lineup_editors (series_id, player_id, added_by)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (series_id, player_id) DO NOTHING`,
+                [seriesId, pid, req.user.userId || null]
+            );
+        }
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.userId, 'series_lineup_editors_updated', seriesId,
+            `Editors: ${incoming.length}`);
+        res.json({ success: true, count: incoming.length });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Update series lineup editors error:', e.message);
+        res.status(500).json({ error: 'Failed to update lineup editors' });
+    } finally {
+        client.release();
+    }
+});
+
+// GET /api/admin/series/:seriesId/players — list all players ever registered on
+// any game in this series. Used by the admin series-settings screen to populate
+// the "who can edit the line-up?" picker.
+app.get('/api/admin/series/:seriesId/players', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { seriesId } = req.params;
+        const r = await pool.query(`
+            SELECT DISTINCT p.id, p.alias, p.full_name, p.squad_number
+            FROM registrations r
+            JOIN games g ON g.id = r.game_id
+            JOIN players p ON p.id = r.player_id
+            WHERE g.series_id = $1
+            ORDER BY p.alias NULLS LAST, p.full_name`,
+            [seriesId]
+        );
+        res.json({ players: r.rows });
+    } catch (e) {
+        console.error('Get series players error:', e.message);
+        res.status(500).json({ error: 'Failed to load series players' });
+    }
+});
+
 
 // POST /api/games/:id/captain/handoff — captain passes captaincy to another player
 app.post('/api/games/:id/captain/handoff', authenticateToken, async (req, res) => {
@@ -7365,7 +7496,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
         const { gameId } = req.params;
         await client.query('BEGIN');
         const registrations = await client.query(
-            `SELECT player_id, status, backup_type, amount_paid, registered_by_player_id FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
+            `SELECT player_id, status, backup_type, amount_paid, amount_paid_free, registered_by_player_id FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
             [gameId]
         );
         const gameResult = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
@@ -7398,12 +7529,25 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
 
         let totalRefunded = 0;
         for (const reg of registrations.rows) {
-            const refundAmt = parseFloat(reg.amount_paid || fallbackCost);
+            // web47 round 2 — W-71 fix: must refund BOTH the real-balance portion
+            // (amount_paid) AND the free-credit portion (amount_paid_free). Previous
+            // version only refunded amount_paid, so players who paid with mixed
+            // free+real credits lost their free portion on cancellation.
+            const refundPaid = parseFloat(reg.amount_paid || 0);
+            const refundFree = parseFloat(reg.amount_paid_free || 0);
+            // Fallback: legacy rows with both amount_paid and amount_paid_free NULL
+            // get the old behaviour (full fallback cost as a real refund).
+            const useFallback = !reg.amount_paid && !reg.amount_paid_free;
+            const realRefund  = useFallback ? fallbackCost : refundPaid;
             const refundTarget = reg.registered_by_player_id || reg.player_id;
-            if (refundAmt > 0) {
-                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundAmt, refundTarget]);
-                await recordCreditTransaction(client, refundTarget, refundAmt, 'refund', 'Game cancelled - refund');
+            if (realRefund > 0) {
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [realRefund, refundTarget]);
+                await recordCreditTransaction(client, refundTarget, realRefund, 'refund', 'Game cancelled - refund');
                 totalRefunded++;
+            }
+            if (!useFallback && refundFree > 0) {
+                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundFree, refundTarget]);
+                await recordCreditTransaction(client, refundTarget, refundFree, 'free_credit', 'Game cancelled - free credit restored');
             }
         }
         const guests = await client.query('SELECT invited_by, guest_name, amount_paid FROM game_guests WHERE game_id = $1', [gameId]);
@@ -7526,22 +7670,34 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
         const cost = parseFloat(game.cost_per_player);
         
         for (const gid of gameIds) {
-            // Refund all players who paid (confirmed + confirmed_backup)
+            // Refund all players who paid (confirmed + confirmed_backup).
+            // web47 round 2 — W-71b fix: include amount_paid_free portion (mirrors
+            // single-game cancellation fix above).
             const registrations = await client.query(
-                `SELECT player_id, amount_paid, registered_by_player_id FROM registrations WHERE game_id = $1 
+                `SELECT player_id, amount_paid, amount_paid_free, registered_by_player_id FROM registrations WHERE game_id = $1 
                  AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
                 [gid]
             );
             for (const reg of registrations.rows) {
-                const refundAmt = parseFloat(reg.amount_paid || cost);
+                const refundPaid = parseFloat(reg.amount_paid || 0);
+                const refundFree = parseFloat(reg.amount_paid_free || 0);
+                const useFallback = !reg.amount_paid && !reg.amount_paid_free;
+                const realRefund = useFallback ? cost : refundPaid;
                 const refundTarget = reg.registered_by_player_id || reg.player_id;
-                if (refundAmt > 0) {
+                if (realRefund > 0) {
                     await client.query(
                         'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                        [refundAmt, refundTarget]
+                        [realRefund, refundTarget]
                     );
-                    await recordCreditTransaction(client, refundTarget, refundAmt, 'refund', 'Series ' + seriesName + ' cancelled - refund');
+                    await recordCreditTransaction(client, refundTarget, realRefund, 'refund', 'Series ' + seriesName + ' cancelled - refund');
                     totalRefunded++;
+                }
+                if (!useFallback && refundFree > 0) {
+                    await client.query(
+                        'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                        [refundFree, refundTarget]
+                    );
+                    await recordCreditTransaction(client, refundTarget, refundFree, 'free_credit', 'Series ' + seriesName + ' cancelled - free credit restored');
                 }
             }
             
@@ -9916,6 +10072,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.refs_required, g.ref_pay, g.ref_review_ends,
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    g.requires_organiser, g.lineup_enabled,
+                   g.early_bird_price, g.super_early_bird_price, g.opponent_id,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
@@ -10562,8 +10719,21 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
                 p.full_name,
                 p.alias,
                 p.squad_number,
+                p.photo_url,
+                p.reliability_tier,
+                p.position_areas,
                 p.overall_rating,
                 p.goalkeeper_rating,
+                p.defending_rating,
+                p.strength_rating,
+                p.pace_rating,
+                p.decisions_rating,
+                p.shooting_rating,
+                p.fitness_rating,
+                p.assisting_rating,
+                p.total_appearances,
+                p.total_wins,
+                p.motm_wins,
                 p.referral_code,
                 r.status,
                 r.position_preference,
@@ -10578,7 +10748,12 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1
             GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number,
-                     p.overall_rating, p.goalkeeper_rating, p.referral_code, r.status,
+                     p.photo_url, p.reliability_tier, p.position_areas,
+                     p.overall_rating, p.goalkeeper_rating, p.defending_rating,
+                     p.strength_rating, p.pace_rating, p.decisions_rating,
+                     p.shooting_rating, p.fitness_rating, p.assisting_rating,
+                     p.total_appearances, p.total_wins, p.motm_wins,
+                     p.referral_code, r.status,
                      r.position_preference, r.tournament_team_preference
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY p.squad_number ASC NULLS LAST
@@ -19096,25 +19271,39 @@ app.post('/api/admin/series/:id/finalize', authenticateToken, requireAdmin, asyn
 // WONDERFUL PAYMENTS — Open Banking top-up integration
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Helper: call Wonderful REST API
-async function wonderfulRequest(method, path, body = null) {
-    const opts = {
-        method,
-        headers: {
-            'Authorization': `Bearer ${WONDERFUL_API_KEY}`,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-        },
-    };
-    if (body) opts.body = JSON.stringify(body);
-    const res = await fetch(`https://api.wonderful.one${path}`, opts);
-    const json = await res.json();
-    if (!res.ok) throw Object.assign(new Error(json.message || 'Wonderful API error'), { status: res.status, body: json });
-    return json;
+// Helper: call Wonderful REST API with 15s timeout.
+// Without a timeout the native fetch can hang forever — hanging a webhook means the
+// reconciler's wonderfulReconcilerRunning lock stays held and the whole sweep stalls.
+async function wonderfulRequest(method, path, body = null, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const opts = {
+            method,
+            headers: {
+                'Authorization': `Bearer ${WONDERFUL_API_KEY}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            },
+            signal: controller.signal,
+        };
+        if (body) opts.body = JSON.stringify(body);
+        const res = await fetch(`https://api.wonderful.one${path}`, opts);
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) throw Object.assign(new Error(json.message || `Wonderful API ${res.status}`), { status: res.status, body: json });
+        return json;
+    } catch (e) {
+        if (e.name === 'AbortError') throw Object.assign(new Error(`Wonderful API timeout after ${timeoutMs}ms`), { code: 'TIMEOUT' });
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
-// Shared helper — send top-up confirmation email after any successful Wonderful credit
-async function sendWonderfulCreditEmail(playerId, pounds, ref) {
+// Shared helper — send top-up confirmation email after any successful Wonderful credit.
+// Accepts optional balAfter so the email shows the balance immediately after the top-up
+// (not the post-game-deduction balance that a fresh DB read would return).
+async function sendWonderfulCreditEmail(playerId, pounds, ref, balAfter = null) {
     try {
         const pRow = await pool.query(
             `SELECT p.alias, p.full_name, u.email
@@ -19123,8 +19312,13 @@ async function sendWonderfulCreditEmail(playerId, pounds, ref) {
         );
         if (!pRow.rows[0]?.email) return;
         const name = pRow.rows[0].alias || pRow.rows[0].full_name;
-        const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
-        const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
+        let newBal;
+        if (balAfter !== null && balAfter !== undefined) {
+            newBal = parseFloat(balAfter).toFixed(2);
+        } else {
+            const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
+            newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
+        }
         await emailTransporter.sendMail({
             from: '"TotalFooty" <totalfooty19@gmail.com>',
             to:   pRow.rows[0].email,
@@ -19149,7 +19343,18 @@ async function sendWonderfulCreditEmail(playerId, pounds, ref) {
 }
 
 // POST /api/payments/wonderful/initiate
-// Authenticated — creates a Wonderful payment request and returns the pay_link
+// Authenticated — creates a Wonderful payment request and returns the pay_link.
+//
+// Order matters (bug fixed web47 round 2):
+//   1. INSERT our DB row FIRST with status='init_pending' — guarantees we always
+//      have a record of the attempt even if Wonderful hangs/fails/racing.
+//   2. Call Wonderful's API.
+//   3. On success: UPDATE to status='pending' with wpId + pay_link.
+//      On failure: UPDATE to status='init_failed' so the reconciler ignores it.
+//
+// Previously we called Wonderful first and INSERTed after — if the INSERT failed
+// or the process died between the two, Wonderful had a live payment that our
+// reconciler couldn't see (it only scans our table). Permanent money loss.
 app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiateLimiter, async (req, res) => {
     if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'Online payments are temporarily unavailable' });
     try {
@@ -19173,29 +19378,7 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         const player = playerRow.rows[0];
         if (!player.email) return res.status(400).json({ error: 'No email address on account — contact support to top up.' });
 
-        // Unique merchant reference — max 18 chars, only letters/numbers/dashes
-        const tsShort = Date.now().toString(36).toUpperCase(); // base-36 timestamp ~8 chars
-        const merchantRef = `TF-${playerId.slice(0, 5)}-${tsShort}`.slice(0, 18);
-
-        // Create payment with Wonderful v2 API
-        const wonderfulRes = await wonderfulRequest('POST', '/v2/quick-pay', {
-            customer_email_address:  player.email,
-            merchant_payment_reference: merchantRef,
-            payment_description: `TotalFooty credit top-up £${pounds}`,
-            amount:      amountPence,
-            redirect_url: `https://totalfooty.co.uk/?wonderful_payment_id=${merchantRef}`,
-            webhook_url: `https://totalfooty-api.onrender.com/api/webhooks/wonderful`,
-        });
-
-        const wpId   = wonderfulRes.data?.id;
-        const payLink = wonderfulRes.data?.pay_link;
-        if (!payLink) throw new Error('Wonderful returned no pay_link');
-
-        // Sanitise position / backup_type. /register accepts any position string
-        // (e.g. "Outfield", "GK", "Outfield, GK"), so we do the same here — just
-        // cap length to avoid DB abuse, and default to 'Outfield' if missing/invalid.
-        // Stored on the payment row so the post-webhook auto-register honours the player's
-        // actual chosen position (bug fixed web47 — webhook was hardcoding 'No Preference').
+        // Sanitise position / backup_type (same rules as before)
         let validPos = 'Outfield';
         if (typeof position_preference === 'string') {
             const trimmed = position_preference.trim();
@@ -19204,35 +19387,487 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         const validBackupType = ['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backup_type)
             ? backup_type : null;
 
-        // Store pending payment in DB
-        await pool.query(
+        // Idempotency (W-25): if the SAME player has an in-flight pay request
+        // for the SAME amount + game_id in the last 60s, return its pay_link
+        // instead of creating a duplicate. Guards against double-click / fast
+        // back-and-forward / mobile fat-finger.
+        const dupeCheck = await pool.query(
+            `SELECT id, merchant_reference, pay_link
+             FROM wonderful_payments
+             WHERE player_id = $1
+               AND amount_pence = $2
+               AND (game_id IS NOT DISTINCT FROM $3)
+               AND status IN ('pending', 'init_pending')
+               AND pay_link IS NOT NULL
+               AND created_at > NOW() - INTERVAL '60 seconds'
+             ORDER BY created_at DESC LIMIT 1`,
+            [playerId, amountPence, game_id || null]
+        );
+        if (dupeCheck.rows.length) {
+            const dup = dupeCheck.rows[0];
+            console.log(`[WF initiate] idempotent hit — returning existing pay_link for ref ${dup.merchant_reference} (player ${playerId})`);
+            return res.json({ pay_link: dup.pay_link, merchant_reference: dup.merchant_reference });
+        }
+
+        // Unique merchant reference — max 18 chars, only letters/numbers/dashes
+        const tsShort = Date.now().toString(36).toUpperCase();
+        const merchantRef = `TF-${playerId.slice(0, 5)}-${tsShort}`.slice(0, 18);
+
+        // ── STEP 1: INSERT DB row BEFORE calling Wonderful ─────────────────
+        // status='init_pending' + wpId=NULL + pay_link=NULL. If the process
+        // dies after this point, the reconciler can still find the row by
+        // merchant_reference and resolve/credit it.
+        const insertRes = await pool.query(
             `INSERT INTO wonderful_payments
                 (wonderful_payment_id, merchant_reference, player_id, amount_pence, status, game_id, pay_link,
                  position_preference, backup_type)
-             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8)`,
-            [wpId, merchantRef, playerId, amountPence, game_id || null, payLink, validPos, validBackupType]
+             VALUES (NULL, $1, $2, $3, 'init_pending', $4, NULL, $5, $6)
+             RETURNING id`,
+            [merchantRef, playerId, amountPence, game_id || null, validPos, validBackupType]
         );
+        const pmtRowId = insertRes.rows[0].id;
+        console.log(`[WF initiate] inserted init_pending row ${pmtRowId} · ref ${merchantRef} · £${pounds.toFixed(2)}${game_id ? ` · game ${game_id}` : ''}`);
+
+        // ── STEP 2: Call Wonderful ────────────────────────────────────────
+        let wonderfulRes;
+        try {
+            wonderfulRes = await wonderfulRequest('POST', '/v2/quick-pay', {
+                customer_email_address:  player.email,
+                merchant_payment_reference: merchantRef,
+                payment_description: `TotalFooty credit top-up £${pounds}`,
+                amount:      amountPence,
+                redirect_url: `https://totalfooty.co.uk/?wonderful_payment_id=${merchantRef}`,
+                webhook_url: `https://totalfooty-api.onrender.com/api/webhooks/wonderful`,
+            });
+        } catch (wErr) {
+            // Mark row as init_failed so the reconciler skips it. If Wonderful
+            // actually DID create the payment despite returning an error (rare),
+            // the list-search in _wonderfulVerifyStatus will still find it and
+            // the admin can manually reconcile.
+            await pool.query(
+                `UPDATE wonderful_payments SET status = 'init_failed' WHERE id = $1`,
+                [pmtRowId]
+            ).catch(() => {});
+            console.error(`[WF initiate] Wonderful API call failed for ref ${merchantRef}:`, wErr.message);
+            return res.status(500).json({ error: 'Failed to create payment. Please try again.' });
+        }
+
+        const wpId    = wonderfulRes.data?.id || null;
+        const payLink = wonderfulRes.data?.pay_link || null;
+        if (!payLink) {
+            await pool.query(
+                `UPDATE wonderful_payments SET status = 'init_failed' WHERE id = $1`,
+                [pmtRowId]
+            ).catch(() => {});
+            console.error(`[WF initiate] Wonderful returned no pay_link for ref ${merchantRef}`);
+            return res.status(500).json({ error: 'Failed to create payment. Please try again.' });
+        }
+
+        // ── STEP 3: UPDATE row with Wonderful's response — now pending ────
+        await pool.query(
+            `UPDATE wonderful_payments
+             SET status = 'pending', wonderful_payment_id = $1, pay_link = $2
+             WHERE id = $3`,
+            [wpId, payLink, pmtRowId]
+        );
+        console.log(`[WF initiate] ref ${merchantRef} → pending · wpId ${wpId || 'NULL'} · pay_link returned`);
 
         await auditLog(pool, playerId, 'wonderful_initiated', playerId,
             `Wonderful payment initiated: £${pounds.toFixed(2)} · Ref: ${merchantRef}`);
 
         res.json({ pay_link: payLink, merchant_reference: merchantRef });
     } catch (e) {
-        console.error('Wonderful initiate error:', e.message, e.body || '');
+        console.error('[WF initiate] error:', e.message, e.body || '');
         res.status(500).json({ error: 'Failed to create payment. Please try again.' });
     }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// WONDERFUL PAYMENT PROCESSING — shared helpers used by webhook, status-poll
+// recovery, admin reconcile/manual-credit, and the background reconciler.
+// Single source of truth for: verify, credit, auto-register. Every success
+// path routes through creditAndAutoRegisterWonderful() — fixes the long-running
+// "webhook credited but game signup was lost" bug.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Verify a payment with Wonderful's API. Tries direct GET (if we have a
+// wonderful_payment_id), then falls back to listing recent payments and matching
+// by merchant_reference. Persists the resolved wpId when found via list search.
+//
+// Returns { verified, resolvedWpId }
+//   verified     — 'paid' | 'accepted' | 'failed' | 'cancelled' | 'processing' | 'submitted' | null
+//   resolvedWpId — Wonderful's payment id (possibly newly resolved)
+async function _wonderfulVerifyStatus(pmt) {
+    if (!WONDERFUL_API_KEY) return { verified: null, resolvedWpId: pmt.wonderful_payment_id || null };
+
+    let verified = null;
+    let resolvedWpId = pmt.wonderful_payment_id || null;
+
+    // Direct GET first if we have an ID
+    if (resolvedWpId) {
+        try {
+            const verifyRes = await wonderfulRequest('GET', `/v2/payments/${resolvedWpId}`);
+            verified = verifyRes.data?.status || verifyRes.status || null;
+        } catch (e) {
+            console.warn('[WF verify] direct GET failed for', resolvedWpId, ':', e.message);
+        }
+    }
+
+    // Fallback: list search by merchant_reference (also handles the case where
+    // wonderful_payment_id was never persisted at initiate time)
+    if (!verified) {
+        try {
+            const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
+            const payments = listRes.data?.payments || listRes.data || [];
+            const found = (Array.isArray(payments) ? payments : []).find(p =>
+                p.merchant_payment_reference === pmt.merchant_reference ||
+                p.merchant_reference === pmt.merchant_reference
+            );
+            if (found) {
+                verified = found.status || null;
+                const foundWpId = found.id || null;
+                if (foundWpId && foundWpId !== resolvedWpId) {
+                    resolvedWpId = foundWpId;
+                    await pool.query(
+                        `UPDATE wonderful_payments SET wonderful_payment_id = COALESCE(wonderful_payment_id, $1) WHERE id = $2`,
+                        [resolvedWpId, pmt.id]
+                    ).catch(() => {});
+                }
+            }
+        } catch (e) {
+            console.warn('[WF verify] list search failed:', e.message);
+        }
+    }
+
+    return { verified, resolvedWpId };
+}
+
+// Auto-register a player for a game after their Wonderful top-up is credited.
+// Mirrors the validation flow of /api/games/:id/register so a Wonderful PAY & JOIN
+// player ends up in the same state as someone who clicked SIGN UP with existing
+// balance. Returns { status, reason } — used by the frontend status poll to render
+// the correct success/backup/failure message.
+async function _wonderfulAutoRegister(pmt) {
+    try {
+        const gameRow = await pool.query(
+            `SELECT g.id, g.cost_per_player, g.game_status, g.team_selection_type,
+                    g.max_players, g.requires_organiser, g.exclusivity,
+                    g.early_bird_price, g.super_early_bird_price, g.game_date,
+                    g.tournament_team_count,
+                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
+             FROM games g WHERE g.id = $1`,
+            [pmt.game_id]
+        );
+        const game = gameRow.rows[0];
+        if (!game) return { status: 'failed_game_not_found', reason: 'Game no longer exists' };
+        if (!['available', 'confirmed'].includes(game.game_status)) {
+            return { status: 'failed_game_closed', reason: `Game is ${game.game_status}, no longer accepting registrations` };
+        }
+
+        const playerRow = await pool.query(
+            'SELECT reliability_tier, is_organiser FROM players WHERE id = $1',
+            [pmt.player_id]
+        );
+        const playerTier = playerRow.rows[0]?.reliability_tier;
+        const isOrganiser = !!playerRow.rows[0]?.is_organiser;
+
+        if (playerTier === 'white' || playerTier === 'black') {
+            return { status: 'failed_tier', reason: `Account tier ${playerTier} — signup blocked` };
+        }
+
+        // Exclusivity badge check
+        if (game.exclusivity === 'clm' || game.exclusivity === 'allstars' || game.exclusivity === 'misfits') {
+            const badgeName = game.exclusivity === 'clm' ? 'CLM'
+                            : game.exclusivity === 'allstars' ? 'TF All Star'
+                            : 'Misfits';
+            const badgeRes = await pool.query(`
+                SELECT 1 FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name = $2
+            `, [pmt.player_id, badgeName]);
+            if (badgeRes.rows.length === 0) {
+                return { status: 'failed_exclusivity', reason: `Game restricted to ${badgeName} — badge required` };
+            }
+        }
+
+        // Idempotency — already registered? (webhook can fire twice, reconciler too)
+        const already = await pool.query(
+            `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2`,
+            [pmt.game_id, pmt.player_id]
+        );
+        if (already.rows.length) {
+            return {
+                status: already.rows[0].status === 'confirmed' ? 'confirmed' : 'backup',
+                reason: 'Already registered'
+            };
+        }
+
+        // Capacity — mirror /register. effectiveMax reserves the last slot for an
+        // organiser if the game requires one and the caller isn't one.
+        let effectiveMax = parseInt(game.max_players);
+        if (game.requires_organiser && !isOrganiser) {
+            const orgCountRes = await pool.query(`
+                SELECT COUNT(*) AS cnt FROM registrations r
+                JOIN players p ON p.id = r.player_id
+                WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
+            `, [pmt.game_id]);
+            if (parseInt(orgCountRes.rows[0].cnt) === 0) {
+                effectiveMax = parseInt(game.max_players) - 1;
+            }
+        }
+        const isFull = parseInt(game.current_players) >= effectiveMax;
+
+        const positionValue = pmt.position_preference || 'Outfield';
+        const requestedBackupType = pmt.backup_type;
+        const isGKOnly = String(positionValue).trim().toUpperCase() === 'GK';
+
+        // Organiser comp (cap 6 per game, matches /register)
+        let isComped = false;
+        if (isOrganiser) {
+            const compRes = await pool.query(
+                "SELECT COUNT(*) AS cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
+                [pmt.game_id]
+            );
+            if (parseInt(compRes.rows[0].cnt) < 6) isComped = true;
+        }
+
+        const effectivePrice = getEffectivePrice(game).price;
+
+        // GK capacity — if game has space but player chose GK-only and GK slots
+        // are full, fall through to gk_backup (don't reject — they already paid).
+        let gkFullForced = false;
+        if (!isFull && isGKOnly) {
+            const maxGKSlots = game.team_selection_type === 'vs_external' ? 1
+                             : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4)
+                             : 2;
+            const gkCountRes = await pool.query(`
+                SELECT COUNT(*) AS gk_count FROM registrations
+                WHERE game_id = $1 AND status = 'confirmed'
+                  AND UPPER(TRIM(position_preference)) = 'GK'
+            `, [pmt.game_id]);
+            if (parseInt(gkCountRes.rows[0].gk_count) >= maxGKSlots) {
+                gkFullForced = true;
+            }
+        }
+
+        if (isFull || gkFullForced) {
+            // Backup registration. confirmed_backup pays now; normal/gk are free.
+            let backupType;
+            if (gkFullForced) {
+                backupType = 'gk_backup';
+            } else {
+                backupType = ['normal_backup','confirmed_backup','gk_backup']
+                    .includes(requestedBackupType) ? requestedBackupType : 'normal_backup';
+            }
+            const finalBackupType = (backupType === 'gk_backup' && !isGKOnly) ? 'normal_backup' : backupType;
+
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                let amountPaid = 0, amountPaidFree = 0;
+                if (finalBackupType === 'confirmed_backup' && !isComped) {
+                    const { realCharged, freeCharged } = await applyGameFee(
+                        client, pmt.player_id, effectivePrice,
+                        `Confirmed backup for game ${pmt.game_id} (via Wonderful)`
+                    );
+                    amountPaid = realCharged;
+                    amountPaidFree = freeCharged || 0;
+                }
+                await client.query(
+                    `INSERT INTO registrations
+                        (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, is_comped, registered_at)
+                     VALUES ($1, $2, 'backup', $3, $4, $5, $6, $7, NOW())`,
+                    [pmt.game_id, pmt.player_id, positionValue, finalBackupType, amountPaid, amountPaidFree, isComped]
+                );
+                await client.query('COMMIT');
+                const status = gkFullForced ? 'backup_gk_full' : 'backup_game_full';
+                const reason = gkFullForced
+                    ? `GK slots full — added to GK backup list`
+                    : `Game filled while payment was being processed — added to ${finalBackupType === 'confirmed_backup' ? 'confirmed ' : ''}backup list`;
+                await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
+                    `Auto-registered as ${finalBackupType} (${gkFullForced ? 'GK full' : 'game full'} at credit time) via Wonderful ${pmt.merchant_reference}`);
+                // Registration timeline event (used by audit.html) + push notification
+                // (web47 round 2: previously only the normal /register path fired these,
+                // so Wonderful pay-and-join signups were invisible to the timeline / mobile).
+                const evtType = finalBackupType === 'confirmed_backup' ? 'confirmed_backup_joined'
+                              : finalBackupType === 'gk_backup' ? 'gk_backup_joined'
+                              : 'backup_joined';
+                registrationEvent(pool, pmt.game_id, pmt.player_id, evtType,
+                    `Position: ${positionValue} | Backup type: ${finalBackupType} | via Wonderful`).catch(() => {});
+                getGameDataForNotification(pmt.game_id).then(gd =>
+                    sendNotification('backup_added', pmt.player_id, gd).catch(() => {})
+                ).catch(() => {});
+                return { status, reason };
+            } catch (e) {
+                await client.query('ROLLBACK').catch(() => {});
+                console.error('Wonderful backup auto-register failed:', e.message);
+                return { status: 'failed_db_error', reason: e.message };
+            } finally {
+                client.release();
+            }
+        } else {
+            // Game has space — confirmed registration
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                let amountPaid = 0, amountPaidFree = 0;
+                if (!isComped) {
+                    const { realCharged, freeCharged } = await applyGameFee(
+                        client, pmt.player_id, effectivePrice,
+                        `Registration for game ${pmt.game_id} (via Wonderful${getEffectivePrice(game).tier !== 'standard' ? ' · ' + getEffectivePrice(game).tier : ''})`
+                    );
+                    amountPaid = realCharged;
+                    amountPaidFree = freeCharged || 0;
+                }
+                await client.query(
+                    `INSERT INTO registrations
+                        (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, is_comped, registered_at)
+                     VALUES ($1, $2, 'confirmed', $3, $4, $5, $6, NOW())`,
+                    [pmt.game_id, pmt.player_id, positionValue, amountPaid, amountPaidFree, isComped]
+                );
+                await client.query('COMMIT');
+                await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
+                    `Auto-registered${isComped ? ' (organiser comp)' : ''} via Wonderful ${pmt.merchant_reference}`);
+                // Registration timeline event (used by audit.html) + push notification
+                // (web47 round 2: previously only the normal /register path fired these,
+                // so Wonderful pay-and-join signups were invisible to the timeline / mobile).
+                registrationEvent(pool, pmt.game_id, pmt.player_id, 'signed_up',
+                    `Position: ${positionValue}${isComped ? ' | Comped' : ''} | via Wonderful`).catch(() => {});
+                getGameDataForNotification(pmt.game_id).then(gd =>
+                    sendNotification('game_registered', pmt.player_id, gd).catch(() => {})
+                ).catch(() => {});
+                // Dynamic star rating + RAF game-credit — mirror /register epilogue (W-75/W-76).
+                // These run fire-and-forget so a failure here doesn't block the credit.
+                reviewDynamicStarRating(pool, pmt.game_id).catch(e =>
+                    console.error('[WF auto-register] star rating review failed:', e.message)
+                );
+                triggerRafGameCredit(pmt.player_id).catch(e =>
+                    console.error('[WF auto-register] RAF game credit failed:', e.message)
+                );
+                return {
+                    status: isComped ? 'confirmed_comped' : 'confirmed',
+                    reason: isComped ? 'Organiser comp — game covered by the GAFFA' : null
+                };
+            } catch (e) {
+                await client.query('ROLLBACK').catch(() => {});
+                console.error('Wonderful confirmed auto-register failed:', e.message);
+                return { status: 'failed_db_error', reason: e.message };
+            } finally {
+                client.release();
+            }
+        }
+    } catch (e) {
+        console.error('Wonderful game auto-register error:', e.message);
+        return { status: 'failed_exception', reason: e.message };
+    }
+}
+
+// Atomic credit + auto-register — the shared entry point used by every Wonderful
+// success path: webhook, status-poll recovery, admin reconcile, admin manual-credit,
+// and the background reconciler sweep.
+//
+// Idempotency is handled by a single atomic UPDATE ... WHERE status != 'credited'
+// RETURNING * — so concurrent callers can't double-credit.
+//
+// Options:
+//   adminId      — users.id of admin triggering credit (audit trail). null = self-service.
+//   contextLabel — appended to ledger/audit descriptions, e.g. 'recovery', 'reconciler'.
+//   verifyWpId   — wonderful_payment_id resolved by verify (persisted via COALESCE).
+//
+// Returns { credited, alreadyCredited, pounds, balBefore, balAfter, autoRegister:{status,reason} }
+async function creditAndAutoRegisterWonderful(pmt, options = {}) {
+    const { adminId = null, contextLabel = '', verifyWpId = null } = options;
+    const ctxSuffix = contextLabel ? ` (${contextLabel})` : '';
+
+    // Atomic claim + credit. Rollback on any failure — payment stays non-credited
+    // so the reconciler / next webhook can retry safely.
+    const client = await pool.connect();
+    let pounds, balBefore, balAfter, freshPmt;
+    try {
+        await client.query('BEGIN');
+        const claim = await client.query(
+            `UPDATE wonderful_payments
+             SET status = 'credited', confirmed_at = NOW(), credited_at = NOW(),
+                 wonderful_payment_id = COALESCE(wonderful_payment_id, $1)
+             WHERE id = $2 AND status != 'credited'
+             RETURNING *`,
+            [verifyWpId || pmt.wonderful_payment_id || null, pmt.id]
+        );
+        if (!claim.rows.length) {
+            await client.query('ROLLBACK');
+            return { credited: false, alreadyCredited: true, pounds: pmt.amount_pence / 100, autoRegister: { status: null, reason: null } };
+        }
+        freshPmt = claim.rows[0];
+        pounds = freshPmt.amount_pence / 100;
+        const balRes = await client.query(
+            'SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1',
+            [freshPmt.player_id]
+        );
+        balBefore = parseFloat(balRes.rows[0]?.balance || 0);
+        await client.query(
+            `INSERT INTO credits (player_id, balance, last_updated)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (player_id) DO UPDATE
+             SET balance = credits.balance + $2, last_updated = NOW()`,
+            [freshPmt.player_id, pounds]
+        );
+        balAfter = balBefore + pounds;
+        await client.query('COMMIT');
+    } catch (txErr) {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+        throw txErr;
+    } finally {
+        try { client.release(); } catch (_) {}
+    }
+
+    // Post-commit side-effects. Intentionally outside the tx — if any fail, log but
+    // don't roll back the credit (balance is correct, ledger/audit are best-effort).
+    await recordCreditTransaction(pool, freshPmt.player_id, pounds, 'wonderful_topup',
+        `Wonderful bank payment${ctxSuffix} — ref ${freshPmt.merchant_reference}`, adminId);
+
+    const auditActor = adminId || freshPmt.player_id;
+    const auditPrefix = adminId ? 'ADMIN CREDIT: ' : '';
+    await auditLog(pool, auditActor, 'wonderful_credited', freshPmt.player_id,
+        `${auditPrefix}£${pounds.toFixed(2)} credited via Wonderful${ctxSuffix} · Balance: £${balBefore.toFixed(2)} → £${balAfter.toFixed(2)} · Ref: ${freshPmt.merchant_reference}`);
+
+    setImmediate(() => triggerRafActivation(freshPmt.player_id).catch(() => {}));
+    setImmediate(() => sendWonderfulCreditEmail(freshPmt.player_id, pounds, freshPmt.merchant_reference, balAfter));
+
+    // Auto-register if payment linked to a game — runs in ALL credit paths now
+    // (bug fixed web47: previously only the webhook ran this, so recovery/reconcile
+    // paths credited the player but left them unregistered for the game they paid to join).
+    let autoRegister = { status: null, reason: null };
+    if (freshPmt.game_id) {
+        try {
+            autoRegister = await _wonderfulAutoRegister(freshPmt);
+        } catch (e) {
+            autoRegister = { status: 'failed_exception', reason: e.message };
+            console.error('Wonderful auto-register wrapper threw:', e.message);
+        }
+        await pool.query(
+            `UPDATE wonderful_payments
+                SET auto_register_status = $1, auto_register_reason = $2
+              WHERE id = $3`,
+            [autoRegister.status, autoRegister.reason, freshPmt.id]
+        ).catch(e => console.error('Failed to persist auto_register_status:', e.message));
+    }
+
+    return { credited: true, alreadyCredited: false, pounds, balBefore, balAfter, autoRegister };
+}
+
 // POST /api/webhooks/wonderful
-// Public — Wonderful calls this when payment status changes
-// Security: we NEVER trust payload alone — always re-verify via GET
+// Public — Wonderful calls this when payment status changes.
+// Security: NEVER trust the payload alone — always re-verify via GET.
+// Reliability: if this webhook is lost (cold start, transient error, network),
+// the background reconciler (below) will pick it up within ~5 minutes.
 app.post('/api/webhooks/wonderful', async (req, res) => {
-    // Respond immediately so Wonderful doesn't retry
+    // Ack immediately so Wonderful doesn't retry
     res.json({ received: true });
 
     try {
-        // Log full body for debugging — harmless, no sensitive data
-        console.log('[Wonderful webhook] body:', JSON.stringify(req.body));
+        console.log('[WF webhook] body:', JSON.stringify(req.body));
 
         // Extract Wonderful's payment ID — cover all known field name variants
         const wpId = req.body?.id
@@ -19253,44 +19888,19 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
             || req.body?.data?.reference
             || null;
 
-        // Must have at least one identifier to proceed
-        console.log('[Wonderful webhook] extracted wpId:', wpId, 'webhookRef:', webhookRef);
+        console.log('[WF webhook] extracted wpId:', wpId, 'webhookRef:', webhookRef);
         if (!wpId && !webhookRef) {
-            return console.warn('[Wonderful webhook] no payment ID or merchant reference in body — cannot process');
+            return console.warn('[WF webhook] no payment ID or merchant reference — cannot process');
         }
 
-        // Fetch payment record — try wonderful_payment_id first, then merchant_reference
-        // Wonderful sends order_id in webhook which may differ from payment id — resolve via API if needed
+        // Find the payment row. Prefer wpId, fall back to merchant_reference.
+        // If neither matches, the reconciler will catch it by its own sweep.
         let pmt = null;
         if (wpId) {
             const byId = await pool.query(
                 `SELECT * FROM wonderful_payments WHERE wonderful_payment_id = $1`, [wpId]
             );
             pmt = byId.rows[0] || null;
-
-            // order_id may not match wonderful_payment_id — try resolving via Wonderful API
-            if (!pmt && WONDERFUL_API_KEY) {
-                try {
-                    // Try fetching payment list filtered by order_id, or search all pending
-                    const searchRes = await pool.query(
-                        `SELECT * FROM wonderful_payments WHERE status = 'pending' ORDER BY created_at DESC LIMIT 20`
-                    );
-                    // Find by verifying each pending payment until we match order_id
-                    for (const candidate of searchRes.rows) {
-                        if (!candidate.wonderful_payment_id) continue;
-                        try {
-                            const vRes = await wonderfulRequest('GET', `/v2/payments/${candidate.wonderful_payment_id}`);
-                            if (vRes.data?.order_id === wpId || String(vRes.data?.id) === String(wpId)) {
-                                pmt = candidate;
-                                console.log('[Wonderful webhook] resolved order_id', wpId, '→ wonderful_payment_id', candidate.wonderful_payment_id);
-                                break;
-                            }
-                        } catch (_) { continue; }
-                    }
-                } catch (e) {
-                    console.warn('[Wonderful webhook] order_id resolution failed:', e.message);
-                }
-            }
         }
         if (!pmt && webhookRef) {
             const byRef = await pool.query(
@@ -19299,466 +19909,102 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
             pmt = byRef.rows[0] || null;
         }
         if (!pmt) {
-            return console.warn('[Wonderful webhook] no matching payment record — wpId:', wpId, 'ref:', webhookRef);
+            return console.warn('[WF webhook] no matching payment record (reconciler will retry) — wpId:', wpId, 'ref:', webhookRef);
         }
         if (pmt.status === 'credited') {
-            return console.log('[Wonderful webhook] already credited, skipping:', pmt.merchant_reference);
+            return console.log('[WF webhook] already credited, skipping:', pmt.merchant_reference);
         }
-        // For async banks (HSBC, Nationwide etc.) status may be 'processing' — allow crediting
 
-        // SECURITY: independently verify status with Wonderful API — never trust webhook payload alone
-        if (!WONDERFUL_API_KEY) return;
-        // Resolve the best ID to use for verify
-        let verifyId = wpId || pmt.wonderful_payment_id;
-        let verified;
-        try {
-            if (verifyId) {
-                const verifyRes = await wonderfulRequest('GET', `/v2/payments/${verifyId}`);
-                verified = verifyRes.data?.status;
-            }
-        } catch (verifyErr) {
-            console.warn('[Wonderful webhook] direct verify failed, trying list search:', verifyErr.message);
-            verified = null;
-        }
-        // Fallback: if verify failed or no verifyId, search by merchant_reference
-        if (!verified && WONDERFUL_API_KEY) {
-            try {
-                const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
-                const found = (listRes.data?.payments || listRes.data || []).find(p2 =>
-                    p2.merchant_payment_reference === pmt.merchant_reference ||
-                    p2.merchant_reference === pmt.merchant_reference
-                );
-                if (found) {
-                    verified = found.status;
-                    verifyId = found.id;
-                    console.log('[Wonderful webhook] resolved via list — wpId:', verifyId, 'status:', verified);
-                    // Store resolved ID in DB
-                    await pool.query(
-                        `UPDATE wonderful_payments SET wonderful_payment_id = COALESCE(wonderful_payment_id, $1) WHERE id = $2`,
-                        [verifyId, pmt.id]
-                    );
-                }
-            } catch (listErr) {
-                console.warn('[Wonderful webhook] list search failed:', listErr.message);
-            }
-        }
+        // Verify with Wonderful API — never trust webhook payload alone
+        const { verified, resolvedWpId } = await _wonderfulVerifyStatus(pmt);
+        console.log('[WF webhook] verify status:', verified, '| ref:', pmt.merchant_reference);
+
         if (!verified) {
-            return console.error('[Wonderful webhook] could not verify payment status — ref:', pmt.merchant_reference);
+            // Verify failed — do not touch status. Reconciler retries every 5 min.
+            return console.error('[WF webhook] could not verify (reconciler will retry) — ref:', pmt.merchant_reference);
         }
 
-        // v2 API: payment status can be 'paid' or 'accepted' for successful payments
-        console.log('[Wonderful webhook] verify status:', verified, '| wpId:', wpId, '| ref:', pmt.merchant_reference);
         if (verified !== 'paid' && verified !== 'accepted') {
-            // Update status but don't credit
+            // Record Wonderful's state without crediting
             await pool.query(
                 `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status != 'credited'`,
-                [verified || 'pending', verifyId || wpId, pmt.id]
-            );
+                [verified, resolvedWpId, pmt.id]
+            ).catch(() => {});
             return;
         }
 
-        // Idempotency: claim + credit atomically in a transaction.
-        // If the credits UPDATE fails for any reason, the whole transaction rolls back
-        // so wonderful_payments.status is NOT marked 'credited' — allowing retry.
-        const webhookClient = await pool.connect();
-        let pounds, balBefore, balAfter;
+        // Paid — delegate to shared helper for credit + auto-register
         try {
-            await webhookClient.query('BEGIN');
-            const claim = await webhookClient.query(
-                `UPDATE wonderful_payments
-                 SET status = 'credited', confirmed_at = NOW(), credited_at = NOW(),
-                     wonderful_payment_id = COALESCE(wonderful_payment_id, $1)
-                 WHERE id = $2 AND status != 'credited'
-                 RETURNING *`,
-                [verifyId || wpId, pmt.id]
-            );
-            if (!claim.rows.length) {
-                await webhookClient.query('ROLLBACK');
-                console.log('[Wonderful webhook] idempotency check — already credited, skipping');
-                return;
+            const result = await creditAndAutoRegisterWonderful(pmt, { verifyWpId: resolvedWpId });
+            if (result.alreadyCredited) {
+                console.log('[WF webhook] already credited (concurrent race), skipping:', pmt.merchant_reference);
+            } else {
+                console.log(`[WF webhook] credited £${result.pounds.toFixed(2)} · auto-register: ${result.autoRegister.status || 'topup-only'} · ref: ${pmt.merchant_reference}`);
             }
-            pounds = pmt.amount_pence / 100;
-            const balBeforeRow = await webhookClient.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
-            balBefore = parseFloat(balBeforeRow.rows[0]?.balance || 0);
-            await webhookClient.query(
-                `INSERT INTO credits (player_id, balance, last_updated)
-                 VALUES ($1, $2, NOW())
-                 ON CONFLICT (player_id) DO UPDATE
-                 SET balance = credits.balance + $2, last_updated = NOW()`,
-                [pmt.player_id, pounds]
-            );
-            balAfter = balBefore + pounds;
-            await webhookClient.query('COMMIT');
-        } catch (txErr) {
-            await webhookClient.query('ROLLBACK').catch(() => {});
-            console.error('[Wonderful webhook] transaction failed — rolled back, payment NOT marked credited:', txErr.message);
-            return;
-        } finally {
-            webhookClient.release();
-        }
-
-        // Post-commit: logging and side-effects (outside transaction intentionally)
-        await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
-            `Wonderful bank payment — ref ${pmt.merchant_reference}`, null);
-
-        await auditLog(pool, pmt.player_id, 'wonderful_credited', pmt.player_id,
-            `£${pounds.toFixed(2)} credited via Wonderful · Balance: £${balBefore.toFixed(2)} → £${balAfter.toFixed(2)} · Ref: ${pmt.merchant_reference}`);
-
-        // Trigger RAF activation bonus if this is the referred player's first top-up
-        setImmediate(() => triggerRafActivation(pmt.player_id).catch(() => {}));
-
-        // Send confirmation email to player
-        setImmediate(() => sendWonderfulCreditEmail(pmt.player_id, pounds, pmt.merchant_reference));
-
-        // If payment was linked to a specific game, auto-register the player.
-        // This block mirrors the validation flow of /api/games/:id/register so a player
-        // paying via Wonderful ends up in the same state as if they'd clicked SIGN UP
-        // with existing balance. Web47 rewrite — previous version silently skipped on
-        // many edge cases (exclusivity, full games, organiser comp, position prefs lost).
-        if (pmt.game_id) {
-            setImmediate(async () => {
-                // We'll update wonderful_payments.auto_register_status with the outcome so the
-                // frontend status poll can surface what actually happened.
-                let outcomeStatus = 'topup_only';   // default if nothing registered
-                let outcomeReason = null;
-
-                try {
-                    const gameRow = await pool.query(
-                        `SELECT g.id, g.cost_per_player, g.game_status, g.team_selection_type,
-                                g.max_players, g.requires_organiser, g.exclusivity,
-                                g.early_bird_price, g.super_early_bird_price, g.game_date,
-                                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
-                                 + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
-                         FROM games g WHERE g.id = $1`,
-                        [pmt.game_id]
-                    );
-                    const game = gameRow.rows[0];
-                    if (!game) {
-                        outcomeStatus = 'failed_game_not_found';
-                        outcomeReason = 'Game no longer exists';
-                    } else if (!['available', 'confirmed'].includes(game.game_status)) {
-                        outcomeStatus = 'failed_game_closed';
-                        outcomeReason = `Game is ${game.game_status}, no longer accepting registrations`;
-                    } else {
-                        // Fetch player state (tier + organiser flag + position prefs from payment row)
-                        const playerRow = await pool.query(
-                            'SELECT reliability_tier, is_organiser FROM players WHERE id = $1',
-                            [pmt.player_id]
-                        );
-                        const playerTier = playerRow.rows[0]?.reliability_tier;
-                        const isOrganiser = !!playerRow.rows[0]?.is_organiser;
-
-                        // Tier ban
-                        if (playerTier === 'white' || playerTier === 'black') {
-                            outcomeStatus = 'failed_tier';
-                            outcomeReason = `Account tier ${playerTier} — signup blocked`;
-                        } else {
-                            // Exclusivity badge checks
-                            let blockedByExclusivity = false;
-                            if (game.exclusivity === 'clm' || game.exclusivity === 'allstars' || game.exclusivity === 'misfits') {
-                                const badgeName = game.exclusivity === 'clm' ? 'CLM'
-                                                : game.exclusivity === 'allstars' ? 'TF All Star'
-                                                : 'Misfits';
-                                const badgeRes = await pool.query(`
-                                    SELECT 1 FROM player_badges pb
-                                    JOIN badges b ON b.id = pb.badge_id
-                                    WHERE pb.player_id = $1 AND b.name = $2
-                                `, [pmt.player_id, badgeName]);
-                                if (badgeRes.rows.length === 0) {
-                                    blockedByExclusivity = true;
-                                    outcomeStatus = 'failed_exclusivity';
-                                    outcomeReason = `Game restricted to ${badgeName} — badge required`;
-                                }
-                            }
-
-                            if (!blockedByExclusivity) {
-                                // Already registered? (idempotency — webhook can fire twice)
-                                const already = await pool.query(
-                                    `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2`,
-                                    [pmt.game_id, pmt.player_id]
-                                );
-                                if (already.rows.length) {
-                                    outcomeStatus = already.rows[0].status === 'confirmed' ? 'confirmed' : 'backup';
-                                    outcomeReason = 'Already registered';
-                                } else {
-                                    // Capacity check — mirror /register logic. effectiveMax reserves
-                                    // the last slot for an organiser if the game requires one and
-                                    // the caller isn't one.
-                                    let effectiveMax = parseInt(game.max_players);
-                                    if (game.requires_organiser && !isOrganiser) {
-                                        const orgCountRes = await pool.query(`
-                                            SELECT COUNT(*) AS cnt FROM registrations r
-                                            JOIN players p ON p.id = r.player_id
-                                            WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
-                                        `, [pmt.game_id]);
-                                        if (parseInt(orgCountRes.rows[0].cnt) === 0) {
-                                            effectiveMax = parseInt(game.max_players) - 1;
-                                        }
-                                    }
-                                    const isFull = parseInt(game.current_players) >= effectiveMax;
-
-                                    // Resolve position + backup choice from stored payment row
-                                    const positionValue = pmt.position_preference || 'Outfield';
-                                    const requestedBackupType = pmt.backup_type; // nullable
-                                    const isGKOnly = String(positionValue).trim().toUpperCase() === 'GK';
-
-                                    // Organiser comp eligibility (cap 6 per game, matches /register)
-                                    let isComped = false;
-                                    if (isOrganiser) {
-                                        const compRes = await pool.query(
-                                            "SELECT COUNT(*) AS cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
-                                            [pmt.game_id]
-                                        );
-                                        if (parseInt(compRes.rows[0].cnt) < 6) isComped = true;
-                                    }
-
-                                    const effectivePrice = getEffectivePrice(game).price;
-
-                                    // GK capacity check — if game has space but the player chose
-                                    // GK-only and all GK slots are taken, fall through to backup as
-                                    // gk_backup (rather than reject outright like /register does —
-                                    // the player has already paid, we want them registered somehow).
-                                    let gkFullForced = false;
-                                    if (!isFull && isGKOnly) {
-                                        const maxGKSlots = game.team_selection_type === 'vs_external' ? 1
-                                                         : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4)
-                                                         : 2;
-                                        const gkCountRes = await pool.query(`
-                                            SELECT COUNT(*) AS gk_count FROM registrations
-                                            WHERE game_id = $1 AND status = 'confirmed'
-                                            AND UPPER(TRIM(position_preference)) = 'GK'
-                                        `, [pmt.game_id]);
-                                        if (parseInt(gkCountRes.rows[0].gk_count) >= maxGKSlots) {
-                                            gkFullForced = true;
-                                        }
-                                    }
-
-                                    if (isFull || gkFullForced) {
-                                        // Game full — register as backup. backup_type defaults to
-                                        // 'normal_backup' if none was specified at initiate time.
-                                        // confirmed_backup pays now; normal + gk are free at signup.
-                                        let backupType;
-                                        if (gkFullForced) {
-                                            // GK slots full but game has space — player chose GK, so gk_backup
-                                            backupType = 'gk_backup';
-                                        } else {
-                                            backupType = ['normal_backup','confirmed_backup','gk_backup']
-                                                .includes(requestedBackupType) ? requestedBackupType : 'normal_backup';
-                                        }
-                                        // GK backup only valid if player chose GK
-                                        const finalBackupType = (backupType === 'gk_backup' && !isGKOnly) ? 'normal_backup' : backupType;
-
-                                        const client = await pool.connect();
-                                        try {
-                                            await client.query('BEGIN');
-                                            let amountPaid = 0;
-                                            let amountPaidFree = 0;
-                                            if (finalBackupType === 'confirmed_backup' && !isComped) {
-                                                const { realCharged, freeCharged } = await applyGameFee(
-                                                    client, pmt.player_id, effectivePrice,
-                                                    `Confirmed backup for game ${pmt.game_id} (via Wonderful)`
-                                                );
-                                                amountPaid = realCharged;
-                                                amountPaidFree = freeCharged || 0;
-                                            }
-                                            await client.query(
-                                                `INSERT INTO registrations
-                                                    (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, is_comped, registered_at)
-                                                 VALUES ($1, $2, 'backup', $3, $4, $5, $6, $7, NOW())`,
-                                                [pmt.game_id, pmt.player_id, positionValue, finalBackupType, amountPaid, amountPaidFree, isComped]
-                                            );
-                                            await client.query('COMMIT');
-                                            outcomeStatus = gkFullForced ? 'backup_gk_full' : 'backup_game_full';
-                                            outcomeReason = gkFullForced
-                                                ? `GK slots full — added to GK backup list`
-                                                : `Game filled while payment was being processed — added to ${finalBackupType === 'confirmed_backup' ? 'confirmed ' : ''}backup list`;
-                                            await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
-                                                `Auto-registered as ${finalBackupType} (${gkFullForced ? 'GK full' : 'game full'} at webhook) via Wonderful ${pmt.merchant_reference}`);
-                                        } catch (e) {
-                                            await client.query('ROLLBACK').catch(() => {});
-                                            outcomeStatus = 'failed_db_error';
-                                            outcomeReason = e.message;
-                                            console.error('Wonderful backup auto-register failed:', e.message);
-                                        } finally {
-                                            client.release();
-                                        }
-                                    } else {
-                                        // Game has space — confirmed registration
-                                        const client = await pool.connect();
-                                        try {
-                                            await client.query('BEGIN');
-                                            let amountPaid = 0;
-                                            let amountPaidFree = 0;
-                                            if (!isComped) {
-                                                const { realCharged, freeCharged } = await applyGameFee(
-                                                    client, pmt.player_id, effectivePrice,
-                                                    `Registration for game ${pmt.game_id} (via Wonderful${getEffectivePrice(game).tier !== 'standard' ? ' · ' + getEffectivePrice(game).tier : ''})`
-                                                );
-                                                amountPaid = realCharged;
-                                                amountPaidFree = freeCharged || 0;
-                                            }
-                                            await client.query(
-                                                `INSERT INTO registrations
-                                                    (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, is_comped, registered_at)
-                                                 VALUES ($1, $2, 'confirmed', $3, $4, $5, $6, NOW())`,
-                                                [pmt.game_id, pmt.player_id, positionValue, amountPaid, amountPaidFree, isComped]
-                                            );
-                                            await client.query('COMMIT');
-                                            outcomeStatus = isComped ? 'confirmed_comped' : 'confirmed';
-                                            outcomeReason = isComped
-                                                ? 'Organiser comp — game covered by the GAFFA'
-                                                : null;
-                                            await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
-                                                `Auto-registered${isComped ? ' (organiser comp)' : ''} via Wonderful ${pmt.merchant_reference}`);
-                                        } catch (e) {
-                                            await client.query('ROLLBACK').catch(() => {});
-                                            outcomeStatus = 'failed_db_error';
-                                            outcomeReason = e.message;
-                                            console.error('Wonderful confirmed auto-register failed:', e.message);
-                                        } finally {
-                                            client.release();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } catch (e) {
-                    outcomeStatus = 'failed_exception';
-                    outcomeReason = e.message;
-                    console.error('Wonderful game auto-register error:', e.message);
-                }
-
-                // Persist outcome so the frontend status poll can show the right message
-                await pool.query(
-                    `UPDATE wonderful_payments
-                        SET auto_register_status = $1, auto_register_reason = $2
-                      WHERE merchant_reference = $3`,
-                    [outcomeStatus, outcomeReason, pmt.merchant_reference]
-                ).catch(e => console.error('Failed to persist auto_register_status:', e.message));
-            });
+        } catch (e) {
+            console.error('[WF webhook] credit helper failed (reconciler will retry):', e.message);
         }
     } catch (e) {
         console.error('Wonderful webhook processing error:', e.message);
     }
 });
 
-// GET /api/payments/wonderful/status/:ref — player polls for confirmation after redirect
-// Used by the success screen to show confirmed/pending state. Returns auto-register outcome
-// so the frontend can show what happened to the game signup (bug fixed web47 — previously
-// only returned credit status, player never knew if they were actually registered).
+// GET /api/payments/wonderful/status/:ref — player polls for confirmation after redirect.
+// Returns credit status AND auto-register outcome so the frontend overlay can show the
+// right message. Performs cold-start recovery: if Wonderful confirms paid but our DB
+// hasn't been updated yet (e.g. webhook lost during Render cold-start), credit + auto-
+// register happen here. The background reconciler also covers this case, but the poll
+// path gives the user instant feedback while they're still in the tab.
 app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, res) => {
     try {
         const { ref } = req.params;
         const row = await pool.query(
-            `SELECT status, amount_pence, game_id, credited_at, wonderful_payment_id,
-                    auto_register_status, auto_register_reason
-             FROM wonderful_payments
-             WHERE merchant_reference = $1 AND player_id = $2`,
+            `SELECT * FROM wonderful_payments WHERE merchant_reference = $1 AND player_id = $2`,
             [ref, req.user.playerId]
         );
         if (!row.rows.length) return res.status(404).json({ error: 'Payment not found' });
         const p = row.rows[0];
 
-        // COLD-START RECOVERY: if our DB says pending but Wonderful confirms paid,
-        // credit the player now. This handles webhook misses due to Render cold starts.
-        console.log('[Wonderful status-poll] ref:', ref, 'db_status:', p.status, 'wp_id:', p.wonderful_payment_id || 'NULL');
+        console.log('[WF status-poll] ref:', ref, 'db_status:', p.status, 'wp_id:', p.wonderful_payment_id || 'NULL');
+
+        // Cold-start recovery
         if (p.status !== 'credited' && WONDERFUL_API_KEY) {
-            try {
-                // If no wonderful_payment_id stored, search Wonderful's API by merchant_reference
-                let verifyStatus = null;
-                let resolvedWpId = p.wonderful_payment_id;
-                if (resolvedWpId) {
-                    const verifyRes = await wonderfulRequest('GET', `/v2/payments/${resolvedWpId}`);
-                    verifyStatus = verifyRes.data?.status;
-                    console.log('[Wonderful status-poll] verify result:', verifyStatus);
-                } else {
-                    // No stored payment ID — search by listing recent payments
-                    try {
-                        const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
-                        const found = (listRes.data?.payments || listRes.data || []).find(p2 =>
-                            p2.merchant_payment_reference === ref || p2.merchant_reference === ref
-                        );
-                        if (found) {
-                            resolvedWpId = found.id;
-                            verifyStatus = found.status;
-                            // Update DB with real payment ID for future lookups
-                            await pool.query(
-                                `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE merchant_reference = $2 AND wonderful_payment_id IS NULL`,
-                                [resolvedWpId, ref]
-                            );
-                            console.log('[Wonderful status-poll] resolved via list search — wpId:', resolvedWpId, 'status:', verifyStatus);
-                        }
-                    } catch (listErr) {
-                        console.warn('[Wonderful status-poll] list search failed:', listErr.message);
+            const { verified, resolvedWpId } = await _wonderfulVerifyStatus(p);
+            if (verified === 'paid' || verified === 'accepted') {
+                try {
+                    const result = await creditAndAutoRegisterWonderful(p, {
+                        contextLabel: 'recovery',
+                        verifyWpId: resolvedWpId
+                    });
+                    if (result.credited) {
+                        console.log(`[WF status-poll] recovery credited £${result.pounds.toFixed(2)} · auto-register: ${result.autoRegister.status || 'topup-only'} · ref: ${ref}`);
                     }
+                } catch (e) {
+                    console.error('[WF status-poll] recovery failed:', e.message);
                 }
-                const verifiedStatus = verifyStatus;
-                console.log('[Wonderful status-poll] final verifiedStatus:', verifiedStatus, 'for ref:', ref);
-                if (verifiedStatus === 'paid' || verifiedStatus === 'accepted') {
-                    console.log('[Wonderful status poll] cold-start recovery — crediting via status poll for ref:', ref);
-                    // Atomic claim — prevents double-credit if webhook also fires
-                    const client = await pool.connect();
-                    try {
-                        await client.query('BEGIN');
-                        const claim = await client.query(
-                            `UPDATE wonderful_payments
-                             SET status = 'credited', confirmed_at = NOW(), credited_at = NOW()
-                             WHERE merchant_reference = $1 AND player_id = $2 AND status != 'credited'
-                             RETURNING *`,
-                            [ref, req.user.playerId]
-                        );
-                        if (claim.rows.length > 0) {
-                            const pounds = p.amount_pence / 100;
-                            const balBeforeRow2 = await client.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [req.user.playerId]);
-                            const balBefore2 = parseFloat(balBeforeRow2.rows[0]?.balance || 0);
-                            await client.query(
-                                `INSERT INTO credits (player_id, balance, last_updated)
-                                 VALUES ($1, $2, NOW())
-                                 ON CONFLICT (player_id) DO UPDATE
-                                 SET balance = credits.balance + $2, last_updated = NOW()`,
-                                [req.user.playerId, pounds]
-                            );
-                            const balAfter2 = balBefore2 + pounds;
-                            await client.query('COMMIT');
-                            // Post-commit logging — uses pool (outside transaction intentionally)
-                            await recordCreditTransaction(pool, req.user.playerId, pounds, 'wonderful_topup',
-                                `Wonderful bank payment (status-poll recovery) — ref ${ref}`, null);
-                            await auditLog(pool, req.user.playerId, 'wonderful_credited', req.user.playerId,
-                                `£${pounds.toFixed(2)} credited via Wonderful (recovery) · Balance: £${balBefore2.toFixed(2)} → £${balAfter2.toFixed(2)} · Ref: ${ref}`);
-                            // Trigger RAF activation if this is the player's first top-up
-                            setImmediate(() => triggerRafActivation(req.user.playerId).catch(() => {}));
-                            setImmediate(() => sendWonderfulCreditEmail(req.user.playerId, pounds, ref));
-                            return res.json({
-                                status: 'credited',
-                                amount: pounds.toFixed(2),
-                                game_id: p.game_id,
-                                credited_at: new Date(),
-                                auto_register_status: null, // recovery path — auto-register runs async after webhook
-                                auto_register_reason: null,
-                            });
-                        }
-                        await client.query('ROLLBACK');
-                    } catch (creditErr) {
-                        await client.query('ROLLBACK').catch(() => {});
-                        console.error('[Wonderful status poll] recovery credit failed:', creditErr.message);
-                    } finally {
-                        client.release();
-                    }
-                }
-            } catch (verifyErr) {
-                // Verify failed — return current DB status, don't error the poll
-                console.warn('[Wonderful status poll] verify failed:', verifyErr.message);
+            } else if (verified && verified !== 'paid' && verified !== 'accepted') {
+                // Mirror Wonderful's state in our DB without crediting
+                await pool.query(
+                    `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status != 'credited'`,
+                    [verified, resolvedWpId, p.id]
+                ).catch(() => {});
             }
         }
 
+        // Return fresh state (reflects any update above)
+        const row2 = await pool.query(
+            `SELECT status, amount_pence, game_id, credited_at, auto_register_status, auto_register_reason
+             FROM wonderful_payments WHERE id = $1`,
+            [p.id]
+        );
+        const pp = row2.rows[0] || p;
         res.json({
-            status:      p.status,
-            amount:      (p.amount_pence / 100).toFixed(2),
-            game_id:     p.game_id,
-            credited_at: p.credited_at,
-            auto_register_status: p.auto_register_status || null,
-            auto_register_reason: p.auto_register_reason || null,
+            status:               pp.status,
+            amount:               (pp.amount_pence / 100).toFixed(2),
+            game_id:              pp.game_id,
+            credited_at:          pp.credited_at,
+            auto_register_status: pp.auto_register_status || null,
+            auto_register_reason: pp.auto_register_reason || null,
         });
     } catch (e) {
         console.error('Wonderful status error:', e.message);
@@ -19766,7 +20012,8 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
     }
 });
 
-// POST /api/admin/payments/wonderful/reconcile/:ref — manually trigger credit for a specific payment
+// POST /api/admin/payments/wonderful/reconcile/:ref
+// Superadmin — manually triggers credit + auto-register for one payment.
 app.post('/api/admin/payments/wonderful/reconcile/:ref', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const { ref } = req.params;
@@ -19774,71 +20021,49 @@ app.post('/api/admin/payments/wonderful/reconcile/:ref', authenticateToken, requ
         if (!row.rows.length) return res.status(404).json({ error: 'Payment not found' });
         const pmt = row.rows[0];
         if (pmt.status === 'credited') return res.json({ message: 'Already credited', status: 'credited' });
-
-        // Verify with Wonderful API
-        let verifyStatus = null;
-        let resolvedWpId = pmt.wonderful_payment_id;
         if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'Wonderful API not configured' });
 
-        if (resolvedWpId) {
-            const vr = await wonderfulRequest('GET', `/v2/payments/${resolvedWpId}`);
-            verifyStatus = vr.data?.status;
-        } else {
-            const lr = await wonderfulRequest('GET', '/v2/payments?limit=50');
-            const found = (lr.data?.payments || lr.data || []).find(p2 =>
-                p2.merchant_payment_reference === ref || p2.merchant_reference === ref
-            );
-            if (found) { verifyStatus = found.status; resolvedWpId = found.id; }
+        const { verified, resolvedWpId } = await _wonderfulVerifyStatus(pmt);
+        if (verified !== 'paid' && verified !== 'accepted') {
+            return res.json({ message: `Wonderful status: ${verified || 'unknown'} — not creditable`, status: verified });
         }
 
-        if (verifyStatus !== 'paid' && verifyStatus !== 'accepted') {
-            return res.json({ message: `Wonderful status: ${verifyStatus || 'unknown'} — not creditable`, status: verifyStatus });
-        }
-
-        const client = await pool.connect();
         try {
-            await client.query('BEGIN');
-            const claim = await client.query(
-                `UPDATE wonderful_payments SET status='credited', confirmed_at=NOW(), credited_at=NOW(),
-                 wonderful_payment_id=COALESCE(wonderful_payment_id,$1) WHERE id=$2 AND status!='credited' RETURNING *`,
-                [resolvedWpId, pmt.id]
-            );
-            if (!claim.rows.length) { await client.query('ROLLBACK'); return res.json({ message: 'Already credited during reconcile' }); }
-            const pounds = pmt.amount_pence / 100;
-            await client.query(
-                `INSERT INTO credits (player_id, balance, last_updated)
-                 VALUES ($1, $2, NOW())
-                 ON CONFLICT (player_id) DO UPDATE
-                 SET balance = credits.balance + $2, last_updated = NOW()`,
-                [pmt.player_id, pounds]
-            );
-            await client.query('COMMIT');
-            await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup', `Wonderful reconcile — ref ${ref}`, null);
-            await auditLog(pool, pmt.player_id, 'wonderful_credited', req.user.playerId, `Manual reconcile: £${pounds.toFixed(2)} credited — ref ${ref}`);
-            setImmediate(() => sendWonderfulCreditEmail(pmt.player_id, pounds, ref));
-            res.json({ message: `Credited £${pounds.toFixed(2)} to player`, status: 'credited', pounds });
+            const result = await creditAndAutoRegisterWonderful(pmt, {
+                adminId: req.user.userId,
+                contextLabel: 'reconcile',
+                verifyWpId: resolvedWpId
+            });
+            if (result.alreadyCredited) return res.json({ message: 'Already credited during reconcile' });
+            return res.json({
+                message: `Credited £${result.pounds.toFixed(2)} to player`,
+                status: 'credited',
+                pounds: result.pounds,
+                auto_register_status: result.autoRegister.status,
+                auto_register_reason: result.autoRegister.reason
+            });
         } catch (e) {
-            await client.query('ROLLBACK').catch(() => {});
             console.error('Reconcile credit failed:', e.message);
-            res.status(500).json({ error: 'Reconcile failed: ' + e.message });
-        } finally { client.release(); }
+            return res.status(500).json({ error: 'Reconcile failed: ' + e.message });
+        }
     } catch (e) {
         console.error('Reconcile endpoint error:', e.message);
         res.status(500).json({ error: 'Failed to reconcile' });
     }
 });
 
-// GET /api/admin/payments/wonderful/pending — list all non-credited payments for admin review
+// GET /api/admin/payments/wonderful/pending — list non-credited payments for admin review
 app.get('/api/admin/payments/wonderful/pending', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const rows = await pool.query(`
             SELECT wp.id, wp.merchant_reference, wp.wonderful_payment_id,
                    wp.amount_pence, wp.status, wp.created_at, wp.credited_at,
+                   wp.game_id, wp.auto_register_status,
                    p.alias, p.full_name, p.id as player_id
             FROM wonderful_payments wp
             JOIN players p ON p.id = wp.player_id
             ORDER BY wp.created_at DESC
-            LIMIT 100
+            LIMIT 200
         `);
         res.json({ payments: rows.rows });
     } catch (e) {
@@ -19848,89 +20073,52 @@ app.get('/api/admin/payments/wonderful/pending', authenticateToken, requireSuper
 });
 
 // POST /api/admin/payments/wonderful/manual-credit
-// Superadmin only — manually credit a player for a Wonderful payment that the webhook missed
-// Typical cause: Render cold start meant webhook was received but processing failed silently
+// Superadmin — manually credit a payment. Uses list-search fallback when
+// wonderful_payment_id is NULL (bug fixed web47: previous version hard-rejected
+// those, even though they were precisely the payments most likely to be stuck).
 app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requireSuperAdmin, async (req, res) => {
     const { merchant_reference } = req.body;
     if (!merchant_reference) return res.status(400).json({ error: 'merchant_reference required' });
     try {
-        // Look up payment by merchant reference
         const pmtRow = await pool.query(
             `SELECT * FROM wonderful_payments WHERE merchant_reference = $1`,
             [merchant_reference]
         );
-        if (!pmtRow.rows.length) return res.status(404).json({ error: 'Payment not found for that reference' });
+        if (!pmtRow.rows.length) return res.status(404).json({ error: 'Payment not found' });
         const pmt = pmtRow.rows[0];
-
-        if (pmt.status === 'credited') {
-            return res.status(409).json({ error: 'Already credited', payment: pmt });
-        }
-
-        // Verify with Wonderful API before crediting
+        if (pmt.status === 'credited') return res.status(409).json({ error: 'Already credited', payment: pmt });
         if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'WONDERFUL_API_KEY not set' });
-        const verifyId = pmt.wonderful_payment_id;
-        if (!verifyId) return res.status(400).json({ error: 'No wonderful_payment_id on record — cannot verify. Check Wonderful dashboard manually.' });
 
-        let verified;
-        try {
-            const verifyRes = await wonderfulRequest('GET', `/v2/payments/${verifyId}`);
-            verified = verifyRes.data?.status;
-        } catch (e) {
-            return res.status(502).json({ error: 'Wonderful API verify failed: ' + e.message });
+        // Verify — list-search fallback handles NULL wonderful_payment_id
+        const { verified, resolvedWpId } = await _wonderfulVerifyStatus(pmt);
+        if (!verified) {
+            return res.status(502).json({ error: 'Could not verify with Wonderful — check dashboard and try again.' });
         }
-
         if (verified !== 'paid' && verified !== 'accepted') {
             return res.status(400).json({ error: `Wonderful payment status is '${verified}' — not creditable`, verified_status: verified });
         }
 
-        // Idempotency claim + credit atomically — rolled back if either step fails
-        const mcClient = await pool.connect();
-        let pounds, balBefore3, balAfter3;
         try {
-            await mcClient.query('BEGIN');
-            const claim = await mcClient.query(
-                `UPDATE wonderful_payments
-                 SET status = 'credited', confirmed_at = NOW(), credited_at = NOW()
-                 WHERE id = $1 AND status != 'credited'
-                 RETURNING *`,
-                [pmt.id]
-            );
-            if (!claim.rows.length) {
-                await mcClient.query('ROLLBACK');
-                return res.status(409).json({ error: 'Race condition — already credited' });
-            }
-            pounds = pmt.amount_pence / 100;
-            const balBeforeRow3 = await mcClient.query('SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1', [pmt.player_id]);
-            balBefore3 = parseFloat(balBeforeRow3.rows[0]?.balance || 0);
-            await mcClient.query(
-                `INSERT INTO credits (player_id, balance, last_updated)
-                 VALUES ($1, $2, NOW())
-                 ON CONFLICT (player_id) DO UPDATE
-                 SET balance = credits.balance + $2, last_updated = NOW()`,
-                [pmt.player_id, pounds]
-            );
-            balAfter3 = balBefore3 + pounds;
-            await mcClient.query('COMMIT');
-        } catch (txErr) {
-            await mcClient.query('ROLLBACK').catch(() => {});
-            return res.status(500).json({ error: 'Credit transaction failed: ' + txErr.message });
-        } finally {
-            mcClient.release();
+            const result = await creditAndAutoRegisterWonderful(pmt, {
+                adminId: req.user.userId,
+                contextLabel: 'manual-credit',
+                verifyWpId: resolvedWpId
+            });
+            if (result.alreadyCredited) return res.status(409).json({ error: 'Race condition — already credited' });
+
+            const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [pmt.player_id]);
+            const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
+            return res.json({
+                success: true,
+                amount: result.pounds.toFixed(2),
+                player_id: pmt.player_id,
+                new_balance: newBal,
+                auto_register_status: result.autoRegister.status,
+                auto_register_reason: result.autoRegister.reason
+            });
+        } catch (e) {
+            return res.status(500).json({ error: 'Credit transaction failed: ' + e.message });
         }
-
-        await recordCreditTransaction(pool, pmt.player_id, pounds, 'wonderful_topup',
-            `Manual credit by superadmin — Wonderful ref ${pmt.merchant_reference}`, null);
-        await auditLog(pool, pmt.player_id, 'wonderful_credited', req.user.playerId,
-            `MANUAL CREDIT: £${pounds.toFixed(2)} via Wonderful · Balance: £${balBefore3.toFixed(2)} → £${balAfter3.toFixed(2)} · Ref: ${pmt.merchant_reference}`);
-
-        const balRow = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [pmt.player_id]);
-        const newBal = parseFloat(balRow.rows[0]?.balance || 0).toFixed(2);
-
-        // Send confirmation email + trigger RAF activation
-        setImmediate(() => sendWonderfulCreditEmail(pmt.player_id, pounds, pmt.merchant_reference));
-        setImmediate(() => triggerRafActivation(pmt.player_id).catch(() => {}));
-
-        res.json({ success: true, amount: pounds.toFixed(2), player_id: pmt.player_id, new_balance: newBal });
     } catch (e) {
         console.error('Manual Wonderful credit error:', e.message);
         res.status(500).json({ error: 'Server error: ' + e.message });
@@ -19964,7 +20152,7 @@ app.put('/api/admin/series/:seriesId/scoreline', authenticateToken, requireSuper
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web39-fix2`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web47`);
 
     // ── Team-email settle recovery sweep ────────────────────────────────────
     // Pending "settle" timers live in memory (setTimeout). If the server restarts
@@ -19994,6 +20182,78 @@ app.listen(PORT, () => {
     setTimeout(recoverPendingTeamSettles, 5000);
     // And periodically thereafter
     setInterval(recoverPendingTeamSettles, 2 * 60 * 1000); // every 2 minutes
+
+    // ── Wonderful payment reconciler ────────────────────────────────────────
+    // The webhook is the primary credit path but it can fail silently: Render
+    // cold starts, transient network errors, Wonderful API hiccups, dropped
+    // browser tabs. This sweep finds any payment that's still non-credited and
+    // re-verifies with Wonderful, crediting (+ auto-registering for the game,
+    // if applicable) if paid. Runs on boot (catches webhooks missed during a
+    // deploy or cold-start) and every 5 minutes thereafter.
+    let wonderfulReconcilerRunning = false;
+    async function reconcilePendingWonderfulPayments() {
+        if (wonderfulReconcilerRunning) return; // avoid overlap if previous run is slow
+        if (!WONDERFUL_API_KEY) return;
+        wonderfulReconcilerRunning = true;
+        try {
+            // Only look back 72 hours — older stuck payments need manual admin
+            // intervention anyway. LIMIT 30 per run so we don't hammer Wonderful.
+            // Skip terminal states (credited/failed/cancelled/expired/init_failed)
+            // and rows younger than 30s (to avoid racing a live initiate call).
+            // We INCLUDE init_pending rows because a stuck init_pending might be one
+            // where the DB INSERT succeeded but the subsequent Wonderful call failed
+            // to return cleanly — _wonderfulVerifyStatus will list-search and resolve.
+            const pending = await pool.query(
+                `SELECT * FROM wonderful_payments
+                 WHERE status NOT IN ('credited', 'failed', 'cancelled', 'expired', 'init_failed')
+                   AND created_at BETWEEN NOW() - INTERVAL '72 hours' AND NOW() - INTERVAL '30 seconds'
+                 ORDER BY created_at ASC
+                 LIMIT 30`
+            );
+            if (pending.rows.length === 0) return;
+            console.log(`💳 [WF reconciler]: checking ${pending.rows.length} pending payment(s)…`);
+
+            let credited = 0, stillPending = 0, failed = 0;
+            for (const pmt of pending.rows) {
+                try {
+                    const { verified, resolvedWpId } = await _wonderfulVerifyStatus(pmt);
+                    if (!verified) { failed++; continue; }
+                    if (verified === 'paid' || verified === 'accepted') {
+                        const result = await creditAndAutoRegisterWonderful(pmt, {
+                            contextLabel: 'reconciler',
+                            verifyWpId: resolvedWpId
+                        });
+                        if (result.credited) {
+                            credited++;
+                            console.log(`  ✓ credited £${result.pounds.toFixed(2)} — ref ${pmt.merchant_reference}${pmt.game_id ? ` · auto-register: ${result.autoRegister.status || 'topup-only'}` : ''}`);
+                        }
+                    } else {
+                        // Not paid — mirror Wonderful's state in our DB without crediting
+                        if (pmt.status !== verified) {
+                            await pool.query(
+                                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status != 'credited'`,
+                                [verified, resolvedWpId, pmt.id]
+                            ).catch(() => {});
+                        }
+                        stillPending++;
+                    }
+                } catch (e) {
+                    failed++;
+                    console.error(`  ✗ reconciler error for ref ${pmt.merchant_reference}:`, e.message);
+                }
+            }
+            if (credited > 0 || failed > 0) {
+                console.log(`💳 Wonderful reconciler done: ${credited} credited, ${stillPending} still pending, ${failed} failed`);
+            }
+        } catch (e) {
+            console.error('Wonderful reconciler sweep error:', e.message);
+        } finally {
+            wonderfulReconcilerRunning = false;
+        }
+    }
+    // Fire on boot (after brief delay for DB pool) + every 5 min thereafter
+    setTimeout(reconcilePendingWonderfulPayments, 10_000);
+    setInterval(reconcilePendingWonderfulPayments, 5 * 60 * 1000);
 
     // Keep database AND backend warm (ping every 5 minutes)
     setInterval(async () => {
