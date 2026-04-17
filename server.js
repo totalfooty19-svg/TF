@@ -10719,7 +10719,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
                 p.squad_number,
                 p.photo_url,
                 p.reliability_tier,
-                p.position_areas,
+                r.position_areas,
                 p.overall_rating,
                 p.goalkeeper_rating,
                 p.defending_rating,
@@ -10746,7 +10746,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
             WHERE r.game_id = $1
             GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number,
-                     p.photo_url, p.reliability_tier, p.position_areas,
+                     p.photo_url, p.reliability_tier, r.position_areas,
                      p.overall_rating, p.goalkeeper_rating, p.defending_rating,
                      p.strength_rating, p.pace_rating, p.decisions_rating,
                      p.shooting_rating, p.fitness_rating, p.assisting_rating,
