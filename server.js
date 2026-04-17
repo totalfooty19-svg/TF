@@ -321,7 +321,7 @@ async function recordCreditTransaction(db, playerId, amount, type, description, 
 // already includes them — we just need to classify the transaction correctly.
 // Returns { realCharged } — the portion paid from real balance (for amount_paid).
 async function applyGameFee(db, playerId, cost, description) {
-    if (!cost || cost <= 0) return { realCharged: 0 };
+    if (!cost || cost <= 0) return { realCharged: 0, freeCharged: 0 };
 
     // Remaining free credits = net sum of all free_credit transactions
     const fcResult = await db.query(
@@ -354,7 +354,10 @@ async function applyGameFee(db, playerId, cost, description) {
         await recordCreditTransaction(db, playerId, -realCharged, 'game_fee', description);
     }
 
-    return { realCharged };
+    // Return both portions so callers can persist amount_paid (real) + amount_paid_free
+    // on the registration row. This enables exact refund on drop-out regardless of EB
+    // tier changes between signup and drop-out (bug fixed web47).
+    return { realCharged, freeCharged: freeUsed };
 }
 
 // ── EARLY BIRD PRICING HELPER ────────────────────────────────────────────────
@@ -628,8 +631,82 @@ async function reviewDynamicStarRating(pool, gameId) {
 
 // ── PUSH NOTIFICATIONS ───────────────────────────────────────────────────────
 
+// sendAwardsOpenEmails: email every confirmed participant when awards voting opens.
+// Throttled via games.awards_emailed_at — we set it to NOW() on first send so
+// repeat triggers (e.g. admin re-runs finalize) don't spam the same players.
+// If awards_emailed_at is already set, this function is a no-op.
+async function sendAwardsOpenEmails(gameId) {
+    try {
+        // Check throttle: if we've already sent emails for this awards-open event, skip.
+        // Column exists only after the web47 migration below — use COALESCE-safe guard.
+        const gRow = await pool.query(`
+            SELECT g.game_date, g.game_url, g.format, g.awards_close_at,
+                   g.awards_emailed_at,
+                   v.name AS venue_name
+            FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.id = $1`, [gameId]);
+        if (!gRow.rows.length) return;
+        const g = gRow.rows[0];
+        if (g.awards_emailed_at) return; // already emailed — throttle
+
+        // Get confirmed participants + their emails (skip opt-outs)
+        const pRes = await pool.query(`
+            SELECT p.id, p.email, p.alias, p.full_name
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.email IS NOT NULL`,
+            [gameId]
+        );
+        if (!pRes.rows.length) return;
+
+        const d = new Date(g.game_date);
+        const dayStr = d.toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long', timeZone:'Europe/London' });
+        const venueName = (g.venue_name || 'your game');
+        const closeDate = g.awards_close_at
+            ? new Date(g.awards_close_at).toLocaleString('en-GB', { weekday:'short', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit', timeZone:'Europe/London' })
+            : 'soon';
+        const gameLink = `https://totalfooty.co.uk/game.html?url=${g.game_url}`;
+
+        // Fire emails in parallel, swallow individual failures
+        await Promise.all(pRes.rows.map(async (p) => {
+            const first = (p.alias || p.full_name || '').split(' ')[0] || 'Player';
+            try {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to: p.email,
+                    subject: `🗳️ Vote now — awards open for ${venueName}`,
+                    html: wrapEmailHtml(`
+                        <h2 style="color:#c299ff;font-size:22px;font-weight:900;margin:0 0 16px;">AWARDS ARE OPEN 🏆</h2>
+                        <p style="color:#ccc;font-size:15px;margin:0 0 12px;">Hey ${htmlEncode(first)},</p>
+                        <p style="color:#ccc;font-size:14px;margin:0 0 20px;">Voting is now open for <strong style="color:#fff;">${htmlEncode(venueName)} — ${htmlEncode(dayStr)}</strong>. Cast your votes for MOTM, Engine, Brick Wall, Donkey and more.</p>
+                        <div style="background:#110a16;border:2px solid #2a1a3a;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
+                            <div style="font-size:42px;margin-bottom:6px;">⭐ 🐴 🔋 🧱 🎬</div>
+                            <div style="font-size:12px;color:#7b6b8a;font-weight:700;">Voting closes ${htmlEncode(closeDate)}</div>
+                        </div>
+                        <a href="${gameLink}" style="display:block;text-align:center;padding:14px;background:#c299ff;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">CAST MY VOTES →</a>
+                        <p style="color:#555;font-size:11px;margin-top:20px;">You're receiving this because you played in this game. Votes close 24h after awards open.</p>
+                    `)
+                });
+            } catch (_) { /* individual send failure ignored */ }
+        }));
+
+        // Mark as emailed so repeat awards-open triggers don't re-spam
+        await pool.query(
+            `UPDATE games SET awards_emailed_at = NOW() WHERE id = $1`,
+            [gameId]
+        );
+    } catch (e) {
+        console.warn(`sendAwardsOpenEmails failed for game ${gameId} (non-critical):`, e.message);
+    }
+}
+
 // sendTeamsConfirmedEmails: notify all confirmed players of their team assignment
-async function sendTeamsConfirmedEmails(gameId) {
+async function sendTeamsConfirmedEmails(gameId, options = {}) {
+    // options:
+    //   emailOnlyPlayerIds: Set<uuid>  — if provided, only email these players (used by diff settle)
+    //   persistSnapshot:    boolean    — if true (default), save current team assignments to DB for future diff
+    const emailOnlyPlayerIds = options.emailOnlyPlayerIds || null;
+    const persistSnapshot    = options.persistSnapshot !== false; // default true
     try {
         // Fetch game info
         const gRow = await pool.query(`
@@ -645,9 +722,9 @@ async function sendTeamsConfirmedEmails(gameId) {
         const venue  = g.venue_name || 'TBC';
         const gameLink = `https://totalfooty.co.uk/game.html?url=${g.game_url}`;
 
-        // Fetch each player with their team colour + email
+        // Fetch each player with their team colour + email + player_id (for filter + snapshot)
         const players = await pool.query(`
-            SELECT p.alias, p.full_name, u.email, t.team_name
+            SELECT p.id AS player_id, p.alias, p.full_name, u.email, t.team_name
             FROM team_players tp
             JOIN teams t ON t.id = tp.team_id
             JOIN players p ON p.id = tp.player_id
@@ -662,7 +739,11 @@ async function sendTeamsConfirmedEmails(gameId) {
         const isExternalGame = gameTypeRow.rows[0]?.team_selection_type === 'vs_external';
         const opponent = gameTypeRow.rows[0]?.external_opponent || 'opponent';
 
+        let emailedCount = 0;
         for (const player of players.rows) {
+            // Diff-email filter: skip players not in the changed set
+            if (emailOnlyPlayerIds && !emailOnlyPlayerIds.has(player.player_id)) continue;
+
             const name      = player.alias || player.full_name;
             const teamName  = player.team_name || 'TBC';
             const isRed     = teamName.toLowerCase() === 'red';
@@ -701,12 +782,139 @@ async function sendTeamsConfirmedEmails(gameId) {
                     <a href="${gameLink}" style="display:block;text-align:center;padding:14px;background:${teamColor};color:#fff;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;letter-spacing:1px;">VIEW GAME PAGE →</a>
                 `)
             }).catch(e => console.error(`Teams email failed for ${player.email}:`, e.message));
+            emailedCount++;
         }
-        console.log(`📧 Teams confirmed emails sent for game ${gameId} (${players.rows.length} players)`);
+        console.log(`📧 Teams confirmed emails sent for game ${gameId} (${emailedCount}/${players.rows.length} players${emailOnlyPlayerIds ? ' — diff' : ''})`);
+
+        // Persist current snapshot of team assignments so future regens can diff against it.
+        // Snapshot shape: { "<playerId>": "<teamName>", ... }
+        if (persistSnapshot) {
+            const snapshot = {};
+            for (const p of players.rows) snapshot[p.player_id] = p.team_name;
+            await pool.query(
+                `UPDATE games SET last_teams_email_snapshot = $1::jsonb WHERE id = $2`,
+                [JSON.stringify(snapshot), gameId]
+            ).catch(e => console.error('Failed to persist team email snapshot:', e.message));
+        }
     } catch (e) {
         console.error('sendTeamsConfirmedEmails error (non-critical):', e.message);
     }
 }
+
+// ── Team-email debounce helpers ──────────────────────────────────────────────
+// Admins often regenerate teams multiple times before settling. Firing emails on every
+// regen spams players. Instead, after the FIRST generation emails go out immediately;
+// subsequent regens within TEAM_EMAIL_DEBOUNCE_MS suppress the email and (re)schedule a
+// 10-minute "settle" that diff-emails only players whose team changed.
+// State is persisted in games.teams_email_settle_at + games.last_teams_email_snapshot
+// so restarts/deploys don't lose the pending settle (startup sweep reconciles any
+// settles whose time has already passed).
+const TEAM_EMAIL_DEBOUNCE_MS = 10 * 60 * 1000; // 10 minutes
+const _teamEmailTimers = new Map(); // gameId -> setTimeout handle
+
+// Read the currently-assigned team for every player on a game as a plain object
+async function getTeamSnapshot(gameId) {
+    const r = await pool.query(`
+        SELECT tp.player_id, t.team_name
+        FROM team_players tp
+        JOIN teams t ON t.id = tp.team_id
+        WHERE t.game_id = $1`, [gameId]);
+    const snap = {};
+    for (const row of r.rows) snap[row.player_id] = row.team_name;
+    return snap;
+}
+
+// Compute the set of players who need to be emailed based on old vs new snapshot.
+// A player needs an email if:
+//   - They're in the new snapshot but not the old (added to teams)
+//   - They're in the new snapshot but on a different team than the old
+// (Players removed from teams aren't re-emailed — they weren't playing anyway; the admin
+//  flow for removing confirmed players is dropout/swap which has its own notifications.)
+function computeTeamDiff(oldSnapshot, newSnapshot) {
+    const changed = new Set();
+    const oldSnap = oldSnapshot || {};
+    for (const [playerId, newTeam] of Object.entries(newSnapshot)) {
+        if (oldSnap[playerId] !== newTeam) changed.add(playerId);
+    }
+    return changed;
+}
+
+// Schedule (or reschedule) the 10-minute settle timer for a game.
+// Persists the settle-at time in the DB so a server restart can recover it.
+async function scheduleTeamEmailSettle(gameId) {
+    // Cancel any in-memory pending timer for this game
+    if (_teamEmailTimers.has(gameId)) {
+        clearTimeout(_teamEmailTimers.get(gameId));
+        _teamEmailTimers.delete(gameId);
+    }
+    const settleAt = new Date(Date.now() + TEAM_EMAIL_DEBOUNCE_MS);
+    await pool.query(
+        `UPDATE games SET teams_email_settle_at = $1 WHERE id = $2`,
+        [settleAt, gameId]
+    ).catch(e => console.error('Failed to persist teams_email_settle_at:', e.message));
+
+    const handle = setTimeout(() => {
+        _teamEmailTimers.delete(gameId);
+        fireTeamEmailSettle(gameId).catch(e =>
+            console.error(`Team email settle failed for ${gameId}:`, e.message));
+    }, TEAM_EMAIL_DEBOUNCE_MS);
+    _teamEmailTimers.set(gameId, handle);
+    console.log(`⏱️  Team email settle scheduled for game ${gameId} at ${settleAt.toISOString()}`);
+}
+
+// Fire the settle: diff current teams against last-emailed snapshot, email only the
+// players whose team actually changed, and clear the pending settle marker.
+async function fireTeamEmailSettle(gameId) {
+    try {
+        const gRow = await pool.query(
+            `SELECT last_teams_email_snapshot FROM games WHERE id = $1`, [gameId]
+        );
+        if (!gRow.rows.length) return;
+        const lastSnapshot = gRow.rows[0].last_teams_email_snapshot || {};
+        const currentSnapshot = await getTeamSnapshot(gameId);
+        const changedIds = computeTeamDiff(lastSnapshot, currentSnapshot);
+
+        if (changedIds.size === 0) {
+            console.log(`⏱️  Team email settle fired for game ${gameId} — no team changes, no emails sent`);
+            // Still update snapshot to current state + clear settle marker so we're clean
+            await pool.query(
+                `UPDATE games SET teams_email_settle_at = NULL, last_teams_email_snapshot = $1::jsonb WHERE id = $2`,
+                [JSON.stringify(currentSnapshot), gameId]
+            );
+            return;
+        }
+
+        await sendTeamsConfirmedEmails(gameId, { emailOnlyPlayerIds: changedIds, persistSnapshot: true });
+        // Also fire push notifications for changed players only
+        try {
+            const gameData = await getGameDataForNotification(gameId);
+            for (const pid of changedIds) {
+                sendNotification('teams_confirmed', pid, gameData).catch(() => {});
+            }
+        } catch (_) { /* non-critical */ }
+        await pool.query(
+            `UPDATE games SET teams_email_settle_at = NULL WHERE id = $1`,
+            [gameId]
+        );
+        console.log(`⏱️  Team email settle fired for game ${gameId} — diff emailed ${changedIds.size} player(s)`);
+    } catch (e) {
+        console.error('fireTeamEmailSettle error:', e.message);
+    }
+}
+
+// Cancel any pending settle for a game (used by confirm-draft / confirm-game, which
+// are explicit final actions that should email immediately).
+async function cancelPendingTeamEmail(gameId) {
+    if (_teamEmailTimers.has(gameId)) {
+        clearTimeout(_teamEmailTimers.get(gameId));
+        _teamEmailTimers.delete(gameId);
+    }
+    await pool.query(
+        `UPDATE games SET teams_email_settle_at = NULL WHERE id = $1`,
+        [gameId]
+    ).catch(e => console.error('Failed to clear teams_email_settle_at:', e.message));
+}
+
 
 // getGameDataForNotification: fetch minimal game info for push payloads
 async function getGameDataForNotification(gameId) {
@@ -2399,6 +2607,113 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
     }
 });
 
+// GET /api/players/me/pending-votes
+// Returns dashboard-ready data for the "Awards" slot on the home dashboard.
+// Two buckets:
+//   - pending: games I played in where awards_open=true AND I haven't voted yet
+//   - results: games I played in where awards were confirmed within last 48h
+// Tapping the dashboard slot opens the most recent game in whichever bucket is
+// populated (pending takes precedence). When both buckets are empty the client
+// falls back to showing Recent Games in that same slot. (Web47)
+app.get('/api/players/me/pending-votes', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+
+        // Bucket 1: games with awards currently open where I haven't cast any vote
+        const pendingResult = await pool.query(`
+            SELECT g.id            AS game_id,
+                   g.game_url      AS game_url,
+                   g.game_date     AS game_date,
+                   v.name          AS venue_name,
+                   COALESCE((SELECT COUNT(*) FROM game_award_votes gav
+                             WHERE gav.game_id = g.id AND gav.voter_player_id = $1), 0) AS my_vote_count
+            FROM games g
+            JOIN registrations r ON r.game_id = g.id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE r.player_id = $1
+              AND r.status = 'confirmed'
+              AND g.awards_open = true
+              AND (g.awards_close_at IS NULL OR g.awards_close_at > NOW())
+            ORDER BY g.game_date DESC
+            LIMIT 20
+        `, [playerId]);
+
+        const pending = pendingResult.rows
+            .filter(r => parseInt(r.my_vote_count) === 0)
+            .map(r => ({
+                game_id:    r.game_id,
+                game_url:   r.game_url,
+                game_date:  r.game_date,
+                venue_name: r.venue_name,
+            }));
+
+        // Bucket 2: games with awards confirmed in last 48h that I was in. We look at
+        // game_awards.created_at — records are inserted when the awards close/resolve.
+        // Fallback: if no created_at field ordering gives inconsistent results, use
+        // games.awards_close_at as a proxy for "recently announced".
+        const resultsResult = await pool.query(`
+            SELECT DISTINCT g.id   AS game_id,
+                   g.game_url      AS game_url,
+                   g.game_date     AS game_date,
+                   v.name          AS venue_name,
+                   g.awards_close_at AS awards_close_at,
+                   (SELECT COUNT(*) FROM game_awards ga WHERE ga.game_id = g.id) AS award_count
+            FROM games g
+            JOIN registrations r ON r.game_id = g.id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            JOIN game_awards ga2 ON ga2.game_id = g.id
+            WHERE r.player_id = $1
+              AND r.status = 'confirmed'
+              AND g.awards_open = false
+              AND g.awards_close_at IS NOT NULL
+              AND g.awards_close_at > NOW() - INTERVAL '48 hours'
+            ORDER BY g.awards_close_at DESC
+            LIMIT 5
+        `, [playerId]);
+
+        const results = resultsResult.rows.map(r => ({
+            game_id:         r.game_id,
+            game_url:        r.game_url,
+            game_date:       r.game_date,
+            venue_name:      r.venue_name,
+            awards_close_at: r.awards_close_at,
+            award_count:     parseInt(r.award_count || 0),
+        }));
+
+        res.json({ pending, results });
+    } catch (error) {
+        console.error('Get pending votes error:', error);
+        res.status(500).json({ error: 'Failed to get pending votes' });
+    }
+});
+
+// POST /api/analytics/vote-widget-tap
+// Logs a tap event on the dashboard smart slot. Used to measure engagement with
+// the votes/results/recent cascade. Fire-and-forget from the client — we always
+// return 200 to avoid blocking the user flow even if logging fails.
+// Body: { slot_mode: 'votes'|'results'|'recent'|'empty', game_id?: uuid, platform?: 'web'|'mobile' }
+app.post('/api/analytics/vote-widget-tap', authenticateToken, async (req, res) => {
+    try {
+        const { slot_mode, game_id, platform } = req.body || {};
+        const validModes = ['votes', 'results', 'recent', 'empty'];
+        const mode = validModes.includes(slot_mode) ? slot_mode : 'empty';
+        const plat = (platform === 'mobile' || platform === 'web') ? platform : 'web';
+        // game_id is optional and only validated as a string — if it's bad we just
+        // store null rather than rejecting the entire event.
+        const gid = (typeof game_id === 'string' && game_id.length >= 32 && game_id.length <= 40) ? game_id : null;
+        await pool.query(
+            `INSERT INTO vote_widget_taps (player_id, slot_mode, game_id, platform, created_at)
+             VALUES ($1, $2, $3, $4, NOW())`,
+            [req.user.playerId, mode, gid, plat]
+        );
+        res.json({ ok: true });
+    } catch (error) {
+        // Silent failure — analytics should never break the user flow
+        console.warn('vote-widget-tap log failed:', error.message);
+        res.json({ ok: false });
+    }
+});
+
 app.put('/api/players/me', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -3704,6 +4019,25 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         } else {
             game.confirmed_organiser_count = 0;
         }
+
+        // ORGANISER-COMP: Expose current comp count + availability flag so the player-facing
+        // game modal can show the correct "ORGANISER SIGN UP" button (free) vs the regular
+        // paid signup button. Comp cap is 6 per game (matches /register endpoint logic).
+        // The flag is only truthy if the current user is actually an organiser AND a comp slot
+        // is still available on this game.
+        const compCountRow = await pool.query(
+            "SELECT COUNT(*) AS cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
+            [req.params.id]
+        );
+        const compCount = parseInt(compCountRow.rows[0].cnt) || 0;
+        game.comp_count = compCount;
+        game.comp_cap = 6;
+        // Only compute eligibility for the calling user — avoids leaking organiser status
+        const callerCheck = await pool.query(
+            'SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]
+        );
+        const callerIsOrganiser = !!callerCheck.rows[0]?.is_organiser;
+        game.organiser_comp_available = callerIsOrganiser && compCount < 6;
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -4435,7 +4769,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         }
 
         // Determine registration status
-        let status, regBackupType = null, regAmountPaid = null;
+        let status, regBackupType = null, regAmountPaid = null, regAmountPaidFree = null;
         
         if (isFull) {
             // Game is full - must be a backup registration
@@ -4473,9 +4807,11 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                         return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                     }
                     
-                    // Capture realCharged so amount_paid correctly records the real-balance portion
-                    const { realCharged: backupCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Confirmed backup for game ${gameId} (${pricingTier} pricing)`);
+                    // Capture realCharged + freeCharged so amount_paid and amount_paid_free
+                    // correctly record both portions — needed for exact EB-aware refund on drop-out
+                    const { realCharged: backupCharged, freeCharged: backupFreeCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Confirmed backup for game ${gameId} (${pricingTier} pricing)`);
                     regAmountPaid = backupCharged;
+                    regAmountPaidFree = backupFreeCharged;
                 }
             }
         } else {
@@ -4494,8 +4830,9 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     return res.status(400).json({ error: 'Insufficient credits' });
                 }
                 
-                const { realCharged: selfRegCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Registration for game ${gameId} (${pricingTier} pricing)`);
+                const { realCharged: selfRegCharged, freeCharged: selfRegFreeCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Registration for game ${gameId} (${pricingTier} pricing)`);
                 regAmountPaid = selfRegCharged;
+                regAmountPaidFree = selfRegFreeCharged;
             }
         }
         
@@ -4511,12 +4848,13 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
 
         // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, venue_clash_team_preference, amount_paid, is_comped, position_areas)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, venue_clash_team_preference, amount_paid, amount_paid_free, is_comped, position_areas)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
              game.is_venue_clash ? (venueClashTeamPreference || null) : null,
              isComped ? 0 : ((status === 'confirmed' || regBackupType === 'confirmed_backup') ? (regAmountPaid ?? effectiveCost) : 0),
+             isComped ? 0 : ((status === 'confirmed' || regBackupType === 'confirmed_backup') ? (regAmountPaidFree ?? 0) : 0),
              isComped,
              sanitisedPositionAreas]
         );
@@ -4573,7 +4911,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     : 'Registered successfully';
             }
         } else if (regBackupType === 'confirmed_backup') {
-            message = `You're on the confirmed backup list. £${parseFloat(game.cost_per_player).toFixed(2)} has been deducted and you'll be first in line if a spot opens. If you don't get on, you'll be refunded after the game.`;
+            message = `You're on the confirmed backup list. £${effectiveCost.toFixed(2)} has been deducted and you'll be first in line if a spot opens. If you don't get on, you'll be refunded after the game.`;
         } else if (regBackupType === 'gk_backup') {
             message = "You're on the GK backup list. You'll be notified if a GK spot becomes available.";
         } else {
@@ -4960,7 +5298,7 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
 
         // Fetch the registration — must belong to this game and be registered by this player
         const regResult = await client.query(
-            `SELECT r.id, r.player_id, r.status, r.amount_paid, r.registered_by_player_id,
+            `SELECT r.id, r.player_id, r.status, r.amount_paid, r.amount_paid_free, r.registered_by_player_id,
                     p.alias, p.full_name,
                     g.game_status, g.teams_generated, g.player_editing_locked
              FROM registrations r
@@ -5001,11 +5339,12 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
 
         const playerName = reg.alias || reg.full_name;
         const refundAmt = parseFloat(reg.amount_paid || 0);
+        const refundFreeAmt = parseFloat(reg.amount_paid_free || 0);
 
         // Delete the registration
         await client.query('DELETE FROM registrations WHERE id = $1', [registrationId]);
 
-        // Refund whoever paid (the registering player)
+        // Refund whoever paid (the registering player) — both real and free portions
         if (refundAmt > 0) {
             await client.query(
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
@@ -5013,14 +5352,22 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
             );
             await recordCreditTransaction(client, playerId, refundAmt, 'refund', `Removed ${playerName} from game`);
         }
+        if (refundFreeAmt > 0) {
+            await client.query(
+                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                [refundFreeAmt, playerId]
+            );
+            await recordCreditTransaction(client, playerId, refundFreeAmt, 'free_credit', `Free credit restored — removed ${playerName} from game`);
+        }
 
         await client.query('COMMIT');
 
+        const totalRefund = refundAmt + refundFreeAmt;
         res.json({
-            message: `${playerName} has been removed.${refundAmt > 0 ? ` £${refundAmt.toFixed(2)} refunded to your balance.` : ''}`
+            message: `${playerName} has been removed.${totalRefund > 0 ? ` £${totalRefund.toFixed(2)} refunded to your balance.` : ''}`
         });
         setImmediate(() => gameAuditLog(pool, gameId, null, 'player_removed',
-            `Player: ${playerName} removed by registering player ${playerId} | Refunded: £${refundAmt.toFixed(2)}`));
+            `Player: ${playerName} removed by registering player ${playerId} | Refunded: £${totalRefund.toFixed(2)}`));
 
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -5072,9 +5419,12 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
             return res.status(400).json({ error: 'You are not on the normal backup list for this game' });
         }
 
-        // Check if there is actually a confirmed spot available (atomic)
+        // Check if there is actually a confirmed spot available (atomic).
+        // Include early_bird_price, super_early_bird_price, game_date so we can compute
+        // effective price for the charge below (bug fixed web47 — was always charging full cost).
         const game = await client.query(
             `SELECT g.cost_per_player, g.max_players,
+                    g.early_bird_price, g.super_early_bird_price, g.game_date,
                     ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
                      + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
              FROM games g WHERE g.id = $1`,
@@ -5090,8 +5440,8 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
             return res.status(409).json({ error: `Sorry — that spot was just claimed. You're still on backup.` });
         }
 
-        // Check credits
-        const cost = parseFloat(cost_per_player || 0);
+        // Check credits — at effective price (honours EB tiers).
+        const { price: cost } = getEffectivePrice(game.rows[0]);
         const creditRes = await client.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
         const balance = parseFloat(creditRes.rows[0]?.balance || 0);
         if (balance < cost) {
@@ -5102,16 +5452,28 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
             });
         }
 
-        // Claim the spot — promote to confirmed
+        // Claim the spot — promote to confirmed (amount_paid gets updated after the charge
+        // so it correctly reflects the real-balance portion, matching the pattern used by
+        // self-registration / admin-add / Wonderful auto-register).
         await client.query(
             `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
             [regCheck.rows[0].id]
         );
 
-        // Charge credits
+        // Charge credits at effective price; applyGameFee consumes free credits first and
+        // returns realCharged + freeCharged (the portions actually debited).
+        let realCharged = 0;
+        let freeCharged = 0;
         if (cost > 0) {
-            await applyGameFee(client, playerId, cost, `Claimed open spot — game ${gameId}`);
+            const chargeResult = await applyGameFee(client, playerId, cost, `Claimed open spot — game ${gameId}`);
+            realCharged = chargeResult.realCharged;
+            freeCharged = chargeResult.freeCharged || 0;
         }
+        // Record both real-balance and free-credit portions — enables exact drop-out refund
+        await client.query(
+            'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
+            [realCharged, freeCharged, regCheck.rows[0].id]
+        );
 
         // In-app notification confirmation
         await client.query(
@@ -5167,10 +5529,13 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         }
 
         // Lock game row to prevent race conditions
+        // IMPORTANT: early_bird_price + super_early_bird_price are required for getEffectivePrice()
+        // below — without them it silently falls back to standard price (bug fixed web47).
         const gameLock = await client.query(`
             SELECT max_players, cost_per_player, exclusivity,
                    player_editing_locked, team_selection_type, position_type, tournament_team_count,
-                   series_id, game_status, game_date, star_rating, min_rating_enabled
+                   series_id, game_status, game_date, star_rating, min_rating_enabled,
+                   early_bird_price, super_early_bird_price
             FROM games WHERE id = $1 FOR UPDATE
         `, [gameId]);
 
@@ -5324,7 +5689,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         }
 
         // Determine status and handle credit deduction from REGISTERING PLAYER
-        let status, regBackupType = null, friendAmountPaid = null;
+        let status, regBackupType = null, friendRealCharged = 0, friendFreeCharged = 0;
 
         if (isFull) {
             if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
@@ -5344,30 +5709,49 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             regBackupType = backupType;
 
             if (backupType === 'confirmed_backup') {
+                // Effective price honours early-bird / super-early-bird tiers.
+                // Using cost_per_player here blocked players whose balance covered the EB
+                // price but not full price (bug fixed web47).
+                const { price: effectivePrice, tier: priceTier } = getEffectivePrice(game);
                 const creditResult = await client.query('SELECT balance FROM credits WHERE player_id = $1', [registeringPlayerId]);
-                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
+                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(effectivePrice * 100)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                 }
-                await applyGameFee(client, registeringPlayerId, getEffectivePrice(game).price, `Confirmed backup for ${friendName} in game ${gameId} (${getEffectivePrice(game).tier} pricing)`);
+                const { realCharged, freeCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Confirmed backup for ${friendName} in game ${gameId} (${priceTier} pricing)`);
+                friendRealCharged = realCharged;
+                friendFreeCharged = freeCharged || 0;
             }
         } else {
             status = 'confirmed';
+            // Effective price honours early-bird / super-early-bird tiers (bug fixed web47).
+            const { price: effectivePrice, tier: priceTier } = getEffectivePrice(game);
             const creditResult = await client.query('SELECT balance FROM credits WHERE player_id = $1', [registeringPlayerId]);
-            if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(parseFloat(game.cost_per_player) * 100)) {
+            if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(effectivePrice * 100)) {
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
-            await applyGameFee(client, registeringPlayerId, getEffectivePrice(game).price, `Registration for ${friendName} in game ${gameId} (${getEffectivePrice(game).tier} pricing)`);
+            const { realCharged, freeCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Registration for ${friendName} in game ${gameId} (${priceTier} pricing)`);
+            friendRealCharged = realCharged;
+            friendFreeCharged = freeCharged || 0;
         }
 
-        // Insert registration under friend's player_id, recording who paid
+        // Insert registration under friend's player_id, recording who paid.
+        // amount_paid stores the REAL-BALANCE portion (not total) — same semantics as every
+        // other registration path. Free-credit portion is refunded separately on dropout.
+        // chargedPriceForDisplay is the full effective price; used only for notifications
+        // that show the player what was deducted in total.
+        const chargedPrice = friendRealCharged; // → amount_paid
+        const chargedPriceForDisplay = (status === 'confirmed' || regBackupType === 'confirmed_backup')
+            ? getEffectivePrice(game).price
+            : 0;
         await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid, registered_by_player_id, tournament_team_preference)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, registered_by_player_id, tournament_team_preference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
             [
                 gameId, friendPlayerId, status, positionValue, regBackupType,
-                (status === 'confirmed' || regBackupType === 'confirmed_backup') ? game.cost_per_player : 0,
+                chargedPrice,
+                friendFreeCharged,
                 registeringPlayerId,
                 tournamentTeamPreference || null
             ]
@@ -5377,9 +5761,9 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
 
         let message;
         if (status === 'confirmed') {
-            message = `${friendName} has been registered! £${parseFloat(game.cost_per_player).toFixed(2)} deducted from your balance.`;
+            message = `${friendName} has been registered! £${chargedPriceForDisplay.toFixed(2)} deducted from your balance.`;
         } else if (regBackupType === 'confirmed_backup') {
-            message = `${friendName} has been added to the confirmed backup list. £${parseFloat(game.cost_per_player).toFixed(2)} deducted from your balance.`;
+            message = `${friendName} has been added to the confirmed backup list. £${chargedPriceForDisplay.toFixed(2)} deducted from your balance.`;
         } else {
             message = `${friendName} has been added to the backup list.`;
         }
@@ -5421,7 +5805,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
 
                 // Push notification to registering player
                 const regNotifMsg = status === 'confirmed'
-                    ? `You signed up ${friendName} for ${gameDate} at ${venue}. £${parseFloat(game.cost_per_player).toFixed(2)} deducted.`
+                    ? `You signed up ${friendName} for ${gameDate} at ${venue}. £${chargedPriceForDisplay.toFixed(2)} deducted.`
                     : `You added ${friendName} to the backup list for ${gameDate} at ${venue}.`;
                 await pool.query(
                     'INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, $2, $3, $4)',
@@ -5813,9 +6197,16 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         
         await client.query('BEGIN');
         
-        // Lock the game row
+        // Lock the game row.
+        // early_bird_price, super_early_bird_price, game_date are needed for the refund
+        // calculation below — without them the refund code can't recompute effective price
+        // and ends up using full cost_per_player, which over-refunds the difference as
+        // phantom free credit for EB registrations (bug fixed web47).
         const gameCheck = await client.query(
-            'SELECT player_editing_locked, teams_generated, cost_per_player, team_selection_type, tournament_team_count, requires_organiser FROM games WHERE id = $1 FOR UPDATE',
+            `SELECT player_editing_locked, teams_generated, cost_per_player, team_selection_type,
+                    tournament_team_count, requires_organiser,
+                    early_bird_price, super_early_bird_price, game_date
+             FROM games WHERE id = $1 FOR UPDATE`,
             [gameId]
         );
         
@@ -5830,10 +6221,26 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         
         const cost = parseFloat(gameCheck.rows[0].cost_per_player);
         const teamsWereGenerated = !!gameCheck.rows[0].teams_generated;
+
+        // Compute the effective price at THIS moment — the total amount that was
+        // actually debited at registration time (real balance + free credit combined).
+        // CAVEAT: if the EB tier has transitioned since registration (e.g. player
+        // registered at super-EB 8 days out, now dropping out 2 days out at standard),
+        // this approximation will slightly under-credit the free-credit portion.
+        // Worst case is a small missed free-credit refund — never an over-refund.
+        // A stored `amount_debited_total` column would be exact; this is close enough.
+        const { price: effectiveDebited } = getEffectivePrice({
+            game_date:               gameCheck.rows[0].game_date,
+            cost_per_player:         gameCheck.rows[0].cost_per_player,
+            early_bird_price:        gameCheck.rows[0].early_bird_price,
+            super_early_bird_price:  gameCheck.rows[0].super_early_bird_price
+        });
         
-        // Get the dropping player's registration — also fetch who paid (registered_by_player_id)
+        // Get the dropping player's registration — also fetch who paid (registered_by_player_id).
+        // Web47: amount_paid_free now stored at signup, enables exact refund regardless of
+        // EB tier changes between signup and drop-out (fixed over-refund bug).
         const regResult = await client.query(
-            'SELECT id, status, backup_type, position_preference, registered_by_player_id, is_comped, amount_paid FROM registrations WHERE game_id = $1 AND player_id = $2',
+            'SELECT id, status, backup_type, position_preference, registered_by_player_id, is_comped, amount_paid, amount_paid_free FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
         
@@ -5851,9 +6258,14 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         const refundTargetId = droppingReg.registered_by_player_id || req.user.playerId;
         
         // Refund if they paid (confirmed players or confirmed backups) — skip if comped (£0 was taken)
+        let totalRefunded = 0;
         if (!wasComped && (wasConfirmed || wasConfirmedBackup)) {
-            const paidAmt = parseFloat(droppingReg.amount_paid ?? cost);
-            const freeAmt = Math.max(0, cost - paidAmt);
+            // Use stored amount_paid + amount_paid_free directly — exact refund regardless of
+            // current EB tier. Legacy rows with NULL amount_paid_free default to 0 which means
+            // refund is capped at amount_paid (safe — never over-refunds).
+            const paidAmt = parseFloat(droppingReg.amount_paid ?? 0);
+            const freeAmt = parseFloat(droppingReg.amount_paid_free ?? 0);
+            totalRefunded = paidAmt + freeAmt;
             const refundDesc = refundTargetId !== req.user.playerId
                 ? `Dropout refund for ${req.user.playerId} (paid by you)`
                 : 'Dropped out of game - refund';
@@ -5921,7 +6333,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                         [candidate.player_id]
                     );
                     const balance = creditCheck.rows.length > 0 ? parseFloat(creditCheck.rows[0].balance) : 0;
-                    if (balance >= cost) {
+                    // Balance check uses effective price — a GK backup whose balance covers
+                    // the EB price should be eligible for promotion (bug fixed web47).
+                    if (balance >= effectiveDebited) {
                         promotedPlayer = candidate;
                         break;
                     }
@@ -5979,17 +6393,23 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     [promotedPlayer.id]
                 );
                 
-                // If they weren't a confirmed_backup, charge them now
+                // If they weren't a confirmed_backup, charge them now at effective price
+                // (EB tier at promotion time — not full cost_per_player, bug fixed web47).
                 if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                    await applyGameFee(client, promotedPlayer.player_id, cost, `Promoted from backup - game ${gameId}`);
+                    const { realCharged: promotedCharged, freeCharged: promotedFreeCharged } = await applyGameFee(client, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`);
+                    // Record both portions so drop-out refund is exact.
+                    await client.query(
+                        'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
+                        [promotedCharged, promotedFreeCharged || 0, promotedPlayer.id]
+                    );
                 }
-                
+
                 // Create notification for promoted player
                 await client.query(
                     `INSERT INTO notifications (player_id, type, message, game_id)
                      VALUES ($1, 'backup_promoted', $2, $3)`,
-                    [promotedPlayer.player_id, 
-                     `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
+                    [promotedPlayer.player_id,
+                     `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${effectiveDebited.toFixed(2)} has been deducted from your balance.`}`,
                      gameId]
                 );
             }
@@ -6008,7 +6428,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 // No confirmed organiser left — look for an organiser in the backup list
                 const orgBackup = await client.query(`
                     SELECT r.id, r.player_id, r.backup_type, r.position_preference,
-                           r.amount_paid, p.full_name, p.alias
+                           r.amount_paid, r.amount_paid_free, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     WHERE r.game_id = $1 AND r.status = 'backup' AND p.is_organiser = true
@@ -6026,9 +6446,10 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     const ob = orgBackup.rows[0];
                     // Refund if confirmed_backup (they pre-paid) — organisers always play free
                     if (ob.backup_type === 'confirmed_backup') {
-                        const obCost    = parseFloat(gameCheck.rows[0].cost_per_player);
-                        const obPaid    = parseFloat(ob.amount_paid ?? obCost);
-                        const obFree    = Math.max(0, obCost - obPaid);
+                        // Use stored amount_paid + amount_paid_free directly (exact refund,
+                        // no EB-arithmetic). Legacy rows with NULL amount_paid_free default to 0.
+                        const obPaid    = parseFloat(ob.amount_paid ?? 0);
+                        const obFree    = parseFloat(ob.amount_paid_free ?? 0);
                         if (obPaid > 0) {
                             await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [obPaid, ob.player_id]);
                             await recordCreditTransaction(client, ob.player_id, obPaid, 'refund', `Organiser comp — promoted from backup for game ${gameId}`);
@@ -6073,9 +6494,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             if (wasComped) {
                 message = 'Successfully dropped out.';
             } else if (refundTargetId !== req.user.playerId) {
-                message = `Successfully dropped out. £${cost.toFixed(2)} refunded to the player who signed you up.`;
+                message = `Successfully dropped out. £${totalRefunded.toFixed(2)} refunded to the player who signed you up.`;
             } else {
-                message = `Successfully dropped out. £${cost.toFixed(2)} refunded to your balance.`;
+                message = `Successfully dropped out. £${totalRefunded.toFixed(2)} refunded to your balance.`;
             }
             if (teamsWereGenerated) {
                 message += ' Note: teams have been reset and will need to be regenerated.';
@@ -6110,7 +6531,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             }
             try {
                 const evtType = wasConfirmed ? 'dropped_out' : 'backup_removed';
-                const evtDetail = wasConfirmedBackup ? 'Was confirmed backup' : wasConfirmed ? `Refunded £${cost.toFixed(2)}` : 'No charge';
+                const evtDetail = wasConfirmedBackup ? 'Was confirmed backup' : wasConfirmed ? `Refunded £${totalRefunded.toFixed(2)}` : 'No charge';
                 // Enrich audit with player full name for easier cross-reference
                 const _playerNameRow = await pool.query(
                     'SELECT p.full_name, p.alias, u.email FROM players p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $1', [req.user.playerId]
@@ -6129,8 +6550,8 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     ['Game',     `${gameData.day} ${gameData.time}`],
                     ['Venue',    gameData.venue],
                 ];
-                if (!wasComped && (wasConfirmed || wasConfirmedBackup) && cost > 0) {
-                    _notifRows.push(['Refunded', `£${cost.toFixed(2)}${refundTargetId !== req.user.playerId ? ' (to original payer)' : ''}`]);
+                if (!wasComped && (wasConfirmed || wasConfirmedBackup) && totalRefunded > 0) {
+                    _notifRows.push(['Refunded', `£${totalRefunded.toFixed(2)}${refundTargetId !== req.user.playerId ? ' (to original payer)' : ''}`]);
                 }
                 if (promotedPlayer) {
                     _notifRows.push(['Promoted', promotedPlayer.alias || promotedPlayer.full_name]);
@@ -6349,13 +6770,22 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         const { gameId } = req.params;
         
         // Block tournament and vs_external games — both use non-algorithm assignment
-        const tournCheck = await pool.query('SELECT team_selection_type FROM games WHERE id = $1', [gameId]);
+        // Also read teams_generated + snapshot presence — used below to decide whether to
+        // email immediately (first generation) or debounce (regeneration).
+        const tournCheck = await pool.query(
+            'SELECT team_selection_type, teams_generated, last_teams_email_snapshot IS NOT NULL AS has_snapshot FROM games WHERE id = $1',
+            [gameId]
+        );
         if (tournCheck.rows[0]?.team_selection_type === 'tournament') {
             return res.status(400).json({ error: 'Tournament games must use manual team draft, not auto-generate' });
         }
         if (tournCheck.rows[0]?.team_selection_type === 'vs_external') {
             return res.status(400).json({ error: 'External games do not use team generation — use Confirm Game to assign the full squad to the TF team.' });
         }
+        // A "regeneration" is when the game had teams previously AND a snapshot exists
+        // (meaning emails have been sent before). The first-ever generate-teams hits the
+        // immediate-email path; every subsequent call goes through the debounce.
+        const isRegeneration = !!(tournCheck.rows[0]?.teams_generated && tournCheck.rows[0]?.has_snapshot);
         
         // Get all confirmed registrations with player stats
         const playersResult = await pool.query(`
@@ -6816,13 +7246,21 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                     [gameId]
                 );
                 for (const row of confirmed.rows) {
+                    // Push notifications (teams_created) always fire — these are lighter than emails
+                    // and serve as a "something changed" heads-up that won't annoy at volume.
                     await sendNotification('teams_created', row.player_id, gameData).catch(() => {});
                 }
             } catch (e) {
                 console.error('Teams created notification failed (non-critical):', e.message);
             }
-            // Email all players their team assignment (generate path also confirms teams)
-            await sendTeamsConfirmedEmails(gameId);
+            // Email path: first-time generation emails everyone immediately; regeneration
+            // schedules (or resets) a 10-minute debounced settle that diff-emails only
+            // players whose team actually changed.
+            if (isRegeneration) {
+                await scheduleTeamEmailSettle(gameId);
+            } else {
+                await sendTeamsConfirmedEmails(gameId);
+            }
         });
         
         // Calculate stats
@@ -7436,9 +7874,13 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
         const { gameId } = req.params;
         const { redTeam, blueTeam, teams: tournamentTeams } = req.body;
         
-        // Get game info
-        const gameResult = await client.query('SELECT series_id, team_selection_type, tournament_team_count FROM games WHERE id = $1', [gameId]);
+        // Get game info (also fetch teams_generated + snapshot presence for email debounce decision)
+        const gameResult = await client.query(
+            `SELECT series_id, team_selection_type, tournament_team_count,
+                    teams_generated, last_teams_email_snapshot IS NOT NULL AS has_snapshot
+             FROM games WHERE id = $1`, [gameId]);
         const game = gameResult.rows[0];
+        const isRegeneration = !!(game?.teams_generated && game?.has_snapshot);
 
         // FIX-052: Build set of confirmed player IDs to validate against
         const validPlayersResult = await client.query(
@@ -7587,8 +8029,14 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
                 isDraftMemorySave ? 'draft_saved' : 'teams_confirmed',
                 isDraftMemorySave ? 'Draft saved (non-final)' : 'Teams manually confirmed');
             if (!isDraftMemorySave) {
-                // Email all confirmed players their team assignment
-                await sendTeamsConfirmedEmails(gameId);
+                // Email path mirrors generate-teams: first manual confirm emails everyone,
+                // subsequent re-saves debounce for 10 minutes and diff-email only the
+                // players whose team actually changed.
+                if (isRegeneration) {
+                    await scheduleTeamEmailSettle(gameId);
+                } else {
+                    await sendTeamsConfirmedEmails(gameId);
+                }
             }
         });
     } catch (error) {
@@ -7625,6 +8073,9 @@ app.post('/api/admin/games/:gameId/confirm-draft', authenticateToken, requireGam
         setImmediate(async () => {
             try {
                 await gameAuditLog(pool, gameId, req.user.playerId, 'teams_confirmed', 'Draft confirmed and game locked');
+                // Explicit final action — cancel any pending debounced settle so players
+                // don't get a duplicate diff-email on top of this full confirmation.
+                await cancelPendingTeamEmail(gameId);
                 const confirmedPlayers = await pool.query(
                     `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`, [gameId]
                 );
@@ -7691,6 +8142,8 @@ app.post('/api/admin/games/:gameId/confirm-game', authenticateToken, requireGame
         // Post-commit: notifications + emails + audit
         setImmediate(async () => {
             try {
+                // Explicit final action — cancel any pending debounced settle
+                await cancelPendingTeamEmail(gameId);
                 const gameData = await getGameDataForNotification(gameId);
                 for (const { player_id } of players.rows) {
                     sendNotification('teams_confirmed', player_id, gameData).catch(() => {});
@@ -7736,7 +8189,14 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
     try {
         const { gameId } = req.params;
         const { redTeam, blueTeam } = req.body;
-        
+
+        // Capture prior state for email debounce decision (before any UPDATE touches teams)
+        const _priorStateRow = await pool.query(
+            `SELECT teams_generated, last_teams_email_snapshot IS NOT NULL AS has_snapshot FROM games WHERE id = $1`,
+            [gameId]
+        );
+        const isRegeneration = !!(_priorStateRow.rows[0]?.teams_generated && _priorStateRow.rows[0]?.has_snapshot);
+
         // Get game details for response
         // Update existing teams (they were created by generate-teams)
         await pool.query(`
@@ -7853,7 +8313,11 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
             } catch (e) {
                 console.warn('Audit team composition failed (non-critical):', e.message);
             }
-            sendTeamsConfirmedEmails(gameId);
+            if (isRegeneration) {
+                await scheduleTeamEmailSettle(gameId);
+            } else {
+                await sendTeamsConfirmedEmails(gameId);
+            }
         });
     } catch (error) {
         console.error('Confirm teams error:', error);
@@ -8444,6 +8908,12 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
              WHERE id = $2`,
             [winningTeam, gameId, validatedBalanceScore]
         );
+        // Web47: email confirmed participants once when awards open (helper is throttled
+        // via games.awards_emailed_at so repeat triggers don't re-spam). Fire and forget —
+        // don't block the game-completion transaction on email send.
+        if (shouldHaveMotm) {
+            sendAwardsOpenEmails(gameId).catch(() => {});
+        }
         
         // 2. Get all players in the game
         const playersResult = await client.query(
@@ -8610,15 +9080,13 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
 
         // FIX-099: Refund confirmed backups who were never promoted when game completes
         // Runs after COMMIT in setImmediate — uses its own client per player to avoid blocking the response
-        // NOTE: cost_per_player is NOT in scope here (game completion does not fetch it),
-        // so we JOIN g.cost_per_player directly in the query
+        // Web47: amount_paid_free stored at signup = exact refund, no EB-arithmetic needed.
         setImmediate(async () => {
             try {
                 const unpromotedBackups = await pool.query(
                     `SELECT r.id, r.player_id, r.is_comped, r.registered_by_player_id,
-                            r.amount_paid, g.cost_per_player
+                            r.amount_paid, r.amount_paid_free
                      FROM registrations r
-                     JOIN games g ON g.id = r.game_id
                      WHERE r.game_id = $1
                        AND r.status = 'backup'
                        AND r.backup_type = 'confirmed_backup'`,
@@ -8632,13 +9100,10 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 for (const backup of unpromotedBackups.rows) {
                     const refundTarget = backup.registered_by_player_id || backup.player_id;
                     const wasComped    = !!backup.is_comped;
-                    // Mirror exactly how the game was paid — same logic as the dropout refund:
-                    //   amount_paid = real balance charged at signup  → restore as 'refund'
-                    //   freeAmt     = free credits consumed at signup → restore as 'free_credit'
-                    // amount_paid is now correctly stored at registration time.
-                    // Null fallback: assume full real-balance payment if amount_paid missing.
-                    const paidAmt = parseFloat(backup.amount_paid ?? backup.cost_per_player ?? 0);
-                    const freeAmt = Math.max(0, parseFloat(backup.cost_per_player || 0) - paidAmt);
+                    // Use stored amount_paid + amount_paid_free directly — exact refund.
+                    // Legacy rows with NULL amount_paid_free default to 0 (safe under-refund).
+                    const paidAmt = parseFloat(backup.amount_paid ?? 0);
+                    const freeAmt = parseFloat(backup.amount_paid_free ?? 0);
 
                     const refundClient = await pool.connect();
                     try {
@@ -10184,13 +10649,15 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
             return res.status(400).json({ error: 'This player is already confirmed as a referee for this game' });
         }
         
-        // Get game details for capacity + GK checks
+        // Get game details for capacity + GK checks + effective-price calc (EB-aware, web47)
         const gameResult = await pool.query(
-            'SELECT cost_per_player, max_players, team_selection_type, tournament_team_count FROM games WHERE id = $1',
+            `SELECT cost_per_player, max_players, team_selection_type, tournament_team_count,
+                    early_bird_price, super_early_bird_price, game_date
+             FROM games WHERE id = $1`,
             [gameId]
         );
         const game = gameResult.rows[0];
-        const cost = parseFloat(game.cost_per_player);
+        const cost = getEffectivePrice(game).price;
         
         // Check capacity (confirmed registrations + guests)
         const countResult = await pool.query(
@@ -10237,16 +10704,16 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         try {
             await txClient.query('BEGIN');
         
-            const { realCharged: adminAddCharged } = await applyGameFee(txClient, playerId, cost, `Admin added to game ${gameId}`);
+            const { realCharged: adminAddCharged, freeCharged: adminAddFree } = await applyGameFee(txClient, playerId, cost, `Admin added to game ${gameId}`);
         
             // Add player — normalise 'goalkeeper' -> 'GK' to match all server-side position checks
             const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper'
                 ? 'GK'
                 : (position || 'outfield');
             await txClient.query(
-                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
-                 VALUES ($1, $2, 'confirmed', $3, $4)`,
-                [gameId, playerId, normPosition, adminAddCharged]
+                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, amount_paid_free)
+                 VALUES ($1, $2, 'confirmed', $3, $4, $5)`,
+                [gameId, playerId, normPosition, adminAddCharged, adminAddFree || 0]
             );
 
             await txClient.query('COMMIT');
@@ -10352,12 +10819,12 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         const discountClient = await pool.connect();
         try {
             await discountClient.query('BEGIN');
-            const { realCharged: customAddCharged } = await applyGameFee(discountClient, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`);
+            const { realCharged: customAddCharged, freeCharged: customAddFree } = await applyGameFee(discountClient, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`);
             const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper' ? 'GK' : (position || 'outfield');
             await discountClient.query(
-                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid)
-                 VALUES ($1, $2, 'confirmed', $3, $4)`,
-                [gameId, playerId, normPosition, customAddCharged]
+                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, amount_paid_free)
+                 VALUES ($1, $2, 'confirmed', $3, $4, $5)`,
+                [gameId, playerId, normPosition, customAddCharged, customAddFree || 0]
             );
             await discountClient.query('COMMIT');
         } catch (txErr) {
@@ -10384,8 +10851,9 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         const { gameId, registrationId } = req.params;
         
         // Get registration details (include position + status + who paid for backup promotion and correct refund)
+        // Web47: amount_paid_free stored at signup = exact refund regardless of EB tier.
         const regResult = await pool.query(
-            'SELECT player_id, status, backup_type, position_preference, registered_by_player_id, amount_paid FROM registrations WHERE id = $1 AND game_id = $2',
+            'SELECT player_id, status, backup_type, position_preference, registered_by_player_id, amount_paid, amount_paid_free FROM registrations WHERE id = $1 AND game_id = $2',
             [registrationId, gameId]
         );
         
@@ -10401,17 +10869,21 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
         // If a friend was registered by someone else, refund that person — not the friend
         const refundTargetId = removedReg.registered_by_player_id || playerId;
         
-        // Get game cost and type
+        // Get game cost and type — effectiveDebited still needed for promoted-backup charging
         const gameResult = await pool.query(
-            'SELECT cost_per_player, team_selection_type, tournament_team_count FROM games WHERE id = $1',
+            `SELECT cost_per_player, team_selection_type, tournament_team_count,
+                    early_bird_price, super_early_bird_price, game_date
+             FROM games WHERE id = $1`,
             [gameId]
         );
         const cost = parseFloat(gameResult.rows[0].cost_per_player);
-        
-        // Only refund if they actually paid (confirmed or confirmed_backup)
+        const { price: effectiveDebited } = getEffectivePrice(gameResult.rows[0]);
+
+        // Only refund if they actually paid (confirmed or confirmed_backup).
+        // Use stored amount_paid + amount_paid_free directly (exact, no EB-arithmetic).
         if (wasConfirmed || wasConfirmedBackup) {
-            const paidAmt = parseFloat(removedReg.amount_paid ?? cost);
-            const freeAmt = Math.max(0, cost - paidAmt);
+            const paidAmt = parseFloat(removedReg.amount_paid ?? 0);
+            const freeAmt = parseFloat(removedReg.amount_paid_free ?? 0);
             const refundDesc = refundTargetId !== playerId
                 ? `Admin removed ${playerId} from game — refund to original payer`
                 : `Admin removed from game ${gameId}`;
@@ -10505,7 +10977,13 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                         [promotedPlayer.id]
                     );
                     if (promotedPlayer.backup_type !== 'confirmed_backup') {
-                        await applyGameFee(promoClient, promotedPlayer.player_id, cost, `Promoted from backup - game ${gameId}`);
+                        // Charge effective price + record both portions so future dropout
+                        // refunds the correct real+free split.
+                        const { realCharged: adminPromoCharged, freeCharged: adminPromoFree } = await applyGameFee(promoClient, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`);
+                        await promoClient.query(
+                            'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
+                            [adminPromoCharged, adminPromoFree || 0, promotedPlayer.id]
+                        );
                     }
                     await promoClient.query('COMMIT');
                 } catch (promoErr) {
@@ -10519,7 +10997,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                     await pool.query(
                         `INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, 'backup_promoted', $2, $3)`,
                         [promotedPlayer.player_id,
-                         `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${cost.toFixed(2)} has been deducted from your balance.`}`,
+                         `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${effectiveDebited.toFixed(2)} has been deducted from your balance.`}`,
                          gameId]
                     );
                     // Send push + WhatsApp notification to promoted player
@@ -12687,6 +13165,8 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
              WHERE id = $2`,
             [winningTeam, gameId]
         );
+        // Web47: email confirmed participants once when awards open (throttled)
+        sendAwardsOpenEmails(gameId).catch(() => {});
         
         // 2. Get all confirmed players
         const playersResult = await client.query(
@@ -18673,7 +19153,7 @@ async function sendWonderfulCreditEmail(playerId, pounds, ref) {
 app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiateLimiter, async (req, res) => {
     if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'Online payments are temporarily unavailable' });
     try {
-        const { amount_pounds, game_id } = req.body;
+        const { amount_pounds, game_id, position_preference, backup_type } = req.body;
         const playerId = req.user.playerId;
 
         // Validate amount: £1–£200 in whole pounds
@@ -18711,12 +19191,26 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         const payLink = wonderfulRes.data?.pay_link;
         if (!payLink) throw new Error('Wonderful returned no pay_link');
 
+        // Sanitise position / backup_type. /register accepts any position string
+        // (e.g. "Outfield", "GK", "Outfield, GK"), so we do the same here — just
+        // cap length to avoid DB abuse, and default to 'Outfield' if missing/invalid.
+        // Stored on the payment row so the post-webhook auto-register honours the player's
+        // actual chosen position (bug fixed web47 — webhook was hardcoding 'No Preference').
+        let validPos = 'Outfield';
+        if (typeof position_preference === 'string') {
+            const trimmed = position_preference.trim();
+            if (trimmed.length > 0 && trimmed.length <= 120) validPos = trimmed;
+        }
+        const validBackupType = ['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backup_type)
+            ? backup_type : null;
+
         // Store pending payment in DB
         await pool.query(
             `INSERT INTO wonderful_payments
-                (wonderful_payment_id, merchant_reference, player_id, amount_pence, status, game_id, pay_link)
-             VALUES ($1, $2, $3, $4, 'pending', $5, $6)`,
-            [wpId, merchantRef, playerId, amountPence, game_id || null, payLink]
+                (wonderful_payment_id, merchant_reference, player_id, amount_pence, status, game_id, pay_link,
+                 position_preference, backup_type)
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8)`,
+            [wpId, merchantRef, playerId, amountPence, game_id || null, payLink, validPos, validBackupType]
         );
 
         await auditLog(pool, playerId, 'wonderful_initiated', playerId,
@@ -18916,46 +19410,232 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         // Send confirmation email to player
         setImmediate(() => sendWonderfulCreditEmail(pmt.player_id, pounds, pmt.merchant_reference));
 
-        // If payment was linked to a specific game, auto-register the player
+        // If payment was linked to a specific game, auto-register the player.
+        // This block mirrors the validation flow of /api/games/:id/register so a player
+        // paying via Wonderful ends up in the same state as if they'd clicked SIGN UP
+        // with existing balance. Web47 rewrite — previous version silently skipped on
+        // many edge cases (exclusivity, full games, organiser comp, position prefs lost).
         if (pmt.game_id) {
             setImmediate(async () => {
+                // We'll update wonderful_payments.auto_register_status with the outcome so the
+                // frontend status poll can surface what actually happened.
+                let outcomeStatus = 'topup_only';   // default if nothing registered
+                let outcomeReason = null;
+
                 try {
                     const gameRow = await pool.query(
                         `SELECT g.id, g.cost_per_player, g.game_status, g.team_selection_type,
-                                g.max_players, g.requires_organiser,
-                                (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') AS confirmed_count
+                                g.max_players, g.requires_organiser, g.exclusivity,
+                                g.early_bird_price, g.super_early_bird_price, g.game_date,
+                                ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                                 + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
                          FROM games g WHERE g.id = $1`,
                         [pmt.game_id]
                     );
                     const game = gameRow.rows[0];
-                    if (!game || game.game_status !== 'available' || parseInt(game.confirmed_count) >= parseInt(game.max_players)) return;
-                    // Check not already registered
-                    const already = await pool.query(
-                        `SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2`, [pmt.game_id, pmt.player_id]
-                    );
-                    if (already.rows.length) return;
-                    // Deduct game fee and register
-                    const client = await pool.connect();
-                    try {
-                        await client.query('BEGIN');
-                        const { realCharged } = await applyGameFee(client, pmt.player_id, game.cost_per_player, `Registration for game ${pmt.game_id} (via Wonderful)`);
-                        await client.query(
-                            `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, registered_at)
-                             VALUES ($1, $2, 'confirmed', 'No Preference', $3, NOW())`,
-                            [pmt.game_id, pmt.player_id, realCharged]
+                    if (!game) {
+                        outcomeStatus = 'failed_game_not_found';
+                        outcomeReason = 'Game no longer exists';
+                    } else if (!['available', 'confirmed'].includes(game.game_status)) {
+                        outcomeStatus = 'failed_game_closed';
+                        outcomeReason = `Game is ${game.game_status}, no longer accepting registrations`;
+                    } else {
+                        // Fetch player state (tier + organiser flag + position prefs from payment row)
+                        const playerRow = await pool.query(
+                            'SELECT reliability_tier, is_organiser FROM players WHERE id = $1',
+                            [pmt.player_id]
                         );
-                        await client.query('COMMIT');
-                        await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
-                            `Auto-registered after Wonderful payment ${pmt.merchant_reference}`);
-                    } catch (e) {
-                        await client.query('ROLLBACK').catch(() => {});
-                        console.error('Wonderful auto-register failed (non-critical):', e.message);
-                    } finally {
-                        client.release();
+                        const playerTier = playerRow.rows[0]?.reliability_tier;
+                        const isOrganiser = !!playerRow.rows[0]?.is_organiser;
+
+                        // Tier ban
+                        if (playerTier === 'white' || playerTier === 'black') {
+                            outcomeStatus = 'failed_tier';
+                            outcomeReason = `Account tier ${playerTier} — signup blocked`;
+                        } else {
+                            // Exclusivity badge checks
+                            let blockedByExclusivity = false;
+                            if (game.exclusivity === 'clm' || game.exclusivity === 'allstars' || game.exclusivity === 'misfits') {
+                                const badgeName = game.exclusivity === 'clm' ? 'CLM'
+                                                : game.exclusivity === 'allstars' ? 'TF All Star'
+                                                : 'Misfits';
+                                const badgeRes = await pool.query(`
+                                    SELECT 1 FROM player_badges pb
+                                    JOIN badges b ON b.id = pb.badge_id
+                                    WHERE pb.player_id = $1 AND b.name = $2
+                                `, [pmt.player_id, badgeName]);
+                                if (badgeRes.rows.length === 0) {
+                                    blockedByExclusivity = true;
+                                    outcomeStatus = 'failed_exclusivity';
+                                    outcomeReason = `Game restricted to ${badgeName} — badge required`;
+                                }
+                            }
+
+                            if (!blockedByExclusivity) {
+                                // Already registered? (idempotency — webhook can fire twice)
+                                const already = await pool.query(
+                                    `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2`,
+                                    [pmt.game_id, pmt.player_id]
+                                );
+                                if (already.rows.length) {
+                                    outcomeStatus = already.rows[0].status === 'confirmed' ? 'confirmed' : 'backup';
+                                    outcomeReason = 'Already registered';
+                                } else {
+                                    // Capacity check — mirror /register logic. effectiveMax reserves
+                                    // the last slot for an organiser if the game requires one and
+                                    // the caller isn't one.
+                                    let effectiveMax = parseInt(game.max_players);
+                                    if (game.requires_organiser && !isOrganiser) {
+                                        const orgCountRes = await pool.query(`
+                                            SELECT COUNT(*) AS cnt FROM registrations r
+                                            JOIN players p ON p.id = r.player_id
+                                            WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
+                                        `, [pmt.game_id]);
+                                        if (parseInt(orgCountRes.rows[0].cnt) === 0) {
+                                            effectiveMax = parseInt(game.max_players) - 1;
+                                        }
+                                    }
+                                    const isFull = parseInt(game.current_players) >= effectiveMax;
+
+                                    // Resolve position + backup choice from stored payment row
+                                    const positionValue = pmt.position_preference || 'Outfield';
+                                    const requestedBackupType = pmt.backup_type; // nullable
+                                    const isGKOnly = String(positionValue).trim().toUpperCase() === 'GK';
+
+                                    // Organiser comp eligibility (cap 6 per game, matches /register)
+                                    let isComped = false;
+                                    if (isOrganiser) {
+                                        const compRes = await pool.query(
+                                            "SELECT COUNT(*) AS cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
+                                            [pmt.game_id]
+                                        );
+                                        if (parseInt(compRes.rows[0].cnt) < 6) isComped = true;
+                                    }
+
+                                    const effectivePrice = getEffectivePrice(game).price;
+
+                                    // GK capacity check — if game has space but the player chose
+                                    // GK-only and all GK slots are taken, fall through to backup as
+                                    // gk_backup (rather than reject outright like /register does —
+                                    // the player has already paid, we want them registered somehow).
+                                    let gkFullForced = false;
+                                    if (!isFull && isGKOnly) {
+                                        const maxGKSlots = game.team_selection_type === 'vs_external' ? 1
+                                                         : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4)
+                                                         : 2;
+                                        const gkCountRes = await pool.query(`
+                                            SELECT COUNT(*) AS gk_count FROM registrations
+                                            WHERE game_id = $1 AND status = 'confirmed'
+                                            AND UPPER(TRIM(position_preference)) = 'GK'
+                                        `, [pmt.game_id]);
+                                        if (parseInt(gkCountRes.rows[0].gk_count) >= maxGKSlots) {
+                                            gkFullForced = true;
+                                        }
+                                    }
+
+                                    if (isFull || gkFullForced) {
+                                        // Game full — register as backup. backup_type defaults to
+                                        // 'normal_backup' if none was specified at initiate time.
+                                        // confirmed_backup pays now; normal + gk are free at signup.
+                                        let backupType;
+                                        if (gkFullForced) {
+                                            // GK slots full but game has space — player chose GK, so gk_backup
+                                            backupType = 'gk_backup';
+                                        } else {
+                                            backupType = ['normal_backup','confirmed_backup','gk_backup']
+                                                .includes(requestedBackupType) ? requestedBackupType : 'normal_backup';
+                                        }
+                                        // GK backup only valid if player chose GK
+                                        const finalBackupType = (backupType === 'gk_backup' && !isGKOnly) ? 'normal_backup' : backupType;
+
+                                        const client = await pool.connect();
+                                        try {
+                                            await client.query('BEGIN');
+                                            let amountPaid = 0;
+                                            let amountPaidFree = 0;
+                                            if (finalBackupType === 'confirmed_backup' && !isComped) {
+                                                const { realCharged, freeCharged } = await applyGameFee(
+                                                    client, pmt.player_id, effectivePrice,
+                                                    `Confirmed backup for game ${pmt.game_id} (via Wonderful)`
+                                                );
+                                                amountPaid = realCharged;
+                                                amountPaidFree = freeCharged || 0;
+                                            }
+                                            await client.query(
+                                                `INSERT INTO registrations
+                                                    (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, is_comped, registered_at)
+                                                 VALUES ($1, $2, 'backup', $3, $4, $5, $6, $7, NOW())`,
+                                                [pmt.game_id, pmt.player_id, positionValue, finalBackupType, amountPaid, amountPaidFree, isComped]
+                                            );
+                                            await client.query('COMMIT');
+                                            outcomeStatus = gkFullForced ? 'backup_gk_full' : 'backup_game_full';
+                                            outcomeReason = gkFullForced
+                                                ? `GK slots full — added to GK backup list`
+                                                : `Game filled while payment was being processed — added to ${finalBackupType === 'confirmed_backup' ? 'confirmed ' : ''}backup list`;
+                                            await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
+                                                `Auto-registered as ${finalBackupType} (${gkFullForced ? 'GK full' : 'game full'} at webhook) via Wonderful ${pmt.merchant_reference}`);
+                                        } catch (e) {
+                                            await client.query('ROLLBACK').catch(() => {});
+                                            outcomeStatus = 'failed_db_error';
+                                            outcomeReason = e.message;
+                                            console.error('Wonderful backup auto-register failed:', e.message);
+                                        } finally {
+                                            client.release();
+                                        }
+                                    } else {
+                                        // Game has space — confirmed registration
+                                        const client = await pool.connect();
+                                        try {
+                                            await client.query('BEGIN');
+                                            let amountPaid = 0;
+                                            let amountPaidFree = 0;
+                                            if (!isComped) {
+                                                const { realCharged, freeCharged } = await applyGameFee(
+                                                    client, pmt.player_id, effectivePrice,
+                                                    `Registration for game ${pmt.game_id} (via Wonderful${getEffectivePrice(game).tier !== 'standard' ? ' · ' + getEffectivePrice(game).tier : ''})`
+                                                );
+                                                amountPaid = realCharged;
+                                                amountPaidFree = freeCharged || 0;
+                                            }
+                                            await client.query(
+                                                `INSERT INTO registrations
+                                                    (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, is_comped, registered_at)
+                                                 VALUES ($1, $2, 'confirmed', $3, $4, $5, $6, NOW())`,
+                                                [pmt.game_id, pmt.player_id, positionValue, amountPaid, amountPaidFree, isComped]
+                                            );
+                                            await client.query('COMMIT');
+                                            outcomeStatus = isComped ? 'confirmed_comped' : 'confirmed';
+                                            outcomeReason = isComped
+                                                ? 'Organiser comp — game covered by the GAFFA'
+                                                : null;
+                                            await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
+                                                `Auto-registered${isComped ? ' (organiser comp)' : ''} via Wonderful ${pmt.merchant_reference}`);
+                                        } catch (e) {
+                                            await client.query('ROLLBACK').catch(() => {});
+                                            outcomeStatus = 'failed_db_error';
+                                            outcomeReason = e.message;
+                                            console.error('Wonderful confirmed auto-register failed:', e.message);
+                                        } finally {
+                                            client.release();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 } catch (e) {
-                    console.error('Wonderful game auto-register error (non-critical):', e.message);
+                    outcomeStatus = 'failed_exception';
+                    outcomeReason = e.message;
+                    console.error('Wonderful game auto-register error:', e.message);
                 }
+
+                // Persist outcome so the frontend status poll can show the right message
+                await pool.query(
+                    `UPDATE wonderful_payments
+                        SET auto_register_status = $1, auto_register_reason = $2
+                      WHERE merchant_reference = $3`,
+                    [outcomeStatus, outcomeReason, pmt.merchant_reference]
+                ).catch(e => console.error('Failed to persist auto_register_status:', e.message));
             });
         }
     } catch (e) {
@@ -18964,12 +19644,15 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
 });
 
 // GET /api/payments/wonderful/status/:ref — player polls for confirmation after redirect
-// Used by the success screen to show confirmed/pending state
+// Used by the success screen to show confirmed/pending state. Returns auto-register outcome
+// so the frontend can show what happened to the game signup (bug fixed web47 — previously
+// only returned credit status, player never knew if they were actually registered).
 app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, res) => {
     try {
         const { ref } = req.params;
         const row = await pool.query(
-            `SELECT status, amount_pence, game_id, credited_at, wonderful_payment_id
+            `SELECT status, amount_pence, game_id, credited_at, wonderful_payment_id,
+                    auto_register_status, auto_register_reason
              FROM wonderful_payments
              WHERE merchant_reference = $1 AND player_id = $2`,
             [ref, req.user.playerId]
@@ -19046,7 +19729,14 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
                             // Trigger RAF activation if this is the player's first top-up
                             setImmediate(() => triggerRafActivation(req.user.playerId).catch(() => {}));
                             setImmediate(() => sendWonderfulCreditEmail(req.user.playerId, pounds, ref));
-                            return res.json({ status: 'credited', amount: pounds.toFixed(2), game_id: p.game_id, credited_at: new Date() });
+                            return res.json({
+                                status: 'credited',
+                                amount: pounds.toFixed(2),
+                                game_id: p.game_id,
+                                credited_at: new Date(),
+                                auto_register_status: null, // recovery path — auto-register runs async after webhook
+                                auto_register_reason: null,
+                            });
                         }
                         await client.query('ROLLBACK');
                     } catch (creditErr) {
@@ -19067,6 +19757,8 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
             amount:      (p.amount_pence / 100).toFixed(2),
             game_id:     p.game_id,
             credited_at: p.credited_at,
+            auto_register_status: p.auto_register_status || null,
+            auto_register_reason: p.auto_register_reason || null,
         });
     } catch (e) {
         console.error('Wonderful status error:', e.message);
@@ -19273,7 +19965,36 @@ app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT} — build: web39-fix2`);
-    
+
+    // ── Team-email settle recovery sweep ────────────────────────────────────
+    // Pending "settle" timers live in memory (setTimeout). If the server restarts
+    // or Render cold-starts during a pending window, the timer is lost. This sweep
+    // runs on boot (to catch settles whose scheduled time has already passed) and
+    // every 2 minutes (to catch settles orphaned by any runtime anomaly).
+    const recoverPendingTeamSettles = async () => {
+        try {
+            const due = await pool.query(
+                `SELECT id FROM games
+                 WHERE teams_email_settle_at IS NOT NULL
+                   AND teams_email_settle_at <= NOW()`
+            );
+            if (due.rows.length === 0) return;
+            console.log(`⏱️  Recovering ${due.rows.length} pending team-email settle(s)`);
+            for (const row of due.rows) {
+                // Skip if there's already an in-memory timer running for this game
+                // (avoids firing twice if the sweep interleaves with a live schedule).
+                if (_teamEmailTimers.has(row.id)) continue;
+                await fireTeamEmailSettle(row.id);
+            }
+        } catch (e) {
+            console.error('Team email settle recovery error:', e.message);
+        }
+    };
+    // Fire once on boot (after a short delay to let DB pool stabilise)
+    setTimeout(recoverPendingTeamSettles, 5000);
+    // And periodically thereafter
+    setInterval(recoverPendingTeamSettles, 2 * 60 * 1000); // every 2 minutes
+
     // Keep database AND backend warm (ping every 5 minutes)
     setInterval(async () => {
         try {
