@@ -3028,8 +3028,9 @@ app.get('/api/player/favourite-series', authenticateToken, async (req, res) => {
 // POST /api/player/favourite-series/:seriesId — add favourite (idempotent via ON CONFLICT)
 app.post('/api/player/favourite-series/:seriesId', authenticateToken, async (req, res) => {
     try {
-        const seriesId = parseInt(req.params.seriesId, 10);
-        if (!Number.isInteger(seriesId) || seriesId <= 0) {
+        // game_series.id is UUID — validate as non-empty string, not as integer.
+        const seriesId = String(req.params.seriesId || '').trim();
+        if (!seriesId) {
             return res.status(400).json({ error: 'Invalid series id' });
         }
         // Confirm series exists
@@ -3053,8 +3054,9 @@ app.post('/api/player/favourite-series/:seriesId', authenticateToken, async (req
 // DELETE /api/player/favourite-series/:seriesId — remove favourite
 app.delete('/api/player/favourite-series/:seriesId', authenticateToken, async (req, res) => {
     try {
-        const seriesId = parseInt(req.params.seriesId, 10);
-        if (!Number.isInteger(seriesId) || seriesId <= 0) {
+        // game_series.id is UUID — validate as non-empty string, not as integer.
+        const seriesId = String(req.params.seriesId || '').trim();
+        if (!seriesId) {
             return res.status(400).json({ error: 'Invalid series id' });
         }
         await pool.query(
@@ -4482,8 +4484,9 @@ app.get('/api/player/favourite-opponents', authenticateToken, async (req, res) =
 app.post('/api/player/favourite-opponents/:opponentId', authenticateToken, async (req, res) => {
     try {
         const playerId = req.user.playerId;
-        const opponentId = parseInt(req.params.opponentId);
-        if (!Number.isFinite(opponentId)) return res.status(400).json({ error: 'Invalid opponent id' });
+        // opponents.id is UUID — validate as non-empty string, not as integer.
+        const opponentId = String(req.params.opponentId || '').trim();
+        if (!opponentId) return res.status(400).json({ error: 'Invalid opponent id' });
 
         // Verify opponent exists
         const check = await pool.query('SELECT id FROM opponents WHERE id = $1', [opponentId]);
@@ -4504,8 +4507,9 @@ app.post('/api/player/favourite-opponents/:opponentId', authenticateToken, async
 app.delete('/api/player/favourite-opponents/:opponentId', authenticateToken, async (req, res) => {
     try {
         const playerId = req.user.playerId;
-        const opponentId = parseInt(req.params.opponentId);
-        if (!Number.isFinite(opponentId)) return res.status(400).json({ error: 'Invalid opponent id' });
+        // opponents.id is UUID — validate as non-empty string, not as integer.
+        const opponentId = String(req.params.opponentId || '').trim();
+        if (!opponentId) return res.status(400).json({ error: 'Invalid opponent id' });
         await pool.query(
             'DELETE FROM player_favourite_opponents WHERE player_id = $1 AND opponent_id = $2',
             [playerId, opponentId]
