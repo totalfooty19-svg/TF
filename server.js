@@ -966,11 +966,13 @@ const NOTIF_TEMPLATES = {
     award_motm:           d => ({ title: '⭐ Man of the Match!',          body: `You won MOTM for ${d.day} at ${d.venue}!` }),
     award_engine:         d => ({ title: '🔋 Best Engine!',               body: `Voted Best Engine for ${d.day} at ${d.venue}.` }),
     award_wall:           d => ({ title: '🧱 Brick Wall!',                body: `Voted Brick Wall for ${d.day} at ${d.venue}.` }),
-    award_reckless:       d => ({ title: '🦵 Reckless Tackler',           body: `You won Reckless Tackler for ${d.day}. You know what you did.` }),
-    award_hollywood:      d => ({ title: '🎬 Mr Hollywood',               body: `You won Mr Hollywood for ${d.day}. No end product, as always.` }),
+    award_reckless:       d => ({ title: '🚑 Reckless Tackler',           body: `You won Reckless Tackler for ${d.day}. You know what you did.` }),
     award_moaner:         d => ({ title: '😩 The Moaner',                 body: `You won The Moaner for ${d.day}. The team appreciated your encouragement.` }),
-    award_howler:         d => ({ title: '🤦 Howler Award',               body: `You won The Howler for ${d.day}. Moment of the match, for the wrong reasons.` }),
     award_donkey:         d => ({ title: '🐴 Donkey Award',               body: `You won the Donkey Award for ${d.day}. Below par — even for yourself.` }),
+    // NEW — Batch 5 awards revamp
+    award_cold_moment:    d => ({ title: '🥶 Cold Moment!',               body: `You won the Cold Moment Award for ${d.day} at ${d.venue}. One moment that left us amazed.` }),
+    award_walker:         d => ({ title: '🚶‍♂️ Walker Award',              body: `You won the Walker Award for ${d.day}. Had enough, left early — couldn't handle the loss or banter (or both!).` }),
+    award_pig:            d => ({ title: '🐷 Pig Award',                  body: `You won the Pig Award for ${d.day}. A bit greedy — next time, pass the ball.` }),
     award_mr_day:         d => ({ title: `📅 Mr ${d.day}!`,              body: `7 consecutive ${d.day} appearances in a row. Legendary consistency.` }),
     award_on_fire:        d => ({ title: "🔥 You're On Fire!",           body: `4 wins in a row. Your team can't stop winning right now.` }),
     award_back_from_dead: d => ({ title: "🧟 Back from the Dead!",        body: `Welcome back! You've been away for a while. Good to have you back.` }),
@@ -1946,6 +1948,12 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.reliability_tier, 
                     COALESCE(p.position, 'outfield') AS position_preference,
                     p.referral_code,
+                    p.region_code,
+                    p.coachable,
+                    p.preferred_locations,
+                    p.default_positions_11aside,
+                    p.default_position_areas,
+                    p.has_seen_help_guide,
                     CASE WHEN p.total_appearances > 0 
                          THEN ROUND(CAST(p.total_wins AS NUMERIC) / p.total_appearances * 100, 1) 
                          ELSE 0 END AS win_percent,
@@ -2815,8 +2823,272 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PREFERENCES — player-level settings hub (Batch 2 of unified deploy)
+// ═══════════════════════════════════════════════════════════════════════════
+// Required DDL (run once in production before deploying):
+//
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS preferred_locations TEXT DEFAULT NULL;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS default_positions_11aside TEXT DEFAULT NULL;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS default_position_areas TEXT DEFAULT NULL;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS has_seen_help_guide BOOLEAN NOT NULL DEFAULT FALSE;
+//   -- Veteran seed (from help-guide audit — avoid surprise tour launch for 700 existing players):
+//   UPDATE players SET has_seen_help_guide = TRUE
+//     WHERE id IN (SELECT DISTINCT player_id FROM registrations WHERE player_id IS NOT NULL);
+//
+//   CREATE TABLE IF NOT EXISTS player_favourite_series (
+//     id          SERIAL PRIMARY KEY,
+//     player_id   INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+//     series_id   INTEGER NOT NULL REFERENCES game_series(id) ON DELETE CASCADE,
+//     created_at  TIMESTAMPTZ DEFAULT NOW(),
+//     UNIQUE (player_id, series_id)
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_pfs_player ON player_favourite_series(player_id);
+//   CREATE INDEX IF NOT EXISTS idx_pfs_series ON player_favourite_series(series_id);
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// GUEST REVAMP — per-game guest stats (Batch 8)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS relative_rating        INTEGER NULL;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS position_classification TEXT NULL;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS defending_rating  INTEGER DEFAULT 0;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS strength_rating   INTEGER DEFAULT 0;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS fitness_rating    INTEGER DEFAULT 0;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS pace_rating       INTEGER DEFAULT 0;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS shooting_rating   INTEGER DEFAULT 0;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS assisting_rating  INTEGER DEFAULT 0;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS decisions_rating  INTEGER DEFAULT 0;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS goalkeeper_rating INTEGER DEFAULT 0;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS is_admin_override BOOLEAN DEFAULT FALSE;
+//   ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS derived_from_parent_ovr INTEGER NULL;
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// BEEF SEMANTIC FLIP — wipe existing beef rows (Batch 8)
+// ═══════════════════════════════════════════════════════════════════════════
+// Legacy beef rows were entered under "keep apart" meaning. New semantic is
+// "keep together". Wipe the table once before the algorithm flip takes effect.
+// ONE-OFF — do NOT re-run on subsequent deploys (beef rows will accumulate
+// under new meaning after this and should be preserved).
+//
+//   DELETE FROM beef;
+//   -- (If a migrations_log table exists, guard the delete:
+//   --   INSERT INTO migrations_log (migration_name, ran_at)
+//   --   VALUES ('beef_semantic_flip_wipe', NOW());
+//   -- otherwise run the DELETE once manually and never again.)
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// RECREATE SERIES — parent link (Batch 9)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//   ALTER TABLE game_series
+//     ADD COLUMN IF NOT EXISTS parent_series_id INTEGER
+//       REFERENCES game_series(id) ON DELETE SET NULL;
+//   CREATE INDEX IF NOT EXISTS idx_gs_parent ON game_series(parent_series_id);
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// OPPONENT FAVOURITES — new table (Batch 9)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//   CREATE TABLE IF NOT EXISTS player_favourite_opponents (
+//     id          SERIAL PRIMARY KEY,
+//     player_id   INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+//     opponent_id INTEGER NOT NULL REFERENCES opponents(id) ON DELETE CASCADE,
+//     created_at  TIMESTAMPTZ DEFAULT NOW(),
+//     UNIQUE (player_id, opponent_id)
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_pfo_player   ON player_favourite_opponents(player_id);
+//   CREATE INDEX IF NOT EXISTS idx_pfo_opponent ON player_favourite_opponents(opponent_id);
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Shared position/region whitelists
+const _PREFS_ALLOWED_POSITIONS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF']);
+const _PREFS_ALLOWED_AREAS     = new Set(['defence','midfield','attack']);
+const _PREFS_ALLOWED_LOCATIONS = new Set(['Birmingham','Coventry','Manchester','Nuneaton','Leamington']);
+
+// GET /api/player/preferences — returns all prefs for current player
+app.get('/api/player/preferences', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT preferred_locations,
+                    default_positions_11aside,
+                    default_position_areas,
+                    coachable,
+                    region_code
+             FROM players WHERE id = $1`,
+            [req.user.playerId]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+        const r = result.rows[0];
+        res.json({
+            preferred_locations:       r.preferred_locations || '',
+            default_positions_11aside: r.default_positions_11aside || '',
+            default_position_areas:    r.default_position_areas || '',
+            coachable:                 !!r.coachable,
+            region_code:               r.region_code || null,
+        });
+    } catch (error) {
+        console.error('Get preferences error:', error);
+        res.status(500).json({ error: 'Failed to get preferences' });
+    }
+});
+
+// PATCH /api/player/preferences — partial update (any subset of fields)
+app.patch('/api/player/preferences', authenticateToken, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const updates = [];
+        const values  = [];
+        let idx = 1;
+
+        // preferred_locations — comma-string, whitelist each entry
+        if (body.preferred_locations !== undefined) {
+            const clean = String(body.preferred_locations || '')
+                .split(',').map(s => s.trim()).filter(s => _PREFS_ALLOWED_LOCATIONS.has(s));
+            // dedupe while preserving order
+            const deduped = [...new Set(clean)];
+            updates.push(`preferred_locations = $${idx++}`);
+            values.push(deduped.length > 0 ? deduped.join(',') : null);
+        }
+
+        // default_positions_11aside — comma-string, GK/LB/etc whitelist
+        if (body.default_positions_11aside !== undefined) {
+            const clean = String(body.default_positions_11aside || '')
+                .split(',').map(s => s.trim()).filter(s => _PREFS_ALLOWED_POSITIONS.has(s));
+            const deduped = [...new Set(clean)];
+            updates.push(`default_positions_11aside = $${idx++}`);
+            values.push(deduped.length > 0 ? deduped.join(',') : null);
+        }
+
+        // default_position_areas — comma-string, defence/midfield/attack whitelist
+        if (body.default_position_areas !== undefined) {
+            const clean = String(body.default_position_areas || '')
+                .split(',').map(s => s.trim()).filter(s => _PREFS_ALLOWED_AREAS.has(s));
+            const deduped = [...new Set(clean)];
+            updates.push(`default_position_areas = $${idx++}`);
+            values.push(deduped.length > 0 ? deduped.join(',') : null);
+        }
+
+        // coachable — boolean
+        if (body.coachable !== undefined) {
+            updates.push(`coachable = $${idx++}`);
+            values.push(!!body.coachable);
+        }
+
+        if (updates.length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+
+        values.push(req.user.playerId);
+        await pool.query(
+            `UPDATE players SET ${updates.join(', ')} WHERE id = $${idx}`,
+            values
+        );
+
+        // Return the fresh state so client can update its local copy
+        const after = await pool.query(
+            `SELECT preferred_locations, default_positions_11aside, default_position_areas,
+                    coachable, region_code
+             FROM players WHERE id = $1`,
+            [req.user.playerId]
+        );
+        const r = after.rows[0];
+        res.json({
+            preferred_locations:       r.preferred_locations || '',
+            default_positions_11aside: r.default_positions_11aside || '',
+            default_position_areas:    r.default_position_areas || '',
+            coachable:                 !!r.coachable,
+            region_code:               r.region_code || null,
+        });
+    } catch (error) {
+        console.error('Patch preferences error:', error);
+        res.status(500).json({ error: 'Failed to update preferences' });
+    }
+});
+
+// GET /api/player/favourite-series — list favourited series (with series meta)
+app.get('/api/player/favourite-series', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT pfs.series_id, pfs.created_at,
+                    gs.series_name, gs.series_type, gs.series_status
+             FROM player_favourite_series pfs
+             LEFT JOIN game_series gs ON gs.id = pfs.series_id
+             WHERE pfs.player_id = $1
+             ORDER BY pfs.created_at DESC`,
+            [req.user.playerId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get favourite-series error:', error);
+        res.status(500).json({ error: 'Failed to get favourites' });
+    }
+});
+
+// POST /api/player/favourite-series/:seriesId — add favourite (idempotent via ON CONFLICT)
+app.post('/api/player/favourite-series/:seriesId', authenticateToken, async (req, res) => {
+    try {
+        const seriesId = parseInt(req.params.seriesId, 10);
+        if (!Number.isInteger(seriesId) || seriesId <= 0) {
+            return res.status(400).json({ error: 'Invalid series id' });
+        }
+        // Confirm series exists
+        const seriesCheck = await pool.query('SELECT id FROM game_series WHERE id = $1', [seriesId]);
+        if (seriesCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Series not found' });
+        }
+        await pool.query(
+            `INSERT INTO player_favourite_series (player_id, series_id)
+             VALUES ($1, $2)
+             ON CONFLICT (player_id, series_id) DO NOTHING`,
+            [req.user.playerId, seriesId]
+        );
+        res.json({ success: true, series_id: seriesId });
+    } catch (error) {
+        console.error('Add favourite-series error:', error);
+        res.status(500).json({ error: 'Failed to add favourite' });
+    }
+});
+
+// DELETE /api/player/favourite-series/:seriesId — remove favourite
+app.delete('/api/player/favourite-series/:seriesId', authenticateToken, async (req, res) => {
+    try {
+        const seriesId = parseInt(req.params.seriesId, 10);
+        if (!Number.isInteger(seriesId) || seriesId <= 0) {
+            return res.status(400).json({ error: 'Invalid series id' });
+        }
+        await pool.query(
+            `DELETE FROM player_favourite_series
+             WHERE player_id = $1 AND series_id = $2`,
+            [req.user.playerId, seriesId]
+        );
+        res.json({ success: true, series_id: seriesId });
+    } catch (error) {
+        console.error('Remove favourite-series error:', error);
+        res.status(500).json({ error: 'Failed to remove favourite' });
+    }
+});
+
+// POST /api/player/help-guide-seen — marks the dashboard help guide as viewed
+// (used to prevent auto-launch of the tour on subsequent dashboard loads)
+app.post('/api/player/help-guide-seen', authenticateToken, async (req, res) => {
+    try {
+        await pool.query(
+            'UPDATE players SET has_seen_help_guide = TRUE WHERE id = $1',
+            [req.user.playerId]
+        );
+        res.json({ success: true });
+    } catch (error) {
+        console.error('help-guide-seen error:', error.message);
+        res.status(500).json({ error: 'Failed to save preference' });
+    }
+});
+
 // Upload profile photo (base64)
-app.post('/api/players/me/photo', authenticateToken, async (req, res) => {
+app.post('/api/players/me/photo',
+    authenticateToken,
+    express.json({ limit: '5mb' }),
+async (req, res) => {
     try {
         const { photoData } = req.body; // Base64 string
         
@@ -4166,6 +4438,85 @@ app.delete('/api/opponents/:id', authenticateToken, requireSuperAdmin, async (re
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
+
+// ── Batch 9 — Opponent favourites ─────────────────────────────────────
+// GET  /api/player/favourite-opponents        — list my favourite opponents + next game against each
+// POST /api/player/favourite-opponents/:id    — add a favourite
+// DELETE /api/player/favourite-opponents/:id  — remove a favourite
+app.get('/api/player/favourite-opponents', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+        const result = await pool.query(
+            `SELECT
+                pfo.opponent_id,
+                pfo.created_at AS favourited_at,
+                o.name,
+                o.logo_url,
+                o.star_rating,
+                (SELECT json_build_object(
+                    'id',          g.id,
+                    'game_url',    g.game_url,
+                    'game_date',   g.game_date,
+                    'venue_name',  v.name
+                 )
+                 FROM games g
+                 LEFT JOIN venues v ON v.id = g.venue_id
+                 WHERE g.opponent_id = pfo.opponent_id
+                   AND g.game_date >= NOW()
+                   AND g.game_status IN ('available','confirmed')
+                 ORDER BY g.game_date ASC
+                 LIMIT 1) AS next_game
+             FROM player_favourite_opponents pfo
+             JOIN opponents o ON o.id = pfo.opponent_id
+             WHERE pfo.player_id = $1
+             ORDER BY pfo.created_at DESC`,
+            [playerId]
+        );
+        res.json({ favourites: result.rows });
+    } catch (e) {
+        console.error('GET favourite-opponents:', e.message);
+        res.status(500).json({ error: 'Failed to load favourite opponents' });
+    }
+});
+
+app.post('/api/player/favourite-opponents/:opponentId', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+        const opponentId = parseInt(req.params.opponentId);
+        if (!Number.isFinite(opponentId)) return res.status(400).json({ error: 'Invalid opponent id' });
+
+        // Verify opponent exists
+        const check = await pool.query('SELECT id FROM opponents WHERE id = $1', [opponentId]);
+        if (check.rows.length === 0) return res.status(404).json({ error: 'Opponent not found' });
+
+        await pool.query(
+            `INSERT INTO player_favourite_opponents (player_id, opponent_id)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+            [playerId, opponentId]
+        );
+        res.json({ success: true, opponent_id: opponentId });
+    } catch (e) {
+        console.error('POST favourite-opponent:', e.message);
+        res.status(500).json({ error: 'Failed to add favourite' });
+    }
+});
+
+app.delete('/api/player/favourite-opponents/:opponentId', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+        const opponentId = parseInt(req.params.opponentId);
+        if (!Number.isFinite(opponentId)) return res.status(400).json({ error: 'Invalid opponent id' });
+        await pool.query(
+            'DELETE FROM player_favourite_opponents WHERE player_id = $1 AND opponent_id = $2',
+            [playerId, opponentId]
+        );
+        res.json({ success: true, opponent_id: opponentId });
+    } catch (e) {
+        console.error('DELETE favourite-opponent:', e.message);
+        res.status(500).json({ error: 'Failed to remove favourite' });
+    }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res) => {
@@ -4373,6 +4724,215 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
     }
 });
 
+// ── Batch 9 — Recreate Series (admin) ─────────────────────────────────
+// GET /api/admin/game-series/:seriesId/recreate-template
+//   Returns the latest game's settings as a pre-fill template for the recreate modal.
+// POST /api/admin/game-series/recreate
+//   Creates a new series (linked via parent_series_id) + N weekly games + optionally
+//   copies favourites over from the parent series.
+
+app.get('/api/admin/game-series/:seriesId/recreate-template', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { seriesId } = req.params;
+
+        const seriesRow = await pool.query(
+            'SELECT id, series_name, series_type, series_status FROM game_series WHERE id = $1',
+            [seriesId]
+        );
+        if (seriesRow.rows.length === 0) {
+            return res.status(404).json({ error: 'Series not found' });
+        }
+        const series = seriesRow.rows[0];
+
+        const latestGame = await pool.query(`
+            SELECT g.venue_id, v.name AS venue_name,
+                   g.game_date,
+                   TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS kickoff_time,
+                   EXTRACT(DOW FROM g.game_date AT TIME ZONE 'Europe/London')::int AS day_of_week,
+                   g.max_players, g.cost_per_player, g.format, g.regularity,
+                   g.exclusivity, g.position_type, g.team_selection_type,
+                   g.external_opponent, g.tf_kit_color, g.opp_kit_color,
+                   g.tournament_team_count, g.tournament_name,
+                   g.star_rating, g.star_rating_locked,
+                   g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
+                   g.refs_required, g.ref_pay, g.requires_organiser,
+                   g.early_bird_price, g.super_early_bird_price,
+                   g.opponent_id
+              FROM games g
+              LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE g.series_id = $1
+             ORDER BY g.game_date DESC
+             LIMIT 1
+        `, [seriesId]);
+        if (latestGame.rows.length === 0) {
+            return res.status(404).json({ error: 'Series has no games — cannot derive template' });
+        }
+
+        const favCount = await pool.query(
+            'SELECT COUNT(*)::int AS n FROM player_favourite_series WHERE series_id = $1',
+            [seriesId]
+        );
+
+        // Count games still upcoming — used by UI to decide whether to prominent-flag the button
+        const upcomingGames = await pool.query(
+            `SELECT COUNT(*)::int AS n FROM games WHERE series_id = $1 AND game_date >= NOW()`,
+            [seriesId]
+        );
+
+        res.json({
+            parent_series: series,
+            template: latestGame.rows[0],
+            favourites_count: favCount.rows[0].n,
+            upcoming_games_count: upcomingGames.rows[0].n,
+            suggested_series_name: `${series.series_name} (New Season)`,
+        });
+    } catch (e) {
+        console.error('GET recreate-template:', e.message);
+        res.status(500).json({ error: 'Failed to load recreate template' });
+    }
+});
+
+app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManager, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const {
+            parent_series_id,
+            series_name,
+            series_type,
+            first_game_date,
+            number_of_games_to_create,
+            copy_favourites,
+            game_template,
+        } = req.body;
+
+        // Validation
+        if (!parent_series_id) { return res.status(400).json({ error: 'parent_series_id is required' }); }
+        if (!series_name || series_name.trim().length < 2) {
+            return res.status(400).json({ error: 'series_name must be at least 2 characters' });
+        }
+        if (!first_game_date || isNaN(Date.parse(first_game_date))) {
+            return res.status(400).json({ error: 'Valid first_game_date is required' });
+        }
+        const gamesToCreate = parseInt(number_of_games_to_create);
+        if (!Number.isFinite(gamesToCreate) || gamesToCreate < 1 || gamesToCreate > 52) {
+            return res.status(400).json({ error: 'number_of_games_to_create must be between 1 and 52' });
+        }
+        if (!game_template || typeof game_template !== 'object') {
+            return res.status(400).json({ error: 'game_template is required' });
+        }
+
+        await client.query('BEGIN');
+
+        // Verify parent series exists
+        const parent = await client.query(
+            'SELECT id FROM game_series WHERE id = $1',
+            [parent_series_id]
+        );
+        if (parent.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Parent series not found' });
+        }
+
+        // Create new series linked to parent
+        const newSeries = await client.query(
+            `INSERT INTO game_series (series_name, series_type, series_status, parent_series_id)
+             VALUES ($1, $2, 'active', $3)
+             RETURNING id`,
+            [series_name.trim(), (series_type || 'standard'), parent_series_id]
+        );
+        const newSeriesId = newSeries.rows[0].id;
+
+        // Create N weekly games using template values (reuse addWeeksLondon for DST safety)
+        const createdGames = [];
+        for (let i = 0; i < gamesToCreate; i++) {
+            const gameDate = addWeeksLondon(first_game_date, i);
+            const gameUrl  = crypto.randomBytes(8).toString('hex');
+
+            const inserted = await client.query(`
+                INSERT INTO games (
+                    venue_id, game_date, max_players, cost_per_player, format, regularity,
+                    exclusivity, position_type, game_url, series_id,
+                    team_selection_type, tf_kit_color, opp_kit_color,
+                    star_rating, star_rating_locked,
+                    refs_required, ref_pay, requires_organiser,
+                    early_bird_price, super_early_bird_price, opponent_id,
+                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
+                    tournament_team_count, tournament_name, external_opponent
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+                RETURNING id, game_url
+            `, [
+                game_template.venue_id, gameDate.toISOString(),
+                parseInt(game_template.max_players),
+                parseFloat(game_template.cost_per_player),
+                game_template.format || '5-a-side',
+                game_template.regularity || 'weekly',
+                game_template.exclusivity || 'none',
+                game_template.position_type || 'outfield_gk',
+                gameUrl, newSeriesId,
+                game_template.team_selection_type || 'standard',
+                game_template.tf_kit_color || null,
+                game_template.opp_kit_color || null,
+                game_template.star_rating || null,
+                !!game_template.star_rating_locked,
+                parseInt(game_template.refs_required) || 0,
+                parseFloat(game_template.ref_pay) || 0,
+                !!game_template.requires_organiser,
+                game_template.early_bird_price != null && game_template.early_bird_price !== ''
+                    ? parseFloat(game_template.early_bird_price) : null,
+                game_template.super_early_bird_price != null && game_template.super_early_bird_price !== ''
+                    ? parseFloat(game_template.super_early_bird_price) : null,
+                game_template.opponent_id || null,
+                !!game_template.is_venue_clash,
+                game_template.venue_clash_team1_name || null,
+                game_template.venue_clash_team2_name || null,
+                game_template.tournament_team_count || null,
+                game_template.tournament_name || null,
+                game_template.external_opponent || null,
+            ]);
+            createdGames.push(inserted.rows[0]);
+        }
+
+        // Copy favourites if requested
+        let favouritesCopied = 0;
+        if (copy_favourites === true || copy_favourites === 'true') {
+            const copied = await client.query(
+                `INSERT INTO player_favourite_series (player_id, series_id)
+                 SELECT player_id, $1
+                 FROM player_favourite_series
+                 WHERE series_id = $2
+                 ON CONFLICT DO NOTHING`,
+                [newSeriesId, parent_series_id]
+            );
+            favouritesCopied = copied.rowCount;
+        }
+
+        await client.query('COMMIT');
+
+        // Audit log (async, non-blocking)
+        setImmediate(() => gameAuditLog(pool, null, req.user.playerId, 'series_recreated',
+            JSON.stringify({
+                parent_series_id, new_series_id: newSeriesId,
+                games_created: createdGames.length,
+                favourites_copied: favouritesCopied,
+            })
+        ).catch(() => {}));
+
+        res.json({
+            success: true,
+            new_series_id: newSeriesId,
+            games_created: createdGames.length,
+            favourites_copied: favouritesCopied,
+            games: createdGames,
+        });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('POST recreate-series:', e);
+        res.status(500).json({ error: 'Failed to recreate series' });
+    } finally {
+        client.release();
+    }
+});
+
 // Get players registered for a specific game
 // GET /api/games/:id/calendar.ics — download ICS file for a registered game
 app.get('/api/games/:id/calendar.ics', authenticateToken, async (req, res) => {
@@ -4532,15 +5092,28 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 NULL::integer as squad_number,
                 'confirmed' as status,
                 NULL::text as backup_type,
-                'outfield' as positions,
-                'outfield' as position_preference,
+                -- Batch 8: derive positions + position_preference from position_classification
+                CASE WHEN gg.position_classification = 'gk' THEN 'GK' ELSE 'Outfield' END as positions,
+                CASE WHEN gg.position_classification = 'gk' THEN 'GK' ELSE 'outfield' END as position_preference,
+                gg.position_classification,
                 NULL::text as tournament_team_preference,
                 gg.team_name,
                 NULL::text as fixed_team,
                 NULL::integer[] as pairs,
                 NULL::integer[] as avoids,
                 TRUE as is_guest,
-                gg.overall_rating
+                gg.overall_rating,
+                gg.relative_rating,
+                gg.defending_rating,
+                gg.strength_rating,
+                gg.fitness_rating,
+                gg.pace_rating,
+                gg.shooting_rating,
+                gg.assisting_rating,
+                gg.decisions_rating,
+                gg.goalkeeper_rating,
+                gg.is_admin_override,
+                gg.derived_from_parent_ovr
             FROM game_guests gg
             LEFT JOIN players host ON host.id = gg.invited_by
             WHERE gg.game_id = $1
@@ -4886,6 +5459,38 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         
         await client.query('COMMIT');
         
+        // PREFS AUTO-ADD: After successful registration, auto-add the game's venue region
+        // to the player's preferred_locations. Zero-friction preference discovery.
+        // Runs outside the transaction so a failure here never blocks registration.
+        setImmediate(async () => {
+            try {
+                const venueRegion = await pool.query(
+                    `SELECT v.region FROM games g
+                     JOIN venues v ON v.id = g.venue_id
+                     WHERE g.id = $1`,
+                    [gameId]
+                );
+                const gameLoc = venueRegion.rows[0]?.region;
+                if (gameLoc) {
+                    const pr = await pool.query(
+                        'SELECT preferred_locations FROM players WHERE id = $1',
+                        [req.user.playerId]
+                    );
+                    const current = (pr.rows[0]?.preferred_locations || '')
+                        .split(',').map(s => s.trim()).filter(Boolean);
+                    if (!current.includes(gameLoc)) {
+                        current.push(gameLoc);
+                        await pool.query(
+                            'UPDATE players SET preferred_locations = $1 WHERE id = $2',
+                            [current.join(','), req.user.playerId]
+                        );
+                    }
+                }
+            } catch (e) {
+                console.warn('preferred_locations auto-add failed (non-critical):', e.message);
+            }
+        });
+        
         // For draft_memory games — look up if this player has a memorised team in this series
         let fixedTeam = null;
         if (status === 'confirmed' && game.team_selection_type === 'draft_memory' && game.series_id) {
@@ -5001,12 +5606,163 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
 // GUEST +1 SYSTEM
 // ==========================================
 
+// ── Batch 8 — Guest stat derivation ───────────────────────────────────
+// Computes a guest's 7 individual stats + overall_rating + goalkeeper_rating
+// from parent's stats, a slider delta (-4..+4), and the guest's position
+// classification (gk / defender / midfielder / attacker).
+//
+// Locked rules (GAFFA 19 Apr 2026):
+//   - No conservative "-2" discount — trust the slider
+//   - Archetype flip: if parent's archetype differs from guest's, flip ±1
+//     between defensive (def/str/fit) and attacking (sht/ast/pac) stats
+//   - Delta spread: for def/atk guests spread across archetype's 3 stats
+//     first, then overflow to decisions, then loop back
+//   - Midfielders distribute delta in order: fitness → assisting → decisions
+//   - Tie-rule on archetype detection: defender wins over attacker
+//   - GK guests use the goalkeeper_rating scale with ×2 multiplier
+//
+function _deriveParentArchetype(parent) {
+    const def = parseInt(parent.defending_rating || 0);
+    const str = parseInt(parent.strength_rating  || 0);
+    const fit = parseInt(parent.fitness_rating   || 0);
+    const pac = parseInt(parent.pace_rating      || 0);
+    const sht = parseInt(parent.shooting_rating  || 0);
+    const ast = parseInt(parent.assisting_rating || 0);
+    const dec = parseInt(parent.decisions_rating || 0);
+    const gk  = parseInt(parent.goalkeeper_rating || 0);
+
+    const outfieldMax = Math.max(def, str, fit, pac, sht, ast, dec);
+
+    // GK parent if goalkeeper_rating exceeds their best outfield stat
+    if (gk > outfieldMax) return 'gk';
+
+    const hasDefTop = (def === outfieldMax) || (str === outfieldMax);
+    const hasAtkTop = (sht === outfieldMax) || (ast === outfieldMax);
+
+    // Tie rule: defender wins over attacker
+    if (hasDefTop) return 'defender';
+    if (hasAtkTop) return 'attacker';
+    return 'midfielder';
+}
+
+function _clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function _deriveGkGuestStats(parent, delta) {
+    // GK uses goalkeeper_rating scale (0–99); ×2 multiplier so ±4 on slider
+    // maps to ±8 on GK rating — proportional to the wider scale.
+    const parentGk = parseInt(parent.goalkeeper_rating || parent.overall_rating || 84);
+    const targetGk = _clamp(parentGk + (delta * 2), 30, 99);
+    return {
+        defending_rating:  0,
+        strength_rating:   0,
+        fitness_rating:    0,
+        pace_rating:       0,
+        shooting_rating:   0,
+        assisting_rating:  0,
+        decisions_rating:  0,
+        goalkeeper_rating: targetGk,
+        overall_rating:    targetGk,  // for team-balance purposes GK guests contribute their gk_rating
+    };
+}
+
+function _spreadDelta(stats, keys, delta) {
+    // Mutates `stats` by distributing |delta| across `keys` in order.
+    // If |delta| > keys.length, overflow wraps back to the start.
+    const sign = delta < 0 ? -1 : 1;
+    let remaining = Math.abs(delta);
+    let idx = 0;
+    while (remaining > 0) {
+        const k = keys[idx % keys.length];
+        stats[k] = (stats[k] || 0) + sign;
+        remaining -= 1;
+        idx += 1;
+    }
+}
+
+function deriveGuestStats(parent, delta, guestPosition) {
+    const pos = (guestPosition || 'midfielder').toLowerCase();
+    if (pos === 'gk') return _deriveGkGuestStats(parent, delta);
+
+    const parentArchetype = _deriveParentArchetype(parent);
+
+    // GK parent bringing an outfielder — reset to flat base
+    if (parentArchetype === 'gk') {
+        const target = parseInt(parent.goalkeeper_rating || 84) + delta;
+        const stats  = {
+            defending_rating: 12, strength_rating: 12, fitness_rating: 12,
+            pace_rating:      12, shooting_rating: 12, assisting_rating: 12,
+            decisions_rating: 12,
+        };
+        const needed = target - 84;  // 12*7 = 84 base
+        if (pos === 'defender') {
+            _spreadDelta(stats, ['defending_rating','strength_rating','fitness_rating','decisions_rating'], needed);
+        } else if (pos === 'attacker') {
+            _spreadDelta(stats, ['shooting_rating','assisting_rating','pace_rating','decisions_rating'], needed);
+        } else {
+            _spreadDelta(stats, ['fitness_rating','assisting_rating','decisions_rating'], needed);
+        }
+        // Clamp
+        for (const k of Object.keys(stats)) stats[k] = _clamp(stats[k], 0, 20);
+        const overall = stats.defending_rating + stats.strength_rating + stats.fitness_rating
+                      + stats.pace_rating + stats.shooting_rating + stats.assisting_rating
+                      + stats.decisions_rating;
+        return { ...stats, goalkeeper_rating: 0, overall_rating: overall };
+    }
+
+    // Outfield parent → outfield guest: copy and apply archetype flip + delta
+    const stats = {
+        defending_rating:  parseInt(parent.defending_rating  || 0),
+        strength_rating:   parseInt(parent.strength_rating   || 0),
+        fitness_rating:    parseInt(parent.fitness_rating    || 0),
+        pace_rating:       parseInt(parent.pace_rating       || 0),
+        shooting_rating:   parseInt(parent.shooting_rating   || 0),
+        assisting_rating:  parseInt(parent.assisting_rating  || 0),
+        decisions_rating:  parseInt(parent.decisions_rating  || 0),
+    };
+
+    // Step 1 — archetype flip (±1 defensive↔attacking) if archetypes differ
+    if (parentArchetype !== pos) {
+        if (pos === 'defender') {
+            stats.defending_rating += 1; stats.strength_rating  += 1; stats.fitness_rating += 1;
+            stats.shooting_rating  -= 1; stats.assisting_rating -= 1; stats.pace_rating    -= 1;
+        } else if (pos === 'attacker') {
+            stats.shooting_rating  += 1; stats.assisting_rating += 1; stats.pace_rating    += 1;
+            stats.defending_rating -= 1; stats.strength_rating  -= 1; stats.fitness_rating -= 1;
+        }
+        // Midfielder — no flip (blend)
+    }
+
+    // Step 2 — apply delta, priority order depends on archetype
+    if (pos === 'defender') {
+        _spreadDelta(stats, ['defending_rating','strength_rating','fitness_rating','decisions_rating'], delta);
+    } else if (pos === 'attacker') {
+        _spreadDelta(stats, ['shooting_rating','assisting_rating','pace_rating','decisions_rating'], delta);
+    } else {
+        // midfielder — fitness → assisting → decisions
+        _spreadDelta(stats, ['fitness_rating','assisting_rating','decisions_rating'], delta);
+    }
+
+    // Step 3 — clamp each to 0..20
+    for (const k of Object.keys(stats)) stats[k] = _clamp(stats[k], 0, 20);
+
+    // Step 4 — sum for overall
+    const overall = stats.defending_rating + stats.strength_rating + stats.fitness_rating
+                  + stats.pace_rating + stats.shooting_rating + stats.assisting_rating
+                  + stats.decisions_rating;
+
+    return { ...stats, goalkeeper_rating: 0, overall_rating: overall };
+}
+
+// Slider-label → integer delta mapping (stored in DB as relative_rating).
+// Values intentionally skip ±3 (sliders snap to 7 named positions).
+const _SLIDER_DELTA_MAP = { '-4': -4, '-2': -2, '-1': -1, '0': 0, '1': 1, '2': 2, '4': 4 };
+
 // Add a +1 guest to a game
 app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
         const gameId = req.params.id;
-        const { guestName, tournamentTeamPreference } = req.body;
+        const { guestName, relative_rating, position_classification, tournamentTeamPreference } = req.body;
         const playerId = req.user.playerId;
 
         if (!guestName || guestName.trim().length < 2) {
@@ -5016,6 +5772,17 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         // FIX-080: Guest name max length
         if (guestName.trim().length > 50) {
             return res.status(400).json({ error: 'Guest name must be 50 characters or fewer' });
+        }
+
+        // Batch 8 — validate new fields
+        const deltaRaw  = (relative_rating != null) ? String(relative_rating) : '0';
+        if (!_SLIDER_DELTA_MAP.hasOwnProperty(deltaRaw)) {
+            return res.status(400).json({ error: 'Invalid relative rating — must be one of -4, -2, -1, 0, 1, 2, 4' });
+        }
+        const delta = _SLIDER_DELTA_MAP[deltaRaw];
+        const posClass = String(position_classification || 'midfielder').toLowerCase();
+        if (!['gk','defender','midfielder','attacker'].includes(posClass)) {
+            return res.status(400).json({ error: 'Invalid position classification' });
         }
 
         await client.query('BEGIN');
@@ -5108,27 +5875,66 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         // Deduct credits from the inviting player (free credits first)
         await applyGameFee(client, playerId, cost, `+1 guest (${guestName.trim()}) for game`);
 
-        // Get player's overall rating (compute from individual stats if overall_rating is NULL)
+        // Get parent's full stat set for derivation
         const playerRating = await client.query(
             `SELECT overall_rating, defending_rating, strength_rating, fitness_rating,
-                    pace_rating, decisions_rating, assisting_rating, shooting_rating
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating,
+                    goalkeeper_rating
              FROM players WHERE id = $1`,
             [playerId]
         );
-        const pr = playerRating.rows[0] || {};
-        const computedOverall = (pr.overall_rating != null)
-            ? parseInt(pr.overall_rating)
-            : (parseInt(pr.defending_rating || 0) + parseInt(pr.strength_rating || 0) +
-               parseInt(pr.fitness_rating || 0) + parseInt(pr.pace_rating || 0) +
-               parseInt(pr.decisions_rating || 0) + parseInt(pr.assisting_rating || 0) +
-               parseInt(pr.shooting_rating || 0));
-        const guestRating = Math.max(0, computedOverall - 2);
+        const parent = playerRating.rows[0] || {};
 
-        // Insert guest record
+        // Batch 8 — GK slot full check (dedicated GKs only; flex-GK handled separately)
+        if (posClass === 'gk') {
+            const gkCount = await client.query(
+                `SELECT
+                    (SELECT COUNT(*) FROM registrations
+                      WHERE game_id = $1 AND status = 'confirmed'
+                        AND UPPER(TRIM(position_preference)) = 'GK')
+                    +
+                    (SELECT COUNT(*) FROM game_guests
+                      WHERE game_id = $1 AND position_classification = 'gk') AS total_gk`,
+                [gameId]
+            );
+            const totalGK = parseInt(gkCount.rows[0].total_gk || 0);
+            // Exception: parent is a dedicated GK themselves → allowed (algo splits
+            // the pair across teams). For other parents, cap at 2 GKs total.
+            const parentIsDedicatedGK = _deriveParentArchetype(parent) === 'gk';
+            if (!parentIsDedicatedGK && totalGK >= 2) {
+                await client.query('ROLLBACK');
+                client.release();
+                return res.status(400).json({
+                    error: 'Sorry, we already have 2 goalkeepers. Select outfield position or cancel guest sign-up?'
+                });
+            }
+        }
+
+        // Derive full stat set from parent + slider + position
+        const derived = deriveGuestStats(parent, delta, posClass);
+        const parentOverall = (parent.overall_rating != null)
+            ? parseInt(parent.overall_rating)
+            : (parseInt(parent.defending_rating || 0) + parseInt(parent.strength_rating || 0) +
+               parseInt(parent.fitness_rating || 0)   + parseInt(parent.pace_rating || 0) +
+               parseInt(parent.decisions_rating || 0) + parseInt(parent.assisting_rating || 0) +
+               parseInt(parent.shooting_rating || 0));
+
+        // Insert guest record with full derived stat set
         await client.query(
-            `INSERT INTO game_guests (game_id, invited_by, guest_name, overall_rating, amount_paid, guest_number, tournament_team_preference)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [gameId, playerId, guestName.trim(), guestRating, cost, nextGuestNumber, tournamentTeamPreference || null]
+            `INSERT INTO game_guests (
+                game_id, invited_by, guest_name, overall_rating, amount_paid, guest_number,
+                tournament_team_preference,
+                relative_rating, position_classification,
+                defending_rating, strength_rating, fitness_rating,
+                pace_rating, shooting_rating, assisting_rating, decisions_rating,
+                goalkeeper_rating, is_admin_override, derived_from_parent_ovr
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+            [gameId, playerId, guestName.trim(), derived.overall_rating, cost, nextGuestNumber,
+             tournamentTeamPreference || null,
+             delta, posClass,
+             derived.defending_rating, derived.strength_rating, derived.fitness_rating,
+             derived.pace_rating, derived.shooting_rating, derived.assisting_rating, derived.decisions_rating,
+             derived.goalkeeper_rating, false, parentOverall]
         );
 
         // Get player's referral code — generate one on the fly if missing (legacy accounts)
@@ -5185,6 +5991,28 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Failed to add guest' });
     } finally {
         client.release();
+    }
+});
+
+// ── Batch 8 — GET /api/games/:id/my-guests ───────────────────────────
+// Returns the authenticated player's own guest rows for a given game.
+// Used by game.html's add-guest modal to render a "your guests" remove list.
+app.get('/api/games/:id/my-guests', authenticateToken, async (req, res) => {
+    try {
+        const gameId   = req.params.id;
+        const playerId = req.user.playerId;
+        const result = await pool.query(
+            `SELECT id, guest_name, guest_number, overall_rating,
+                    position_classification, relative_rating
+             FROM game_guests
+             WHERE game_id = $1 AND invited_by = $2
+             ORDER BY guest_number ASC`,
+            [gameId, playerId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get my guests error:', error);
+        res.status(500).json({ error: 'Failed to get your guests' });
     }
 });
 
@@ -5286,6 +6114,160 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
         res.status(500).json({ error: 'Failed to remove guest' });
     } finally {
         client.release();
+    }
+});
+
+// ── Batch 8 — Guest stat admin override + reset endpoints ─────────────
+// PATCH /api/games/:gameId/guests/:guestId/stats
+// Admin-only manual edit of a guest's derived stats. Server recomputes
+// overall_rating from the 7 outfield stats (or goalkeeper_rating for GK
+// guests) and flags is_admin_override = TRUE so the reset button un-greys.
+app.patch('/api/games/:gameId/guests/:guestId/stats', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId, guestId } = req.params;
+        const {
+            defending_rating, strength_rating, fitness_rating,
+            pace_rating, shooting_rating, assisting_rating, decisions_rating,
+            goalkeeper_rating
+        } = req.body;
+
+        // Validate 0..20 for each outfield stat, 0..99 for goalkeeper
+        const outfieldKeys = {
+            defending_rating, strength_rating, fitness_rating,
+            pace_rating, shooting_rating, assisting_rating, decisions_rating
+        };
+        for (const [k, v] of Object.entries(outfieldKeys)) {
+            const n = parseInt(v);
+            if (!Number.isFinite(n) || n < 0 || n > 20) {
+                return res.status(400).json({ error: `${k} must be an integer 0..20` });
+            }
+        }
+        const gk = parseInt(goalkeeper_rating || 0);
+        if (!Number.isFinite(gk) || gk < 0 || gk > 99) {
+            return res.status(400).json({ error: 'goalkeeper_rating must be an integer 0..99' });
+        }
+
+        // Load the guest to determine classification + previous values
+        const existing = await pool.query(
+            `SELECT position_classification, defending_rating, strength_rating, fitness_rating,
+                    pace_rating, shooting_rating, assisting_rating, decisions_rating,
+                    goalkeeper_rating, overall_rating
+             FROM game_guests WHERE id = $1 AND game_id = $2`,
+            [guestId, gameId]
+        );
+        if (existing.rows.length === 0) {
+            return res.status(404).json({ error: 'Guest not found' });
+        }
+        const before = existing.rows[0];
+
+        // Recompute overall server-side (never trust client's overall_rating)
+        const isGk = before.position_classification === 'gk';
+        const newOverall = isGk
+            ? gk
+            : (parseInt(defending_rating) + parseInt(strength_rating) + parseInt(fitness_rating) +
+               parseInt(pace_rating) + parseInt(shooting_rating) + parseInt(assisting_rating) +
+               parseInt(decisions_rating));
+
+        await pool.query(
+            `UPDATE game_guests SET
+                defending_rating = $1, strength_rating = $2, fitness_rating = $3,
+                pace_rating = $4, shooting_rating = $5, assisting_rating = $6, decisions_rating = $7,
+                goalkeeper_rating = $8, overall_rating = $9, is_admin_override = TRUE
+             WHERE id = $10 AND game_id = $11`,
+            [parseInt(defending_rating), parseInt(strength_rating), parseInt(fitness_rating),
+             parseInt(pace_rating), parseInt(shooting_rating), parseInt(assisting_rating), parseInt(decisions_rating),
+             gk, newOverall, guestId, gameId]
+        );
+
+        await gameAuditLog(pool, gameId, req.user.playerId, 'guest_stats_overridden', JSON.stringify({
+            guest_id: guestId,
+            before: {
+                def: before.defending_rating, str: before.strength_rating, fit: before.fitness_rating,
+                pac: before.pace_rating, sht: before.shooting_rating, ast: before.assisting_rating,
+                dec: before.decisions_rating, gk: before.goalkeeper_rating, overall: before.overall_rating
+            },
+            after: {
+                def: parseInt(defending_rating), str: parseInt(strength_rating), fit: parseInt(fitness_rating),
+                pac: parseInt(pace_rating), sht: parseInt(shooting_rating), ast: parseInt(assisting_rating),
+                dec: parseInt(decisions_rating), gk, overall: newOverall
+            }
+        }));
+
+        res.json({ success: true, overall_rating: newOverall, is_admin_override: true });
+    } catch (error) {
+        console.error('Guest stats override error:', error);
+        res.status(500).json({ error: 'Failed to update guest stats' });
+    }
+});
+
+// POST /api/games/:gameId/guests/:guestId/reset-stats
+// Re-runs derivation from current parent stats + stored relative_rating +
+// position_classification. Clears is_admin_override and refreshes
+// derived_from_parent_ovr to the parent's current overall.
+app.post('/api/games/:gameId/guests/:guestId/reset-stats', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId, guestId } = req.params;
+
+        const guestResult = await pool.query(
+            `SELECT gg.invited_by, gg.relative_rating, gg.position_classification
+             FROM game_guests gg
+             WHERE gg.id = $1 AND gg.game_id = $2`,
+            [guestId, gameId]
+        );
+        if (guestResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Guest not found' });
+        }
+        const { invited_by, relative_rating, position_classification } = guestResult.rows[0];
+
+        const parentResult = await pool.query(
+            `SELECT overall_rating, defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating,
+                    goalkeeper_rating
+             FROM players WHERE id = $1`,
+            [invited_by]
+        );
+        if (parentResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Parent player not found' });
+        }
+        const parent = parentResult.rows[0];
+
+        const delta = parseInt(relative_rating) || 0;
+        const derived = deriveGuestStats(parent, delta, position_classification || 'midfielder');
+
+        const parentOverall = (parent.overall_rating != null)
+            ? parseInt(parent.overall_rating)
+            : (parseInt(parent.defending_rating || 0) + parseInt(parent.strength_rating || 0) +
+               parseInt(parent.fitness_rating || 0)   + parseInt(parent.pace_rating || 0) +
+               parseInt(parent.decisions_rating || 0) + parseInt(parent.assisting_rating || 0) +
+               parseInt(parent.shooting_rating || 0));
+
+        await pool.query(
+            `UPDATE game_guests SET
+                defending_rating = $1, strength_rating = $2, fitness_rating = $3,
+                pace_rating = $4, shooting_rating = $5, assisting_rating = $6, decisions_rating = $7,
+                goalkeeper_rating = $8, overall_rating = $9,
+                is_admin_override = FALSE, derived_from_parent_ovr = $10
+             WHERE id = $11 AND game_id = $12`,
+            [derived.defending_rating, derived.strength_rating, derived.fitness_rating,
+             derived.pace_rating, derived.shooting_rating, derived.assisting_rating, derived.decisions_rating,
+             derived.goalkeeper_rating, derived.overall_rating,
+             parentOverall, guestId, gameId]
+        );
+
+        await gameAuditLog(pool, gameId, req.user.playerId, 'guest_stats_reset', JSON.stringify({
+            guest_id: guestId, delta, position_classification, new_overall: derived.overall_rating
+        }));
+
+        res.json({
+            success: true,
+            overall_rating: derived.overall_rating,
+            is_admin_override: false,
+            derived_from_parent_ovr: parentOverall,
+            stats: derived
+        });
+    } catch (error) {
+        console.error('Guest stats reset error:', error);
+        res.status(500).json({ error: 'Failed to reset guest stats' });
     }
 });
 
@@ -6798,7 +7780,7 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
     const client = await pool.connect();
     try {
         const gameId = req.params.id;
-        const { positions, pairs, avoids } = req.body;
+        const { positions, positionAreas, pairs, avoids } = req.body;
 
         // FIX-047: Block updates after teams generated
         const state = await client.query('SELECT teams_generated, team_selection_type, is_venue_clash FROM games WHERE id = $1', [gameId]);
@@ -6817,6 +7799,12 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
         if (safePairs.length > 10 || safeAvoids.length > 10) {
             return res.status(400).json({ error: 'Max 10 pairs/avoids allowed' });
         }
+
+        // Batch 6 — sanitise position_areas with same whitelist used at signup
+        const _ALLOWED_AREAS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF','defence','midfield','attack']);
+        const sanitisedPositionAreas = positionAreas
+            ? String(positionAreas).split(',').map(s => s.trim()).filter(s => _ALLOWED_AREAS.has(s)).join(',') || null
+            : null;
         
         // Get registration
         const regResult = await client.query(
@@ -6832,10 +7820,10 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
 
         await client.query('BEGIN');
         
-        // Update positions
+        // Update positions (both position_preference and the 11-a-side pitch position_areas)
         await client.query(
-            'UPDATE registrations SET position_preference = $1 WHERE id = $2',
-            [positions, registrationId]
+            'UPDATE registrations SET position_preference = $1, position_areas = $2 WHERE id = $3',
+            [positions, sanitisedPositionAreas, registrationId]
         );
         
         // Delete old preferences
@@ -6897,6 +7885,49 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
         res.status(500).json({ error: 'Failed to update preferences' });
     } finally {
         client.release();
+    }
+});
+
+// ── Batch 6 — GET /api/games/:id/my-preferences ──────────────────────
+// Returns ONLY the authenticated player's own preferences for this game.
+// Never accepts a client-supplied playerId — always uses req.user.playerId.
+// Powers the in-game prefs modal on both web and mobile.
+app.get('/api/games/:id/my-preferences', authenticateToken, async (req, res) => {
+    try {
+        const gameId   = req.params.id;
+        const playerId = req.user.playerId;
+
+        // Find the player's registration (confirmed OR backup — backups can plan ahead)
+        const regResult = await pool.query(
+            `SELECT r.id, r.position_preference, r.position_areas
+             FROM registrations r
+             WHERE r.game_id = $1 AND r.player_id = $2 AND r.status IN ('confirmed', 'backup')`,
+            [gameId, playerId]
+        );
+        if (regResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Not registered for this game' });
+        }
+        const reg = regResult.rows[0];
+
+        // Load the pairs/avoids
+        const prefsResult = await pool.query(
+            `SELECT target_player_id, preference_type
+             FROM registration_preferences
+             WHERE registration_id = $1`,
+            [reg.id]
+        );
+        const pairs  = prefsResult.rows.filter(r => r.preference_type === 'pair').map(r => r.target_player_id);
+        const avoids = prefsResult.rows.filter(r => r.preference_type === 'avoid').map(r => r.target_player_id);
+
+        res.json({
+            position_preference: reg.position_preference || 'outfield',
+            position_areas:      reg.position_areas || null,
+            pairs,
+            avoids
+        });
+    } catch (error) {
+        console.error('Get my preferences error:', error);
+        res.status(500).json({ error: 'Failed to get preferences' });
     }
 });
 
@@ -6964,19 +7995,28 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         }));
         
         // Also fetch +N guests for this game (multi-guest)
+        // Batch 8 — pull full derived stat set instead of hardcoding 0s.
+        // Batch 7 team-algo rewrite will consume position_classification +
+        // the 7 individual stats for proper balance calculations.
         const guestsResult = await pool.query(`
-            SELECT g.id as guest_id, g.guest_name, g.overall_rating, g.invited_by, g.guest_number
+            SELECT g.id as guest_id, g.guest_name, g.overall_rating, g.invited_by, g.guest_number,
+                   g.position_classification, g.relative_rating,
+                   g.defending_rating, g.strength_rating, g.fitness_rating,
+                   g.pace_rating, g.shooting_rating, g.assisting_rating, g.decisions_rating,
+                   g.goalkeeper_rating, g.is_admin_override, g.derived_from_parent_ovr
             FROM game_guests g
             WHERE g.game_id = $1
             ORDER BY g.invited_by, g.guest_number
         `, [gameId]);
-        
+
         // Build guest groups: map of invited_by -> array of guest objects
         const guestGroups = new Map();
         for (const guest of guestsResult.rows) {
             if (!guestGroups.has(guest.invited_by)) {
                 guestGroups.set(guest.invited_by, []);
             }
+            // Derive position_preference from classification (GK guests → 'gk', everyone else → 'outfield')
+            const guestPosPref = guest.position_classification === 'gk' ? 'gk' : 'outfield';
             guestGroups.get(guest.invited_by).push({
                 reg_id: null,
                 player_id: `guest_${guest.guest_id}`,
@@ -6984,15 +8024,19 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 alias: `${guest.guest_name} (Guest)`,
                 squad_number: null,
                 overall_rating: guest.overall_rating || 0,
-                goalkeeper_rating: 0,
-                defending_rating: 0,
-                strength_rating: 0,
-                fitness_rating: 0,
-                pace_rating: 0,
-                decisions_rating: 0,
-                assisting_rating: 0,
-                shooting_rating: 0,
-                position_preference: 'outfield',
+                goalkeeper_rating: parseInt(guest.goalkeeper_rating || 0),
+                defending_rating:  parseInt(guest.defending_rating  || 0),
+                strength_rating:   parseInt(guest.strength_rating   || 0),
+                fitness_rating:    parseInt(guest.fitness_rating    || 0),
+                pace_rating:       parseInt(guest.pace_rating       || 0),
+                decisions_rating:  parseInt(guest.decisions_rating  || 0),
+                assisting_rating:  parseInt(guest.assisting_rating  || 0),
+                shooting_rating:   parseInt(guest.shooting_rating   || 0),
+                position_preference:     guestPosPref,
+                position_classification: guest.position_classification || 'midfielder',
+                relative_rating:         guest.relative_rating,
+                is_admin_override:       !!guest.is_admin_override,
+                derived_from_parent_ovr: guest.derived_from_parent_ovr,
                 pairs: [guest.invited_by],
                 avoids: [],
                 is_guest: true
@@ -7003,320 +8047,471 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             return res.status(400).json({ error: 'Need at least 2 players to generate teams' });
         }
         
-        // Get beef relationships (rating 3+) - optional, may not exist yet
-        let highBeefs = new Map();
-        let lowBeefs = new Map();
-        
+        // Batch 7 — Beef relationships, loaded into per-level Maps.
+        // Semantics flipped in Batch 8: beef now means "keep together on same team".
+        // Beef 5 = never relaxed; Beef 1-4 = soft grouping preferences.
+        const beef1 = new Map(), beef2 = new Map(), beef3 = new Map(), beef4 = new Map(), beef5 = new Map();
+        const beefByLevel = { 1: beef1, 2: beef2, 3: beef3, 4: beef4, 5: beef5 };
         try {
-            const beefsResult = await pool.query(`
-                SELECT player_id, target_player_id, rating
-                FROM beef
-                WHERE rating >= 2
-            `);
-            
-            beefsResult.rows.forEach(beef => {
-                if (beef.rating >= 3) {
-                    if (!highBeefs.has(beef.player_id)) highBeefs.set(beef.player_id, []);
-                    highBeefs.get(beef.player_id).push(beef.target_player_id);
-                } else if (beef.rating >= 2) {
-                    if (!lowBeefs.has(beef.player_id)) lowBeefs.set(beef.player_id, []);
-                    lowBeefs.get(beef.player_id).push(beef.target_player_id);
-                }
-            });
+            const beefsResult = await pool.query(`SELECT player_id, target_player_id, rating FROM beef WHERE rating >= 1`);
+            for (const b of beefsResult.rows) {
+                const m = beefByLevel[b.rating];
+                if (!m) continue;
+                if (!m.has(b.player_id)) m.set(b.player_id, []);
+                m.get(b.player_id).push(b.target_player_id);
+            }
         } catch (beefError) {
-            // Beef table doesn't exist yet - that's fine, continue without it
+            // Beef table doesn't exist yet - continue without it
         }
         
         // ===================================================
-        // ALGORITHM — GUEST-FIRST INTERTWINED PICKING
+        // ALGORITHM — PHASED TEAM GENERATION (Batch 7 rewrite)
         // ===================================================
-        const redTeam = [];
+        // See team-selection-algo.md for full specification. Phases:
+        //   1. Guest groups (already built above as guestGroups)
+        //   2. Beef 5 lock groups — chained Beef 5 pairs form atomic units
+        //   3. Pair/avoid classification — mutual vs one-way
+        //   4. Build unit list (beef5 > parent > solo)
+        //   5. GK assignment (0 / 1 / 2+ cases)
+        //   6. Greedy balance — biggest unit first
+        //   7. Swap loop — hill-climb via dissatisfaction score
+        //   8. Relax loop — random one-at-a-time per tier; Beef 5 never relaxed
+        //
+        // Priority order (strongest to weakest):
+        //   Beef 5 (never) > Beef 4 > Beef 3 > Beef 2 > Beef 1 >
+        //   Mutual Avoid > Mutual Pair > One-way Avoid > One-way Pair
+
+        const allGuests = Array.from(guestGroups.values()).flat();
+        const totalPlayerCount = players.length + allGuests.length;
+        const isOddCount = (totalPlayerCount % 2) === 1;
+        const overallBuffer = isOddCount ? 2 : 1;
+
+        // ── Helpers ────────────────────────────────────────────
+        const toStrId = (x) => String(x);
+        const sumStat = (team, stat) => team.reduce((s, p) => s + (parseInt(p[stat]) || 0), 0);
+        const ovrSum  = (team) => sumStat(team, 'overall_rating');
+        const defSum  = (team) => sumStat(team, 'defending_rating');
+        const fitSum  = (team) => sumStat(team, 'fitness_rating');
+        const isDedicatedGK = (p) =>
+            p.position_preference?.trim().toLowerCase() === 'gk' ||
+            p.position_classification === 'gk';
+        const outfieldOnly = (team) => team.filter(p => !isDedicatedGK(p));
+        const avgStatOutfield = (team, stat) => {
+            const of = outfieldOnly(team);
+            return of.length ? sumStat(of, stat) / of.length : 0;
+        };
+        const hasAnyGuest = (team) => team.some(p => p.is_guest);
+
+        const isDefender = (p) => {
+            if (p.is_guest) return p.position_classification === 'defender';
+            if (p.position_areas) {
+                const zones = p.position_areas.split(',').map(s => s.trim().toUpperCase());
+                if (zones.some(z => ['LB','RB','CB','DEFENCE'].includes(z))) return true;
+            }
+            // Archetype fallback — defender-wins tie rule
+            const stats = {
+                def: parseInt(p.defending_rating || 0), str: parseInt(p.strength_rating || 0),
+                fit: parseInt(p.fitness_rating || 0),   pac: parseInt(p.pace_rating || 0),
+                sht: parseInt(p.shooting_rating || 0),  ast: parseInt(p.assisting_rating || 0),
+                dec: parseInt(p.decisions_rating || 0)
+            };
+            const outMax = Math.max(...Object.values(stats));
+            return (stats.def === outMax) || (stats.str === outMax);
+        };
+
+        const allPlayersMap = new Map();
+        for (const p of players)    allPlayersMap.set(toStrId(p.player_id), p);
+        for (const g of allGuests)  allPlayersMap.set(toStrId(g.player_id), g);
+
+        // ── Phase 2: Beef 5 lock groups (union-find chaining) ──
+        const ufParent = new Map();
+        const ufFind = (x) => {
+            let r = x;
+            while (ufParent.get(r) !== r) r = ufParent.get(r);
+            return r;
+        };
+        const ufUnion = (a, b) => {
+            const ra = ufFind(a), rb = ufFind(b);
+            if (ra !== rb) ufParent.set(ra, rb);
+        };
+        for (const id of allPlayersMap.keys()) ufParent.set(id, id);
+        for (const [srcRaw, targets] of beef5.entries()) {
+            const src = toStrId(srcRaw);
+            for (const tRaw of targets) {
+                const t = toStrId(tRaw);
+                if (ufParent.has(src) && ufParent.has(t)) ufUnion(src, t);
+            }
+        }
+        const beef5GroupMap = new Map();
+        for (const id of allPlayersMap.keys()) {
+            const root = ufFind(id);
+            if (!beef5GroupMap.has(root)) beef5GroupMap.set(root, []);
+            beef5GroupMap.get(root).push(id);
+        }
+        const beef5Groups = Array.from(beef5GroupMap.values()).filter(g => g.length > 1);
+        const beef5MemberIds = new Set(beef5Groups.flat());
+
+        // ── Phase 3: Pair/avoid classification ──
+        const pairsMap  = new Map();
+        const avoidsMap = new Map();
+        for (const p of players) {
+            const pid = toStrId(p.player_id);
+            pairsMap.set(pid,  new Set((p.pairs  || []).filter(Boolean).map(toStrId)));
+            avoidsMap.set(pid, new Set((p.avoids || []).filter(Boolean).map(toStrId)));
+        }
+        const mutualPairs   = [];
+        const onewayPairs   = [];
+        const mutualAvoids  = [];
+        const onewayAvoids  = [];
+        for (const [pid, targets] of pairsMap.entries()) {
+            for (const t of targets) {
+                if (pairsMap.get(t)?.has(pid)) {
+                    if (pid < t) mutualPairs.push({ a: pid, b: t });
+                } else {
+                    onewayPairs.push({ from: pid, to: t });
+                }
+            }
+        }
+        for (const [pid, targets] of avoidsMap.entries()) {
+            for (const t of targets) {
+                if (avoidsMap.get(t)?.has(pid)) {
+                    if (pid < t) mutualAvoids.push({ a: pid, b: t });
+                } else {
+                    onewayAvoids.push({ from: pid, to: t });
+                }
+            }
+        }
+
+        // Active constraint sets — these may be relaxed in Phase 8
+        let activeOnewayPairs  = [...onewayPairs];
+        let activeOnewayAvoids = [...onewayAvoids];
+        let activeMutualPairs  = [...mutualPairs];
+        let activeMutualAvoids = [...mutualAvoids];
+        const buildBeefConstraints = (m) => {
+            const out = [];
+            for (const [srcRaw, targets] of m.entries()) {
+                for (const t of targets) {
+                    const a = String(srcRaw), b = String(t);
+                    if (a < b) out.push({ a, b });
+                }
+            }
+            return out;
+        };
+        let activeBeef1 = buildBeefConstraints(beef1);
+        let activeBeef2 = buildBeefConstraints(beef2);
+        let activeBeef3 = buildBeefConstraints(beef3);
+        let activeBeef4 = buildBeefConstraints(beef4);
+        const beef5Constraints = buildBeefConstraints(beef5);
+
+        // ── Phase 4: Build unit list ──
+        const units = [];
+        // Beef 5 atomic units first (pull in attached guests)
+        for (const memberIds of beef5Groups) {
+            const members = [];
+            for (const id of memberIds) {
+                const p = allPlayersMap.get(id);
+                if (!p) continue;
+                members.push(p);
+                if (!p.is_guest) {
+                    const mine = guestGroups.get(p.player_id) || [];
+                    for (const g of mine) members.push(g);
+                }
+            }
+            units.push({
+                kind: 'beef5',
+                members,
+                sumOverall: members.reduce((s, m) => s + (m.overall_rating || 0), 0)
+            });
+        }
+        // Parents with guests (not already in beef5)
+        for (const p of players) {
+            const pid = toStrId(p.player_id);
+            if (beef5MemberIds.has(pid)) continue;
+            const myGuests = guestGroups.get(p.player_id) || [];
+            if (myGuests.length > 0) {
+                const members = [p, ...myGuests];
+                units.push({
+                    kind: 'parent',
+                    members,
+                    sumOverall: members.reduce((s, m) => s + (m.overall_rating || 0), 0)
+                });
+            }
+        }
+        // Solo players (not parents, not in beef5)
+        for (const p of players) {
+            const pid = toStrId(p.player_id);
+            if (beef5MemberIds.has(pid)) continue;
+            if ((guestGroups.get(p.player_id) || []).length > 0) continue;
+            units.push({
+                kind: 'solo',
+                members: [p],
+                sumOverall: p.overall_rating || 0
+            });
+        }
+
+        // ── Phase 5: GK assignment ──
+        const redTeam  = [];
         const blueTeam = [];
-        
-        // PRIORITY 1: Assign 1 GK to each team
-        // Only treat as GK if they selected GK exclusively (not GK + outfield)
-        const goalkeepers = players.filter(p => p.position_preference?.trim().toLowerCase() === 'gk');
-        const outfield = players.filter(p => p.position_preference?.trim().toLowerCase() !== 'gk');
-        
-        if (goalkeepers.length >= 1) redTeam.push(goalkeepers[0]);
-        if (goalkeepers.length >= 2) blueTeam.push(goalkeepers[1]);
-        if (goalkeepers.length >= 3) outfield.push(...goalkeepers.slice(2)); // Extra GKs as outfield
-        
-        // Separate parents (players who brought guests) from solo players
-        const parentPlayers = [];
-        const soloPlayers = [];
-        
-        for (const player of outfield) {
-            if (guestGroups.has(player.player_id)) {
-                parentPlayers.push({
-                    parent: player,
-                    guests: guestGroups.get(player.player_id),
-                    totalRating: (player.overall_rating || 0) + 
-                        guestGroups.get(player.player_id).reduce((sum, g) => sum + (g.overall_rating || 0), 0)
-                });
+        const placedUnitIdx = new Set();
+
+        const findUnitContainingId = (pid) => {
+            const sid = toStrId(pid);
+            return units.findIndex(u => u.members.some(m => toStrId(m.player_id) === sid));
+        };
+        const dedicatedGKIds = players
+            .filter(p => isDedicatedGK(p))
+            .map(p => toStrId(p.player_id));
+        const numDedicatedGKs = dedicatedGKIds.length;
+
+        let gkTeam = null; // Used for defender-count buffer rule
+
+        if (numDedicatedGKs === 1) {
+            const gkIdx = findUnitContainingId(dedicatedGKIds[0]);
+            if (gkIdx >= 0) {
+                redTeam.push(...units[gkIdx].members);
+                placedUnitIdx.add(gkIdx);
+                gkTeam = 'red';
+            }
+        } else if (numDedicatedGKs >= 2) {
+            const gkAIdx = findUnitContainingId(dedicatedGKIds[0]);
+            if (gkAIdx >= 0 && !placedUnitIdx.has(gkAIdx)) {
+                redTeam.push(...units[gkAIdx].members);
+                placedUnitIdx.add(gkAIdx);
+            }
+            const gkBIdx = findUnitContainingId(dedicatedGKIds[1]);
+            if (gkBIdx >= 0 && !placedUnitIdx.has(gkBIdx)) {
+                blueTeam.push(...units[gkBIdx].members);
+                placedUnitIdx.add(gkBIdx);
+            }
+            // Extra GKs (3rd+) placed as regular units in Phase 6
+        }
+
+        // ── Phase 6: Greedy balance ──
+        const unplacedIdxs = units.map((_, i) => i).filter(i => !placedUnitIdx.has(i));
+        unplacedIdxs.sort((a, b) => units[b].sumOverall - units[a].sumOverall);
+        for (const i of unplacedIdxs) {
+            const u = units[i];
+            if (ovrSum(redTeam) <= ovrSum(blueTeam)) redTeam.push(...u.members);
+            else                                      blueTeam.push(...u.members);
+            placedUnitIdx.add(i);
+        }
+
+        // ── Team-of lookup (stateful — refers to current red/blue arrays) ──
+        const teamOf = (pid) => {
+            const sid = toStrId(pid);
+            if (redTeam.some(p => toStrId(p.player_id) === sid))  return 'red';
+            if (blueTeam.some(p => toStrId(p.player_id) === sid)) return 'blue';
+            return null;
+        };
+
+        // ── Dissatisfaction score ──
+        function computeDissatisfaction(red, blue, widenBeef5 = false) {
+            const overallGap  = Math.abs(ovrSum(red) - ovrSum(blue));
+            const redDefs     = red.filter(isDefender).length;
+            const blueDefs    = blue.filter(isDefender).length;
+            const defenderGap = Math.abs(redDefs - blueDefs);
+            const guestsPresent = hasAnyGuest(red) || hasAnyGuest(blue);
+            // When guests present, compare per-outfield-player averages (×3 to compare vs buffer-3 sum scale)
+            const defSumGap = guestsPresent
+                ? Math.abs(avgStatOutfield(red, 'defending_rating') - avgStatOutfield(blue, 'defending_rating')) * 3
+                : Math.abs(defSum(red) - defSum(blue));
+            const fitSumGap = guestsPresent
+                ? Math.abs(avgStatOutfield(red, 'fitness_rating')   - avgStatOutfield(blue, 'fitness_rating'))   * 3
+                : Math.abs(fitSum(red) - fitSum(blue));
+            // Count constraint breaks based on CURRENT red/blue (not closure over arguments)
+            const teamOfNow = (pid) => {
+                const sid = toStrId(pid);
+                if (red.some(p  => toStrId(p.player_id) === sid)) return 'red';
+                if (blue.some(p => toStrId(p.player_id) === sid)) return 'blue';
+                return null;
+            };
+            const brokenOwP = activeOnewayPairs.filter(c  => teamOfNow(c.from) !== teamOfNow(c.to)).length;
+            const brokenOwA = activeOnewayAvoids.filter(c => teamOfNow(c.from) === teamOfNow(c.to)).length;
+            const brokenMP  = activeMutualPairs.filter(c  => teamOfNow(c.a)    !== teamOfNow(c.b)).length;
+            const brokenMA  = activeMutualAvoids.filter(c => teamOfNow(c.a)    === teamOfNow(c.b)).length;
+            const brokenB1  = activeBeef1.filter(c => teamOfNow(c.a) !== teamOfNow(c.b)).length;
+            const brokenB2  = activeBeef2.filter(c => teamOfNow(c.a) !== teamOfNow(c.b)).length;
+            const brokenB3  = activeBeef3.filter(c => teamOfNow(c.a) !== teamOfNow(c.b)).length;
+            const brokenB4  = activeBeef4.filter(c => teamOfNow(c.a) !== teamOfNow(c.b)).length;
+            const beef5Broken = beef5Constraints.filter(c => teamOfNow(c.a) !== teamOfNow(c.b)).length;
+            const defBuffer = widenBeef5 ? 5 : 3;
+            return {
+                overallGap, defenderGap, defSumGap, fitSumGap,
+                brokenOwP, brokenOwA, brokenMP, brokenMA,
+                brokenB1, brokenB2, brokenB3, brokenB4, beef5Broken,
+                score:
+                    Math.max(0, overallGap - overallBuffer) * 5 +
+                    Math.max(0, defenderGap - 1)            * 10 +
+                    Math.max(0, defSumGap   - defBuffer)    * 2 +
+                    Math.max(0, fitSumGap   - defBuffer)    * 2 +
+                    beef5Broken * 1000 +
+                    brokenB4 * 40 + brokenB3 * 30 + brokenB2 * 20 + brokenB1 * 10 +
+                    brokenMA * 8  + brokenMP * 6  + brokenOwA * 4  + brokenOwP * 2,
+            };
+        }
+
+        function thresholdsMet(red, blue, widenBeef5 = false) {
+            const d = computeDissatisfaction(red, blue, widenBeef5);
+            let defenderOK;
+            if (gkTeam) {
+                const redDefs  = red.filter(isDefender).length;
+                const blueDefs = blue.filter(isDefender).length;
+                if (gkTeam === 'red' && redDefs <= blueDefs) {
+                    defenderOK = (blueDefs - redDefs) <= 2;
+                } else if (gkTeam === 'blue' && blueDefs <= redDefs) {
+                    defenderOK = (redDefs - blueDefs) <= 2;
+                } else {
+                    defenderOK = d.defenderGap <= 1;
+                }
             } else {
-                soloPlayers.push(player);
+                defenderOK = d.defenderGap <= 1;
             }
-        }
-        
-        // Check placed GKs for guest groups — their guests must join them
-        const gkParentGroups = [];
-        for (let i = 0; i < Math.min(goalkeepers.length, 2); i++) {
-            const gk = goalkeepers[i];
-            if (guestGroups.has(gk.player_id)) {
-                gkParentGroups.push({
-                    parent: gk,
-                    guests: guestGroups.get(gk.player_id),
-                    team: i === 0 ? 'red' : 'blue'
-                });
-            }
-        }
-        
-        // Sort parent groups by total rating descending
-        parentPlayers.sort((a, b) => b.totalRating - a.totalRating);
-        
-        // Sort solo players by overall rating descending
-        soloPlayers.sort((a, b) => (b.overall_rating || 0) - (a.overall_rating || 0));
-        
-        // Helper: find and remove closest-rated solo player to a target rating
-        const findClosestSolo = (targetRating, availableSolos) => {
-            if (availableSolos.length === 0) return null;
-            let bestIdx = 0;
-            let bestDiff = Math.abs((availableSolos[0].overall_rating || 0) - targetRating);
-            for (let i = 1; i < availableSolos.length; i++) {
-                const diff = Math.abs((availableSolos[i].overall_rating || 0) - targetRating);
-                if (diff < bestDiff) {
-                    bestDiff = diff;
-                    bestIdx = i;
-                }
-            }
-            return availableSolos.splice(bestIdx, 1)[0];
-        };
-        
-        // PHASE 0: Place guests for GKs who brought them
-        for (const gkGroup of gkParentGroups) {
-            const targetTeam = gkGroup.team === 'red' ? redTeam : blueTeam;
-            const opposingTeam = gkGroup.team === 'red' ? blueTeam : redTeam;
-            const teamLabel = gkGroup.team.toUpperCase();
-            const oppLabel = gkGroup.team === 'red' ? 'BLUE' : 'RED';
-            
-            for (const guest of gkGroup.guests) {
-                targetTeam.push(guest);
-                
-                const balancePlayer = findClosestSolo(guest.overall_rating || 0, soloPlayers);
-                if (balancePlayer) {
-                    opposingTeam.push(balancePlayer);
-                }
-            }
-        }
-        
-        // PHASE 1: Place outfield guest groups with intertwined picking
-        
-        let nextTeamForGroup = 'red';
-        
-        for (const group of parentPlayers) {
-            const targetTeam = nextTeamForGroup === 'red' ? redTeam : blueTeam;
-            const opposingTeam = nextTeamForGroup === 'red' ? blueTeam : redTeam;
-            const teamLabel = nextTeamForGroup.toUpperCase();
-            const oppLabel = nextTeamForGroup === 'red' ? 'BLUE' : 'RED';
-            
-            targetTeam.push(group.parent);
-            
-            const matchPlayer = findClosestSolo(group.parent.overall_rating || 0, soloPlayers);
-            if (matchPlayer) {
-                opposingTeam.push(matchPlayer);
-            }
-            
-            for (const guest of group.guests) {
-                targetTeam.push(guest);
-                
-                const balancePlayer = findClosestSolo(guest.overall_rating || 0, soloPlayers);
-                if (balancePlayer) {
-                    opposingTeam.push(balancePlayer);
-                }
-            }
-            
-            nextTeamForGroup = nextTeamForGroup === 'red' ? 'blue' : 'red';
-        }
-        
-        // ===================================================
-        // PHASE 2: OVR Snake Draft (REPLACES old priority waterfall)
-        // ===================================================
-        // Why OVR-only sort: tested 10,000 games — composite sorting
-        // (OVR + DEF*0.3 + FIT*0.3) degrades OVR balance in 26% of cases.
-        // The snake's equalising property only holds when sorted by the
-        // thing you're balancing. DEF+FIT is handled by Phase 3B instead.
-        soloPlayers.sort((a, b) => (b.overall_rating || 0) - (a.overall_rating || 0));
-
-        // Helper functions (used in Phase 2 and both swap passes below)
-        const hasHighBeef = (player, team) => {
-            const beefs = highBeefs.get(player.player_id) || [];
-            return team.some(tp => beefs.includes(tp.player_id));
-        };
-        const hasLowBeef = (player, team) => {
-            const beefs = lowBeefs.get(player.player_id) || [];
-            return team.some(tp => beefs.includes(tp.player_id));
-        };
-        const wantsToPairWith = (player, team) =>
-            (player.pairs || []).some(pid => team.find(tp => tp.player_id === pid));
-        const wantsToAvoid = (player, team) =>
-            (player.avoids || []).some(pid => team.find(tp => tp.player_id === pid));
-        // Organiser split helper — counts organisers already placed on a team
-        const orgCount = team => team.filter(p => p.is_organiser).length;
-
-        // snakeIdx starts from total players already placed (Phases 0+1)
-        // so the snake direction continues correctly rather than resetting.
-        // Without this, two consecutive picks go to the same team.
-        let snakeIdx = redTeam.length + blueTeam.length;
-        for (const player of soloPlayers) {
-            let assignToRed;
-            if (redTeam.length > blueTeam.length) {
-                assignToRed = false; // size
-            } else if (blueTeam.length > redTeam.length) {
-                assignToRed = true;  // size
-            } else {
-                // Snake direction
-                const round = Math.floor(snakeIdx / 2);
-                const posInRound = snakeIdx % 2;
-                assignToRed = (round % 2 === 0) ? posInRound === 0 : posInRound === 1;
-                // High beef override
-                if (assignToRed && hasHighBeef(player, redTeam))  assignToRed = false;
-                else if (!assignToRed && hasHighBeef(player, blueTeam)) assignToRed = true;
-                // Organiser split — just below high beef; keeps organisers distributed across teams
-                if (player.is_organiser) {
-                    const redOrgs  = orgCount(redTeam);
-                    const blueOrgs = orgCount(blueTeam);
-                    if (redOrgs > blueOrgs)  assignToRed = false; // red already has more, push to blue
-                    else if (blueOrgs > redOrgs) assignToRed = true;  // blue already has more, push to red
-                    // If equal, snake direction already determined above — leave unchanged
-                }
-                // Pair preference (soft — only if beef/organiser split didn't already decide)
-                const snakeResult = (round % 2 === 0) ? posInRound === 0 : posInRound === 1;
-                if (assignToRed === snakeResult) {
-                    if (wantsToPairWith(player, redTeam)  && !wantsToAvoid(player, redTeam))  assignToRed = true;
-                    if (wantsToPairWith(player, blueTeam) && !wantsToAvoid(player, blueTeam)) assignToRed = false;
-                }
-                // Low beef — last tiebreaker
-                if (assignToRed  && hasLowBeef(player, redTeam)  && !hasLowBeef(player, blueTeam)) assignToRed = false;
-                if (!assignToRed && hasLowBeef(player, blueTeam) && !hasLowBeef(player, redTeam))  assignToRed = true;
-            }
-            if (assignToRed) { redTeam.push(player); }
-            else             { blueTeam.push(player); }
-            snakeIdx++;
+            const defBuf = widenBeef5 ? 5 : 3;
+            return d.overallGap <= overallBuffer && defenderOK
+                && d.defSumGap <= defBuf && d.fitSumGap <= defBuf
+                && d.beef5Broken === 0;
         }
 
-        // ===================================================
-        // PHASE 3A: OVR Equalisation (NEW — does not exist today)
-        // ===================================================
-        const ovrSum = arr => arr.reduce((s, p) => s + (p.overall_rating || 0), 0);
-        const defSum = arr => arr.reduce((s, p) => s + (p.defending_rating || 0), 0);
-        const fitSum = arr => arr.reduce((s, p) => s + (p.fitness_rating || 0), 0);
-        const swapAllowed = (rp, bp) => {
-            const newRed  = redTeam.map(p  => p.player_id === rp.player_id ? bp : p);
-            const newBlue = blueTeam.map(p => p.player_id === bp.player_id ? rp : p);
-            if (hasHighBeef(rp, newBlue)) return false;
-            if (hasHighBeef(bp, newRed))  return false;
-            // Don't move rp if its pair partner is in red with it
-            if ((rp.pairs || []).some(pid => redTeam.find(t => t.player_id === pid && t.player_id !== rp.player_id))) return false;
-            // Don't move bp if its pair partner is in blue with it
-            if ((bp.pairs || []).some(pid => blueTeam.find(t => t.player_id === pid && t.player_id !== bp.player_id))) return false;
-            // Don't worsen organiser balance — a swap that puts both organisers on same team is blocked
-            const orgImbalanceBefore = Math.abs(orgCount(redTeam) - orgCount(blueTeam));
-            const orgImbalanceAfter  = Math.abs(orgCount(newRed)  - orgCount(newBlue));
-            if (orgImbalanceAfter > orgImbalanceBefore) return false;
-            return true;
-        };
-        for (let pass = 0; pass < 5; pass++) {
-            const currentDiff = Math.abs(ovrSum(redTeam) - ovrSum(blueTeam));
-            if (currentDiff <= 1) { break; }
-            let best = null, bestDiff = currentDiff;
+        // ── Phase 7: Swap loop ──
+        function trySwapPair(idxR, idxB) {
+            const candR = redTeam[idxR];
+            const candB = blueTeam[idxB];
+            if (!candR || !candB) return false;
+            // Hard constraints — cannot move guests solo, or break beef5 atomicity
+            if (candR.is_guest || candB.is_guest) return false;
+            if (beef5MemberIds.has(toStrId(candR.player_id))) return false;
+            if (beef5MemberIds.has(toStrId(candB.player_id))) return false;
+            // Simulate: swap, move any attached guests too
+            const guestsR = guestGroups.get(candR.player_id) || [];
+            const guestsB = guestGroups.get(candB.player_id) || [];
+            const strip = (team, mvs) => team.filter(p =>
+                !mvs.some(m => toStrId(m.player_id) === toStrId(p.player_id))
+            );
+            const nr = strip(redTeam.slice(),  [candR, ...guestsR]);
+            const nb = strip(blueTeam.slice(), [candB, ...guestsB]);
+            nr.push(candB, ...guestsB);
+            nb.push(candR, ...guestsR);
+            const before = computeDissatisfaction(redTeam, blueTeam).score;
+            const after  = computeDissatisfaction(nr, nb).score;
+            if (after < before) {
+                redTeam.length = 0;  redTeam.push(...nr);
+                blueTeam.length = 0; blueTeam.push(...nb);
+                return true;
+            }
+            return false;
+        }
+
+        // Single-swap hill-climb, 50 attempts
+        for (let attempt = 0; attempt < 50; attempt++) {
+            let improved = false;
+            outer:
             for (let i = 0; i < redTeam.length; i++) {
                 for (let j = 0; j < blueTeam.length; j++) {
-                    if (!swapAllowed(redTeam[i], blueTeam[j])) continue;
-                    const nr = redTeam.map(p  => p.player_id === redTeam[i].player_id  ? blueTeam[j] : p);
-                    const nb = blueTeam.map(p => p.player_id === blueTeam[j].player_id ? redTeam[i]  : p);
-                    const d  = Math.abs(ovrSum(nr) - ovrSum(nb));
-                    if (d < bestDiff) { bestDiff = d; best = { i, j }; }
+                    if (trySwapPair(i, j)) { improved = true; break outer; }
                 }
             }
-            if (best) {
-                [redTeam[best.i], blueTeam[best.j]] = [blueTeam[best.j], redTeam[best.i]];
-            } else {
-                break;
-            }
+            if (!improved) break;
+            if (thresholdsMet(redTeam, blueTeam)) break;
         }
-        const lockedOvr = Math.abs(ovrSum(redTeam) - ovrSum(blueTeam));
 
-        // ===================================================
-        // PHASE 3B: DEF+FIT Optimisation (NEW — does not exist today)
-        // ===================================================
-        let currentLockedOvr = lockedOvr;
-        for (let pass = 0; pass < 3; pass++) {
-            const currSec = Math.abs(defSum(redTeam) - defSum(blueTeam)) + Math.abs(fitSum(redTeam) - fitSum(blueTeam));
-            let best = null, bestSec = currSec, bestOvr = currentLockedOvr;
-            for (let i = 0; i < redTeam.length; i++) {
-                for (let j = 0; j < blueTeam.length; j++) {
-                    if (!swapAllowed(redTeam[i], blueTeam[j])) continue;
-                    const nr = redTeam.map(p  => p.player_id === redTeam[i].player_id  ? blueTeam[j] : p);
-                    const nb = blueTeam.map(p => p.player_id === blueTeam[j].player_id ? redTeam[i]  : p);
-                    const newOvr = Math.abs(ovrSum(nr) - ovrSum(nb));
-                    const newSec = Math.abs(defSum(nr) - defSum(nb)) + Math.abs(fitSum(nr) - fitSum(nb));
-                    // Only accept if OVR doesn't worsen AND secondary improves
-                    if (newOvr <= currentLockedOvr && newSec < bestSec) {
-                        bestSec = newSec; bestOvr = newOvr; best = { i, j };
-                    }
-                }
-            }
-            if (best) {
-                [redTeam[best.i], blueTeam[best.j]] = [blueTeam[best.j], redTeam[best.i]];
-                currentLockedOvr = bestOvr;
-            } else {
-                break;
-            }
+        // ── Phase 8: Relax loop ──
+        const relaxationsApplied = [];
+        const warnings = [];
+
+        const relaxTiers = [
+            { name: 'one_way_pair',   arr: activeOnewayPairs   },
+            { name: 'one_way_avoid',  arr: activeOnewayAvoids  },
+            { name: 'mutual_pair',    arr: activeMutualPairs   },
+            { name: 'mutual_avoid',   arr: activeMutualAvoids  },
+            { name: 'beef_1',         arr: activeBeef1         },
+            { name: 'beef_2',         arr: activeBeef2         },
+            { name: 'beef_3',         arr: activeBeef3         },
+            { name: 'beef_4',         arr: activeBeef4         },
+        ];
+
+        function logRelax(tierName, pair) {
+            const aId = pair.a || pair.from;
+            const bId = pair.b || pair.to;
+            const aObj = allPlayersMap.get(String(aId));
+            const bObj = allPlayersMap.get(String(bId));
+            const entry = {
+                tier: tierName,
+                player_a_id: aId,
+                player_a_name: aObj?.alias || aObj?.full_name || String(aId),
+                player_b_id: bId,
+                player_b_name: bObj?.alias || bObj?.full_name || String(bId),
+                reason: 'balance_required',
+            };
+            relaxationsApplied.push(entry);
+            setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId,
+                'team_gen_constraint_relaxed', JSON.stringify(entry)).catch(() => {}));
         }
-        
-        // ===================================================
-        // PHASE 3C: Zone Balance (soft preference)
-        // ===================================================
-        const ZONE_MAP_3C = {
-            GK:'defence', LB:'defence', RB:'defence', CB:'defence',
-            DM:'midfield', CM:'midfield', AM:'midfield', LM:'midfield', RM:'midfield',
-            CF:'attack',
-            defence:'defence', midfield:'midfield', attack:'attack'
-        };
-        const playerZones3C = p => {
-            if (!p.position_areas) return [];
-            return [...new Set(p.position_areas.split(',').map(s => ZONE_MAP_3C[s.trim()]).filter(Boolean))];
-        };
-        const zoneImbalance3C = (red, blue) =>
-            ['defence','midfield','attack'].reduce((sum, z) => {
-                const rc = red.filter(p => playerZones3C(p).includes(z)).length;
-                const bc = blue.filter(p => playerZones3C(p).includes(z)).length;
-                return sum + Math.abs(rc - bc);
-            }, 0);
-        const hasZoneData = [...redTeam, ...blueTeam].some(p => p.position_areas);
-        if (hasZoneData) {
-            const lockedOvr3C = Math.abs(ovrSum(redTeam) - ovrSum(blueTeam));
-            for (let pass = 0; pass < 3; pass++) {
-                const currZone = zoneImbalance3C(redTeam, blueTeam);
-                if (currZone === 0) break;
-                let best = null, bestZone = currZone;
-                for (let i = 0; i < redTeam.length; i++) {
-                    for (let j = 0; j < blueTeam.length; j++) {
-                        if (!swapAllowed(redTeam[i], blueTeam[j])) continue;
-                        const nr = redTeam.map((p, idx) => idx === i ? blueTeam[j] : p);
-                        const nb = blueTeam.map((p, idx) => idx === j ? redTeam[i] : p);
-                        const newOvr  = Math.abs(ovrSum(nr) - ovrSum(nb));
-                        const newZone = zoneImbalance3C(nr, nb);
-                        if (newOvr <= lockedOvr3C && newZone < bestZone) {
-                            bestZone = newZone; best = { i, j };
+
+        outerRelax:
+        for (const tier of relaxTiers) {
+            while (tier.arr.length > 0) {
+                if (thresholdsMet(redTeam, blueTeam)) break outerRelax;
+                const idx = Math.floor(Math.random() * tier.arr.length);
+                const dropped = tier.arr.splice(idx, 1)[0];
+                logRelax(tier.name, dropped);
+                // Try another swap pass after dropping this constraint
+                for (let attempt = 0; attempt < 25; attempt++) {
+                    let improved = false;
+                    outerSwap:
+                    for (let i = 0; i < redTeam.length; i++) {
+                        for (let j = 0; j < blueTeam.length; j++) {
+                            if (trySwapPair(i, j)) { improved = true; break outerSwap; }
                         }
                     }
+                    if (!improved) break;
                 }
-                if (best) [redTeam[best.i], blueTeam[best.j]] = [blueTeam[best.j], redTeam[best.i]];
-                else break;
             }
         }
+
+        // Beef 5 buffer widening fallback (if still not met but would be with wider buffers)
+        if (!thresholdsMet(redTeam, blueTeam) && thresholdsMet(redTeam, blueTeam, true)) {
+            warnings.push('Defence/fitness sums widened to keep Beef 5 partners together');
+            setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId,
+                'team_gen_beef5_widened', JSON.stringify({ widened_to: 5 })).catch(() => {}));
+        }
+
+        const finalDiss = computeDissatisfaction(redTeam, blueTeam);
+        if (finalDiss.beef5Broken > 0) {
+            warnings.push('Beef 5 could not be honoured — partners split across teams');
+        }
+
+        const dissatisfaction = {
+            score: finalDiss.score,
+            honoured: {
+                mutual_pairs:   mutualPairs.length   - finalDiss.brokenMP,
+                mutual_avoids:  mutualAvoids.length  - finalDiss.brokenMA,
+                one_way_pairs:  onewayPairs.length   - finalDiss.brokenOwP,
+                one_way_avoids: onewayAvoids.length  - finalDiss.brokenOwA,
+                beef_1: activeBeef1.length - finalDiss.brokenB1,
+                beef_2: activeBeef2.length - finalDiss.brokenB2,
+                beef_3: activeBeef3.length - finalDiss.brokenB3,
+                beef_4: activeBeef4.length - finalDiss.brokenB4,
+                beef_5: beef5Constraints.length - finalDiss.beef5Broken,
+            },
+            broken: {
+                mutual_pairs:   finalDiss.brokenMP,
+                mutual_avoids:  finalDiss.brokenMA,
+                one_way_pairs:  finalDiss.brokenOwP,
+                one_way_avoids: finalDiss.brokenOwA,
+                beef_1: finalDiss.brokenB1, beef_2: finalDiss.brokenB2,
+                beef_3: finalDiss.brokenB3, beef_4: finalDiss.brokenB4,
+                beef_5: finalDiss.beef5Broken,
+            },
+            warnings,
+        };
+        const thresholds = {
+            overall_gap:        finalDiss.overallGap,
+            defender_gap:       finalDiss.defenderGap,
+            defence_sum_gap:    Math.round(finalDiss.defSumGap),
+            fitness_sum_gap:    Math.round(finalDiss.fitSumGap),
+            all_within_buffers: thresholdsMet(redTeam, blueTeam),
+        };
+
 
         // Delete existing teams if any (for re-generation)
         await pool.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
@@ -7456,22 +8651,27 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         };
         
         res.json({
+            success: true,
             message: 'Teams generated successfully',
             redTeam:   redTeam.map(mapPlayer),
             blueTeam:  blueTeam.map(mapPlayer),
             redStats,
             blueStats,
-            beefs: Array.from(highBeefs.entries()).map(([playerId, targets]) => ({
-                playerId,
-                targets,
-                rating: 3
-            })).concat(
-                Array.from(lowBeefs.entries()).map(([playerId, targets]) => ({
-                    playerId,
-                    targets,
-                    rating: 2
-                }))
-            )
+            // Batch 7 — algorithm diagnostics
+            thresholds,
+            dissatisfaction,
+            relaxations_applied: relaxationsApplied,
+            // Backward-compat: expose beef relationships for any legacy UI readers.
+            // Note: under the flipped semantics, beef now means "kept together", not "kept apart".
+            beefs: (() => {
+                const out = [];
+                for (const [pid, targets] of beef1.entries()) out.push({ playerId: pid, targets, rating: 1 });
+                for (const [pid, targets] of beef2.entries()) out.push({ playerId: pid, targets, rating: 2 });
+                for (const [pid, targets] of beef3.entries()) out.push({ playerId: pid, targets, rating: 3 });
+                for (const [pid, targets] of beef4.entries()) out.push({ playerId: pid, targets, rating: 4 });
+                for (const [pid, targets] of beef5.entries()) out.push({ playerId: pid, targets, rating: 5 });
+                return out;
+            })(),
         });
         setImmediate(async () => {
             const redAvg = redTeam.length ? (redStats.overall / redTeam.length).toFixed(1) : '0';
@@ -10375,8 +11575,21 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                 NULL::integer as motm_wins,
                 NULL::integer as total_wins,
                 NULL::text as reliability_tier,
-                'outfield' as position_preference,
+                -- Batch 8: derive from real position_classification
+                CASE WHEN gg.position_classification = 'gk' THEN 'GK' ELSE 'outfield' END as position_preference,
+                gg.position_classification,
                 gg.overall_rating,
+                gg.relative_rating,
+                gg.defending_rating,
+                gg.strength_rating,
+                gg.fitness_rating,
+                gg.pace_rating,
+                gg.shooting_rating,
+                gg.assisting_rating,
+                gg.decisions_rating,
+                gg.goalkeeper_rating,
+                gg.is_admin_override,
+                gg.derived_from_parent_ovr,
                 NULL::text as fixed_team,
                 NULL::json as badges,
                 TRUE as is_guest
@@ -11312,9 +12525,14 @@ async function finaliseRefereeReviews(gameId) {
 // TF GAME AWARDS — helper functions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const AWARD_TYPES = ['motm','best_engine','brick_wall','reckless_tackler','mr_hollywood','the_moaner','howler','donkey','goalscorer'];
-const POSITIVE_AWARDS = ['motm','best_engine','brick_wall','goalscorer'];
-const BANTER_AWARDS   = ['reckless_tackler','mr_hollywood','the_moaner','howler','donkey'];
+const AWARD_TYPES = [
+    'motm',
+    'best_engine', 'brick_wall', 'goalscorer', 'cold_moment',
+    'reckless_tackler', 'the_moaner', 'donkey',
+    'walker', 'pig'
+];
+const POSITIVE_AWARDS = ['motm','best_engine','brick_wall','goalscorer','cold_moment'];
+const BANTER_AWARDS   = ['reckless_tackler','the_moaner','donkey','walker','pig'];
 const MIN_VOTES_REQUIRED = 3; // default for all awards except MOTM
 const AWARD_MIN_VOTES = { goalscorer: 2 }; // per-award overrides
 
@@ -11336,15 +12554,18 @@ async function sendAwardEmail(playerId, awardType, extraData = {}) {
             best_engine:    'award_engine',
             brick_wall:     'award_wall',
             reckless_tackler: 'award_reckless',
-            mr_hollywood:   'award_hollywood',
             the_moaner:     'award_moaner',
-            howler:         'award_howler',
             donkey:         'award_donkey',
             mr_day:         'award_mr_day',
             on_fire:        'award_on_fire',
             back_from_dead: 'award_back_from_dead',
             engine_badge:   'award_engine_badge',
             wall_badge:     'award_wall_badge',
+            donkey_badge:   'award_donkey_badge',   // Bundled fix — badgeEmailMap references this key
+            // NEW (3) — Batch 5 awards revamp
+            cold_moment:    'award_cold_moment',
+            walker:         'award_walker',
+            pig:            'award_pig',
         };
         const tmplKey = templateMap[awardType];
         if (!tmplKey || !NOTIF_TEMPLATES[tmplKey]) return;
@@ -12125,13 +13346,17 @@ app.post('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) =
             return res.status(400).json({ error: 'Award voting is not currently open for this game' });
         }
 
-        // Check voter is confirmed-registered for this game
-        const regResult = await pool.query(
-            'SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = $3',
-            [gameId, voterId, 'confirmed']
-        );
-        if (regResult.rows.length === 0) {
-            return res.status(403).json({ error: 'You must be a confirmed player in this game to vote' });
+        // Check voter is a confirmed player OR a confirmed referee for this game
+        const eligibilityResult = await pool.query(`
+            SELECT 1 FROM registrations
+            WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
+            UNION
+            SELECT 1 FROM game_referees
+            WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
+            LIMIT 1
+        `, [gameId, voterId]);
+        if (eligibilityResult.rows.length === 0) {
+            return res.status(403).json({ error: 'You must be a confirmed player or referee in this game to vote' });
         }
 
         // Check nominee is confirmed-registered for this game
@@ -12300,7 +13525,7 @@ app.get('/api/public/players/leaderboard/awards', async (req, res) => {
                 COALESCE(SUM(CASE WHEN ga.award_type = 'motm'        THEN ga.motm_value  ELSE 0 END), 0) as motm_total,
                 COALESCE(SUM(CASE WHEN ga.award_type = 'best_engine' THEN 1              ELSE 0 END), 0) as engine_count,
                 COALESCE(SUM(CASE WHEN ga.award_type = 'brick_wall'  THEN 1              ELSE 0 END), 0) as wall_count,
-                COALESCE(SUM(CASE WHEN ga.award_type = 'howler'      THEN 1              ELSE 0 END), 0) as howler_count,
+                COALESCE(SUM(CASE WHEN ga.award_type = 'cold_moment' THEN 1              ELSE 0 END), 0) as cold_count,
                 COALESCE(COUNT(ga.id), 0) as total_awards
              FROM players p
              LEFT JOIN game_awards ga ON ga.recipient_player_id = p.id
@@ -12802,7 +14027,11 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ROUND((SELECT AVG(p.overall_rating)
                  FROM registrations r JOIN players p ON p.id = r.player_id
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
-                 AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr
+                 AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
+                -- Batch 9: share-template fields (templates.md)
+                EXISTS(SELECT 1 FROM game_lineups gl WHERE gl.game_id = g.id) AS has_lineup,
+                TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time_london,
+                opp_mgr.name AS opponent_name
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 LEFT JOIN opponents opp_mgr ON opp_mgr.id = g.opponent_id
                 ORDER BY g.game_date DESC`;
@@ -12837,7 +14066,11 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ROUND((SELECT AVG(p.overall_rating)
                  FROM registrations r JOIN players p ON p.id = r.player_id
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
-                 AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr
+                 AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
+                -- Batch 9: share-template fields (templates.md)
+                EXISTS(SELECT 1 FROM game_lineups gl WHERE gl.game_id = g.id) AS has_lineup,
+                TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time_london,
+                opp_clm.name AS opponent_name
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 LEFT JOIN opponents opp_clm ON opp_clm.id = g.opponent_id
                 WHERE (${conditions.join(' OR ')})
@@ -15373,9 +16606,9 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
     // Group → action filter map
     const GROUP_ACTIONS = {
         players:    ['player_created','player_updated','player_deleted','account_updated','stats_updated','tier_recalculated','badges_updated','badge_auto_awarded','badge_auto_removed'],
-        games:      ['game_created','game_confirmed','game_completed','game_locked','game_unlocked','teams_generated','teams_confirmed','teams_deleted','type_converted'],
+        games:      ['game_created','game_confirmed','game_completed','game_locked','game_unlocked','teams_generated','teams_confirmed','teams_deleted','type_converted','team_gen_constraint_relaxed','team_gen_beef5_widened','series_recreated'],
         finance:    ['balance_adjustment','wonderful_initiated','wonderful_credited'],
-        registrations: ['admin_player_added','admin_player_removed','guest_added','guest_removed'],
+        registrations: ['admin_player_added','admin_player_removed','guest_added','guest_removed','guest_stats_overridden','guest_stats_reset'],
         referees:   ['ref_applied','ref_confirmed','ref_withdrawn','ref_unconfirmed','ref_review_received','ref_review_updated','ref_review_comment','ref_score_updated','ref_score_finalised','referee_invite_created'],
         moderation: ['dm_reported','discipline_added','player_unbanned'],
         admins:     ['admin_added','admin_removed','ref_admin_added'],
@@ -18620,15 +19853,19 @@ const METRIC_CONFIG = {
     7:  { name: 'Best Engine',        icon: '🔋', category: 'award', awardType: 'best_engine',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Best Engine',     supportingLabel: 'Best Engine %' },
     8:  { name: 'Reckless Tackler',   icon: '🚑', category: 'award', awardType: 'reckless_tackler', validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Reckless',        supportingLabel: 'Reckless %' },
     9:  { name: 'Goal Scorer',        icon: '⚽', category: 'award', awardType: 'goalscorer',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Goals',           supportingLabel: 'Goal %' },
-    10: { name: 'Mr Hollywood',       icon: '🎬', category: 'award', awardType: 'mr_hollywood',     validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Hollywood',       supportingLabel: 'Hollywood %' },
+    10: { name: 'Mr Hollywood',       icon: '🎬', category: 'award', awardType: 'mr_hollywood',     deprecated: true,  validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Hollywood',       supportingLabel: 'Hollywood %' },
     11: { name: 'The Moaner',         icon: '😩', category: 'award', awardType: 'the_moaner',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Moans',           supportingLabel: 'Moan %' },
-    12: { name: 'Howler',             icon: '🤦', category: 'award', awardType: 'howler',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Howlers',         supportingLabel: 'Howler %' },
+    12: { name: 'Howler',             icon: '🤦', category: 'award', awardType: 'howler',           deprecated: true,  validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Howlers',         supportingLabel: 'Howler %' },
     13: { name: 'Donkey',             icon: '🫏', category: 'award', awardType: 'donkey',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Donkey',          supportingLabel: 'Donkey %' },
     14: { name: 'Dropouts',           icon: '🚪', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Dropouts',        supportingLabel: 'Dropout %' },
     15: { name: 'Guest Signups',      icon: '👥', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Guest Signups',   supportingLabel: 'Per Game' },
     16: { name: 'Discipline Points',  icon: '⚖️', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Disc. Points',    supportingLabel: 'Per Game' },
     17: { name: 'Tournament Wins',    icon: '🏆', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Tournament Wins', supportingLabel: 'Win %' },
     18: { name: 'External Game Wins', icon: '🆚', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'External Wins',   supportingLabel: 'Win %' },
+    // NEW (Batch 5 awards revamp)
+    19: { name: 'Cold Moment',        icon: '🥶', category: 'award', awardType: 'cold_moment',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Cold',            supportingLabel: 'Cold %' },
+    20: { name: 'Walker',             icon: '🚶‍♂️', category: 'award', awardType: 'walker',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Walker',          supportingLabel: 'Walker %' },
+    21: { name: 'Pig',                icon: '🐷', category: 'award', awardType: 'pig',              validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Pig',             supportingLabel: 'Pig %' },
 };
 
 function deriveTier(seriesType, avgStarRating) {
