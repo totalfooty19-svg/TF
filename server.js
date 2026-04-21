@@ -330,8 +330,12 @@ async function recordCreditTransaction(db, playerId, amount, type, description, 
         const balRes = await db.query(
             'SELECT balance FROM credits WHERE player_id = $1', [playerId]
         );
-        const balAfter  = balRes.rows.length > 0 ? parseFloat(balRes.rows[0].balance) : 0;
-        const balBefore = parseFloat((balAfter - parseFloat(amount)).toFixed(2));
+        const balAfter = balRes.rows.length > 0 ? parseFloat(balRes.rows[0].balance) : 0;
+        // Option B: free_credit transactions touch free_credit_balance, NOT balance.
+        // For those rows balance_before == balance_after (real balance didn't change).
+        const balBefore = (type === 'free_credit')
+            ? balAfter
+            : parseFloat((balAfter - parseFloat(amount)).toFixed(2));
         await db.query(
             `INSERT INTO credit_transactions
              (player_id, amount, type, description, admin_id, balance_before, balance_after)
@@ -10231,24 +10235,57 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
             if (reason === 'player_dropout' && removedPlayers && removedPlayers.length > 0) {
                 for (const removal of removedPlayers) {
                     const { playerId, registrationId, refundAmount, isLateDropout } = removal;
-                    
+
+                    // Option B: read stored amount_paid + amount_paid_free BEFORE deleting so
+                    // the refund routes back to the correct buckets. refundAmount is a TOTAL cap.
+                    const regRow = await client.query(
+                        'SELECT amount_paid, amount_paid_free FROM registrations WHERE id = $1',
+                        [registrationId]
+                    );
+                    let refundPaid = 0, refundFree = 0;
+                    if (regRow.rows.length > 0) {
+                        const storedPaid = parseFloat(regRow.rows[0].amount_paid || 0);
+                        const storedFree = parseFloat(regRow.rows[0].amount_paid_free || 0);
+                        const storedTotal = storedPaid + storedFree;
+                        const cap = parseFloat(refundAmount || 0);
+                        if (storedTotal === 0 || storedTotal <= cap) {
+                            refundPaid = storedPaid;
+                            refundFree = storedFree;
+                        } else if (cap > 0) {
+                            const ratio = cap / storedTotal;
+                            refundPaid = parseFloat((storedPaid * ratio).toFixed(2));
+                            refundFree = parseFloat((storedFree * ratio).toFixed(2));
+                        }
+                    } else {
+                        refundPaid = parseFloat(refundAmount || 0);
+                    }
+
                     // Remove player registration
                     await client.query(
                         'DELETE FROM registrations WHERE id = $1',
                         [registrationId]
                     );
-                    
-                    // Process refund if amount > 0
-                    if (refundAmount > 0) {
+
+                    // Process refund — split across buckets (Option B)
+                    if (refundPaid > 0) {
                         await client.query(
-                            `UPDATE credits 
-                             SET balance = balance + $1 
+                            `UPDATE credits
+                             SET balance = balance + $1
                              WHERE player_id = $2`,
-                            [refundAmount, playerId]
+                            [refundPaid, playerId]
                         );
-                        
-                        // Log the refund
-                        await recordCreditTransaction(client, playerId, refundAmount, 'refund', `Removed from game - £${refundAmount.toFixed(2)} refund`);
+                        await recordCreditTransaction(client, playerId, refundPaid, 'refund',
+                            `Removed from game - £${refundPaid.toFixed(2)} refund`);
+                    }
+                    if (refundFree > 0) {
+                        await client.query(
+                            `UPDATE credits
+                             SET free_credit_balance = free_credit_balance + $1
+                             WHERE player_id = $2`,
+                            [refundFree, playerId]
+                        );
+                        await recordCreditTransaction(client, playerId, refundFree, 'free_credit',
+                            `Removed from game - £${refundFree.toFixed(2)} free credit restored`);
                     }
                     
                     // Award discipline points if late dropout
@@ -12903,21 +12940,30 @@ async function sendAwardEmail(playerId, awardType, extraData = {}) {
     }
 }
 
-// Check and grant Engine or Brick Wall badge after award confirmation
+// Check and grant award-based badges.
+// Thresholds: Engine / Brick Wall / Donkey / Cold / Pig = 5; Walker = 2.
+// Original 3 email on grant; Cold/Pig/Walker are silent.
 async function checkAndGrantAwardBadge(playerId, awardType) {
     try {
-        const badgeNameMap = { best_engine: 'Engine', brick_wall: 'Brick Wall', donkey: 'Donkey' };
+        const badgeNameMap = {
+            best_engine: 'Engine', brick_wall: 'Brick Wall', donkey: 'Donkey',
+            cold_moment: 'Cold',   pig: 'Pig',               walker: 'Walker',
+        };
+        const thresholdMap = {
+            best_engine: 5, brick_wall: 5, donkey: 5,
+            cold_moment: 5, pig: 5, walker: 2,
+        };
         const badgeName = badgeNameMap[awardType];
-        if (!badgeName) return;
+        const threshold = thresholdMap[awardType];
+        if (!badgeName || !threshold) return;
 
         const countResult = await pool.query(
             'SELECT COUNT(*) as cnt FROM game_awards WHERE recipient_player_id = $1 AND award_type = $2',
             [playerId, awardType]
         );
         const cnt = parseInt(countResult.rows[0].cnt);
-        if (cnt < 5) return;
+        if (cnt < threshold) return;
 
-        // Check badge exists and player doesn't already have it
         const badgeResult = await pool.query('SELECT id FROM badges WHERE name = $1', [badgeName]);
         if (badgeResult.rows.length === 0) return;
         const badgeId = badgeResult.rows[0].id;
@@ -12932,10 +12978,12 @@ async function checkAndGrantAwardBadge(playerId, awardType) {
             'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
             [playerId, badgeId]
         );
+        await auditLog(pool, null, 'badge_auto_awarded', playerId,
+            `badge: ${badgeName} (auto, ${cnt} ${awardType} awards)`);
         const badgeEmailMap = { best_engine: 'engine_badge', brick_wall: 'wall_badge', donkey: 'donkey_badge' };
         const emailType = badgeEmailMap[awardType];
         if (emailType) setImmediate(() => sendAwardEmail(playerId, emailType, {}));
-        console.log(`✅ ${badgeName} badge auto-granted to player ${playerId}`);
+        console.log(`✅ ${badgeName} badge auto-granted to player ${playerId} (at ${cnt} ${awardType} awards)`);
     } catch (e) {
         console.warn(`checkAndGrantAwardBadge(${awardType}, ${playerId}) failed:`, e.message);
     }
@@ -13056,8 +13104,8 @@ async function closeAwards(gameId) {
                             // Regenerate bio after MOTM win
                             setImmediate(() => regeneratePlayerBio(winner.playerId));
                         }
-                        // Badge checks for Best Engine, Brick Wall and Donkey
-                        if (awardType === 'best_engine' || awardType === 'brick_wall' || awardType === 'donkey') {
+                        // Badge checks for award-driven badges (Engine/Brick Wall/Donkey/Cold/Pig at 5 — Walker at 2)
+                        if (['best_engine','brick_wall','donkey','cold_moment','pig','walker'].includes(awardType)) {
                             await checkAndGrantAwardBadge(winner.playerId, awardType);
                             // Regenerate bio after badge grant
                             setImmediate(() => regeneratePlayerBio(winner.playerId));
@@ -21919,9 +21967,6 @@ app.put('/api/admin/series/:seriesId/scoreline', authenticateToken, requireSuper
     }
 });
 
-// FIX-043: Catch-all 404 — MUST be last, after all routes including Wonderful
-app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
-
 // ═══════════════════════════════════════════════════════════════════════════
 // COMMS CAMPAIGNS — admin compose + send + public claim landing
 // ═══════════════════════════════════════════════════════════════════════════
@@ -21934,15 +21979,16 @@ app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 app.get('/api/admin/comms/players-pool', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const filter     = String(req.query.filter || 'never_played');
-        // Optional region filter — when admin selects a game in Mode A, the UI
-        // passes the game's region so we only suggest players in/near it.
-        // Allowed values must match _PREFS_ALLOWED_LOCATIONS to prevent injection.
+        // Optional region filter — can be passed with OR without a game.
         const reqRegion  = req.query.regionCode ? String(req.query.regionCode) : null;
         const regionCode = (reqRegion && _PREFS_ALLOWED_LOCATIONS.has(reqRegion)) ? reqRegion : null;
-        // Optional: when admin is sending a Mode A campaign, exclude players who
-        // are ALREADY confirmed for that game (no point re-offering). UUID string.
         const excludeGameIdRaw = req.query.excludeGameId ? String(req.query.excludeGameId) : null;
         const excludeGameId = (excludeGameIdRaw && isValidUuid(excludeGameIdRaw)) ? excludeGameIdRaw : null;
+        // NEW: "sent before" filter — 'ever' excludes all-time recipients,
+        //      'days' excludes anyone messaged within last N days.
+        const msgFilter = String(req.query.msgFilter || '');
+        const daysRaw   = parseInt(req.query.notMessagedDays, 10);
+        const notMessagedDays = (msgFilter === 'days' && Number.isFinite(daysRaw) && daysRaw > 0 && daysRaw <= 365) ? daysRaw : null;
 
         // Base: email present + not banned
         const conds = [
@@ -21975,26 +22021,38 @@ app.get('/api/admin/comms/players-pool', authenticateToken, requireAdmin, async 
                             LIKE '%,' || $${ix} || ',%')`);
         }
         if (excludeGameId) {
-            // excludeGameId is already validated as a UUID string above.
             params.push(excludeGameId);
             const ix = params.length;
             conds.push(`NOT EXISTS (SELECT 1 FROM registrations r2
                                       WHERE r2.player_id = p.id
                                         AND r2.game_id = $${ix})`);
         }
+        // Message-history filter — joins comms_recipients via player_id.
+        if (msgFilter === 'ever') {
+            conds.push(`NOT EXISTS (SELECT 1 FROM comms_recipients cr
+                                      WHERE cr.player_id = p.id)`);
+        } else if (notMessagedDays !== null) {
+            params.push(notMessagedDays);
+            const ix = params.length;
+            conds.push(`NOT EXISTS (SELECT 1 FROM comms_recipients cr
+                                      WHERE cr.player_id = p.id
+                                        AND cr.created_at >= NOW() - ($${ix}::int || ' days')::interval)`);
+        }
 
         const result = await pool.query(`
             SELECT p.id, p.alias, p.full_name, u.email,
                    p.region_code, p.preferred_locations,
                    COALESCE(p.total_appearances,0) AS total_appearances,
-                   EXTRACT(DAY FROM (NOW() - p.created_at))::int AS days_since_signup
+                   EXTRACT(DAY FROM (NOW() - p.created_at))::int AS days_since_signup,
+                   (SELECT MAX(cr.created_at) FROM comms_recipients cr
+                     WHERE cr.player_id = p.id) AS last_messaged_at
               FROM players p
               JOIN users u ON u.id = p.user_id
              WHERE ${conds.join(' AND ')}
              ORDER BY p.created_at DESC
              LIMIT 500
         `, params);
-        res.json({ players: result.rows, filter, regionCode, excludeGameId });
+        res.json({ players: result.rows, filter, regionCode, excludeGameId, msgFilter, notMessagedDays });
     } catch (error) {
         console.error('Comms pool error:', error);
         res.status(500).json({ error: 'Failed to load player pool' });
@@ -22431,8 +22489,15 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
 });
 
 
+// FIX-043: Catch-all 404 — MUST be last, after ALL routes (including comms routes).
+// Previously this was placed before the comms routes, which caused all comms endpoints
+// to return 404 because Express matches routes in registration order. Moved to here —
+// immediately before app.listen() — so every genuine route is registered first.
+app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
+
+
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web47`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web50`);
 
     // ── Team-email settle recovery sweep ────────────────────────────────────
     // Pending "settle" timers live in memory (setTimeout). If the server restarts
