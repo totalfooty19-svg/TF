@@ -345,46 +345,51 @@ async function recordCreditTransaction(db, playerId, amount, type, description, 
 
 // ── FREE-CREDIT-FIRST GAME FEE HELPER ───────────────────────────────────────
 // Deducts a game fee, consuming any remaining free credits before real balance.
-// Free credits were added to credits.balance at grant time so the total balance
-// already includes them — we just need to classify the transaction correctly.
-// Returns { realCharged } — the portion paid from real balance (for amount_paid).
+// New model: free_credit_balance is a separate column from balance. Free-first
+// means we drain free_credit_balance down to zero before touching balance.
+// Returns { realCharged, freeCharged } — the portions drawn from each bucket,
+// used by callers to persist amount_paid + amount_paid_free on the registration.
 async function applyGameFee(db, playerId, cost, description) {
     if (!cost || cost <= 0) return { realCharged: 0, freeCharged: 0 };
 
-    // Remaining free credits = net sum of all free_credit transactions
-    const fcResult = await db.query(
-        `SELECT COALESCE(SUM(amount), 0) as remaining_free
-         FROM credit_transactions WHERE player_id = $1 AND type = 'free_credit'`,
+    // Read BOTH balances in the same query for atomicity.
+    const balRes = await db.query(
+        `SELECT COALESCE(balance, 0) AS balance,
+                COALESCE(free_credit_balance, 0) AS free_credit_balance
+           FROM credits WHERE player_id = $1`,
         [playerId]
     );
-    const remainingFree = Math.max(0, parseFloat(fcResult.rows[0].remaining_free));
+    const freeAvailable = parseFloat(balRes.rows[0]?.free_credit_balance || 0);
 
-    // How much of this charge is covered by free credits (pence-accurate)
+    // Pence-accurate split: free first, real for the remainder.
     const costCents = Math.round(cost * 100);
-    const freeCents = Math.min(Math.round(remainingFree * 100), costCents);
+    const freeCents = Math.min(Math.round(freeAvailable * 100), costCents);
     const realCents = costCents - freeCents;
     const freeUsed    = freeCents / 100;
     const realCharged = realCents / 100;
 
-    // Deduct full cost from balance (free credits already live in balance)
-    await db.query(
-        'UPDATE credits SET balance = balance - $1 WHERE player_id = $2',
-        [cost, playerId]
-    );
+    // Single UPDATE decrements both columns in one hit. last_updated bumped to
+    // match the existing convention used by other balance writers.
+    if (freeUsed > 0 || realCharged > 0) {
+        await db.query(
+            `UPDATE credits
+                SET free_credit_balance = free_credit_balance - $1,
+                    balance             = balance - $2,
+                    last_updated        = CURRENT_TIMESTAMP
+              WHERE player_id = $3`,
+            [freeUsed, realCharged, playerId]
+        );
+    }
 
-    // Record free credit consumption as a negative free_credit transaction
+    // Transaction log — one row per bucket used, so audit + reconciliation works.
     if (freeUsed > 0) {
         await recordCreditTransaction(db, playerId, -freeUsed, 'free_credit',
             `${description} (free credit used)`);
     }
-    // Record real balance charge
     if (realCharged > 0) {
         await recordCreditTransaction(db, playerId, -realCharged, 'game_fee', description);
     }
 
-    // Return both portions so callers can persist amount_paid (real) + amount_paid_free
-    // on the registration row. This enables exact refund on drop-out regardless of EB
-    // tier changes between signup and drop-out (bug fixed web47).
     return { realCharged, freeCharged: freeUsed };
 }
 
@@ -2029,7 +2034,8 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.is_organiser,
                     p.referred_by,
                     c.balance as credits,
-                    COALESCE((SELECT SUM(amount) FROM credit_transactions WHERE player_id = p.id AND type = 'free_credit'), 0) as free_credits,
+                    -- Option B: free credits are now their own balance column.
+                    COALESCE(c.free_credit_balance, 0) as free_credits,
                     u.email,
                     u.role,
                     (SELECT COALESCE(alias, full_name)
@@ -3518,10 +3524,15 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
 
         const desc = description?.trim() || (parsedAmount < 0 ? 'Free credit removal' : 'Free credit grant');
 
-        // Record transaction and update balance so free credits can actually be spent
+        // Option B: free credits are a separate bucket from the real-money balance.
+        // Positive grants add to free_credit_balance; admins can also pass a negative
+        // value to remove granted credits. Balance (real money) is NOT touched here.
         await pool.query(
-            `INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-             ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2`,
+            `INSERT INTO credits (player_id, balance, free_credit_balance)
+             VALUES ($1, 0, $2)
+             ON CONFLICT (player_id) DO UPDATE
+                SET free_credit_balance = credits.free_credit_balance + $2,
+                    last_updated        = CURRENT_TIMESTAMP`,
             [req.params.id, parsedAmount]
         );
 
@@ -5479,12 +5490,14 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             // For confirmed backup, deduct credits immediately (unless comped organiser)
             if (backupType === 'confirmed_backup') {
                 if (!isComped && parseFloat(game.cost_per_player) > 0) {
+                    // Option B: affordability = regular balance + free_credit_balance.
                     const creditResult = await client.query(
-                        'SELECT balance FROM credits WHERE player_id = $1',
+                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                           FROM credits WHERE player_id = $1`,
                         [req.user.playerId]
                     );
                     
-                    if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(effectiveCost * 100)) {
+                    if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].total_available) * 100) < Math.round(effectiveCost * 100)) {
                         await client.query('ROLLBACK');
                         return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                     }
@@ -5502,12 +5515,14 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             
             // Deduct credits (skip for comped organisers and free games)
             if (!isComped && parseFloat(game.cost_per_player) > 0) {
+                // Option B: affordability = regular balance + free_credit_balance.
                 const creditResult = await client.query(
-                    'SELECT balance FROM credits WHERE player_id = $1',
+                    `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                       FROM credits WHERE player_id = $1`,
                     [req.user.playerId]
                 );
                 
-                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(effectiveCost * 100)) {
+                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].total_available) * 100) < Math.round(effectiveCost * 100)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits' });
                 }
@@ -5982,19 +5997,28 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         // (refunds 0 of 0).
         const cost = parseFloat(game.cost_per_player);
         const effectiveCost = _isAdminInvite ? 0 : cost;
+        // Track split across buckets so the INSERT below can record amount_paid_free.
+        let _guestRealCharged = 0;
+        let _guestFreeCharged = 0;
 
         if (effectiveCost > 0) {
+            // Option B: affordability = balance + free_credit_balance.
             const creditResult = await client.query(
-                'SELECT balance FROM credits WHERE player_id = $1',
+                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                   FROM credits WHERE player_id = $1`,
                 [playerId]
             );
-            if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < effectiveCost) {
+            if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].total_available) < effectiveCost) {
                 await client.query('ROLLBACK');
                 client.release();
                 return res.status(400).json({ error: `Insufficient credits. You need £${effectiveCost.toFixed(2)} to add a guest.` });
             }
-            // Deduct credits from the inviting player (free credits first)
-            await applyGameFee(client, playerId, effectiveCost, `+1 guest (${guestName.trim()}) for game`);
+            // Deduct credits from the inviting player (free credits first).
+            // Capture the split so we can store it on game_guests for correct-bucket refunds.
+            const { realCharged: _guestReal, freeCharged: _guestFree } =
+                await applyGameFee(client, playerId, effectiveCost, `+1 guest (${guestName.trim()}) for game`);
+            _guestRealCharged = _guestReal;
+            _guestFreeCharged = _guestFree;
         }
 
         // Get parent's full stat set for derivation
@@ -6044,14 +6068,15 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         // Insert guest record with full derived stat set
         await client.query(
             `INSERT INTO game_guests (
-                game_id, invited_by, guest_name, overall_rating, amount_paid, guest_number,
+                game_id, invited_by, guest_name, overall_rating, amount_paid, amount_paid_free, guest_number,
                 tournament_team_preference,
                 relative_rating, position_classification,
                 defending_rating, strength_rating, fitness_rating,
                 pace_rating, shooting_rating, assisting_rating, decisions_rating,
                 goalkeeper_rating, is_admin_override, derived_from_parent_ovr
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
-            [gameId, playerId, guestName.trim(), derived.overall_rating, effectiveCost, nextGuestNumber,
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+            [gameId, playerId, guestName.trim(), derived.overall_rating,
+             _guestRealCharged, _guestFreeCharged, nextGuestNumber,
              tournamentTeamPreference || null,
              delta, posClass,
              derived.defending_rating, derived.strength_rating, derived.fitness_rating,
@@ -6174,19 +6199,19 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
         if (guestId) {
             if (isAdminRemovingGuest) {
                 guestResult = await client.query(
-                    'DELETE FROM game_guests WHERE id = $1 AND game_id = $2 RETURNING guest_name, amount_paid, guest_number, invited_by',
+                    'DELETE FROM game_guests WHERE id = $1 AND game_id = $2 RETURNING guest_name, amount_paid, amount_paid_free, guest_number, invited_by',
                     [guestId, gameId]
                 );
             } else {
                 guestResult = await client.query(
-                    'DELETE FROM game_guests WHERE id = $1 AND game_id = $2 AND invited_by = $3 RETURNING guest_name, amount_paid, guest_number, invited_by',
+                    'DELETE FROM game_guests WHERE id = $1 AND game_id = $2 AND invited_by = $3 RETURNING guest_name, amount_paid, amount_paid_free, guest_number, invited_by',
                     [guestId, gameId, playerId]
                 );
             }
         } else {
             // Fallback: remove the last-added guest for this player (non-admin only path)
             guestResult = await client.query(
-                'DELETE FROM game_guests WHERE id = (SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2 ORDER BY guest_number DESC LIMIT 1) RETURNING guest_name, amount_paid, guest_number, invited_by',
+                'DELETE FROM game_guests WHERE id = (SELECT id FROM game_guests WHERE game_id = $1 AND invited_by = $2 ORDER BY guest_number DESC LIMIT 1) RETURNING guest_name, amount_paid, amount_paid_free, guest_number, invited_by',
                 [gameId, playerId]
             );
         }
@@ -6205,13 +6230,21 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
         // Lock the refund target's credits row before updating
         await client.query('SELECT id FROM credits WHERE player_id = $1 FOR UPDATE', [refundTargetId]);
 
-        // Refund the inviting player
+        // Refund the inviting player — split real + free bucket restoration.
+        const refundFreeAmt = parseFloat(guest.amount_paid_free ?? 0);
         if (refundAmt > 0) {
             await client.query(
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                 [refundAmt, refundTargetId]
             );
             await recordCreditTransaction(client, refundTargetId, refundAmt, 'refund', `Guest (${guest.guest_name}) removed - refund`);
+        }
+        if (refundFreeAmt > 0) {
+            await client.query(
+                'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
+                [refundFreeAmt, refundTargetId]
+            );
+            await recordCreditTransaction(client, refundTargetId, refundFreeAmt, 'free_credit', `Guest (${guest.guest_name}) removed - free credit restored`);
         }
 
         // Re-number remaining guests for the original inviter so numbers stay sequential
@@ -6467,8 +6500,9 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
             await recordCreditTransaction(client, playerId, refundAmt, 'refund', `Removed ${playerName} from game`);
         }
         if (refundFreeAmt > 0) {
+            // Free-credit refund → free_credit_balance bucket (not real balance).
             await client.query(
-                'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
                 [refundFreeAmt, playerId]
             );
             await recordCreditTransaction(client, playerId, refundFreeAmt, 'free_credit', `Free credit restored — removed ${playerName} from game`);
@@ -6556,8 +6590,13 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
 
         // Check credits — at effective price (honours EB tiers).
         const { price: cost } = getEffectivePrice(game.rows[0]);
-        const creditRes = await client.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
-        const balance = parseFloat(creditRes.rows[0]?.balance || 0);
+        // Option B: affordability = regular balance + free_credit_balance.
+        const creditRes = await client.query(
+            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+               FROM credits WHERE player_id = $1`,
+            [playerId]
+        );
+        const balance = parseFloat(creditRes.rows[0]?.total_available || 0);
         if (balance < cost) {
             await client.query('ROLLBACK');
             return res.status(400).json({
@@ -6827,8 +6866,12 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 // Using cost_per_player here blocked players whose balance covered the EB
                 // price but not full price (bug fixed web47).
                 const { price: effectivePrice, tier: priceTier } = getEffectivePrice(game);
-                const creditResult = await client.query('SELECT balance FROM credits WHERE player_id = $1', [registeringPlayerId]);
-                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(effectivePrice * 100)) {
+                const creditResult = await client.query(
+                    `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                       FROM credits WHERE player_id = $1`,
+                    [registeringPlayerId]
+                );
+                if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].total_available) * 100) < Math.round(effectivePrice * 100)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                 }
@@ -6840,8 +6883,12 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             status = 'confirmed';
             // Effective price honours early-bird / super-early-bird tiers (bug fixed web47).
             const { price: effectivePrice, tier: priceTier } = getEffectivePrice(game);
-            const creditResult = await client.query('SELECT balance FROM credits WHERE player_id = $1', [registeringPlayerId]);
-            if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].balance) * 100) < Math.round(effectivePrice * 100)) {
+            const creditResult = await client.query(
+                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                   FROM credits WHERE player_id = $1`,
+                [registeringPlayerId]
+            );
+            if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].total_available) * 100) < Math.round(effectivePrice * 100)) {
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
@@ -7532,19 +7579,21 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 await recordCreditTransaction(client, refundTargetId, paidAmt, 'refund', refundDesc);
             }
             if (freeAmt > 0) {
-                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [freeAmt, refundTargetId]);
+                await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [freeAmt, refundTargetId]);
                 await recordCreditTransaction(client, refundTargetId, freeAmt, 'free_credit', `Free credit restored — dropped out of game ${droppingReg.id}`);
             }
         }
         
         // Remove ALL guests if this player had any, and refund guest fees
         const guestCheck = await client.query(
-            'DELETE FROM game_guests WHERE game_id = $1 AND invited_by = $2 RETURNING guest_name, amount_paid',
+            'DELETE FROM game_guests WHERE game_id = $1 AND invited_by = $2 RETURNING guest_name, amount_paid, amount_paid_free',
             [gameId, req.user.playerId]
         );
         let guestRefunded = null;
         if (guestCheck.rows.length > 0) {
-            const totalGuestRefund = guestCheck.rows.reduce((sum, g) => sum + parseFloat(g.amount_paid || 0), 0);
+            // Split aggregate refund into real + free buckets.
+            const totalGuestRefund     = guestCheck.rows.reduce((sum, g) => sum + parseFloat(g.amount_paid || 0), 0);
+            const totalGuestFreeRefund = guestCheck.rows.reduce((sum, g) => sum + parseFloat(g.amount_paid_free || 0), 0);
             const guestNames = guestCheck.rows.map(g => g.guest_name).join(', ');
             if (totalGuestRefund > 0) {
                 await client.query(
@@ -7552,6 +7601,13 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     [totalGuestRefund, req.user.playerId]
                 );
                 await recordCreditTransaction(client, req.user.playerId, totalGuestRefund, 'refund', `${guestCheck.rows.length} guest(s) removed - dropout refund`);
+            }
+            if (totalGuestFreeRefund > 0) {
+                await client.query(
+                    'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
+                    [totalGuestFreeRefund, req.user.playerId]
+                );
+                await recordCreditTransaction(client, req.user.playerId, totalGuestFreeRefund, 'free_credit', `${guestCheck.rows.length} guest(s) removed - dropout free credit restored`);
             }
             guestRefunded = { names: guestNames, count: guestCheck.rows.length, amount: totalGuestRefund };
         }
@@ -7620,10 +7676,11 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 // Loop through GK backups - check credits for each
                 for (const candidate of gkBackups.rows) {
                     const creditCheck = await client.query(
-                        'SELECT balance FROM credits WHERE player_id = $1',
+                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                           FROM credits WHERE player_id = $1`,
                         [candidate.player_id]
                     );
-                    const balance = creditCheck.rows.length > 0 ? parseFloat(creditCheck.rows[0].balance) : 0;
+                    const balance = creditCheck.rows.length > 0 ? parseFloat(creditCheck.rows[0].total_available) : 0;
                     // Balance check uses effective price — a GK backup whose balance covers
                     // the EB price should be eligible for promotion (bug fixed web47).
                     if (balance >= effectiveDebited) {
@@ -7746,7 +7803,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                             await recordCreditTransaction(client, ob.player_id, obPaid, 'refund', `Organiser comp — promoted from backup for game ${gameId}`);
                         }
                         if (obFree > 0) {
-                            await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [obFree, ob.player_id]);
+                            await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [obFree, ob.player_id]);
                             await recordCreditTransaction(client, ob.player_id, obFree, 'free_credit', `Free credit restored — organiser comp for game ${gameId}`);
                         }
                     }
@@ -8992,16 +9049,21 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
                 totalRefunded++;
             }
             if (!useFallback && refundFree > 0) {
-                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [refundFree, refundTarget]);
+                await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [refundFree, refundTarget]);
                 await recordCreditTransaction(client, refundTarget, refundFree, 'free_credit', 'Game cancelled - free credit restored');
             }
         }
-        const guests = await client.query('SELECT invited_by, guest_name, amount_paid FROM game_guests WHERE game_id = $1', [gameId]);
+        const guests = await client.query('SELECT invited_by, guest_name, amount_paid, amount_paid_free FROM game_guests WHERE game_id = $1', [gameId]);
         for (const guest of guests.rows) {
-            const guestRefund = parseFloat(guest.amount_paid || 0);
+            const guestRefund     = parseFloat(guest.amount_paid || 0);
+            const guestFreeRefund = parseFloat(guest.amount_paid_free || 0);
             if (guestRefund > 0) {
                 await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [guestRefund, guest.invited_by]);
                 await recordCreditTransaction(client, guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund');
+            }
+            if (guestFreeRefund > 0) {
+                await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [guestFreeRefund, guest.invited_by]);
+                await recordCreditTransaction(client, guest.invited_by, guestFreeRefund, 'free_credit', 'Game cancelled - +1 guest free credit restored');
             }
         }
         await client.query('DELETE FROM motm_votes WHERE game_id = $1', [gameId]);
@@ -9140,7 +9202,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
                 }
                 if (!useFallback && refundFree > 0) {
                     await client.query(
-                        'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                        'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
                         [refundFree, refundTarget]
                     );
                     await recordCreditTransaction(client, refundTarget, refundFree, 'free_credit', 'Series ' + seriesName + ' cancelled - free credit restored');
@@ -9149,17 +9211,25 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
             
             // Refund guest fees to the players who invited them
             const guests = await client.query(
-                'SELECT invited_by, amount_paid FROM game_guests WHERE game_id = $1',
+                'SELECT invited_by, amount_paid, amount_paid_free FROM game_guests WHERE game_id = $1',
                 [gid]
             );
             for (const guest of guests.rows) {
-                const guestRefund = parseFloat(guest.amount_paid || 0);
+                const guestRefund     = parseFloat(guest.amount_paid || 0);
+                const guestFreeRefund = parseFloat(guest.amount_paid_free || 0);
                 if (guestRefund > 0) {
                     await client.query(
                         'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
                         [guestRefund, guest.invited_by]
                     );
                     await recordCreditTransaction(client, guest.invited_by, guestRefund, 'refund', 'Series ' + seriesName + ' cancelled - +1 guest refund');
+                }
+                if (guestFreeRefund > 0) {
+                    await client.query(
+                        'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
+                        [guestFreeRefund, guest.invited_by]
+                    );
+                    await recordCreditTransaction(client, guest.invited_by, guestFreeRefund, 'free_credit', 'Series ' + seriesName + ' cancelled - +1 guest free credit restored');
                     guestRefunds++;
                 }
             }
@@ -10726,7 +10796,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                             // Restore free-credit portion back to FC pool
                             if (freeAmt > 0) {
                                 await refundClient.query(
-                                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                                    'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
                                     [freeAmt, refundTarget]
                                 );
                                 await recordCreditTransaction(
@@ -12323,13 +12393,15 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
             }
         }
         
-        // Check/deduct credits — wrapped in transaction to prevent partial failure
+        // Check/deduct credits — wrapped in transaction to prevent partial failure.
+        // Option B: affordability = balance + free_credit_balance.
         const creditResult = await pool.query(
-            'SELECT balance FROM credits WHERE player_id = $1',
+            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+               FROM credits WHERE player_id = $1`,
             [playerId]
         );
         
-        if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].balance) < cost) {
+        if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].total_available) < cost) {
             return res.status(400).json({ error: 'Player has insufficient credits' });
         }
 
@@ -12432,9 +12504,10 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             }
         }
         
-        // Get player credits
+        // Get player credits — Option B: affordability = balance + free_credit_balance.
         const creditResult = await pool.query(
-            'SELECT balance FROM credits WHERE player_id = $1',
+            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+               FROM credits WHERE player_id = $1`,
             [playerId]
         );
         
@@ -12442,7 +12515,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
             return res.status(400).json({ error: 'Player has no credits account' });
         }
         
-        const currentBalance = parseFloat(creditResult.rows[0].balance);
+        const currentBalance = parseFloat(creditResult.rows[0].total_available);
         const customCharge = parseFloat(customAmount);
         
         if (currentBalance < customCharge) {
@@ -12526,7 +12599,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                 await recordCreditTransaction(pool, refundTargetId, paidAmt, 'refund', refundDesc);
             }
             if (freeAmt > 0) {
-                await pool.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [freeAmt, refundTargetId]);
+                await pool.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [freeAmt, refundTargetId]);
                 await recordCreditTransaction(pool, refundTargetId, freeAmt, 'free_credit', `Free credit restored — admin removed from game ${gameId}`);
             }
         }
@@ -12560,9 +12633,10 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                 
                 for (const candidate of gkBackups.rows) {
                     const creditCheck = await pool.query(
-                        'SELECT balance FROM credits WHERE player_id = $1', [candidate.player_id]
+                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                           FROM credits WHERE player_id = $1`, [candidate.player_id]
                     );
-                    if (parseFloat(creditCheck.rows[0]?.balance || 0) >= cost) {
+                    if (parseFloat(creditCheck.rows[0]?.total_available || 0) >= cost) {
                         promotedPlayer = candidate;
                         break;
                     }
@@ -21866,8 +21940,9 @@ app.get('/api/admin/comms/players-pool', authenticateToken, requireAdmin, async 
         const reqRegion  = req.query.regionCode ? String(req.query.regionCode) : null;
         const regionCode = (reqRegion && _PREFS_ALLOWED_LOCATIONS.has(reqRegion)) ? reqRegion : null;
         // Optional: when admin is sending a Mode A campaign, exclude players who
-        // are ALREADY confirmed for that game (no point re-offering).
-        const excludeGameId = req.query.excludeGameId ? parseInt(req.query.excludeGameId) : null;
+        // are ALREADY confirmed for that game (no point re-offering). UUID string.
+        const excludeGameIdRaw = req.query.excludeGameId ? String(req.query.excludeGameId) : null;
+        const excludeGameId = (excludeGameIdRaw && isValidUuid(excludeGameIdRaw)) ? excludeGameIdRaw : null;
 
         // Base: email present + not banned
         const conds = [
@@ -21899,7 +21974,8 @@ app.get('/api/admin/comms/players-pool', authenticateToken, requireAdmin, async 
                          OR (',' || COALESCE(p.preferred_locations,'') || ',')
                             LIKE '%,' || $${ix} || ',%')`);
         }
-        if (excludeGameId && Number.isFinite(excludeGameId)) {
+        if (excludeGameId) {
+            // excludeGameId is already validated as a UUID string above.
             params.push(excludeGameId);
             const ix = params.length;
             conds.push(`NOT EXISTS (SELECT 1 FROM registrations r2
@@ -21990,9 +22066,10 @@ app.post('/api/admin/comms/send', authenticateToken, requireAdmin, async (req, r
                 return res.status(400).json({ error: 'Gift amount must be between £0.01 and £50' });
             }
         } else {
-            // game_signup — verify game exists + still has space
-            const gid = parseInt(giftGameId);
-            if (!Number.isFinite(gid)) return res.status(400).json({ error: 'Game ID required for game_signup' });
+            // game_signup — verify game exists + still has space.
+            // Game IDs are UUIDs, not integers.
+            const gid = String(giftGameId || '');
+            if (!isValidUuid(gid)) return res.status(400).json({ error: 'Valid game UUID required for game_signup' });
             const gameCheck = await client.query(`
                 SELECT g.id, g.format, v.name AS venue_name, g.game_date, g.max_players,
                        g.team_selection_type, g.game_status,
@@ -22023,10 +22100,11 @@ app.post('/api/admin/comms/send', authenticateToken, requireAdmin, async (req, r
 
         // Resolve player emails. Filter out IDs that don't have an email or that
         // duplicate within the request — defensive, admin UI should already cap these.
+        // Player IDs are UUIDs in this database — cast the array accordingly.
         const playersResult = await client.query(`
             SELECT p.id, p.alias, p.full_name, u.email
               FROM players p JOIN users u ON u.id = p.user_id
-             WHERE p.id = ANY($1::int[]) AND u.email IS NOT NULL
+             WHERE p.id = ANY($1::uuid[]) AND u.email IS NOT NULL
         `, [playerIds]);
         if (playersResult.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -22236,9 +22314,13 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
             // Grant via the same pattern as /api/admin/players/:id/free-credits — adds
             // to balance AND records a free_credit transaction. Wrapped in transaction
             // here unlike the admin endpoint, so we get atomicity.
+            // Comms claim gifts free credits — goes to the free_credit_balance bucket.
             await client.query(`
-                INSERT INTO credits (player_id, balance) VALUES ($1, $2)
-                ON CONFLICT (player_id) DO UPDATE SET balance = credits.balance + $2
+                INSERT INTO credits (player_id, balance, free_credit_balance)
+                VALUES ($1, 0, $2)
+                ON CONFLICT (player_id) DO UPDATE
+                   SET free_credit_balance = credits.free_credit_balance + $2,
+                       last_updated        = CURRENT_TIMESTAMP
             `, [req.user.playerId, amt]);
             await recordCreditTransaction(client, req.user.playerId, amt, 'free_credit',
                 `Comms campaign #${r.campaign_id} — claim`);
