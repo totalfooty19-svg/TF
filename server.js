@@ -2689,7 +2689,7 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
 // Returns dashboard-ready data for the "Awards" slot on the home dashboard.
 // Two buckets:
 //   - pending: games I played in where awards_open=true AND I haven't voted yet
-//   - results: games I played in where awards were confirmed within last 48h
+//   - results: games I played in where awards have been confirmed (any time)
 // Tapping the dashboard slot opens the most recent game in whichever bucket is
 // populated (pending takes precedence). When both buckets are empty the client
 // falls back to showing Recent Games in that same slot. (Web47)
@@ -2725,10 +2725,12 @@ app.get('/api/players/me/pending-votes', authenticateToken, async (req, res) => 
                 venue_name: r.venue_name,
             }));
 
-        // Bucket 2: games with awards confirmed in last 48h that I was in. We look at
+        // Bucket 2: games with awards confirmed that I was in. We look at
         // game_awards.created_at — records are inserted when the awards close/resolve.
         // Fallback: if no created_at field ordering gives inconsistent results, use
         // games.awards_close_at as a proxy for "recently announced".
+        // Web51: 48h time filter removed — we now surface all recent award results
+        // (LIMIT 5 caps the list; the mobile app (app13 HomeScreen) shares this feed).
         const resultsResult = await pool.query(`
             SELECT DISTINCT g.id   AS game_id,
                    g.game_url      AS game_url,
@@ -2744,7 +2746,7 @@ app.get('/api/players/me/pending-votes', authenticateToken, async (req, res) => 
               AND r.status = 'confirmed'
               AND g.awards_open = false
               AND g.awards_close_at IS NOT NULL
-              AND g.awards_close_at > NOW() - INTERVAL '48 hours'
+              -- 48-hour filter removed (user request): show recent award results regardless of age
             ORDER BY g.awards_close_at DESC
             LIMIT 5
         `, [playerId]);
@@ -8886,14 +8888,12 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             } catch (e) {
                 console.error('Teams created notification failed (non-critical):', e.message);
             }
-            // Email path: first-time generation emails everyone immediately; regeneration
-            // schedules (or resets) a 10-minute debounced settle that diff-emails only
-            // players whose team actually changed.
-            if (isRegeneration) {
-                await scheduleTeamEmailSettle(gameId);
-            } else {
-                await sendTeamsConfirmedEmails(gameId);
-            }
+            // Web51: Email trigger REMOVED from generate-teams (wizard start). Emails now
+            // fire only from /api/admin/games/:id/confirm-teams (wizard completion — the
+            // admin's explicit CONFIRM TEAMS click in the teams modal). Existing protections
+            // (10-minute debounce + diff-email to changed players only via scheduleTeamEmailSettle)
+            // remain in place on the confirm-teams path. Push notifications above still fire
+            // here as a lighter "something changed" heads-up.
         });
         
         // Calculate stats
@@ -9705,9 +9705,11 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
                 isDraftMemorySave ? 'draft_saved' : 'teams_confirmed',
                 isDraftMemorySave ? 'Draft saved (non-final)' : 'Teams manually confirmed');
             if (!isDraftMemorySave) {
-                // Email path mirrors generate-teams: first manual confirm emails everyone,
-                // subsequent re-saves debounce for 10 minutes and diff-email only the
-                // players whose team actually changed.
+                // Email path: first manual confirm emails everyone; subsequent re-saves
+                // debounce for 10 minutes and diff-email only the players whose team
+                // actually changed. (Web51: generate-teams no longer has its own email
+                // path — this endpoint + confirm-teams are now the only wizard-completion
+                // email triggers for standard/fixed_draft flows.)
                 if (isRegeneration) {
                     await scheduleTeamEmailSettle(gameId);
                 } else {
@@ -12025,6 +12027,7 @@ app.get('/api/public/games/completed', async (req, res) => {
                    COALESCE(g.motm_winner_id, tfa.tfa_winner_id) AS motm_winner_id,
                    g.exclusivity,
                    v.name AS venue_name,
+                   v.photo_url AS venue_photo,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
                    COALESCE(motm_p.alias,     tfa.tfa_alias)  AS motm_winner_alias,
                    COALESCE(motm_p.full_name, tfa.tfa_name)   AS motm_winner_name
@@ -20984,13 +20987,22 @@ async function wonderfulRequest(method, path, body = null, timeoutMs = 15000) {
 async function notifyAdminWonderfulPayment(playerId, pounds, ref, balAfter, gameId = null) {
     try {
         const pRow = await pool.query(
-            `SELECT p.alias, p.full_name, u.email, p.squad_number
+            `SELECT p.alias, p.full_name, u.email, p.squad_number, p.player_number, p.player_number_text
              FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
             [playerId]
         );
         const p = pRow.rows[0] || {};
         const name  = p.alias || p.full_name || `Player ${playerId}`;
-        const squad = p.squad_number ? `TF-${p.squad_number}` : '—';
+        // Squad # field — fallback chain:
+        //   1. squad_number assigned (1-999, or 0 → 'TF-00')
+        //   2. player_number_text (region-prefixed: Birmingham 'B1234', Manchester 'M1234')
+        //   3. player_number (non-prefixed 4-digit ID, 1000+)
+        //   4. '—' only if none of the above
+        const squad = (p.squad_number !== null && p.squad_number !== undefined)
+            ? `TF-${p.squad_number === 0 ? '00' : p.squad_number}`
+            : (p.player_number_text
+                ? `TF-${p.player_number_text}`
+                : (p.player_number ? `TF-${p.player_number}` : '—'));
         const rows = [
             ['Player',      name],
             ['Squad #',     squad],
@@ -21147,13 +21159,75 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         const pmtRowId = insertRes.rows[0].id;
         console.log(`[WF initiate] inserted init_pending row ${pmtRowId} · ref ${merchantRef} · £${pounds.toFixed(2)}${game_id ? ` · game ${game_id}` : ''}`);
 
+        // ── STEP 1.5: Build enriched payment_description ─────────────────
+        // FIX-103 (Web51, Wonderful Pro feature #2): Enrich the description
+        // shown against the Order record in the Wonderful dashboard with
+        // player name + game context (when pay-and-join). Improves admin
+        // reconciliation and gives more meaningful bank-statement context.
+        //
+        // Wonderful API limits (confirmed via docs at https://api.wonderful.one/):
+        //   - payment_description: 255 chars max, free-text
+        //   - merchant_payment_reference: 18 chars (already rich: TF27-GAFFA-XR0GL)
+        //   - NO custom metadata / line-items / payer-name fields supported
+        //     on /v2/quick-pay. Customer first/last name only exist on the
+        //     separate /v2/customers endpoint — out of scope here.
+        //
+        // Description format (aim for <100 chars, capped at 255 defensively):
+        //   Top-up       : "TotalFooty top-up £20.00 — John Smith · TF27"
+        //   Pay-and-join : "TotalFooty £10.00 — Tue, 28 Oct, 18:00 · Coventry — John Smith · TF27"
+        //   Backup join  : "TotalFooty £10.00 backup — Tue, 28 Oct, 18:00 · Coventry — John Smith · TF27"
+        let paymentDescription;
+        try {
+            const _name     = String(player.full_name || player.alias || 'Player').trim();
+            const _squadTag = player.squad_number != null ? `TF${player.squad_number}` : '';
+            const _who      = _squadTag ? `${_name} · ${_squadTag}` : _name;
+            const _amt      = `£${pounds.toFixed(2)}`;
+
+            if (game_id) {
+                // Pay-and-join — fetch venue + kickoff for context. Non-critical:
+                // if this fails we fall back to a game-less top-up-style description.
+                const gameRow = await pool.query(
+                    `SELECT v.name AS venue_name, g.game_date
+                     FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+                     WHERE g.id = $1`,
+                    [game_id]
+                );
+                const g = gameRow.rows[0];
+                if (g) {
+                    const _when = g.game_date
+                        ? new Date(g.game_date).toLocaleString('en-GB', {
+                            weekday: 'short', day: 'numeric', month: 'short',
+                            hour: '2-digit', minute: '2-digit',
+                            timeZone: 'Europe/London'
+                          })
+                        : '';
+                    const _venue = String(g.venue_name || '').trim();
+                    const _ctx   = [_when, _venue].filter(Boolean).join(' · ');
+                    const _kind  = validBackupType ? `${_amt} backup` : _amt;
+                    paymentDescription = _ctx
+                        ? `TotalFooty ${_kind} — ${_ctx} — ${_who}`
+                        : `TotalFooty ${_kind} — ${_who}`;
+                } else {
+                    paymentDescription = `TotalFooty ${_amt} — ${_who}`;
+                }
+            } else {
+                paymentDescription = `TotalFooty top-up ${_amt} — ${_who}`;
+            }
+            // Defensive 255-char cap per Wonderful API limit
+            if (paymentDescription.length > 255) paymentDescription = paymentDescription.slice(0, 255);
+        } catch (descErr) {
+            // Never block a payment over description formatting. Fall back.
+            console.warn(`[WF initiate] payment_description build failed for ref ${merchantRef}:`, descErr.message);
+            paymentDescription = `TotalFooty credit top-up £${pounds}`;
+        }
+
         // ── STEP 2: Call Wonderful ────────────────────────────────────────
         let wonderfulRes;
         try {
             wonderfulRes = await wonderfulRequest('POST', '/v2/quick-pay', {
                 customer_email_address:  player.email,
                 merchant_payment_reference: merchantRef,
-                payment_description: `TotalFooty credit top-up £${pounds}`,
+                payment_description: paymentDescription,
                 amount:      amountPence,
                 redirect_url: `https://totalfooty.co.uk/?wonderful_payment_id=${merchantRef}`,
                 webhook_url: `https://totalfooty-api.onrender.com/api/webhooks/wonderful`,
