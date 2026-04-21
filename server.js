@@ -2031,7 +2031,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                          ELSE 0 END AS motm_percent,
                     p.total_appearances, 
                     p.motm_wins, 
-                    p.total_wins,
+                    p.total_wins, p.total_draws,
                     (SELECT COUNT(*) FROM registrations
                      WHERE player_id = p.id AND status = 'confirmed')::int AS confirmed_registration_count,
                     p.is_clm_admin,
@@ -2153,7 +2153,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
             )
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.photo_url, 
-                p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins,
+                p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins, p.total_draws,
                 p.phone, u.email,
                 p.is_clm_admin, p.is_organiser,
                 c.balance as credits,
@@ -2236,7 +2236,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                  FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
 
                 -- GAME STATS: all time
-                p.total_appearances, p.total_wins, p.motm_wins,
+                p.total_appearances, p.total_wins, p.total_draws, p.motm_wins,
 
                 -- GAME STATS: last 3 months
                 (SELECT COUNT(DISTINCT r.game_id)
@@ -2589,8 +2589,16 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
         const award_counts = {};
         for (const row of awardsRes.rows) award_counts[row.award_type] = parseInt(row.cnt);
 
+        // FIX-105: compute draws + effective wins once — used by both owner/admin and public branches
+        const total_draws = parseInt(player.total_draws || 0);
+        const effective_wins = parseFloat((parseInt(player.total_wins || 0) + total_draws * 0.5).toFixed(1));
+        const effective_win_percent = parseInt(player.total_appearances) > 0
+            ? parseFloat((effective_wins / parseInt(player.total_appearances) * 100).toFixed(1))
+            : 0;
+
         if (isOwnProfile || isAdmin) {
-            res.json({ ...player, win_percent, motm_percent, tournament_wins, external_game_wins, award_counts });
+            res.json({ ...player, win_percent, motm_percent, tournament_wins, external_game_wins, award_counts,
+                       total_draws, effective_wins, effective_win_percent });
         } else {
             // Public view — limited data per visibility matrix
             res.json({
@@ -2602,6 +2610,9 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
                 reliability_tier: player.reliability_tier,
                 total_appearances: player.total_appearances,
                 total_wins:       player.total_wins,
+                total_draws,              // FIX-105
+                effective_wins,           // FIX-105
+                effective_win_percent,    // FIX-105
                 motm_wins:        player.motm_wins,
                 overall_rating:   player.overall_rating,
                 win_percent,
@@ -3560,7 +3571,7 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         const {
             goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
-            total_wins, squad_number, phone, balance, alias, position,
+            total_wins, total_draws, squad_number, phone, balance, alias, position,
             is_featured, social_tiktok, social_instagram, social_youtube, social_facebook,
             email
         } = req.body;
@@ -3614,6 +3625,7 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 shooting_rating = $8,
                 overall_rating = $9,
                 total_wins = $10,
+                total_draws = COALESCE($21, total_draws),
                 squad_number = $11,
                 phone = $12,
                 alias = COALESCE($13, alias),
@@ -3631,7 +3643,8 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
             validateSocialUrl(social_tiktok), validateSocialUrl(social_instagram),
             validateSocialUrl(social_youtube), validateSocialUrl(social_facebook),
             ['goalkeeper','outfield'].includes(position) ? position : 'outfield',
-            playerId]);
+            playerId,
+            total_draws !== undefined && total_draws !== null ? parseInt(total_draws) : null]); // FIX-105 — $21
         
         // Sync player_number with squad_number when a squad number is assigned/changed
         if (squad_number !== undefined && squad_number !== null) {
@@ -5159,6 +5172,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 p.photo_url,
                 p.total_appearances,
                 p.total_wins,
+                p.total_draws,
                 p.motm_wins,
                 p.reliability_tier,
                 r.status,
@@ -5190,7 +5204,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                      p.assisting_rating, p.shooting_rating, p.overall_rating,
                      r.status, r.backup_type, r.is_comped,
                      r.position_preference, r.position_areas, r.tournament_team_preference, r.venue_clash_team_preference, t.team_name,
-                     p.photo_url, p.total_appearances, p.total_wins, p.motm_wins, p.reliability_tier
+                     p.photo_url, p.total_appearances, p.total_wins, p.total_draws, p.motm_wins, p.reliability_tier
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY 
                 CASE r.status WHEN 'confirmed' THEN 1 WHEN 'backup' THEN 2 ELSE 3 END,
@@ -10708,6 +10722,19 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 );
             }
         } else if (winningTeam === 'draw') {
+            // FIX-105: Draws award half a win to ALL players who showed up (both teams).
+            // Stored as +1 to total_draws + per-class total_draws_<class>; effective wins
+            // computed at read-time as (total_wins + total_draws * 0.5). On Fire streak
+            // is unaffected — draws still break the win streak (per-design choice).
+            if (showedUpPlayerIds.length > 0) {
+                const drawsClassCol = `total_draws_${starClass.toLowerCase()}`;
+                await client.query(
+                    `UPDATE players
+                     SET total_draws = total_draws + 1, ${drawsClassCol} = ${drawsClassCol} + 1
+                     WHERE id = ANY($1)`,
+                    [showedUpPlayerIds]
+                );
+            }
         }
         
         // 3. Save discipline records (only for offenses, not on_time)
@@ -11029,7 +11056,9 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
 
                 const winsSummary = _auditWinnerIds.length > 0
                     ? _auditWinnerIds.map(id => n(id)).join(', ')
-                    : (_auditWinningTeam === 'draw' ? 'Draw — no wins' : 'None');
+                    : (_auditWinningTeam === 'draw'
+                        ? `Draw — half-wins awarded to ${_auditShowedUp.length} player(s)` // FIX-105
+                        : 'None');
 
                 const noShowSummary = _auditNoShows.length > 0
                     ? _auditNoShows.map(id => n(id)).join(', ')
@@ -11069,6 +11098,15 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                     await auditLog(pool, null, 'win_awarded', pid,
                         `Win recorded (${_auditWinningTeam} wins) — game ${_auditGameId}`
                     ).catch(() => {});
+                }
+
+                // FIX-105: Draws — half-win awarded to all participants on a draw
+                if (_auditWinningTeam === 'draw') {
+                    for (const pid of _auditShowedUp) {
+                        await auditLog(pool, null, 'draw_recorded', pid,
+                            `Half-win recorded (game drawn) — game ${_auditGameId}`
+                        ).catch(() => {});
+                    }
                 }
 
             } catch (e) {
@@ -11891,6 +11929,7 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                 p.total_appearances,
                 p.motm_wins,
                 p.total_wins,
+                p.total_draws,
                 p.reliability_tier,
                 r.position_preference,
                 r.registered_at,
@@ -11902,7 +11941,7 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
             ${isDraftMemory ? `LEFT JOIN player_fixed_teams pft ON pft.player_id = p.id AND pft.series_id = $2` : ''}
             WHERE r.game_id = $1 AND r.status = 'confirmed'
             GROUP BY p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
-                     p.total_appearances, p.motm_wins, p.total_wins, p.reliability_tier,
+                     p.total_appearances, p.motm_wins, p.total_wins, p.total_draws, p.reliability_tier,
                      r.position_preference, r.registered_at
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY
@@ -11924,6 +11963,7 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                 NULL::integer as total_appearances,
                 NULL::integer as motm_wins,
                 NULL::integer as total_wins,
+                NULL::integer as total_draws,
                 NULL::text as reliability_tier,
                 -- Batch 8: derive from real position_classification
                 CASE WHEN gg.position_classification = 'gk' THEN 'GK' ELSE 'outfield' END as position_preference,
@@ -12059,12 +12099,17 @@ app.get('/api/public/games/completed', async (req, res) => {
 // GET /api/public/players/leaderboard — public leaderboard (no auth, no PII)
 app.get('/api/public/players/leaderboard', async (req, res) => {
     try {
+        // FIX-105: expose total_draws + effective_wins; sort by effective wins
         const result = await pool.query(`
             SELECT p.id, p.alias, p.full_name, p.squad_number, p.photo_url,
-                   p.total_appearances, p.total_wins, p.motm_wins,
+                   p.total_appearances, p.total_wins, p.total_draws, p.motm_wins,
+                   (p.total_wins + p.total_draws * 0.5) AS effective_wins,
                    CASE WHEN p.total_appearances > 0
                         THEN ROUND(p.total_wins::numeric / p.total_appearances * 100, 1)
                         ELSE 0 END AS win_percent,
+                   CASE WHEN p.total_appearances > 0
+                        THEN ROUND((p.total_wins + p.total_draws * 0.5)::numeric / p.total_appearances * 100, 1)
+                        ELSE 0 END AS effective_win_percent,
                    CASE WHEN p.total_appearances > 0
                         THEN ROUND(p.motm_wins::numeric / p.total_appearances * 100, 1)
                         ELSE 0 END AS motm_percent,
@@ -12073,7 +12118,7 @@ app.get('/api/public/players/leaderboard', async (req, res) => {
                     WHERE pb.player_id = p.id) AS badges
             FROM players p
             WHERE p.total_appearances > 0
-            ORDER BY p.total_appearances DESC, p.total_wins DESC
+            ORDER BY (p.total_wins + p.total_draws * 0.5) DESC, p.total_appearances DESC
             LIMIT 50
         `);
         res.json(result.rows);
@@ -12092,14 +12137,14 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
         if (isNaN(playerId)) {
             playerResult = await pool.query(
                 `SELECT id, full_name, alias, squad_number, photo_url, reliability_tier,
-                        total_appearances, total_wins, motm_wins, ai_bio
+                        total_appearances, total_wins, total_draws, motm_wins, ai_bio
                  FROM players WHERE id = $1`,
                 [playerId]
             );
         } else {
             playerResult = await pool.query(
                 `SELECT id, full_name, alias, squad_number, photo_url, reliability_tier,
-                        total_appearances, total_wins, motm_wins, ai_bio
+                        total_appearances, total_wins, total_draws, motm_wins, ai_bio
                  FROM players WHERE squad_number = $1`,
                 [parseInt(playerId)]
             );
@@ -12151,8 +12196,10 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
 
         const appearances  = player.total_appearances || 0;
         const wins         = player.total_wins || 0;
+        const draws        = player.total_draws || 0;                                         // FIX-105
+        const effectiveWins = wins + draws * 0.5;                                             // FIX-105
         const motmWins     = parseFloat(player.motm_wins || 0);
-        const winRatio     = appearances > 0 ? ((wins / appearances) * 100).toFixed(1) : '0.0';
+        const winRatio     = appearances > 0 ? ((effectiveWins / appearances) * 100).toFixed(1) : '0.0'; // FIX-105: effective
         const motmRatio    = appearances > 0 ? ((motmWins / appearances) * 100).toFixed(1) : '0.0';
         const externalWins = parseInt(extWinsResult.rows[0]?.cnt || 0);
         const tournamentWins = parseInt(tournWinsResult.rows[0]?.cnt || 0);
@@ -12166,7 +12213,9 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
                 reliability_tier: player.reliability_tier,
                 total_appearances: appearances,
                 total_wins: wins,
-                win_ratio: winRatio,
+                total_draws: draws,                    // FIX-105
+                effective_wins: effectiveWins,         // FIX-105
+                win_ratio: winRatio,                   // FIX-105: now reflects effective
                 motm_wins: motmWins,
                 motm_ratio: motmRatio,
                 external_wins: externalWins,
@@ -12302,6 +12351,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
                 p.assisting_rating,
                 p.total_appearances,
                 p.total_wins,
+                p.total_draws,
                 p.motm_wins,
                 p.referral_code,
                 r.status,
@@ -12321,7 +12371,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
                      p.overall_rating, p.goalkeeper_rating, p.defending_rating,
                      p.strength_rating, p.pace_rating, p.decisions_rating,
                      p.shooting_rating, p.fitness_rating, p.assisting_rating,
-                     p.total_appearances, p.total_wins, p.motm_wins,
+                     p.total_appearances, p.total_wins, p.total_draws, p.motm_wins,
                      p.referral_code, r.status,
                      r.position_preference, r.tournament_team_preference
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
@@ -14985,6 +15035,18 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
                     [winnerIds]
                 );
             }
+        } else {
+            // FIX-105: Tournament-overall draw (top of league table tied on points/GD/GF).
+            // Award half a win to ALL participants who showed up. Per-class tracked as 'S'
+            // (matches game_awards.star_class behaviour for tournament games).
+            if (showedUpPlayerIds.length > 0) {
+                await client.query(
+                    `UPDATE players
+                     SET total_draws = total_draws + 1, total_draws_s = total_draws_s + 1
+                     WHERE id = ANY($1)`,
+                    [showedUpPlayerIds]
+                );
+            }
         }
         
         // 3. Save discipline records
@@ -17054,6 +17116,7 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
         admins:     ['admin_added','admin_removed','ref_admin_added'],
         motm:       ['motm_voting_started','motm_vote','motm_finalized'],
         awards:     ['award_vote'],
+        comms:      ['comms_campaign_sent','comms_email_sent','comms_email_failed','comms_claimed'], // FIX-104
     };
 
     const allGroups = Object.keys(GROUP_ACTIONS);
@@ -17066,12 +17129,17 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
         let whereGame   = 'WHERE 1=1';
         // award_vote is synthetic (game_award_votes has no action col) — include unless filtering to another group
         let whereAward  = 'WHERE 1=1';
+        // FIX-104: Comms branch synthesises rows from comms_recipients. These three
+        // actions do NOT live in audit_logs — the table itself IS the audit trail.
+        let whereComms  = 'WHERE 1=1';
+        const COMMS_SYNTHETIC_ACTIONS = ['comms_email_sent','comms_email_failed','comms_claimed'];
 
         if (before) {
             params.push(before);
             wherePlayer += ` AND al.created_at < $${params.length}`;
             whereGame   += ` AND gal.created_at < $${params.length}`;
             whereAward  += ` AND COALESCE(gav.created_at, g.game_date) < $${params.length}`;
+            whereComms  += ` AND created_at < $${params.length}`; // FIX-104
         }
         if (filterActions) {
             params.push(filterActions);
@@ -17080,6 +17148,15 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
             // If the active filter doesn't include award_vote, suppress the awards branch entirely
             if (!filterActions.includes('award_vote')) {
                 whereAward = 'WHERE 1=0';
+            }
+            // FIX-104: If the active filter doesn't overlap with any synthetic comms
+            // actions, suppress the comms branch. Otherwise, filter it to the synthetic
+            // actions that ARE in the filter (Postgres handles unmatched values fine).
+            const commsMatching = COMMS_SYNTHETIC_ACTIONS.filter(a => filterActions.includes(a));
+            if (commsMatching.length === 0) {
+                whereComms = 'WHERE 1=0';
+            } else {
+                whereComms += ` AND action = ANY($${params.length})`;
             }
         }
         params.push(limit);
@@ -17134,6 +17211,68 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
             JOIN players np ON np.id = gav.nominee_player_id
             ${whereAward}
 
+            UNION ALL
+
+            -- FIX-104: synthetic comms events derived from comms_recipients.
+            -- Each recipient can emit up to 3 events (email sent, email failed, claim).
+            SELECT * FROM (
+                SELECT
+                    'comms'                                               AS source,
+                    'comms_email_sent'                                    AS action,
+                    CONCAT('Email to ', cr.email_to,
+                           ' — campaign #', cc.id, ' (', cc.campaign_type, ')') AS detail,
+                    cr.email_sent_at                                      AS created_at,
+                    cr.player_id::text                                    AS target_id,
+                    cc.gift_game_id::text                                 AS game_id,
+                    COALESCE(cp.alias, cp.full_name)                      AS admin_name,
+                    COALESCE(rp.alias, rp.full_name, cr.email_to)         AS target_name
+                FROM comms_recipients cr
+                JOIN comms_campaigns cc ON cc.id = cr.campaign_id
+                LEFT JOIN players cp ON cp.id = cc.created_by
+                LEFT JOIN players rp ON rp.id = cr.player_id
+                WHERE cr.email_sent_at IS NOT NULL
+
+                UNION ALL
+
+                SELECT
+                    'comms'                                               AS source,
+                    'comms_email_failed'                                  AS action,
+                    CONCAT('Email to ', cr.email_to,
+                           ' FAILED — ', SUBSTRING(cr.email_send_error FROM 1 FOR 150)) AS detail,
+                    cr.created_at                                         AS created_at,
+                    cr.player_id::text                                    AS target_id,
+                    cc.gift_game_id::text                                 AS game_id,
+                    COALESCE(cp.alias, cp.full_name)                      AS admin_name,
+                    COALESCE(rp.alias, rp.full_name, cr.email_to)         AS target_name
+                FROM comms_recipients cr
+                JOIN comms_campaigns cc ON cc.id = cr.campaign_id
+                LEFT JOIN players cp ON cp.id = cc.created_by
+                LEFT JOIN players rp ON rp.id = cr.player_id
+                WHERE cr.email_send_error IS NOT NULL
+
+                UNION ALL
+
+                SELECT
+                    'comms'                                               AS source,
+                    'comms_claimed'                                       AS action,
+                    CONCAT('Claim: ', cr.claim_outcome,
+                           ' — ', cc.campaign_type,
+                           CASE WHEN cc.gift_amount IS NOT NULL
+                                THEN ' £' || cc.gift_amount::text
+                                ELSE '' END,
+                           ' (campaign #', cc.id, ')')                    AS detail,
+                    cr.claimed_at                                         AS created_at,
+                    cr.player_id::text                                    AS target_id,
+                    cc.gift_game_id::text                                 AS game_id,
+                    COALESCE(rp.alias, rp.full_name, cr.email_to)         AS admin_name,
+                    NULL                                                  AS target_name
+                FROM comms_recipients cr
+                JOIN comms_campaigns cc ON cc.id = cr.campaign_id
+                LEFT JOIN players rp ON rp.id = cr.player_id
+                WHERE cr.claimed_at IS NOT NULL
+            ) comms_events
+            ${whereComms}
+
             ORDER BY created_at DESC
             LIMIT $${limitParam}
         `, params);
@@ -17154,8 +17293,15 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
     }
 });
 
-// GET /api/admin/audit/transactions — paginated credit transaction ledger (FIX-102)
+// GET /api/admin/audit/transactions — paginated credit transaction ledger (FIX-102, FIX-104)
 // Query params: type (filter by transaction type), search (player name), limit, offset
+//
+// FIX-104: ledger now unions in synthetic rows for comms 'game_signup' claims.
+// Those claims never touch credit_transactions (player is comped, no money moves),
+// so without this synthesis they would be invisible in the admin transactions tab.
+// A new virtual type `comms_claim` filters to BOTH:
+//   (a) synthetic game_signup claim rows (type='comms_claim' internally), AND
+//   (b) real free_credit rows whose description starts with 'Comms campaign'.
 app.get('/api/admin/audit/transactions', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const limit  = Math.min(parseInt(req.query.limit)  || 50, 200);
@@ -17163,12 +17309,52 @@ app.get('/api/admin/audit/transactions', authenticateToken, requireAdmin, async 
         const type   = req.query.type   || '';
         const search = req.query.search || '';
 
+        // Base ledger view — real transactions + synthetic game_signup claim rows.
+        // Synthetic rows use type='comms_claim', amount=0, balance_* = NULL so the
+        // frontend can distinguish them and skip the balance-before/after line.
+        const BASE_LEDGER = `(
+            SELECT ct.id::int         AS id,
+                   ct.created_at,
+                   ct.amount::numeric AS amount,
+                   ct.type::text      AS type,
+                   ct.description,
+                   ct.balance_before,
+                   ct.balance_after,
+                   ct.player_id,
+                   ct.admin_id
+              FROM credit_transactions ct
+
+            UNION ALL
+
+            SELECT NULL::int          AS id,
+                   cr.claimed_at      AS created_at,
+                   0::numeric         AS amount,
+                   'comms_claim'::text AS type,
+                   ('Comms campaign #' || cc.id || ' — game signup claim') AS description,
+                   NULL::numeric      AS balance_before,
+                   NULL::numeric      AS balance_after,
+                   cr.player_id,
+                   -- cc.created_by is a player_id; admin_id in credit_transactions is
+                   -- a users.id. Resolve via players.user_id so the downstream
+                   -- LEFT JOIN users au ON au.id = ledger.admin_id works correctly.
+                   (SELECT user_id FROM players WHERE id = cc.created_by) AS admin_id
+              FROM comms_recipients cr
+              JOIN comms_campaigns cc ON cc.id = cr.campaign_id
+             WHERE cr.claim_outcome = 'registered'
+        ) ledger`;
+
         const conditions = [];
         const params     = [];
 
         if (type) {
-            params.push(type);
-            conditions.push(`ct.type = $${params.length}`);
+            if (type === 'comms_claim') {
+                // Virtual filter — matches both synthetic game_signup rows AND
+                // real free_credit rows that came from a comms campaign claim.
+                conditions.push(`(ledger.type = 'comms_claim' OR (ledger.type = 'free_credit' AND ledger.description LIKE 'Comms campaign%'))`);
+            } else {
+                params.push(type);
+                conditions.push(`ledger.type = $${params.length}`);
+            }
         }
         if (search) {
             params.push(`%${search}%`);
@@ -17177,10 +17363,10 @@ app.get('/api/admin/audit/transactions', authenticateToken, requireAdmin, async 
 
         const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
-        // Total count for hasMore
+        // Total count for hasMore — must also run against the unioned ledger.
         const countRes = await pool.query(`
-            SELECT COUNT(*) FROM credit_transactions ct
-            JOIN players pp ON pp.id = ct.player_id
+            SELECT COUNT(*) FROM ${BASE_LEDGER}
+            JOIN players pp ON pp.id = ledger.player_id
             ${where}
         `, params);
         const total = parseInt(countRes.rows[0].count);
@@ -17189,17 +17375,17 @@ app.get('/api/admin/audit/transactions', authenticateToken, requireAdmin, async 
         params.push(offset);
 
         const rows = await pool.query(`
-            SELECT ct.id, ct.created_at, ct.amount, ct.type, ct.description,
-                   ct.balance_before, ct.balance_after,
+            SELECT ledger.id, ledger.created_at, ledger.amount, ledger.type, ledger.description,
+                   ledger.balance_before, ledger.balance_after,
                    pp.id   AS player_id,
                    pp.alias AS player_alias, pp.full_name AS player_name,
                    ap.alias AS admin_alias,  ap.full_name AS admin_name
-            FROM credit_transactions ct
-            JOIN players pp ON pp.id = ct.player_id
-            LEFT JOIN users  au ON au.id = ct.admin_id
+            FROM ${BASE_LEDGER}
+            JOIN players pp ON pp.id = ledger.player_id
+            LEFT JOIN users  au ON au.id = ledger.admin_id
             LEFT JOIN players ap ON ap.user_id = au.id
             ${where}
-            ORDER BY ct.created_at DESC
+            ORDER BY ledger.created_at DESC
             LIMIT $${params.length - 1} OFFSET $${params.length}
         `, params);
 
