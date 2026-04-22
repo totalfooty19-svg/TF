@@ -14495,6 +14495,9 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
             query = `SELECT g.*, opp_mgr.logo_url AS opponent_logo_url, v.name as venue_name,
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id
+                          WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0)
+                  as confirmed_organiser_count,
                 motm_p.alias as motm_winner_alias,
                 COALESCE((SELECT SUM(COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
                  FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
@@ -14534,6 +14537,9 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
             query = `SELECT g.*, opp_clm.logo_url AS opponent_logo_url, v.name as venue_name,
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id
+                          WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0)
+                  as confirmed_organiser_count,
                 motm_p.alias as motm_winner_alias,
                 COALESCE((SELECT SUM(COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
                  FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
@@ -18359,12 +18365,17 @@ app.post('/api/public/contact', async (req, res) => {
 
 
 // ── REPORTING ENDPOINTS ───────────────────────────────────────────────────────
+// Rebuilt end-to-end: full column coverage for BY GAME / BY PLAYER / PLAYER × GAME
+// tabs, plus awards + star classes. Uses CTE pattern for performance over 700+ players.
 
 app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT g.id, g.game_date, g.format, g.exclusivity, g.max_players, g.cost_per_player,
-                g.game_status, g.winning_team, g.game_url, v.name as venue_name,
+                g.game_status, g.winning_team, g.game_url, g.team_selection_type,
+                v.name as venue_name,
+                (g.game_status = 'completed') as is_completed,
+                (g.game_status = 'completed' AND g.winning_team IS NULL) as is_draw,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as signups,
                 COALESCE((SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_count,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'backup'), 0) as backup_count,
@@ -18374,6 +18385,7 @@ app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) 
                     FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) +
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as revenue,
                 COALESCE((SELECT COUNT(*) FROM motm_votes mv WHERE mv.game_id = g.id), 0) as motm_votes_total,
+                COALESCE((SELECT COUNT(*) FROM game_awards ga WHERE ga.game_id = g.id), 0) as awards_total,
                 p.alias as motm_winner
             FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players p ON p.id = g.motm_winner_id
             ORDER BY g.game_date DESC
@@ -18382,25 +18394,175 @@ app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) 
     } catch (error) { console.error('Reports games error:', error); res.status(500).json({ error: 'Failed to load games report' }); }
 });
 
+
 app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT p.id, p.squad_number, p.alias, p.full_name as name, p.reliability_tier as tier,
-                p.total_appearances as appearances, p.motm_wins, p.overall_rating,
-                COALESCE(c.balance, 0) as credit_balance,
-                COALESCE((SELECT SUM(ABS(ct.amount)) FROM credit_transactions ct WHERE ct.player_id = p.id AND ct.type = 'game_fee'), 0) as revenue_spent,
-                COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.player_id = p.id AND r.status = 'confirmed'), 0) as confirmed_games,
-                COALESCE((SELECT COUNT(*) FROM discipline_records dr WHERE dr.player_id = p.id AND dr.offense_type = 'Late Drop Out'), 0) as late_dropouts,
-                COALESCE((SELECT COUNT(*) FROM players ref WHERE ref.referred_by = p.id), 0) as referrals,
-                COALESCE((SELECT COUNT(*) FROM game_guests gg WHERE gg.invited_by = p.id), 0) as guests_added,
-                COALESCE((SELECT json_agg(b.name ORDER BY b.name) FROM player_badges pb JOIN badges b ON b.id = pb.badge_id WHERE pb.player_id = p.id), '[]'::json) as badge_names,
+            WITH win_stats AS (
+                SELECT r.player_id,
+                       COUNT(DISTINCT r.game_id) FILTER (WHERE g.team_selection_type = 'tournament') AS tournament_wins
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                JOIN team_players tp ON tp.player_id = r.player_id
+                JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                WHERE r.status = 'confirmed' AND g.game_status = 'completed'
+                  AND LOWER(g.winning_team) = LOWER(t.team_name)
+                  AND g.team_selection_type != 'vs_external'
+                GROUP BY r.player_id
+            ),
+            ext_wins AS (
+                SELECT r.player_id, COUNT(DISTINCT r.game_id) AS external_wins
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                WHERE r.status = 'confirmed' AND g.game_status = 'completed'
+                  AND g.team_selection_type = 'vs_external'
+                  AND LOWER(g.winning_team) = 'red'
+                GROUP BY r.player_id
+            ),
+            award_counts AS (
+                SELECT recipient_player_id AS player_id,
+                    COUNT(*) FILTER (WHERE award_type = 'motm')             AS aw_motm,
+                    COUNT(*) FILTER (WHERE award_type = 'best_engine')      AS aw_best_engine,
+                    COUNT(*) FILTER (WHERE award_type = 'brick_wall')       AS aw_brick_wall,
+                    COUNT(*) FILTER (WHERE award_type = 'goalscorer')       AS aw_goalscorer,
+                    COUNT(*) FILTER (WHERE award_type = 'cold_moment')      AS aw_cold_moment,
+                    COUNT(*) FILTER (WHERE award_type = 'reckless_tackler') AS aw_reckless_tackler,
+                    COUNT(*) FILTER (WHERE award_type = 'the_moaner')       AS aw_the_moaner,
+                    COUNT(*) FILTER (WHERE award_type = 'donkey')           AS aw_donkey,
+                    COUNT(*) FILTER (WHERE award_type = 'walker')           AS aw_walker,
+                    COUNT(*) FILTER (WHERE award_type = 'pig')              AS aw_pig,
+                    COUNT(*) AS aw_total,
+                    COUNT(*) FILTER (WHERE award_type IN ('motm','best_engine','brick_wall','goalscorer','cold_moment')) AS aw_positive,
+                    COUNT(*) FILTER (WHERE award_type IN ('reckless_tackler','the_moaner','donkey','walker','pig'))       AS aw_banter,
+                    COUNT(*) FILTER (WHERE star_class = 'A') AS star_a,
+                    COUNT(*) FILTER (WHERE star_class = 'B') AS star_b,
+                    COUNT(*) FILTER (WHERE star_class = 'C') AS star_c,
+                    COUNT(*) FILTER (WHERE star_class = 'D') AS star_d,
+                    COUNT(*) FILTER (WHERE star_class = 'E') AS star_e
+                FROM game_awards
+                WHERE recipient_player_id IS NOT NULL
+                GROUP BY recipient_player_id
+            ),
+            disc_stats AS (
+                SELECT player_id,
+                    COUNT(*) FILTER (WHERE offense_type = 'Late Drop Out') AS dropouts,
+                    COALESCE(SUM(points), 0) AS disc_points
+                FROM discipline_records
+                GROUP BY player_id
+            ),
+            guest_stats AS (
+                SELECT invited_by AS player_id, COUNT(*) AS guests_added
+                FROM game_guests WHERE invited_by IS NOT NULL
+                GROUP BY invited_by
+            ),
+            ref_count AS (
+                SELECT referred_by AS player_id, COUNT(DISTINCT id) AS referrals_count
+                FROM players WHERE referred_by IS NOT NULL
+                GROUP BY referred_by
+            ),
+            ref_revenue AS (
+                SELECT ref.referred_by AS player_id,
+                    COALESCE(SUM(ABS(ct.amount)), 0) AS referral_revenue
+                FROM players ref
+                JOIN credit_transactions ct ON ct.player_id = ref.id
+                WHERE ref.referred_by IS NOT NULL AND ct.type = 'game_fee'
+                GROUP BY ref.referred_by
+            ),
+            revenue_stats AS (
+                SELECT player_id, SUM(ABS(amount)) AS revenue_spent
+                FROM credit_transactions
+                WHERE type = 'game_fee'
+                GROUP BY player_id
+            ),
+            badge_stats AS (
+                SELECT pb.player_id,
+                    COUNT(*) AS badge_count,
+                    json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon) ORDER BY b.name) AS badges,
+                    string_agg(b.name, ', ' ORDER BY b.name) AS badge_names_csv
+                FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                GROUP BY pb.player_id
+            )
+            SELECT
+                p.id, p.squad_number, p.alias, p.full_name,
+                COALESCE(p.alias, p.full_name) AS name,
+                p.reliability_tier AS tier,
+                p.total_appearances AS appearances,
+                p.motm_wins,
+                p.total_wins, p.total_draws,
+                COALESCE(ws.tournament_wins, 0) AS tournament_wins,
+                COALESCE(ew.external_wins,   0) AS external_wins,
+
+                -- Skill ratings (all 9)
+                p.overall_rating,
+                p.defending_rating, p.strength_rating, p.fitness_rating, p.pace_rating,
+                p.decisions_rating, p.assisting_rating, p.shooting_rating, p.goalkeeper_rating,
+
+                -- Badges
+                COALESCE(bs.badge_count, 0) AS badge_count,
+                COALESCE(bs.badges, '[]'::json) AS badges,
+                COALESCE(bs.badge_names_csv, '') AS badge_names_csv,
+
+                -- Awards (10 types broken out + 2 aggregates)
+                COALESCE(ac.aw_total,    0) AS awards_total,
+                COALESCE(ac.aw_positive, 0) AS awards_positive,
+                COALESCE(ac.aw_banter,   0) AS awards_banter,
+                COALESCE(ac.aw_motm,             0) AS award_motm,
+                COALESCE(ac.aw_best_engine,      0) AS award_best_engine,
+                COALESCE(ac.aw_brick_wall,       0) AS award_brick_wall,
+                COALESCE(ac.aw_goalscorer,       0) AS award_goalscorer,
+                COALESCE(ac.aw_cold_moment,      0) AS award_cold_moment,
+                COALESCE(ac.aw_reckless_tackler, 0) AS award_reckless_tackler,
+                COALESCE(ac.aw_the_moaner,       0) AS award_the_moaner,
+                COALESCE(ac.aw_donkey,           0) AS award_donkey,
+                COALESCE(ac.aw_walker,           0) AS award_walker,
+                COALESCE(ac.aw_pig,              0) AS award_pig,
+                COALESCE(ac.star_a, 0) AS star_class_a,
+                COALESCE(ac.star_b, 0) AS star_class_b,
+                COALESCE(ac.star_c, 0) AS star_class_c,
+                COALESCE(ac.star_d, 0) AS star_class_d,
+                COALESCE(ac.star_e, 0) AS star_class_e,
+
+                -- Discipline
+                COALESCE(ds.dropouts,    0) AS dropouts,
+                COALESCE(ds.disc_points, 0) AS disc_points,
+
+                -- Engagement
+                COALESCE(gs.guests_added,   0) AS guests_added,
+                COALESCE(rc.referrals_count,0) AS referrals_count,
+                COALESCE(rr.referral_revenue, 0) AS referral_revenue,
+
+                -- Finance
+                COALESCE(rvs.revenue_spent, 0) AS revenue_spent,
+                COALESCE(c.balance, 0) AS credit_balance,
+
+                -- Percentages
+                CASE WHEN p.total_appearances > 0
+                     THEN ROUND(p.total_wins::numeric / p.total_appearances * 100, 1)
+                     ELSE 0 END AS win_percent,
+                CASE WHEN p.total_appearances > 0
+                     THEN ROUND(p.motm_wins::numeric / p.total_appearances * 100, 1)
+                     ELSE 0 END AS motm_percent,
+
                 u.email
-            FROM players p LEFT JOIN credits c ON c.player_id = p.id LEFT JOIN users u ON u.id = p.user_id
+            FROM players p
+            LEFT JOIN credits c       ON c.player_id   = p.id
+            LEFT JOIN users u         ON u.id          = p.user_id
+            LEFT JOIN win_stats ws    ON ws.player_id  = p.id
+            LEFT JOIN ext_wins ew     ON ew.player_id  = p.id
+            LEFT JOIN award_counts ac ON ac.player_id  = p.id
+            LEFT JOIN disc_stats ds   ON ds.player_id  = p.id
+            LEFT JOIN guest_stats gs  ON gs.player_id  = p.id
+            LEFT JOIN ref_count rc    ON rc.player_id  = p.id
+            LEFT JOIN ref_revenue rr  ON rr.player_id  = p.id
+            LEFT JOIN revenue_stats rvs ON rvs.player_id = p.id
+            LEFT JOIN badge_stats bs  ON bs.player_id  = p.id
             ORDER BY p.squad_number ASC NULLS LAST
         `);
         res.json(result.rows);
     } catch (error) { console.error('Reports players error:', error); res.status(500).json({ error: 'Failed to load players report' }); }
 });
+
 
 app.get('/api/reports/players/list', authenticateToken, requireAdmin, async (req, res) => {
     try {
@@ -18409,32 +18571,96 @@ app.get('/api/reports/players/list', authenticateToken, requireAdmin, async (req
     } catch (error) { res.status(500).json({ error: 'Failed to load players list' }); }
 });
 
+
 app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { id } = req.params;
-        const result = await pool.query(`
-            SELECT g.id, g.game_date, g.format, g.game_url, v.name as venue_name,
-                r.status, r.position_preference, r.tournament_team_preference,
-                COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END) as amount_paid,
-                r.is_comped,
-                CASE WHEN g.winning_team IS NOT NULL AND t.team_name = g.winning_team THEN 'W'
-                     WHEN g.winning_team IS NOT NULL AND t.team_name IS NOT NULL THEN 'L'
-                     ELSE NULL END as result,
-                t.team_name,
-                COALESCE((SELECT COUNT(*) FROM motm_votes mv WHERE mv.game_id = g.id AND mv.voted_for_player_id = p.id), 0) as motm_votes_received,
-                COALESCE((SELECT COUNT(*) FROM motm_votes mv2 WHERE mv2.game_id = g.id AND mv2.voter_player_id = p.id), 0) as voted,
-                COALESCE((SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id AND gg.invited_by = p.id), 0) as guests_brought,
-                (g.motm_winner_id = p.id) as won_motm
-            FROM registrations r JOIN games g ON g.id = r.game_id JOIN players p ON p.id = r.player_id
-            LEFT JOIN venues v ON v.id = g.venue_id
-            LEFT JOIN team_players tp ON tp.player_id = p.id
-            LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
-            WHERE r.player_id = $1 AND r.status = 'confirmed' ORDER BY g.game_date DESC
-        `, [id]);
-        res.json(result.rows);
-    } catch (error) { console.error('Reports player games error:', error); res.status(500).json({ error: 'Failed to load player game history' }); }
-});
 
+        // Player summary
+        const pRes = await pool.query(`
+            SELECT p.id, p.squad_number, COALESCE(p.alias, p.full_name) AS name,
+                   p.reliability_tier AS tier,
+                   p.total_appearances AS appearances, p.motm_wins,
+                   p.total_wins, p.total_draws,
+                   p.overall_rating
+            FROM players p WHERE p.id = $1
+        `, [id]);
+        if (pRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+
+        // Games — one row per game the player was confirmed in
+        const gRes = await pool.query(`
+            SELECT g.id AS game_id, g.game_date, g.game_url, g.format, g.exclusivity,
+                g.team_selection_type,
+                g.game_status,
+                v.name AS venue_name,
+                r.status AS player_status,
+                r.position_preference,
+                r.tournament_team_preference,
+                r.is_comped,
+                COALESCE(NULLIF(r.amount_paid, 0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END) AS amount_paid,
+                t.team_name AS player_team,
+                g.winning_team,
+
+                CASE
+                    WHEN g.team_selection_type = 'vs_external' AND LOWER(g.winning_team) = 'red'  THEN 'W'
+                    WHEN g.team_selection_type = 'vs_external' AND LOWER(g.winning_team) = 'blue' THEN 'L'
+                    WHEN g.team_selection_type = 'vs_external' AND g.winning_team IS NULL AND g.game_status = 'completed' THEN 'D'
+                    WHEN g.winning_team IS NULL AND g.game_status = 'completed'                    THEN 'D'
+                    WHEN t.team_name IS NOT NULL AND LOWER(t.team_name) = LOWER(g.winning_team)    THEN 'W'
+                    WHEN t.team_name IS NOT NULL AND g.winning_team IS NOT NULL                    THEN 'L'
+                    ELSE NULL
+                END AS result,
+
+                COALESCE((SELECT COUNT(*) FROM motm_votes mv
+                          WHERE mv.game_id = g.id AND mv.voted_for_player_id = $1), 0) AS motm_votes_received,
+
+                (SELECT COUNT(*) > 0 FROM motm_votes mv2
+                 WHERE mv2.game_id = g.id AND mv2.voter_player_id = $1) AS did_vote_motm,
+
+                (SELECT COALESCE(vp.alias, vp.full_name)
+                 FROM motm_votes mv3
+                 JOIN players vp ON vp.id = mv3.voted_for_player_id
+                 WHERE mv3.game_id = g.id AND mv3.voter_player_id = $1
+                 LIMIT 1) AS voted_for_name,
+
+                (SELECT COALESCE(mw.alias, mw.full_name)
+                 FROM players mw WHERE mw.id = g.motm_winner_id) AS motm_winner,
+
+                (g.motm_winner_id = $1) AS won_motm,
+
+                COALESCE((SELECT COUNT(*) FROM game_guests gg
+                          WHERE gg.game_id = g.id AND gg.invited_by = $1), 0) AS guest_count,
+
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                        'type', ga.award_type,
+                        'star_class', ga.star_class,
+                        'votes', ga.vote_count
+                    ) ORDER BY ga.award_type)
+                    FROM game_awards ga
+                    WHERE ga.game_id = g.id AND ga.recipient_player_id = $1
+                ), '[]'::json) AS awards_received,
+
+                COALESCE((SELECT COUNT(*) FROM game_awards ga2
+                          WHERE ga2.game_id = g.id AND ga2.recipient_player_id = $1), 0) AS awards_count
+
+            FROM registrations r
+            JOIN games g ON g.id = r.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            LEFT JOIN team_players tp ON tp.player_id = r.player_id
+            LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+            WHERE r.player_id = $1 AND r.status = 'confirmed'
+            ORDER BY g.game_date DESC
+        `, [id]);
+
+        res.json({ player: pRes.rows[0], games: gRes.rows });
+    } catch (error) {
+        console.error('Reports player games error:', error);
+        res.status(500).json({ error: 'Failed to load player game history' });
+    }
+});
 
 // FIX-043: Catch-all 404 handler moved to after coaching routes
 
@@ -22820,158 +23046,6 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
     }
 });
 
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SDS PLUS INTERNAL TOOLS — Prospect Finder
-// POST /api/tools/prospect-search
-// Password-protected (hardcoded). Not part of TF auth.
-// Calls Anthropic (knowledge-based, no web_search) to find named B2B prospects.
-// ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/tools/prospect-search', async (req, res) => {
-    const { password, sector, companies, titles, maxResults } = req.body || {};
-
-    if (password !== 'Crown123') {
-        return res.status(401).json({ error: 'Unauthorised' });
-    }
-    if (!ANTHROPIC_API_KEY) {
-        return res.status(500).json({ error: 'Anthropic API not configured on server' });
-    }
-    if (!sector || !titles) {
-        return res.status(400).json({ error: 'sector and titles are required' });
-    }
-
-    const companiesList = (companies || '').split('\n').map(c => c.trim()).filter(Boolean);
-    const titlesList = (titles || '').split('\n').map(t => t.trim()).filter(Boolean);
-    const limit = Math.min(parseInt(maxResults) || 20, 50);
-
-    const companyContext = companiesList.length > 0
-        ? `Target companies: ${companiesList.join(', ')}.`
-        : `Find the leading UK companies in the ${sector} sector.`;
-
-    // System prompt forces raw JSON — no preamble, no markdown, no code fences
-    const systemPrompt = `You are a B2B sales research assistant with extensive knowledge of UK businesses and their senior personnel. You MUST respond with ONLY a raw JSON array. No explanation, no markdown, no code fences, no preamble. Start your response with [ and end with ]. Nothing else.
-
-JSON schema for each object:
-{"firstName":"string","lastName":"string","title":"string","company":"string","sector":"string","linkedin":"string or empty string","confidence":"high|medium|low","notes":"one sentence context"}
-
-confidence values: high=you are confident this person held/holds this role, medium=reasonably likely based on your knowledge, low=possible based on company structure.`;
-
-    const userPrompt = `Using your knowledge of UK businesses and their senior personnel, identify named individuals who work in logistics, distribution, transport or fleet operations at companies in the ${sector} sector.
-
-${companyContext}
-Target job titles (or equivalent seniority): ${titlesList.join(', ')}
-
-Draw on your knowledge of UK trade press (Motor Transport, Fleet News, Logistics Manager), LinkedIn profiles, company announcements and industry news to identify real named people.
-
-Return up to ${limit} people. Only include real individuals you have knowledge of — do not invent names. Include LinkedIn profile URLs where you know them, otherwise use empty string "".`;
-
-    try {
-        console.log(`[SDS Tools] Prospect search started: sector="${sector}", companies=${companiesList.length}, limit=${limit}`);
-
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify({
-                model: 'claude-sonnet-4-20250514',
-                max_tokens: 4000,
-                system: systemPrompt,
-                // No web_search tool — uses training knowledge to avoid rate limits.
-                // Lusha enrichment confirms current details anyway.
-                messages: [{ role: 'user', content: userPrompt }],
-            }),
-        });
-
-        if (!response.ok) {
-            let errBody = {};
-            try { errBody = await response.json(); } catch (_) {}
-            console.error(`[SDS Tools] Anthropic HTTP ${response.status}:`, JSON.stringify(errBody));
-            return res.status(502).json({
-                error: 'Anthropic API error',
-                status: response.status,
-                detail: errBody?.error?.message || JSON.stringify(errBody)
-            });
-        }
-
-        const data = await response.json();
-
-        // Log full response structure for debugging
-        console.log(`[SDS Tools] Response stop_reason: ${data.stop_reason}, content blocks: ${(data.content||[]).length}`);
-        (data.content || []).forEach((b, i) => {
-            console.log(`[SDS Tools] Block ${i}: type=${b.type}${b.type==='text' ? ', text_len='+b.text.length : ''}`);
-        });
-
-        // Collect all text from all text blocks
-        const allText = (data.content || [])
-            .filter(b => b.type === 'text')
-            .map(b => b.text)
-            .join('');
-
-        console.log(`[SDS Tools] Total text length: ${allText.length}`);
-        console.log(`[SDS Tools] First 500 chars: ${allText.slice(0, 500)}`);
-
-        // Robust JSON extraction — handles raw JSON, code fences, and partial wrapping
-        let prospects = [];
-        let parseError = '';
-
-        // Strategy 1: Try parsing the whole text directly
-        try {
-            const trimmed = allText.trim();
-            if (trimmed.startsWith('[')) {
-                prospects = JSON.parse(trimmed);
-            }
-        } catch (e) { parseError = 'direct: ' + e.message; }
-
-        // Strategy 2: Extract from code fences ```json ... ```
-        if (!prospects.length) {
-            try {
-                const fenceMatch = allText.match(/```(?:json)?\s*([\s\S]*?)```/);
-                if (fenceMatch) prospects = JSON.parse(fenceMatch[1].trim());
-            } catch (e) { parseError += ' | fence: ' + e.message; }
-        }
-
-        // Strategy 3: Find first [ ... ] block
-        if (!prospects.length) {
-            try {
-                const bracketMatch = allText.match(/\[[\s\S]*\]/);
-                if (bracketMatch) prospects = JSON.parse(bracketMatch[0]);
-            } catch (e) { parseError += ' | bracket: ' + e.message; }
-        }
-
-        // Strategy 4: Find last complete JSON array (in case of trailing text)
-        if (!prospects.length) {
-            try {
-                const lastBracket = allText.lastIndexOf(']');
-                const firstBracket = allText.indexOf('[');
-                if (firstBracket !== -1 && lastBracket !== -1) {
-                    prospects = JSON.parse(allText.slice(firstBracket, lastBracket + 1));
-                }
-            } catch (e) { parseError += ' | lastbracket: ' + e.message; }
-        }
-
-        if (!Array.isArray(prospects) || prospects.length === 0) {
-            console.error('[SDS Tools] All parse strategies failed. parseError:', parseError);
-            console.error('[SDS Tools] Full response text:', allText.slice(0, 1000));
-            return res.status(502).json({
-                error: 'Could not parse prospect data from response',
-                detail: parseError,
-                raw: allText.slice(0, 500)
-            });
-        }
-
-        const valid = prospects.filter(p => p.firstName && p.lastName && p.company);
-        console.log(`[SDS Tools] Done: found=${valid.length} valid of ${prospects.length} total`);
-        res.json({ prospects: valid, total: valid.length });
-
-    } catch (e) {
-        console.error('[SDS Tools] Unhandled error:', e.message);
-        res.status(500).json({ error: 'Server error', detail: e.message });
-    }
-});
 
 // FIX-043: Catch-all 404 — MUST be last, after ALL routes (including comms routes).
 // Previously this was placed before the comms routes, which caused all comms endpoints
