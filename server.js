@@ -22826,7 +22826,7 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
 // SDS PLUS INTERNAL TOOLS — Prospect Finder
 // POST /api/tools/prospect-search
 // Password-protected (hardcoded). Not part of TF auth.
-// Calls Anthropic with web_search tool to find named B2B prospects.
+// Calls Anthropic (knowledge-based, no web_search) to find named B2B prospects.
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/tools/prospect-search', async (req, res) => {
     const { password, sector, companies, titles, maxResults } = req.body || {};
@@ -22849,22 +22849,22 @@ app.post('/api/tools/prospect-search', async (req, res) => {
         ? `Target companies: ${companiesList.join(', ')}.`
         : `Find the leading UK companies in the ${sector} sector.`;
 
-    // System prompt forces raw JSON output — no preamble, no markdown, reduces tokens and parse failures
-    const systemPrompt = `You are a B2B sales research assistant. You MUST respond with ONLY a raw JSON array. No explanation, no markdown, no code fences, no preamble. Start your response with [ and end with ]. Nothing else.
+    // System prompt forces raw JSON — no preamble, no markdown, no code fences
+    const systemPrompt = `You are a B2B sales research assistant with extensive knowledge of UK businesses and their senior personnel. You MUST respond with ONLY a raw JSON array. No explanation, no markdown, no code fences, no preamble. Start your response with [ and end with ]. Nothing else.
 
 JSON schema for each object:
-{"firstName":"string","lastName":"string","title":"string","company":"string","sector":"string","linkedin":"string or empty","confidence":"high|medium|low","notes":"string"}
+{"firstName":"string","lastName":"string","title":"string","company":"string","sector":"string","linkedin":"string or empty string","confidence":"high|medium|low","notes":"one sentence context"}
 
-confidence: high=confirmed on LinkedIn, medium=found in press/news/company site, low=directory or inferred.`;
+confidence values: high=you are confident this person held/holds this role, medium=reasonably likely based on your knowledge, low=possible based on company structure.`;
 
-    const userPrompt = `Find named UK decision-makers in the ${sector} sector who are responsible for van fleet operations, logistics, distribution or transport.
+    const userPrompt = `Using your knowledge of UK businesses and their senior personnel, identify named individuals who work in logistics, distribution, transport or fleet operations at companies in the ${sector} sector.
 
 ${companyContext}
-Target job titles: ${titlesList.join(', ')}
+Target job titles (or equivalent seniority): ${titlesList.join(', ')}
 
-Use web search to find real named individuals. Search for each company + job title combination. Also search LinkedIn, company websites, press releases and trade press (Motor Transport, Fleet News, Logistics Manager).
+Draw on your knowledge of UK trade press (Motor Transport, Fleet News, Logistics Manager), LinkedIn profiles, company announcements and industry news to identify real named people.
 
-Return up to ${limit} real people. Only include people you have found actual evidence of. Do not invent or guess names. If you cannot find a LinkedIn URL leave it as empty string.`;
+Return up to ${limit} people. Only include real individuals you have knowledge of — do not invent names. Include LinkedIn profile URLs where you know them, otherwise use empty string "".`;
 
     try {
         console.log(`[SDS Tools] Prospect search started: sector="${sector}", companies=${companiesList.length}, limit=${limit}`);
@@ -22880,7 +22880,8 @@ Return up to ${limit} real people. Only include people you have found actual evi
                 model: 'claude-sonnet-4-20250514',
                 max_tokens: 4000,
                 system: systemPrompt,
-                tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+                // No web_search tool — uses training knowledge to avoid rate limits.
+                // Lusha enrichment confirms current details anyway.
                 messages: [{ role: 'user', content: userPrompt }],
             }),
         });
