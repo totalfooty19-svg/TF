@@ -22878,7 +22878,7 @@ If no LinkedIn URL found, use empty string "".`;
                 'anthropic-version': '2023-06-01',
             },
             body: JSON.stringify({
-                model: 'claude-sonnet-4-6',
+                model: 'claude-sonnet-4-20250514',
                 max_tokens: 4000,
                 tools: [{ type: 'web_search_20250305', name: 'web_search' }],
                 messages: [{ role: 'user', content: prompt }],
@@ -22886,10 +22886,10 @@ If no LinkedIn URL found, use empty string "".`;
         });
 
         if (!response.ok) {
-            let errBody = '';
-            try { errBody = JSON.stringify(await response.json()); } catch (_) {}
-            console.error(`[SDS Tools] Anthropic error: HTTP ${response.status} — ${errBody}`);
-            return res.status(502).json({ error: 'Anthropic API error', detail: response.status });
+            let errBody = {};
+            try { errBody = await response.json(); } catch (_) {}
+            console.error(`[SDS Tools] Anthropic error: HTTP ${response.status} —`, JSON.stringify(errBody));
+            return res.status(502).json({ error: 'Anthropic API error', status: response.status, detail: errBody?.error?.message || JSON.stringify(errBody) });
         }
 
         const data = await response.json();
