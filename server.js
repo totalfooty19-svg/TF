@@ -1426,7 +1426,7 @@ app.post('/api/auth/register', async (req, res) => {
 
         // Validate age range — required for insurance purposes
         // Validate region
-        const VALID_REGIONS = ['Coventry', 'Birmingham', 'Leamington', 'Nuneaton', 'Manchester'];
+        const VALID_REGIONS = ['Coventry', 'Birmingham', 'Leamington & Warwick', 'Nuneaton', 'Manchester']; // FIX-107
         const validatedRegion = (region && VALID_REGIONS.includes(region)) ? region : null;
 
         // Validate interests
@@ -3027,7 +3027,7 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
 // Shared position/region whitelists
 const _PREFS_ALLOWED_POSITIONS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF']);
 const _PREFS_ALLOWED_AREAS     = new Set(['defence','midfield','attack']);
-const _PREFS_ALLOWED_LOCATIONS = new Set(['Birmingham','Coventry','Manchester','Nuneaton','Leamington']);
+const _PREFS_ALLOWED_LOCATIONS = new Set(['Birmingham','Coventry','Manchester','Nuneaton','Leamington & Warwick']); // FIX-107
 
 // GET /api/player/preferences — returns all prefs for current player
 app.get('/api/player/preferences', authenticateToken, async (req, res) => {
@@ -3256,6 +3256,51 @@ async (req, res) => {
         res.json({ message: 'Photo uploaded successfully' });
     } catch (error) {
         console.error('Photo upload error:', error);
+        res.status(500).json({ error: 'Upload failed' });
+    }
+});
+
+// FIX-108: Admin-only photo upload for any player (used by player card graphic)
+// Mirrors /api/players/me/photo validation exactly — MIME prefix + magic bytes.
+app.post('/api/admin/players/:id/photo',
+    authenticateToken, requireAdmin,
+    express.json({ limit: '5mb' }),
+async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { photoData } = req.body;
+
+        if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid player ID' });
+        if (!photoData) return res.status(400).json({ error: 'No photo data provided' });
+        if (photoData.length > 2_000_000) return res.status(400).json({ error: 'Photo too large. Max ~1.5MB.' });
+
+        const VALID_PREFIXES = {
+            'data:image/jpeg;base64,': { magic: [0xFF, 0xD8, 0xFF] },
+            'data:image/png;base64,':  { magic: [0x89, 0x50, 0x4E, 0x47] },
+            'data:image/webp;base64,': { magic: [0x52, 0x49, 0x46, 0x46] },
+        };
+        const matchedPrefix = Object.keys(VALID_PREFIXES).find(p => photoData.startsWith(p));
+        if (!matchedPrefix) return res.status(400).json({ error: 'Invalid image format. JPEG, PNG, or WebP only.' });
+
+        const b64Data = photoData.slice(matchedPrefix.length);
+        const rawBytes = Buffer.from(b64Data, 'base64');
+        const expectedMagic = VALID_PREFIXES[matchedPrefix].magic;
+        const actualBytes = [...rawBytes.slice(0, expectedMagic.length)];
+        if (!expectedMagic.every((byte, i) => actualBytes[i] === byte)) {
+            return res.status(400).json({ error: 'File contents do not match declared image type.' });
+        }
+
+        const upd = await pool.query(
+            'UPDATE players SET photo_url = $1 WHERE id = $2 RETURNING alias',
+            [photoData, id]
+        );
+        if (upd.rowCount === 0) return res.status(404).json({ error: 'Player not found' });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'photo_uploaded', id,
+            `Admin updated photo for ${upd.rows[0].alias}`));
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Admin photo upload error:', error);
         res.status(500).json({ error: 'Upload failed' });
     }
 });
@@ -12096,6 +12141,28 @@ app.get('/api/public/games/completed', async (req, res) => {
     }
 });
 
+// ════════════════════════════════════════════════════════════════════════
+// FIX-108 — Admin player card graphic: lightweight picker
+// (photo override endpoint lives earlier in the file at /api/admin/players/:id/photo)
+// ════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/players/picker — admin-only, slim list for the content
+// tf-graphic-12-player-card picker. Returns id, alias, full_name, photo_url,
+// squad_number only. Sorted by alias for predictable dropdown + search.
+app.get('/api/admin/players/picker', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT id, alias, full_name, photo_url, squad_number
+              FROM players
+             ORDER BY LOWER(COALESCE(alias, full_name)) ASC
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Admin player picker error:', error);
+        res.status(500).json({ error: 'Failed to load players' });
+    }
+});
+
 // GET /api/public/players/leaderboard — public leaderboard (no auth, no PII)
 app.get('/api/public/players/leaderboard', async (req, res) => {
     try {
@@ -17312,27 +17379,31 @@ app.get('/api/admin/audit/transactions', authenticateToken, requireAdmin, async 
         // Base ledger view — real transactions + synthetic game_signup claim rows.
         // Synthetic rows use type='comms_claim', amount=0, balance_* = NULL so the
         // frontend can distinguish them and skip the balance-before/after line.
+        //
+        // NOTE: ct.id is cast to TEXT rather than INT — schema uses UUID in some
+        // environments. TEXT is compatible with any id type on both sides of the
+        // UNION and the frontend only uses the id for React keys (string-compatible).
         const BASE_LEDGER = `(
-            SELECT ct.id::int         AS id,
+            SELECT ct.id::text         AS id,
                    ct.created_at,
-                   ct.amount::numeric AS amount,
-                   ct.type::text      AS type,
+                   ct.amount::numeric  AS amount,
+                   ct.type::text       AS type,
                    ct.description,
-                   ct.balance_before,
-                   ct.balance_after,
+                   ct.balance_before::numeric AS balance_before,
+                   ct.balance_after::numeric  AS balance_after,
                    ct.player_id,
                    ct.admin_id
               FROM credit_transactions ct
 
             UNION ALL
 
-            SELECT NULL::int          AS id,
-                   cr.claimed_at      AS created_at,
-                   0::numeric         AS amount,
+            SELECT NULL::text          AS id,
+                   cr.claimed_at       AS created_at,
+                   0::numeric          AS amount,
                    'comms_claim'::text AS type,
                    ('Comms campaign #' || cc.id || ' — game signup claim') AS description,
-                   NULL::numeric      AS balance_before,
-                   NULL::numeric      AS balance_after,
+                   NULL::numeric       AS balance_before,
+                   NULL::numeric       AS balance_after,
                    cr.player_id,
                    -- cc.created_by is a player_id; admin_id in credit_transactions is
                    -- a users.id. Resolve via players.user_id so the downstream
