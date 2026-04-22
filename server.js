@@ -22825,7 +22825,7 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // SDS PLUS INTERNAL TOOLS — Prospect Finder
 // POST /api/tools/prospect-search
-// Password-protected (TOOLS_PASSWORD env var). Not part of TF auth.
+// Password-protected (hardcoded). Not part of TF auth.
 // Calls Anthropic with web_search tool to find named B2B prospects.
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/tools/prospect-search', async (req, res) => {
@@ -22846,30 +22846,29 @@ app.post('/api/tools/prospect-search', async (req, res) => {
     const limit = Math.min(parseInt(maxResults) || 20, 50);
 
     const companyContext = companiesList.length > 0
-        ? `Focus specifically on these companies: ${companiesList.join(', ')}.`
-        : `Find the leading UK companies in the ${sector} sector and search for contacts at those companies.`;
+        ? `Target companies: ${companiesList.join(', ')}.`
+        : `Find the leading UK companies in the ${sector} sector.`;
 
-    const prompt = `You are a B2B sales researcher finding named UK contacts for a logistics software company called SDS Plus.
+    // System prompt forces raw JSON output — no preamble, no markdown, reduces tokens and parse failures
+    const systemPrompt = `You are a B2B sales research assistant. You MUST respond with ONLY a raw JSON array. No explanation, no markdown, no code fences, no preamble. Start your response with [ and end with ]. Nothing else.
 
-Sector: ${sector}
+JSON schema for each object:
+{"firstName":"string","lastName":"string","title":"string","company":"string","sector":"string","linkedin":"string or empty","confidence":"high|medium|low","notes":"string"}
+
+confidence: high=confirmed on LinkedIn, medium=found in press/news/company site, low=directory or inferred.`;
+
+    const userPrompt = `Find named UK decision-makers in the ${sector} sector who are responsible for van fleet operations, logistics, distribution or transport.
+
 ${companyContext}
-Target job titles (find people with these or similar roles): ${titlesList.join(', ')}
+Target job titles: ${titlesList.join(', ')}
 
-Use web search to find real named individuals. Search for:
-- "[Company] [Job Title] LinkedIn UK"
-- "[Company] head of logistics UK"
-- "[Company] distribution director site:linkedin.com"
-- "[Sector] UK distribution director"
+Use web search to find real named individuals. Search for each company + job title combination. Also search LinkedIn, company websites, press releases and trade press (Motor Transport, Fleet News, Logistics Manager).
 
-Find up to ${limit} real named prospects. Only include people you have found actual evidence of — do not invent anyone.
-
-Return ONLY a valid JSON array, no other text, no markdown fences:
-[{"firstName":"Jane","lastName":"Smith","title":"Head of Distribution","company":"Company Ltd","sector":"${sector}","linkedin":"https://linkedin.com/in/...","confidence":"high","notes":"brief context note"}]
-
-confidence values: high=found directly on LinkedIn, medium=found in news/press release/company site, low=inferred from org chart or directory.
-If no LinkedIn URL found, use empty string "".`;
+Return up to ${limit} real people. Only include people you have found actual evidence of. Do not invent or guess names. If you cannot find a LinkedIn URL leave it as empty string.`;
 
     try {
+        console.log(`[SDS Tools] Prospect search started: sector="${sector}", companies=${companiesList.length}, limit=${limit}`);
+
         const response = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -22880,46 +22879,95 @@ If no LinkedIn URL found, use empty string "".`;
             body: JSON.stringify({
                 model: 'claude-sonnet-4-20250514',
                 max_tokens: 4000,
+                system: systemPrompt,
                 tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-                messages: [{ role: 'user', content: prompt }],
+                messages: [{ role: 'user', content: userPrompt }],
             }),
         });
 
         if (!response.ok) {
             let errBody = {};
             try { errBody = await response.json(); } catch (_) {}
-            console.error(`[SDS Tools] Anthropic error: HTTP ${response.status} —`, JSON.stringify(errBody));
-            return res.status(502).json({ error: 'Anthropic API error', status: response.status, detail: errBody?.error?.message || JSON.stringify(errBody) });
+            console.error(`[SDS Tools] Anthropic HTTP ${response.status}:`, JSON.stringify(errBody));
+            return res.status(502).json({
+                error: 'Anthropic API error',
+                status: response.status,
+                detail: errBody?.error?.message || JSON.stringify(errBody)
+            });
         }
 
         const data = await response.json();
-        const textBlocks = (data.content || [])
+
+        // Log full response structure for debugging
+        console.log(`[SDS Tools] Response stop_reason: ${data.stop_reason}, content blocks: ${(data.content||[]).length}`);
+        (data.content || []).forEach((b, i) => {
+            console.log(`[SDS Tools] Block ${i}: type=${b.type}${b.type==='text' ? ', text_len='+b.text.length : ''}`);
+        });
+
+        // Collect all text from all text blocks
+        const allText = (data.content || [])
             .filter(b => b.type === 'text')
             .map(b => b.text)
             .join('');
 
-        const match = textBlocks.match(/\[[\s\S]*\]/);
-        if (!match) {
-            console.error('[SDS Tools] No JSON array in Anthropic response:', textBlocks.slice(0, 300));
-            return res.status(502).json({ error: 'No prospect data returned — try different inputs' });
-        }
+        console.log(`[SDS Tools] Total text length: ${allText.length}`);
+        console.log(`[SDS Tools] First 500 chars: ${allText.slice(0, 500)}`);
 
+        // Robust JSON extraction — handles raw JSON, code fences, and partial wrapping
         let prospects = [];
+        let parseError = '';
+
+        // Strategy 1: Try parsing the whole text directly
         try {
-            prospects = JSON.parse(match[0]);
-        } catch (e) {
-            const clean = match[0].replace(/```json|```/g, '').trim();
-            prospects = JSON.parse(clean);
+            const trimmed = allText.trim();
+            if (trimmed.startsWith('[')) {
+                prospects = JSON.parse(trimmed);
+            }
+        } catch (e) { parseError = 'direct: ' + e.message; }
+
+        // Strategy 2: Extract from code fences ```json ... ```
+        if (!prospects.length) {
+            try {
+                const fenceMatch = allText.match(/```(?:json)?\s*([\s\S]*?)```/);
+                if (fenceMatch) prospects = JSON.parse(fenceMatch[1].trim());
+            } catch (e) { parseError += ' | fence: ' + e.message; }
         }
 
-        const valid = (Array.isArray(prospects) ? prospects : [])
-            .filter(p => p.firstName && p.lastName && p.company);
+        // Strategy 3: Find first [ ... ] block
+        if (!prospects.length) {
+            try {
+                const bracketMatch = allText.match(/\[[\s\S]*\]/);
+                if (bracketMatch) prospects = JSON.parse(bracketMatch[0]);
+            } catch (e) { parseError += ' | bracket: ' + e.message; }
+        }
 
-        console.log(`[SDS Tools] Prospect search: sector="${sector}", found=${valid.length}`);
+        // Strategy 4: Find last complete JSON array (in case of trailing text)
+        if (!prospects.length) {
+            try {
+                const lastBracket = allText.lastIndexOf(']');
+                const firstBracket = allText.indexOf('[');
+                if (firstBracket !== -1 && lastBracket !== -1) {
+                    prospects = JSON.parse(allText.slice(firstBracket, lastBracket + 1));
+                }
+            } catch (e) { parseError += ' | lastbracket: ' + e.message; }
+        }
+
+        if (!Array.isArray(prospects) || prospects.length === 0) {
+            console.error('[SDS Tools] All parse strategies failed. parseError:', parseError);
+            console.error('[SDS Tools] Full response text:', allText.slice(0, 1000));
+            return res.status(502).json({
+                error: 'Could not parse prospect data from response',
+                detail: parseError,
+                raw: allText.slice(0, 500)
+            });
+        }
+
+        const valid = prospects.filter(p => p.firstName && p.lastName && p.company);
+        console.log(`[SDS Tools] Done: found=${valid.length} valid of ${prospects.length} total`);
         res.json({ prospects: valid, total: valid.length });
 
     } catch (e) {
-        console.error('[SDS Tools] prospect-search error:', e.message);
+        console.error('[SDS Tools] Unhandled error:', e.message);
         res.status(500).json({ error: 'Server error', detail: e.message });
     }
 });
