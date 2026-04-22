@@ -18435,6 +18435,7 @@ app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async 
     } catch (error) { console.error('Reports player games error:', error); res.status(500).json({ error: 'Failed to load player game history' }); }
 });
 
+
 // FIX-043: Catch-all 404 handler moved to after coaching routes
 
 // FIX-037: Global handlers — SEC-012: uncaughtException now exits to prevent undefined server state
@@ -22819,6 +22820,110 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
     }
 });
 
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SDS PLUS INTERNAL TOOLS — Prospect Finder
+// POST /api/tools/prospect-search
+// Password-protected (TOOLS_PASSWORD env var). Not part of TF auth.
+// Calls Anthropic with web_search tool to find named B2B prospects.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/tools/prospect-search', async (req, res) => {
+    const TOOLS_PASSWORD = process.env.TOOLS_PASSWORD;
+    const { password, sector, companies, titles, maxResults } = req.body || {};
+
+    if (!TOOLS_PASSWORD || !password || password !== TOOLS_PASSWORD) {
+        return res.status(401).json({ error: 'Unauthorised' });
+    }
+    if (!ANTHROPIC_API_KEY) {
+        return res.status(500).json({ error: 'Anthropic API not configured on server' });
+    }
+    if (!sector || !titles) {
+        return res.status(400).json({ error: 'sector and titles are required' });
+    }
+
+    const companiesList = (companies || '').split('\n').map(c => c.trim()).filter(Boolean);
+    const titlesList = (titles || '').split('\n').map(t => t.trim()).filter(Boolean);
+    const limit = Math.min(parseInt(maxResults) || 20, 50);
+
+    const companyContext = companiesList.length > 0
+        ? `Focus specifically on these companies: ${companiesList.join(', ')}.`
+        : `Find the leading UK companies in the ${sector} sector and search for contacts at those companies.`;
+
+    const prompt = `You are a B2B sales researcher finding named UK contacts for a logistics software company called SDS Plus.
+
+Sector: ${sector}
+${companyContext}
+Target job titles (find people with these or similar roles): ${titlesList.join(', ')}
+
+Use web search to find real named individuals. Search for:
+- "[Company] [Job Title] LinkedIn UK"
+- "[Company] head of logistics UK"
+- "[Company] distribution director site:linkedin.com"
+- "[Sector] UK distribution director"
+
+Find up to ${limit} real named prospects. Only include people you have found actual evidence of — do not invent anyone.
+
+Return ONLY a valid JSON array, no other text, no markdown fences:
+[{"firstName":"Jane","lastName":"Smith","title":"Head of Distribution","company":"Company Ltd","sector":"${sector}","linkedin":"https://linkedin.com/in/...","confidence":"high","notes":"brief context note"}]
+
+confidence values: high=found directly on LinkedIn, medium=found in news/press release/company site, low=inferred from org chart or directory.
+If no LinkedIn URL found, use empty string "".`;
+
+    try {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+                model: 'claude-sonnet-4-6',
+                max_tokens: 4000,
+                tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+                messages: [{ role: 'user', content: prompt }],
+            }),
+        });
+
+        if (!response.ok) {
+            let errBody = '';
+            try { errBody = JSON.stringify(await response.json()); } catch (_) {}
+            console.error(`[SDS Tools] Anthropic error: HTTP ${response.status} — ${errBody}`);
+            return res.status(502).json({ error: 'Anthropic API error', detail: response.status });
+        }
+
+        const data = await response.json();
+        const textBlocks = (data.content || [])
+            .filter(b => b.type === 'text')
+            .map(b => b.text)
+            .join('');
+
+        const match = textBlocks.match(/\[[\s\S]*\]/);
+        if (!match) {
+            console.error('[SDS Tools] No JSON array in Anthropic response:', textBlocks.slice(0, 300));
+            return res.status(502).json({ error: 'No prospect data returned — try different inputs' });
+        }
+
+        let prospects = [];
+        try {
+            prospects = JSON.parse(match[0]);
+        } catch (e) {
+            const clean = match[0].replace(/```json|```/g, '').trim();
+            prospects = JSON.parse(clean);
+        }
+
+        const valid = (Array.isArray(prospects) ? prospects : [])
+            .filter(p => p.firstName && p.lastName && p.company);
+
+        console.log(`[SDS Tools] Prospect search: sector="${sector}", found=${valid.length}`);
+        res.json({ prospects: valid, total: valid.length });
+
+    } catch (e) {
+        console.error('[SDS Tools] prospect-search error:', e.message);
+        res.status(500).json({ error: 'Server error', detail: e.message });
+    }
+});
 
 // FIX-043: Catch-all 404 — MUST be last, after ALL routes (including comms routes).
 // Previously this was placed before the comms routes, which caused all comms endpoints
