@@ -22829,10 +22829,9 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
 // Calls Anthropic with web_search tool to find named B2B prospects.
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/tools/prospect-search', async (req, res) => {
-    const TOOLS_PASSWORD = process.env.TOOLS_PASSWORD;
     const { password, sector, companies, titles, maxResults } = req.body || {};
 
-    if (!TOOLS_PASSWORD || !password || password !== TOOLS_PASSWORD) {
+    if (password !== 'Crown123') {
         return res.status(401).json({ error: 'Unauthorised' });
     }
     if (!ANTHROPIC_API_KEY) {
