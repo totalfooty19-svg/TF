@@ -15444,59 +15444,29 @@ app.get('/api/admin/players/analysis', authenticateToken, requireAdmin, async (r
                                OR pr.team_balance_score = 0)
                           AND pr.motm_winner_id = pr.player_id
                     ) AS motm,
-                    -- DYN OVR — dynamic overall score. Per-game signal:
-                    --   pov = team_balance_score if player's team was 'red' else -team_balance_score
-                    --     (positive = player was favoured, negative = player was underdog)
-                    --   contribution per game (in "notches" — each notch = 9° of arrow rotation):
-                    --     balanced (score = 0) or NULL score  → 0
-                    --     draw                                → -pov / 2  (half-weight; "failed
-                    --                                            to win despite advantage" or
-                    --                                            "held on despite disadvantage")
-                    --     win                                 → GREATEST(-pov, 0)   (underdog
-                    --                                            wins = +|pov|; favoured wins = 0
-                    --                                            because they were expected)
-                    --     loss                                → LEAST(-pov, 0)      (favoured
-                    --                                            losses = -|pov|; underdog
-                    --                                            losses = 0, expected)
+                    -- DYN OVR notches (v2, 2026-04-24 — GAFFA-simplified rule):
+                    --   Unfair game (score != 0, not NULL):
+                    --     Win  → +|score|  (any win in an unfair game = underrated signal)
+                    --     Loss → -|score|  (any loss in an unfair game = overrated signal)
+                    --     Draw → 0         (draws skipped entirely per GAFFA)
+                    --   Balanced game (score = 0) or excluded game (score NULL) → 0
                     --
-                    -- Sum across all scored non-NULL games = total notches. Frontend converts
-                    -- to arrow angle: angle = 90° + (notches × 9°), clamped to [0°, 180°].
-                    -- Direction: negative notches rotate down to red (overrated signal),
-                    -- positive notches rotate up to green (underrated signal).
-                    --
-                    -- Assumption: team_name is 'red' or 'blue' (case-insensitive). For standard
-                    -- games this is always true — custom team names are tournament/external only,
-                    -- which are already excluded by standard_games CTE.
+                    -- Notches accumulate linearly. Frontend converts to arrow angle at 9° per
+                    -- notch, clamped to [0°, 180°]. Players' arrows can swing back toward
+                    -- yellow if subsequent games go the other way. Admin OVR change resets
+                    -- the baseline (see 'Since last overall change' toggle) to put the
+                    -- arrow back near horizontal after a rating adjustment.
                     COALESCE(SUM(
                         CASE
                             WHEN pr.team_balance_score IS NULL
                               OR pr.team_balance_score = 0
                               OR pr.winning_team IS NULL
+                              OR LOWER(pr.winning_team) = 'draw'
                                 THEN 0::numeric
+                            WHEN LOWER(pr.winning_team) = LOWER(pr.team_name) THEN
+                                ABS(pr.team_balance_score)::numeric   -- WIN: +|score|
                             ELSE
-                                -- pov = signed advantage from player's perspective
-                                CASE
-                                    WHEN LOWER(pr.winning_team) = 'draw' THEN
-                                        -(CASE WHEN LOWER(pr.team_name) = 'red'
-                                               THEN pr.team_balance_score
-                                               ELSE -pr.team_balance_score END)::numeric / 2
-                                    WHEN LOWER(pr.winning_team) = LOWER(pr.team_name) THEN
-                                        -- win: underdog wins reward = |pov|; favoured wins = 0
-                                        GREATEST(
-                                            -(CASE WHEN LOWER(pr.team_name) = 'red'
-                                                   THEN pr.team_balance_score
-                                                   ELSE -pr.team_balance_score END)::numeric,
-                                            0::numeric
-                                        )
-                                    ELSE
-                                        -- loss: favoured losses penalty = -|pov|; underdog losses = 0
-                                        LEAST(
-                                            -(CASE WHEN LOWER(pr.team_name) = 'red'
-                                                   THEN pr.team_balance_score
-                                                   ELSE -pr.team_balance_score END)::numeric,
-                                            0::numeric
-                                        )
-                                END
+                                -ABS(pr.team_balance_score)::numeric  -- LOSS: -|score|
                         END
                     ), 0::numeric) AS dyn_ovr_notches,
                     -- Sample-size indicator: unfair games that contributed to the signal.
