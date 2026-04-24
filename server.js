@@ -594,24 +594,35 @@ function effectiveMinOvr(game) { return effectiveMinRating(game).minOvr; }
 
 // ── STAR CLASS ───────────────────────────────────────────────────────────────
 // starClassFromRating: maps a game's star_rating to an A–E class letter.
-//   A = 5★ (top-tier)  B = 4★  C = 3★  D = 2★  E = 1★
-//   Null / unknown defaults to D (assigned to all historic awards at migration).
+//   A = 5★              B = 4–4.5★           C = 3–3.5★
+//   D = 2–2.5★           E = 0–1.5★ (incl. new 0★ "bad game" tier)
+//   Half-star values floor to the nearest integer class boundary
+//   (so 3.5★ is C like 3★, 4.5★ is B like 4★, 0.5★ is E like 1★).
+//   Null / unknown defaults to E (0★-equivalent, lowest award tier).
 function starClassFromRating(starRating) {
-    const r = parseInt(starRating);
-    if (r === 5) return 'A';
+    const r = Math.floor(parseFloat(starRating));
+    if (r >= 5) return 'A';
     if (r === 4) return 'B';
     if (r === 3) return 'C';
     if (r === 2) return 'D';
     if (r === 1) return 'E';
-    return 'D';
+    return 'E'; // 0★ (or NaN / null) → same tier as 1★
 }
 
 // ── DYNAMIC STAR RATINGS ─────────────────────────────────────────────────────
 // reviewDynamicStarRating: recalculate star_rating for a game based on avg OVR.
 // Rules:
-//   - Only runs if star_rating_locked = FALSE (games originally created at 4★ or 5★ are locked)
+//   - Only runs if star_rating_locked = FALSE.
+//     Games are locked when admin creates/edits with 0★, 4★, or 5★ (explicit quality statements).
+//     1-3★ stays dynamic; admin may have under/over-estimated at creation.
 //   - Only runs once ≥ 8 confirmed players are signed up
-//   - avg OVR < 85  → 1★ | 85–<86 → 2★ | 86–<87 → 3★ | ≥87 → 4★
+//   - Uniform half-star boundaries (0.5 OVR = 0.5 star):
+//       <84        → 0★
+//       [84,84.5)  → 0.5★      [84.5,85)  → 1★      [85,85.5)  → 1.5★
+//       [85.5,86)  → 2★        [86,86.5)  → 2.5★    [86.5,87)  → 3★
+//       [87,87.5)  → 3.5★      [87.5,88)  → 4★      [88,88.5)  → 4.5★
+//       ≥88.5      → 5★
+//   - DB column games.star_rating is numeric(3,1) — supports half-star values.
 //   - Called non-critically (never throws to caller)
 async function reviewDynamicStarRating(pool, gameId) {
     try {
@@ -622,7 +633,7 @@ async function reviewDynamicStarRating(pool, gameId) {
         if (!gameRow.rows.length) return;
 
         const { star_rating_locked } = gameRow.rows[0];
-        if (star_rating_locked) return; // 4★ / 5★ at creation — never touch
+        if (star_rating_locked) return; // 0★ / 4★ / 5★ at creation — never touch
 
         // Count confirmed players + guests
         const countRow = await pool.query(
@@ -644,22 +655,24 @@ async function reviewDynamicStarRating(pool, gameId) {
         const avgOvr = parseFloat(ovrRow.rows[0]?.avg_ovr);
         if (isNaN(avgOvr)) return; // No OVR data — leave rating unchanged
 
-        // Map avg OVR → star rating
-        let newStars;
-        if (avgOvr < 85)      newStars = 1;
-        else if (avgOvr < 86) newStars = 2;
-        else if (avgOvr < 87) newStars = 3;
-        else                   newStars = 4;
+        // Map avg OVR → star rating (half-step).
+        // Formula: floor((avg - 84) * 2 + 1) / 2, clamped to [0, 5]
+        //   avg=83 → -1  → clamp → 0       avg=84   → 0.5      avg=84.5 → 1
+        //   avg=85 → 1.5                    avg=86   → 2.5      avg=87   → 3.5
+        //   avg=88 → 4.5                    avg=88.5 → 5        avg=90   → clamp → 5
+        let newStars = Math.floor((avgOvr - 84) * 2 + 1) / 2;
+        if (newStars < 0) newStars = 0;
+        if (newStars > 5) newStars = 5;
 
-        // Only write if changed
-        const currentStars = parseInt(gameRow.rows[0].star_rating) || 0;
+        // Only write if changed. parseFloat handles numeric(3,1) coming back as "3.5" string.
+        const currentStars = parseFloat(gameRow.rows[0].star_rating);
         if (newStars !== currentStars) {
             await pool.query(
                 `UPDATE games SET star_rating = $1 WHERE id = $2`,
                 [newStars, gameId]
             );
             await gameAuditLog(pool, gameId, null, 'star_rating_auto_updated',
-                `Dynamic review: avg OVR ${avgOvr.toFixed(2)} → ${newStars}★ (was ${currentStars}★, players: ${total})`);
+                `Dynamic review: avg OVR ${avgOvr.toFixed(2)} → ${newStars}★ (was ${isNaN(currentStars) ? 'unset' : currentStars + '★'}, players: ${total})`);
         }
     } catch (e) {
         console.warn(`reviewDynamicStarRating failed for game ${gameId} (non-critical):`, e.message);
@@ -4714,6 +4727,11 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         } = req.body;
         const parsedEarlyBird      = earlyBirdPrice      != null && earlyBirdPrice      !== '' ? parseFloat(earlyBirdPrice)      : null;
         const parsedSuperEarlyBird = superEarlyBirdPrice != null && superEarlyBirdPrice !== '' ? parseFloat(superEarlyBirdPrice) : null;
+        // DYNSTAR: normalise star rating so explicit 0★ isn't stripped to null by `|| null`.
+        // Admin sends starRating as a number (0, 1, 2, 3, 4, 5) or null/undefined when unset.
+        const starRatingForDb = (starRating === null || starRating === undefined || starRating === '')
+            ? null
+            : (isNaN(parseInt(starRating)) ? null : parseInt(starRating));
         let resolvedOpponentName = externalOpponent || null;
         let resolvedOpponentId   = opponentId || null;
         if (opponentId) {
@@ -4814,8 +4832,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             seriesUuid, selType, resolvedOpponentName, tfKitColor || null, oppKitColor || null,
                             selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                             selType === 'tournament' ? (tournamentName || null) : null,
-                            starRating || null,
-                            parseInt(starRating) >= 4, // DYNSTAR: lock if originally 4★ or 5★
+                            starRatingForDb,
+                            [0, 4, 5].includes(starRatingForDb), // DYNSTAR: lock if 0★ (admin says "bad game"), 4★, or 5★
                             vcEnabled || false,
                             vcEnabled ? venueClashTeam1Name.trim() : null,
                             vcEnabled ? venueClashTeam2Name.trim() : null,
@@ -4882,8 +4900,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     seriesUuid, selType, resolvedOpponentName, tfKitColor || null, oppKitColor || null,
                     selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                     selType === 'tournament' ? (tournamentName || null) : null,
-                    starRating || null,
-                    parseInt(starRating) >= 4, // DYNSTAR: lock if originally 4★ or 5★
+                    starRatingForDb,
+                    [0, 4, 5].includes(starRatingForDb), // DYNSTAR: lock if 0★ (admin says "bad game"), 4★, or 5★
                     vcEnabled || false,
                     vcEnabled ? venueClashTeam1Name.trim() : null,
                     vcEnabled ? venueClashTeam2Name.trim() : null,
@@ -5054,7 +5072,7 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
                 game_template.team_selection_type || 'standard',
                 game_template.tf_kit_color || null,
                 game_template.opp_kit_color || null,
-                game_template.star_rating || null,
+                (game_template.star_rating === null || game_template.star_rating === undefined ? null : game_template.star_rating),
                 !!game_template.star_rating_locked,
                 parseInt(game_template.refs_required) || 0,
                 parseFloat(game_template.ref_pay) || 0,
@@ -8931,29 +8949,13 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             game_status = CASE WHEN game_status = 'completed' THEN game_status ELSE 'confirmed' END
             WHERE id = $1`, [gameId]);
 
-        // Non-critical: notify all confirmed players that teams are live
-        setImmediate(async () => {
-            try {
-                const gameData = await getGameDataForNotification(gameId);
-                const confirmed = await pool.query(
-                    `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
-                    [gameId]
-                );
-                for (const row of confirmed.rows) {
-                    // Push notifications (teams_created) always fire — these are lighter than emails
-                    // and serve as a "something changed" heads-up that won't annoy at volume.
-                    await sendNotification('teams_created', row.player_id, gameData).catch(() => {});
-                }
-            } catch (e) {
-                console.error('Teams created notification failed (non-critical):', e.message);
-            }
-            // Web51: Email trigger REMOVED from generate-teams (wizard start). Emails now
-            // fire only from /api/admin/games/:id/confirm-teams (wizard completion — the
-            // admin's explicit CONFIRM TEAMS click in the teams modal). Existing protections
-            // (10-minute debounce + diff-email to changed players only via scheduleTeamEmailSettle)
-            // remain in place on the confirm-teams path. Push notifications above still fire
-            // here as a lighter "something changed" heads-up.
-        });
+        // Web54-email-spam-fix (2026-04-24): NO player-facing comms fire on /generate-teams.
+        // Previously a push notification ('teams_created') fired here to every confirmed player,
+        // which spammed players whenever admin regenerated mid-wizard. Emails were already
+        // correctly removed in Web51; the push leak is now removed too. Both emails AND push
+        // fire only from /api/admin/games/:gameId/confirm-teams (the admin's explicit wizard
+        // completion), protected by the 10-minute debounce + diff-settle in
+        // scheduleTeamEmailSettle for regenerations. Superadmin comms are unaffected.
         
         // Calculate stats
         const redStats = {
@@ -9334,6 +9336,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
     try {
         const { gameId } = req.params;
         const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name, early_bird_price, super_early_bird_price, opponent_id: edit_opp_id } = req.body;
+        // DYNSTAR: explicit 0★ must not be stripped to null by `|| null`.
+        const starRatingForDb = (star_rating === null || star_rating === undefined || star_rating === '')
+            ? null
+            : (isNaN(parseInt(star_rating)) ? null : parseInt(star_rating));
         const parsedEB  = early_bird_price       != null && early_bird_price       !== '' ? parseFloat(early_bird_price)       : null;
         const parsedSEB = super_early_bird_price != null && super_early_bird_price !== '' ? parseFloat(super_early_bird_price) : null;
         let resolvedEditOppName = external_opponent !== undefined ? (external_opponent || null) : null;
@@ -9390,7 +9396,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $3, 
                     cost_per_player = $4,
                     star_rating = $5,
-                    star_rating_locked = CASE WHEN $5::smallint >= 4 THEN TRUE ELSE star_rating_locked END,
+                    star_rating_locked = CASE WHEN $5::numeric IN (0,4,5) THEN TRUE ELSE star_rating_locked END,
                     tournament_team_count = COALESCE($6, tournament_team_count),
                     min_rating_enabled = COALESCE($7, min_rating_enabled),
                     refs_required = COALESCE($9, refs_required),
@@ -9408,7 +9414,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     super_early_bird_price = $21,
                     opponent_id = $22
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId]);
+            `, [game_date, venue_id, max_players, cost_per_player, starRatingForDb, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -9416,7 +9422,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $2, 
                     cost_per_player = $3,
                     star_rating = $4,
-                    star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END,
+                    star_rating_locked = CASE WHEN $4::numeric IN (0,4,5) THEN TRUE ELSE star_rating_locked END,
                     tournament_team_count = COALESCE($5, tournament_team_count),
                     min_rating_enabled = COALESCE($6, min_rating_enabled),
                     refs_required = COALESCE($8, refs_required),
@@ -9433,7 +9439,7 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     super_early_bird_price = $19,
                     opponent_id = $20
                 WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, star_rating || null, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId]);
+            `, [venue_id, max_players, cost_per_player, starRatingForDb, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId]);
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
@@ -9505,6 +9511,10 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
     try {
         const { gameId } = req.params;
         const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser, format, position_type, refs_required, ref_pay, early_bird_price: eb_s, super_early_bird_price: seb_s, opponent_id: series_opp_id } = req.body;
+        // DYNSTAR: explicit 0★ must not be stripped to null by `|| null`.
+        const starRatingForDb = (star_rating === null || star_rating === undefined || star_rating === '')
+            ? null
+            : (isNaN(parseInt(star_rating)) ? null : parseInt(star_rating));
         const parsedEB_s  = eb_s  != null && eb_s  !== '' ? parseFloat(eb_s)  : null;
         const parsedSEB_s = seb_s != null && seb_s !== '' ? parseFloat(seb_s) : null;
         // Resolve opponent for series
@@ -9552,13 +9562,13 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
                 const utcDate = new Date(new Date(londonLocal).getTime() - offset);
 
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay), early_bird_price=$13, super_early_bird_price=$14, opponent_id=COALESCE($15, opponent_id), external_opponent=COALESCE($16, external_opponent) WHERE id=$7',
-                    [venue_id, max_players, cost_per_player, star_rating || null, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IN (0,4,5) THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay), early_bird_price=$13, super_early_bird_price=$14, opponent_id=COALESCE($15, opponent_id), external_opponent=COALESCE($16, external_opponent) WHERE id=$7',
+                    [venue_id, max_players, cost_per_player, starRatingForDb, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName]
                 );
             } else {
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::smallint >= 4 THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay), early_bird_price=$12, super_early_bird_price=$13, opponent_id=COALESCE($14, opponent_id), external_opponent=COALESCE($15, external_opponent) WHERE id=$6',
-                    [venue_id, max_players, cost_per_player, star_rating || null, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IN (0,4,5) THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay), early_bird_price=$12, super_early_bird_price=$13, opponent_id=COALESCE($14, opponent_id), external_opponent=COALESCE($15, external_opponent) WHERE id=$6',
+                    [venue_id, max_players, cost_per_player, starRatingForDb, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName]
                 );
             }
         }
@@ -11817,7 +11827,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             tournament_results_finalised: game.tournament_results_finalised,
             series_id: game.series_id || null,
             regularity: game.regularity || null,
-            star_rating: game.star_rating || null,
+            star_rating: (game.star_rating === null || game.star_rating === undefined ? null : game.star_rating),
             min_rating_enabled:   game.min_rating_enabled || false,
             refs_required:         game.refs_required || 0,
             ref_pay:          parseFloat(game.ref_pay) || 0,
@@ -15306,6 +15316,371 @@ app.get('/api/admin/players/stats-list', authenticateToken, requireAdmin, async 
     }
 });
 
+// GET /api/admin/players/analysis
+// Manage Players → Analysis tab data source. Computes W/D/L/MOTM on-the-fly from
+// STANDARD games only (team_selection_type in ('normal','standard') or NULL) — excludes
+// draft_memory / vs_external / tournament, where overall_rating isn't used for team gen.
+//
+// A player only counts for a game if they were actually rostered onto a team for it
+// (team_players JOIN, not LEFT JOIN). Confirmed backups/unrostered players don't
+// get appearances or results — matches how human admin thinks about "games played".
+//
+// Query params:
+//   sinceLastOverallChange=1  — restrict counts to games on-or-after the player's
+//                                most recent player_stat_history row where
+//                                overall_rating actually changed. Players with no
+//                                overall change ever fall through to lifetime counts.
+//
+// last_delta is the signed integer change in overall at that most recent change
+// (e.g. +3 or -2). NULL when the player has no recorded overall change — frontend
+// renders a dash in the LAST Δ column.
+app.get('/api/admin/players/analysis', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const sinceFlag = req.query.sinceLastOverallChange;
+        const since = (sinceFlag === '1' || sinceFlag === 'true' || sinceFlag === true);
+
+        // excludeUnfair toggle: when true, RAW apps/wins/draws/losses/motm drop games where
+        // admin explicitly marked teams uneven on the balance slider (score IS NOT NULL
+        // AND <> 0). NULL-scored games stay in regardless — the toggle is specifically
+        // about removing known-uneven results, not the separate "not a fair reflection"
+        // or legacy cases.
+        //
+        // Per GAFFA: an unfair game is USEFUL data (it signals that some players are
+        // rated wrong — that's why the sum-of-overalls came out even but the result
+        // didn't). The toggle lets admin see the record without that noise; the DYN OVR
+        // arrow column uses the slider data intelligently, independent of this toggle.
+        const exclFlag = req.query.excludeUnfair;
+        const excludeUnfair = (exclFlag === '1' || exclFlag === 'true' || exclFlag === true);
+
+        const result = await pool.query(`
+            WITH
+            -- all completed standard games
+            standard_games AS (
+                SELECT id, game_date, motm_winner_id, winning_team, team_balance_score
+                FROM games
+                WHERE game_status = 'completed'
+                  AND COALESCE(team_selection_type, 'standard') IN ('normal', 'standard')
+            ),
+            -- each row's overall augmented with the previous row's overall
+            history_augmented AS (
+                SELECT
+                    player_id,
+                    created_at,
+                    overall_rating,
+                    LAG(overall_rating) OVER (PARTITION BY player_id ORDER BY created_at) AS prev_overall
+                FROM player_stat_history
+                WHERE overall_rating IS NOT NULL
+            ),
+            -- most recent *actual* overall change per player (rows where overall changed)
+            last_changes AS (
+                SELECT DISTINCT ON (player_id)
+                    player_id,
+                    created_at AS last_change_at,
+                    (overall_rating - prev_overall) AS last_delta
+                FROM history_augmented
+                WHERE prev_overall IS NOT NULL
+                  AND overall_rating <> prev_overall
+                ORDER BY player_id, created_at DESC
+            ),
+            -- one row per (player, game) where the player was rostered onto a team.
+            -- INNER JOIN on team_players/teams enforces "backups don't count" rule.
+            player_results AS (
+                SELECT
+                    r.player_id,
+                    sg.id          AS game_id,
+                    sg.game_date,
+                    sg.winning_team,
+                    sg.motm_winner_id,
+                    sg.team_balance_score,
+                    t.team_name
+                FROM registrations r
+                JOIN standard_games sg ON sg.id = r.game_id
+                JOIN team_players tp   ON tp.player_id = r.player_id
+                JOIN teams t           ON t.id = tp.team_id AND t.game_id = sg.id
+                WHERE r.status = 'confirmed'
+            ),
+            -- aggregate per player; respect the "since last overall change" cutoff when $1 is true.
+            --
+            -- Raw counts honour the excludeUnfair toggle ($2): when ticked, games admin flagged
+            -- as uneven on the balance slider (score IS NOT NULL AND <> 0) are dropped. NULL-
+            -- scored games stay in — the toggle is about filtering known-uneven games only.
+            --
+            -- DYN OVR notches are computed separately below, independent of the toggle.
+            -- Per GAFFA: unfair games are a USEFUL signal that some players are mis-rated
+            -- — the dynamic arrow uses them directly.
+            agg AS (
+                SELECT
+                    pr.player_id,
+                    COUNT(*) FILTER (
+                        WHERE $2::boolean = false
+                           OR pr.team_balance_score IS NULL
+                           OR pr.team_balance_score = 0
+                    ) AS apps,
+                    COUNT(*) FILTER (
+                        WHERE ($2::boolean = false
+                               OR pr.team_balance_score IS NULL
+                               OR pr.team_balance_score = 0)
+                          AND pr.winning_team IS NOT NULL
+                          AND LOWER(pr.winning_team) <> 'draw'
+                          AND LOWER(pr.winning_team) = LOWER(pr.team_name)
+                    ) AS wins,
+                    COUNT(*) FILTER (
+                        WHERE ($2::boolean = false
+                               OR pr.team_balance_score IS NULL
+                               OR pr.team_balance_score = 0)
+                          AND LOWER(pr.winning_team) = 'draw'
+                    ) AS draws,
+                    COUNT(*) FILTER (
+                        WHERE ($2::boolean = false
+                               OR pr.team_balance_score IS NULL
+                               OR pr.team_balance_score = 0)
+                          AND pr.winning_team IS NOT NULL
+                          AND LOWER(pr.winning_team) <> 'draw'
+                          AND LOWER(pr.winning_team) <> LOWER(pr.team_name)
+                    ) AS losses,
+                    COUNT(*) FILTER (
+                        WHERE ($2::boolean = false
+                               OR pr.team_balance_score IS NULL
+                               OR pr.team_balance_score = 0)
+                          AND pr.motm_winner_id = pr.player_id
+                    ) AS motm,
+                    -- DYN OVR — dynamic overall score. Per-game signal:
+                    --   pov = team_balance_score if player's team was 'red' else -team_balance_score
+                    --     (positive = player was favoured, negative = player was underdog)
+                    --   contribution per game (in "notches" — each notch = 9° of arrow rotation):
+                    --     balanced (score = 0) or NULL score  → 0
+                    --     draw                                → -pov / 2  (half-weight; "failed
+                    --                                            to win despite advantage" or
+                    --                                            "held on despite disadvantage")
+                    --     win                                 → GREATEST(-pov, 0)   (underdog
+                    --                                            wins = +|pov|; favoured wins = 0
+                    --                                            because they were expected)
+                    --     loss                                → LEAST(-pov, 0)      (favoured
+                    --                                            losses = -|pov|; underdog
+                    --                                            losses = 0, expected)
+                    --
+                    -- Sum across all scored non-NULL games = total notches. Frontend converts
+                    -- to arrow angle: angle = 90° + (notches × 9°), clamped to [0°, 180°].
+                    -- Direction: negative notches rotate down to red (overrated signal),
+                    -- positive notches rotate up to green (underrated signal).
+                    --
+                    -- Assumption: team_name is 'red' or 'blue' (case-insensitive). For standard
+                    -- games this is always true — custom team names are tournament/external only,
+                    -- which are already excluded by standard_games CTE.
+                    COALESCE(SUM(
+                        CASE
+                            WHEN pr.team_balance_score IS NULL
+                              OR pr.team_balance_score = 0
+                              OR pr.winning_team IS NULL
+                                THEN 0::numeric
+                            ELSE
+                                -- pov = signed advantage from player's perspective
+                                CASE
+                                    WHEN LOWER(pr.winning_team) = 'draw' THEN
+                                        -(CASE WHEN LOWER(pr.team_name) = 'red'
+                                               THEN pr.team_balance_score
+                                               ELSE -pr.team_balance_score END)::numeric / 2
+                                    WHEN LOWER(pr.winning_team) = LOWER(pr.team_name) THEN
+                                        -- win: underdog wins reward = |pov|; favoured wins = 0
+                                        GREATEST(
+                                            -(CASE WHEN LOWER(pr.team_name) = 'red'
+                                                   THEN pr.team_balance_score
+                                                   ELSE -pr.team_balance_score END)::numeric,
+                                            0::numeric
+                                        )
+                                    ELSE
+                                        -- loss: favoured losses penalty = -|pov|; underdog losses = 0
+                                        LEAST(
+                                            -(CASE WHEN LOWER(pr.team_name) = 'red'
+                                                   THEN pr.team_balance_score
+                                                   ELSE -pr.team_balance_score END)::numeric,
+                                            0::numeric
+                                        )
+                                END
+                        END
+                    ), 0::numeric) AS dyn_ovr_notches,
+                    -- Sample-size indicator: unfair games that contributed to the signal.
+                    -- Balanced games don't count (they contribute 0 notches), so this counts only
+                    -- games with score != 0. Frontend greys the arrow at low counts.
+                    COUNT(*) FILTER (
+                        WHERE pr.team_balance_score IS NOT NULL
+                          AND pr.team_balance_score <> 0
+                    ) AS unfair_games
+                FROM player_results pr
+                LEFT JOIN last_changes lc ON lc.player_id = pr.player_id
+                WHERE $1::boolean = false
+                   OR lc.last_change_at IS NULL
+                   OR pr.game_date >= lc.last_change_at
+                GROUP BY pr.player_id
+            )
+            SELECT
+                p.id, p.alias, p.full_name, p.squad_number,
+                p.reliability_tier, p.overall_rating,
+                COALESCE(a.apps, 0)             AS apps,
+                COALESCE(a.wins, 0)             AS wins,
+                COALESCE(a.draws, 0)            AS draws,
+                COALESCE(a.losses, 0)           AS losses,
+                COALESCE(a.motm, 0)             AS motm,
+                COALESCE(a.dyn_ovr_notches, 0)  AS dyn_ovr_notches,
+                COALESCE(a.unfair_games, 0)     AS unfair_games,
+                lc.last_delta,
+                lc.last_change_at
+            FROM players p
+            LEFT JOIN agg a           ON a.player_id = p.id
+            LEFT JOIN last_changes lc ON lc.player_id = p.id
+            ORDER BY p.squad_number NULLS LAST, p.full_name
+        `, [since, excludeUnfair]);
+
+        res.json({
+            players: result.rows,
+            sinceLastOverallChange: since,
+            excludeUnfair
+        });
+    } catch (error) {
+        console.error('Players analysis error:', error);
+        res.status(500).json({ error: 'Failed to load analysis data' });
+    }
+});
+
+// GET /api/admin/players/performance
+// Powers the Manage Players → Performance tab. Returns per-player apps/wins/win%
+// bucketed by the OVR the player held when each game was played — "pre post-game
+// wizard changes". A rating change inserted at time T applies from T forward; games
+// played before T are counted at the PREVIOUS rating.
+//
+// Scope (per GAFFA): include all completed game types. Exclude only games where admin
+// ticked "Not a fair reflection" in the post-game wizard — which stores NULL in
+// team_balance_score for STANDARD games. For non-standard games (tournaments, externals,
+// draft memory, venue clashes) NULL means "slider doesn't apply", so those stay in.
+// Legacy standard games (pre-slider feature) are collateral-excluded here — acceptable
+// since they're the minority and we can't distinguish legacy from "not fair reflection".
+//
+// No toggles. Pure read — always returns the same view of the data.
+app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            WITH
+            eligible_games AS (
+                SELECT id, game_date, winning_team, team_balance_score
+                FROM games
+                WHERE game_status = 'completed'
+                  -- Exclude "not a fair reflection" standard games:
+                  AND NOT (
+                      COALESCE(team_selection_type, 'standard') IN ('normal', 'standard')
+                      AND team_balance_score IS NULL
+                      AND COALESCE(is_venue_clash, false) = false
+                  )
+            ),
+            -- Player + game pairs where they were rostered onto a team.
+            -- Same "backups don't count" rule used elsewhere in this session.
+            player_games AS (
+                SELECT
+                    r.player_id,
+                    eg.id                 AS game_id,
+                    eg.game_date,
+                    eg.winning_team,
+                    eg.team_balance_score,
+                    LOWER(t.team_name)    AS team_name_lower
+                FROM registrations r
+                JOIN eligible_games eg ON eg.id = r.game_id
+                JOIN team_players tp   ON tp.player_id = r.player_id
+                JOIN teams t           ON t.id = tp.team_id AND t.game_id = eg.id
+                WHERE r.status = 'confirmed'
+            ),
+            -- Compute rating periods per player. Each player_stat_history row at T with
+            -- rating H means "starting at T, the player had H". Period [T, next_T) carries
+            -- that rating. First row gets an additional synthetic retroactive period
+            -- [epoch, T) with the same rating — best-guess for games before any recorded
+            -- history entry.
+            rating_periods AS (
+                SELECT
+                    player_id,
+                    overall_rating,
+                    created_at AS period_start,
+                    COALESCE(
+                        LEAD(created_at) OVER (PARTITION BY player_id ORDER BY created_at),
+                        '2099-01-01'::timestamp
+                    ) AS period_end
+                FROM player_stat_history
+                WHERE overall_rating IS NOT NULL
+
+                UNION ALL
+
+                -- Retroactive period: each player's earliest rating applied back to epoch
+                SELECT DISTINCT ON (player_id)
+                    player_id,
+                    overall_rating,
+                    '1970-01-01'::timestamp AS period_start,
+                    created_at              AS period_end
+                FROM player_stat_history
+                WHERE overall_rating IS NOT NULL
+                ORDER BY player_id, created_at ASC
+            ),
+            -- Assign each player-game to the rating that was in effect when they played.
+            -- Strict inequality on period_end handles the "same instant as wizard change"
+            -- edge case correctly: a game played at exactly T is attributed to the OLD
+            -- rating (the period that ended at T), not the new one (which starts at T).
+            games_with_rating AS (
+                SELECT
+                    pg.player_id,
+                    pg.winning_team,
+                    pg.team_name_lower,
+                    pg.team_balance_score,
+                    rp.overall_rating AS ovr_at_game
+                FROM player_games pg
+                LEFT JOIN rating_periods rp
+                    ON rp.player_id     = pg.player_id
+                   AND pg.game_date     >= rp.period_start
+                   AND pg.game_date     <  rp.period_end
+            ),
+            -- Aggregate per (player, rating). Wins via case-insensitive team_name match.
+            --
+            -- fair_apps: subset of apps where team_balance_score IS NOT NULL. This is the
+            -- "reliable sample" count — standard games where admin set the slider and
+            -- confirmed it was a fair reflection of play. Tournaments / externals /
+            -- draft memory / venue clashes always have NULL balance_score so they
+            -- contribute to apps but NOT to fair_apps. Frontend uses fair_apps > 5 as
+            -- the threshold for bolding the cell (strong signal, large enough sample).
+            agg AS (
+                SELECT
+                    player_id,
+                    ovr_at_game,
+                    COUNT(*)                                                            AS apps,
+                    COUNT(*) FILTER (WHERE winning_team IS NOT NULL
+                                       AND LOWER(winning_team) <> 'draw'
+                                       AND LOWER(winning_team) = team_name_lower)       AS wins,
+                    COUNT(*) FILTER (WHERE team_balance_score IS NOT NULL)               AS fair_apps
+                FROM games_with_rating
+                WHERE ovr_at_game IS NOT NULL
+                GROUP BY player_id, ovr_at_game
+            ),
+            -- Build per-player JSON object keyed by rating, in a single pass (not per-player subquery)
+            per_player_json AS (
+                SELECT
+                    player_id,
+                    json_object_agg(
+                        ovr_at_game::text,
+                        json_build_object('apps', apps, 'wins', wins, 'fair_apps', fair_apps)
+                    ) AS per_ovr
+                FROM agg
+                GROUP BY player_id
+            )
+            SELECT
+                p.id, p.alias, p.full_name, p.squad_number,
+                p.overall_rating                  AS current_ovr,
+                COALESCE(pj.per_ovr, '{}'::json)  AS per_ovr
+            FROM players p
+            LEFT JOIN per_player_json pj ON pj.player_id = p.id
+            ORDER BY p.overall_rating DESC NULLS LAST, p.squad_number NULLS LAST, p.full_name
+        `);
+
+        res.json({ players: result.rows });
+    } catch (error) {
+        console.error('Players performance error:', error);
+        res.status(500).json({ error: 'Failed to load performance data' });
+    }
+});
+
 // GET /api/admin/players/:id/stats-graph
 // Returns per-overall-rating data points: for each distinct overall rating the player
 // held, calculate Win% and MOTM% across all completed games played at that rating.
@@ -15453,6 +15828,79 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             WHERE psh.player_id = $1
             ORDER BY psh.created_at DESC
         `, [id]);
+
+        // 2b. Enrich each stat history row with "games at previous overall" context.
+        // For every row where overall_rating actually changed vs the prior entry, we
+        // count this player's STANDARD completed games that fall in the window
+        // [prev.created_at, this.created_at) and classify W/D/L. Rendered in audit.html
+        // under each stat row as:
+        //   "12 games at 82: 7W/3D/2L, 58% win rate"
+        //
+        // Rules (confirmed with GAFFA):
+        //   • Standard games only (team_selection_type in ('normal','standard') or NULL)
+        //   • Player must be rostered onto a team — backups/unrostered don't count
+        //   • Draw = winning_team literal 'draw'; win/loss by case-insensitive team_name match
+        //   • First-ever history entry has no "previous overall" → no enrichment line
+        //
+        // Single query for the player's game history, then sliced per-row in JS. At typical
+        // volume (tens of history rows × low-hundreds of games) this is trivially cheap
+        // versus N correlated subqueries in SQL.
+        const playerGames = await pool.query(`
+            SELECT g.game_date,
+                   LOWER(g.winning_team) AS winning_team,
+                   LOWER(t.team_name)    AS team_name
+            FROM registrations r
+            JOIN games g        ON g.id = r.game_id
+            JOIN team_players tp ON tp.player_id = r.player_id
+            JOIN teams t        ON t.id = tp.team_id AND t.game_id = g.id
+            WHERE r.player_id = $1
+              AND r.status = 'confirmed'
+              AND g.game_status = 'completed'
+              AND COALESCE(g.team_selection_type, 'standard') IN ('normal', 'standard')
+            ORDER BY g.game_date ASC
+        `, [id]);
+
+        const pg = playerGames.rows; // ASC by game_date
+        const statsRows = stats.rows; // DESC by created_at
+        for (let i = 0; i < statsRows.length; i++) {
+            const r    = statsRows[i];
+            const prev = statsRows[i + 1] || null; // next-oldest history row = "before" state
+
+            // Only enrich when overall actually changed vs previous entry.
+            // parseInt guards against numeric/string comparison mismatches from pg driver.
+            const prevOvr = prev ? (prev.overall_rating != null ? parseInt(prev.overall_rating) : null) : null;
+            const curOvr  = r.overall_rating != null ? parseInt(r.overall_rating) : null;
+
+            if (prev == null || prevOvr == null || curOvr == null || prevOvr === curOvr) {
+                r.old_overall   = null;
+                r.apps_at_old   = null;
+                r.wins_at_old   = null;
+                r.draws_at_old  = null;
+                r.losses_at_old = null;
+                r.win_pct_at_old = null;
+                continue;
+            }
+
+            const fromTs = new Date(prev.created_at).getTime();
+            const toTs   = new Date(r.created_at).getTime();
+            let apps = 0, wins = 0, draws = 0, losses = 0;
+            for (const g of pg) {
+                const gTs = new Date(g.game_date).getTime();
+                if (gTs < fromTs || gTs >= toTs) continue;
+                apps++;
+                if (g.winning_team === 'draw') { draws++; continue; }
+                if (g.winning_team && g.team_name && g.winning_team === g.team_name) { wins++; continue; }
+                if (g.winning_team && g.team_name) { losses++; }
+                // NULL winning_team or missing team_name: counted in apps but not classified
+            }
+
+            r.old_overall    = prevOvr;
+            r.apps_at_old    = apps;
+            r.wins_at_old    = wins;
+            r.draws_at_old   = draws;
+            r.losses_at_old  = losses;
+            r.win_pct_at_old = apps > 0 ? Math.round((wins / apps) * 1000) / 10 : null;
+        }
 
         // 3. Registration events (sign up / drop out)
         const regEvents = await pool.query(`
