@@ -10624,7 +10624,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        const { winningTeam, disciplineRecords, beefEntries, motmNominees, teamBalanceScore, swappedPlayerIds } = req.body;
+        const { winningTeam, disciplineRecords, beefEntries, motmNominees, teamBalanceScore, swappedPlayerIds, adminMarkedUnfair } = req.body;
 
         // Validate teamBalanceScore
         let validatedBalanceScore = null;
@@ -10635,6 +10635,12 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             }
             validatedBalanceScore = bs;
         }
+
+        // Web54 (2026-04-24): admin_marked_unfair flag distinguishes admin deliberately
+        // ticking "Not a fair reflection" from pre-slider legacy games that just happen
+        // to have NULL score. Only honour this flag for standard, non-venue-clash games —
+        // other types (tournament/external/venue_clash) always have NULL score regardless.
+        const validatedUnfair = !!adminMarkedUnfair;
 
         // FIX-062: Whitelist winningTeam before any DB work
         const validTeams = ['red', 'blue', 'draw', 'Red', 'Blue', 'Draw'];
@@ -10681,12 +10687,13 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
              SET winning_team = $1, 
                  game_status = 'completed',
                  team_balance_score = $3,
+                 admin_marked_unfair = $4,
                  motm_voting_ends = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'},
                  awards_open = ${shouldHaveMotm ? 'true' : 'false'},
                  awards_close_at = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'},
                  ref_review_ends = NOW() + INTERVAL '24 hours'
              WHERE id = $2`,
-            [winningTeam, gameId, validatedBalanceScore]
+            [winningTeam, gameId, validatedBalanceScore, validatedUnfair]
         );
         // Web47: email confirmed participants once when awards open (helper is throttled
         // via games.awards_emailed_at so repeat triggers don't re-spam). Fire and forget —
@@ -15485,7 +15492,17 @@ app.get('/api/admin/players/analysis', authenticateToken, requireAdmin, async (r
             )
             SELECT
                 p.id, p.alias, p.full_name, p.squad_number,
-                p.reliability_tier, p.overall_rating,
+                p.reliability_tier,
+                -- GK override (2026-04-24): for goalkeepers, the "overall" shown in Analysis
+                -- is their goalkeeper_rating, not outfield overall_rating. Mirrors the swap
+                -- applied in generate-teams, lineup builder, and other admin surfaces. Falls
+                -- back to overall_rating if GK has no goalkeeper_rating set (shouldn't happen
+                -- in practice but avoids nulls).
+                CASE WHEN p.position = 'goalkeeper' AND p.goalkeeper_rating IS NOT NULL
+                     THEN p.goalkeeper_rating
+                     ELSE p.overall_rating
+                END                             AS overall_rating,
+                (p.position = 'goalkeeper')     AS is_gk,
                 COALESCE(a.apps, 0)             AS apps,
                 COALESCE(a.wins, 0)             AS wins,
                 COALESCE(a.draws, 0)            AS draws,
@@ -15518,14 +15535,14 @@ app.get('/api/admin/players/analysis', authenticateToken, requireAdmin, async (r
 // wizard changes". A rating change inserted at time T applies from T forward; games
 // played before T are counted at the PREVIOUS rating.
 //
-// Scope (per GAFFA): include all completed game types. Exclude only games where admin
-// ticked "Not a fair reflection" in the post-game wizard — which stores NULL in
-// team_balance_score for STANDARD games. For non-standard games (tournaments, externals,
-// draft memory, venue clashes) NULL means "slider doesn't apply", so those stay in.
-// Legacy standard games (pre-slider feature) are collateral-excluded here — acceptable
-// since they're the minority and we can't distinguish legacy from "not fair reflection".
+// Scope (Web54, 2026-04-24): STANDARD games only — no tournaments, externals, draft memory,
+// or venue clashes. Of those, only games NOT explicitly marked unfair feed the grid.
+// The admin_marked_unfair BOOLEAN column (added in a migration) distinguishes deliberate
+// ticks from pre-slider legacy NULLs — both got backfilled to TRUE so pre-slider data
+// stays out of the performance signal.
 //
-// No toggles. Pure read — always returns the same view of the data.
+// For GKs, current_ovr and rating buckets are driven by goalkeeper_rating instead of
+// overall_rating (same pattern as Analysis tab).
 app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -15534,12 +15551,11 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
                 SELECT id, game_date, winning_team, team_balance_score
                 FROM games
                 WHERE game_status = 'completed'
-                  -- Exclude "not a fair reflection" standard games:
-                  AND NOT (
-                      COALESCE(team_selection_type, 'standard') IN ('normal', 'standard')
-                      AND team_balance_score IS NULL
-                      AND COALESCE(is_venue_clash, false) = false
-                  )
+                  -- Standard games only (per GAFFA) — no tournament/external/draft-memory
+                  AND COALESCE(team_selection_type, 'standard') IN ('normal', 'standard')
+                  AND COALESCE(is_venue_clash, false) = false
+                  -- Skip games admin marked unfair (explicit tick OR pre-slider legacy)
+                  AND COALESCE(admin_marked_unfair, false) = false
             ),
             -- Player + game pairs where they were rostered onto a team.
             -- Same "backups don't count" rule used elsewhere in this session.
@@ -15562,29 +15578,46 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
             -- that rating. First row gets an additional synthetic retroactive period
             -- [epoch, T) with the same rating — best-guess for games before any recorded
             -- history entry.
+            --
+            -- GK players: use goalkeeper_rating column from history instead of overall_rating.
+            -- If player_stat_history doesn't track GK rating explicitly, fall back to overall.
             rating_periods AS (
                 SELECT
-                    player_id,
-                    overall_rating,
-                    created_at AS period_start,
+                    psh.player_id,
                     COALESCE(
-                        LEAD(created_at) OVER (PARTITION BY player_id ORDER BY created_at),
+                        CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
+                        psh.overall_rating
+                    ) AS ovr_in_period,
+                    psh.created_at AS period_start,
+                    COALESCE(
+                        LEAD(psh.created_at) OVER (PARTITION BY psh.player_id ORDER BY psh.created_at),
                         '2099-01-01'::timestamp
                     ) AS period_end
-                FROM player_stat_history
-                WHERE overall_rating IS NOT NULL
+                FROM player_stat_history psh
+                JOIN players p ON p.id = psh.player_id
+                WHERE COALESCE(
+                    CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
+                    psh.overall_rating
+                ) IS NOT NULL
 
                 UNION ALL
 
                 -- Retroactive period: each player's earliest rating applied back to epoch
-                SELECT DISTINCT ON (player_id)
-                    player_id,
-                    overall_rating,
+                SELECT DISTINCT ON (psh.player_id)
+                    psh.player_id,
+                    COALESCE(
+                        CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
+                        psh.overall_rating
+                    ) AS ovr_in_period,
                     '1970-01-01'::timestamp AS period_start,
-                    created_at              AS period_end
-                FROM player_stat_history
-                WHERE overall_rating IS NOT NULL
-                ORDER BY player_id, created_at ASC
+                    psh.created_at          AS period_end
+                FROM player_stat_history psh
+                JOIN players p ON p.id = psh.player_id
+                WHERE COALESCE(
+                    CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
+                    psh.overall_rating
+                ) IS NOT NULL
+                ORDER BY psh.player_id, psh.created_at ASC
             ),
             -- Assign each player-game to the rating that was in effect when they played.
             -- Strict inequality on period_end handles the "same instant as wizard change"
@@ -15596,7 +15629,7 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
                     pg.winning_team,
                     pg.team_name_lower,
                     pg.team_balance_score,
-                    rp.overall_rating AS ovr_at_game
+                    rp.ovr_in_period AS ovr_at_game
                 FROM player_games pg
                 LEFT JOIN rating_periods rp
                     ON rp.player_id     = pg.player_id
@@ -15605,12 +15638,12 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
             ),
             -- Aggregate per (player, rating). Wins via case-insensitive team_name match.
             --
-            -- fair_apps: subset of apps where team_balance_score IS NOT NULL. This is the
-            -- "reliable sample" count — standard games where admin set the slider and
-            -- confirmed it was a fair reflection of play. Tournaments / externals /
-            -- draft memory / venue clashes always have NULL balance_score so they
-            -- contribute to apps but NOT to fair_apps. Frontend uses fair_apps > 5 as
-            -- the threshold for bolding the cell (strong signal, large enough sample).
+            -- fair_apps: subset of apps where team_balance_score IS NOT NULL AND <> 0.
+            -- This is the "reliable sample" count — standard games where admin set the
+            -- slider to a real value (balanced OR uneven). Games with NULL score that
+            -- pass the unfair filter are rare (would only be NULL score + NOT marked unfair,
+            -- a race condition). Frontend uses fair_apps > 5 as the threshold for bolding
+            -- the cell (strong signal, large enough sample).
             agg AS (
                 SELECT
                     player_id,
@@ -15637,11 +15670,21 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
             )
             SELECT
                 p.id, p.alias, p.full_name, p.squad_number,
-                p.overall_rating                  AS current_ovr,
+                -- GK override: current_ovr is goalkeeper_rating for goalkeepers
+                CASE WHEN p.position = 'goalkeeper' AND p.goalkeeper_rating IS NOT NULL
+                     THEN p.goalkeeper_rating
+                     ELSE p.overall_rating
+                END                               AS current_ovr,
+                (p.position = 'goalkeeper')       AS is_gk,
                 COALESCE(pj.per_ovr, '{}'::json)  AS per_ovr
             FROM players p
             LEFT JOIN per_player_json pj ON pj.player_id = p.id
-            ORDER BY p.overall_rating DESC NULLS LAST, p.squad_number NULLS LAST, p.full_name
+            ORDER BY
+                CASE WHEN p.position = 'goalkeeper' AND p.goalkeeper_rating IS NOT NULL
+                     THEN p.goalkeeper_rating
+                     ELSE p.overall_rating
+                END DESC NULLS LAST,
+                p.squad_number NULLS LAST, p.full_name
         `);
 
         res.json({ players: result.rows });
