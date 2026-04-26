@@ -242,6 +242,51 @@ function addWeeksLondon(isoDateStr, weeks) {
     }
     return target;
 }
+
+// Builds the "tonight, 7:30pm at Daimler Green" trailer used in guest-invite messages.
+// All formatting in Europe/London. Returns null if either field is missing so callers
+// can fall back to a simpler message.
+//   • today + game time ≥ 17:00 → "tonight"
+//   • today + game time <  17:00 → "today"
+//   • next calendar day → "tomorrow"
+//   • else → weekday name (e.g. "Saturday")
+//   • time: "7pm" / "7:30pm" (drops :00 on the hour; handles 12am/12pm)
+function buildGuestInviteWhenAtVenue(gameDate, venueName) {
+    if (!gameDate || !venueName) return null;
+    const d = gameDate instanceof Date ? gameDate : new Date(gameDate);
+    if (isNaN(d.getTime())) return null;
+    const tz = 'Europe/London';
+
+    const dayFmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    const gameDay = dayFmt.format(d);
+    const now = new Date();
+    const todayDay = dayFmt.format(now);
+    const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    const tomorrowDay = dayFmt.format(tomorrow);
+
+    const hmStr = new Intl.DateTimeFormat('en-GB', {
+        timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false
+    }).format(d);
+    const [hh, mm] = hmStr.split(':');
+    const h24 = parseInt(hh, 10);
+    const h12 = h24 === 0 ? 12 : (h24 > 12 ? h24 - 12 : h24);
+    const ampm = h24 < 12 ? 'am' : 'pm';
+    const timeLabel = mm === '00' ? `${h12}${ampm}` : `${h12}:${mm}${ampm}`;
+
+    let whenLabel;
+    if (gameDay === todayDay) {
+        whenLabel = h24 >= 17 ? 'tonight' : 'today';
+    } else if (gameDay === tomorrowDay) {
+        whenLabel = 'tomorrow';
+    } else {
+        whenLabel = new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'long' }).format(d);
+    }
+
+    return `${whenLabel}, ${timeLabel} at ${venueName}`;
+}
+
 // UUID v4 validator — used to reject truncated/malformed IDs from clients with a
 // clean 400 before they hit Postgres and throw 22P02 (which shows as an error in
 // Render logs even though it's really a bad request).
@@ -4677,6 +4722,20 @@ function validateVenuePayload(body) {
     // Free-text fields — clip to safe lengths
     const trim = (v, max) => (v === null || v === undefined) ? null : String(v).trim().slice(0, max) || null;
 
+    // Array fields — DB column is TEXT[]. Accept either a JS array (from API clients)
+    // or a comma-separated string (from the textarea form). Normalises to a clean
+    // JS array so node-postgres binds it correctly to a Postgres array column.
+    // Returns null when input is empty (preserves NULL semantics over empty array).
+    const parseList = (v, maxItemLen = 100, maxItems = 30) => {
+        if (v === null || v === undefined || v === '') return null;
+        const arr = Array.isArray(v) ? v : String(v).split(',');
+        const cleaned = arr
+            .map(s => String(s).trim().slice(0, maxItemLen))
+            .filter(Boolean)
+            .slice(0, maxItems);
+        return cleaned.length ? cleaned : null;
+    };
+
     return {
         ok: true,
         data: {
@@ -4686,7 +4745,7 @@ function validateVenuePayload(body) {
             postcode:              trim(body.postcode, 20),
             pitch_location:        trim(body.pitch_location, 1000),
             pitch_name:            trim(body.pitch_name, 100),
-            facilities:            trim(body.facilities, 1000),
+            facilities:            parseList(body.facilities),
             notes:                 trim(body.notes, 2000),
             special_instructions:  trim(body.special_instructions, 2000),
             parking_pin:           trim(body.parking_pin, 200),
@@ -4990,11 +5049,16 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location,
+                   v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
                    g.teams_generated,
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                   ROUND((SELECT AVG(p.overall_rating)
+                          FROM registrations r JOIN players p ON p.id = r.player_id
+                          WHERE r.game_id = g.id AND r.status = 'confirmed'
+                          AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
@@ -5044,9 +5108,11 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
         
-        // Add venue photos based on venue name
+        // Resolve venue hero photo: admin-set background_image_filename -> hardcoded map -> legacy DB photo_url
         const gamesWithPhotos = result.rows.map(game => {
-            if (game.venue_name && venuePhotoMap[game.venue_name]) {
+            if (game.venue_background_image) {
+                game.venue_photo = `https://totalfooty.co.uk/assets/venues/${game.venue_background_image}`;
+            } else if (game.venue_name && venuePhotoMap[game.venue_name]) {
                 game.venue_photo = venuePhotoMap[game.venue_name];
             }
             // Attach effective price tier for frontend bird display
@@ -5092,6 +5158,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
 
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name,
+                   v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
                    COALESCE(rc.confirmed_count, 0) + COALESCE(gc.guest_count, 0) AS current_players,
                    p.full_name as motm_winner_name,
                    p.alias as motm_winner_alias,
@@ -5164,7 +5231,9 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             return {
                 ...game,
                 motm_winner_name: game.motm_winner_alias || game.motm_winner_name,
-                venue_photo: game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : null,
+                venue_photo: game.venue_background_image
+                    ? `https://totalfooty.co.uk/assets/venues/${game.venue_background_image}`
+                    : (game.venue_name && venuePhotoMap[game.venue_name] ? venuePhotoMap[game.venue_name] : (game.venue_photo || null)),
                 game_time: new Date(game.game_date).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
                 game_day: new Date(game.game_date).toLocaleDateString('en-US', { weekday: 'long' }),
                 effective_price: _ep,
@@ -5227,12 +5296,18 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         // so Postgres doesn't throw 22P02 and spam the Render error logs.
         if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid game id' });
         const gameResult = await pool.query(`
-            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location, g.early_bird_price, g.super_early_bird_price,
+            SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location,
+                   v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
+                   g.early_bird_price, g.super_early_bird_price,
                    opp_pub.logo_url AS opponent_logo_url, opp_pub.star_rating AS opponent_star_rating, opp_pub.social_instagram AS opponent_social_instagram, opp_pub.social_twitter AS opponent_social_twitter, opp_pub.social_website AS opponent_social_website,
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                   ROUND((SELECT AVG(p.overall_rating)
+                          FROM registrations r JOIN players p ON p.id = r.player_id
+                          WHERE r.game_id = g.id AND r.status = 'confirmed'
+                          AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2) as registration_status,
                    (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2) as my_backup_type,
@@ -5352,7 +5427,10 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
         
-        if (game.venue_name && venuePhotoMap[game.venue_name]) {
+        // Resolve venue hero photo: admin-set background_image_filename -> hardcoded map -> legacy DB photo_url
+        if (game.venue_background_image) {
+            game.venue_photo = `https://totalfooty.co.uk/assets/venues/${game.venue_background_image}`;
+        } else if (game.venue_name && venuePhotoMap[game.venue_name]) {
             game.venue_photo = venuePhotoMap[game.venue_name];
         }
         
@@ -6984,7 +7062,13 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
 
         // Lock game row and check capacity
         const gameLock = await client.query(
-            'SELECT max_players, cost_per_player, player_editing_locked, teams_generated, team_selection_type, game_status FROM games WHERE id = $1 FOR UPDATE',
+            `SELECT g.max_players, g.cost_per_player, g.player_editing_locked,
+                    g.teams_generated, g.team_selection_type, g.game_status,
+                    g.game_date, v.name AS venue_name
+             FROM games g
+             LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE g.id = $1
+             FOR UPDATE OF g`,
             [gameId]
         );
         if (gameLock.rows.length === 0) {
@@ -7194,7 +7278,11 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             guestInviteUrl: _a2InviteUrl,
             guestInvitePrompt: _a2InviteUrl
                 ? `Send this to ${guestName.trim()} so they can claim their TotalFooty account — you'll earn £2 free credit when the game completes if they sign up and play!`
-                : null
+                : null,
+            // RAF text trailer: "tonight, 7:30pm at Daimler Green" — both web + app
+            // build the share message as `${alias} has signed you up to play football ${whenAtVenue}. Sign up...`
+            // Null if game_date or venue is missing — clients fall back to the simple message.
+            whenAtVenue: buildGuestInviteWhenAtVenue(game.game_date, game.venue_name)
         });
         setImmediate(async () => {
             const _hostRow = await pool.query('SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]).catch(() => ({ rows: [] }));
@@ -11093,13 +11181,13 @@ app.get('/api/admin/games/:gameId/revenue-breakdown', authenticateToken, require
             SELECT
                 gg.id,
                 gg.guest_name,
-                gg.invited_by_player_id,
+                gg.invited_by,
                 p.alias AS inviter_alias,
                 COALESCE(gg.amount_paid, 0)      AS amount_paid_real,
                 COALESCE(gg.amount_paid_free, 0) AS amount_paid_free,
                 gg.created_at
             FROM game_guests gg
-            LEFT JOIN players p ON p.id = gg.invited_by_player_id
+            LEFT JOIN players p ON p.id = gg.invited_by
             WHERE gg.game_id = $1
             ORDER BY LOWER(gg.guest_name)
         `, [gameId]);
@@ -13761,7 +13849,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.team_selection_type, g.external_opponent, g.tf_kit_color, g.opp_kit_color,
                    g.winning_team, g.motm_voting_ends, g.motm_winner_id, g.tournament_name,
                    g.tournament_team_count, g.tournament_results_finalised, g.series_id,
-                   g.regularity, g.star_rating, g.min_rating_enabled,
+                   g.regularity, g.star_rating, g.star_rating_locked, g.min_rating_enabled,
                    g.position_type,
                    g.teams_generated,
                    g.refs_required, g.ref_pay, g.ref_review_ends,
@@ -13769,6 +13857,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.requires_organiser, g.lineup_enabled,
                    g.early_bird_price, g.super_early_bird_price, g.opponent_id,
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
+                   v.background_image_filename as venue_background_image,
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
                    v.postcode as venue_postcode, v.parking_pin as venue_parking_pin,
                    v.pitch_pin as venue_pitch_pin, v.boot_type as venue_boot_type,
@@ -13776,6 +13865,10 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    opp_pub.logo_url AS opponent_logo_url, opp_pub.star_rating AS opponent_star_rating,
                    opp_pub.social_instagram AS opponent_social_instagram, opp_pub.social_twitter AS opponent_social_twitter, opp_pub.social_website AS opponent_social_website,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                   ROUND((SELECT AVG(p.overall_rating)
+                          FROM registrations r JOIN players p ON p.id = r.player_id
+                          WHERE r.game_id = g.id AND r.status = 'confirmed'
+                          AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) as confirmed_organiser_count
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -13808,9 +13901,12 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
         
-        const venue_photo = game.venue_name && venuePhotoMap[game.venue_name] 
-            ? venuePhotoMap[game.venue_name] 
-            : game.venue_photo;
+        // Resolve venue hero photo: admin-set background_image_filename -> hardcoded map -> legacy DB photo_url
+        const venue_photo = game.venue_background_image
+            ? `https://totalfooty.co.uk/assets/venues/${game.venue_background_image}`
+            : (game.venue_name && venuePhotoMap[game.venue_name]
+                ? venuePhotoMap[game.venue_name]
+                : game.venue_photo);
         
         // Get series scoreline if applicable
         let seriesScoreline = null;
@@ -13875,6 +13971,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             series_id: game.series_id || null,
             regularity: game.regularity || null,
             star_rating: (game.star_rating === null || game.star_rating === undefined ? null : game.star_rating),
+            star_rating_locked: !!game.star_rating_locked,
+            live_avg_ovr: (game.live_avg_ovr === null || game.live_avg_ovr === undefined ? null : parseFloat(game.live_avg_ovr)),
             min_rating_enabled:   game.min_rating_enabled || false,
             refs_required:         game.refs_required || 0,
             ref_pay:          parseFloat(game.ref_pay) || 0,
@@ -14111,13 +14209,17 @@ app.get('/api/public/games', async (req, res) => {
                    g.winning_team, g.motm_winner_id, g.teams_confirmed,
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    g.external_opponent, g.tf_kit_color, g.opp_kit_color,
-                   g.exclusivity, g.star_rating, g.cost_per_player,
+                   g.exclusivity, g.star_rating, g.star_rating_locked, g.cost_per_player,
                    g.early_bird_price, g.super_early_bird_price,
                    v.name AS venue_name, v.address AS venue_address, v.region AS venue_region,
                    gs.series_name,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
                      + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id) AS current_players,
+                   ROUND((SELECT AVG(p.overall_rating)
+                          FROM registrations r JOIN players p ON p.id = r.player_id
+                          WHERE r.game_id = g.id AND r.status = 'confirmed'
+                          AND p.overall_rating IS NOT NULL)::numeric, 1) AS live_avg_ovr,
                    motm_p.alias AS motm_winner_alias, motm_p.full_name AS motm_winner_name
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -14146,8 +14248,14 @@ app.get('/api/public/games', async (req, res) => {
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
         };
+        // Resolve venue hero photo: admin-set background_image_filename -> hardcoded map -> legacy DB photo_url
         const rows = result.rows.map(game => {
-            game.venue_photo = (game.venue_name && venuePhotoMap[game.venue_name]) || null;
+            if (game.venue_background_image) {
+                game.venue_photo = `https://totalfooty.co.uk/assets/venues/${game.venue_background_image}`;
+            } else if (game.venue_name && venuePhotoMap[game.venue_name]) {
+                game.venue_photo = venuePhotoMap[game.venue_name];
+            }
+            // game.venue_photo otherwise stays as DB photo_url (or null)
             const ep = getEffectivePrice(game);
             game.effective_price = ep.price;
             game.pricing_tier    = ep.tier;
@@ -14170,6 +14278,7 @@ app.get('/api/public/games/completed', async (req, res) => {
                    g.exclusivity,
                    v.name AS venue_name,
                    v.photo_url AS venue_photo,
+                   v.background_image_filename AS venue_background_image,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
                    COALESCE(motm_p.alias,     tfa.tfa_alias)  AS motm_winner_alias,
                    COALESCE(motm_p.full_name, tfa.tfa_name)   AS motm_winner_name
@@ -17789,6 +17898,38 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
                         ) IS NOT NULL
                     ) earliest
                     WHERE rn = 1
+
+                    UNION ALL
+
+                    -- BUG-PERF-01: No-history fallback. Players with zero usable
+                    -- player_stat_history rows (never recalibrated since signup)
+                    -- got NO rating_periods row → ovr_at_game was always NULL →
+                    -- filtered out of agg → empty per_ovr → blank grid row even
+                    -- though they had played games. Catch-all period using their
+                    -- CURRENT rating (from players table) spans all time so every
+                    -- played game gets attributed.
+                    SELECT
+                        p.id AS player_id,
+                        COALESCE(
+                            CASE WHEN p.position = 'goalkeeper' THEN p.goalkeeper_rating END,
+                            p.overall_rating
+                        ) AS ovr_in_period,
+                        '1970-01-01'::timestamp AS period_start,
+                        '2099-01-01'::timestamp AS period_end
+                    FROM players p
+                    WHERE COALESCE(
+                        CASE WHEN p.position = 'goalkeeper' THEN p.goalkeeper_rating END,
+                        p.overall_rating
+                    ) IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM player_stat_history psh2
+                        WHERE psh2.player_id = p.id
+                          AND COALESCE(
+                              CASE WHEN p.position = 'goalkeeper' THEN psh2.goalkeeper_rating END,
+                              psh2.overall_rating
+                          ) IS NOT NULL
+                    )
                 ) all_periods
             ),
             -- Assign each player-game to the rating that was in effect when they played.
