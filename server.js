@@ -295,6 +295,186 @@ async function registrationEvent(pool, gameId, playerId, eventType, detail = '')
     }
 }
 
+// ─── Audit tagging — Phase A ────────────────────────────────────────────────
+// Each action code maps to (category, subCategory, actorRole, severity).
+// Used by /api/admin/audit/player/:id and /api/admin/audit/game/:id to
+// enrich every event row with the four metadata fields. The frontend uses
+// them for the new filter axes (category/sub, actor, severity).
+//
+// actorRole:
+//   'player' = the subject of the audit triggered the event themselves
+//   'admin'  = an admin acted on the subject (manual stat edit, balance adj, etc.)
+//   'system' = automatic event (auto stats post-completion, tier recalc, ban lifted)
+//
+// severity:
+//   'high' = money moves, deletions, password resets, bans, force-overrides
+//   'med'  = settings changes, lifecycle, discipline points, badges, stat overrides
+//   'low'  = auto stat updates, page views, login, MOTM/award votes
+//
+// Categories (8 top + 3 new):
+//   account, participation, ops, results, rating, discipline, finance, refs,
+//   comms, series, access
+const AUDIT_TAG_TABLE = {
+    // ─── ACCOUNT & IDENTITY ────────────────────────────────────────────────
+    player_created:           { cat: 'account', sub: 'created',  actor: 'player', sev: 'med'  },
+    player_deleted:           { cat: 'account', sub: 'deleted',  actor: 'admin',  sev: 'high' },
+    player_updated:           { cat: 'account', sub: 'profile',  actor: 'admin',  sev: 'med'  },
+    account_updated:          { cat: 'account', sub: 'profile',  actor: 'player', sev: 'low'  },
+    photo_uploaded:           { cat: 'account', sub: 'profile',  actor: 'player', sev: 'low'  },
+    referral_set:             { cat: 'account', sub: 'profile',  actor: 'player', sev: 'low'  },
+    raf_toggle:               { cat: 'account', sub: 'profile',  actor: 'player', sev: 'low'  },
+    coaching_credentials_updated: { cat: 'account', sub: 'profile', actor: 'admin', sev: 'med' },
+    login:                    { cat: 'account', sub: 'security', actor: 'player', sev: 'low'  },
+    logout:                   { cat: 'account', sub: 'security', actor: 'player', sev: 'low'  },
+    password_changed:         { cat: 'account', sub: 'security', actor: 'player', sev: 'med'  },
+    password_reset:           { cat: 'account', sub: 'security', actor: 'player', sev: 'med'  },
+    force_password_changed:   { cat: 'account', sub: 'security', actor: 'admin',  sev: 'high' },
+    admin_email_changed:      { cat: 'account', sub: 'security', actor: 'admin',  sev: 'high' },
+    admin_password_reset:     { cat: 'account', sub: 'security', actor: 'admin',  sev: 'high' },
+
+    // ─── GAME PARTICIPATION ────────────────────────────────────────────────
+    signed_up:                { cat: 'participation', sub: 'joined',      actor: 'player', sev: 'low' },
+    player_signed_up:         { cat: 'participation', sub: 'joined',      actor: 'player', sev: 'low' },
+    spot_claimed:             { cat: 'participation', sub: 'joined',      actor: 'player', sev: 'low' },
+    backup_joined:            { cat: 'participation', sub: 'joined',      actor: 'player', sev: 'low' },
+    confirmed_backup_joined:  { cat: 'participation', sub: 'joined',      actor: 'player', sev: 'low' },
+    gk_backup_joined:         { cat: 'participation', sub: 'joined',      actor: 'player', sev: 'low' },
+    player_backup_joined:     { cat: 'participation', sub: 'joined',      actor: 'player', sev: 'low' },
+    admin_added:              { cat: 'participation', sub: 'joined',      actor: 'admin',  sev: 'med' },
+    admin_player_added:       { cat: 'participation', sub: 'joined',      actor: 'admin',  sev: 'med' },
+    guest_added:              { cat: 'participation', sub: 'joined',      actor: 'player', sev: 'low' },
+    dropped_out:              { cat: 'participation', sub: 'left',        actor: 'player', sev: 'med' },
+    backup_removed:           { cat: 'participation', sub: 'left',        actor: 'player', sev: 'low' },
+    admin_removed:            { cat: 'participation', sub: 'left',        actor: 'admin',  sev: 'med' },
+    admin_player_removed:     { cat: 'participation', sub: 'left',        actor: 'admin',  sev: 'med' },
+    player_removed:           { cat: 'participation', sub: 'left',        actor: 'admin',  sev: 'med' },
+    guest_removed:            { cat: 'participation', sub: 'left',        actor: 'player', sev: 'low' },
+    admin_drop_no_refund:     { cat: 'participation', sub: 'left',        actor: 'admin',  sev: 'high' },
+    preferences_updated:      { cat: 'participation', sub: 'preferences', actor: 'player', sev: 'low' },
+    team_preference_updated:  { cat: 'participation', sub: 'preferences', actor: 'player', sev: 'low' },
+    captain_handoff:          { cat: 'participation', sub: 'roles',       actor: 'player', sev: 'low' },
+    guest_stats_overridden:   { cat: 'participation', sub: 'roles',       actor: 'admin',  sev: 'med' },
+    guest_stats_reset:        { cat: 'participation', sub: 'roles',       actor: 'admin',  sev: 'med' },
+    confirmed_backup_refund:  { cat: 'participation', sub: 'left',        actor: 'system', sev: 'med' },
+
+    // ─── GAME OPERATIONS (game-side only) ──────────────────────────────────
+    game_created:             { cat: 'ops', sub: 'created',  actor: 'admin', sev: 'med' },
+    settings_updated:         { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'med' },
+    default_organiser_set:    { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'low' },
+    default_organiser_auto_added: { cat: 'participation', sub: 'joined', actor: 'system', sev: 'low' },
+    venue_created:            { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'low' },
+    venue_updated:            { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'low' },
+    venue_archived:           { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'med' },
+    venue_restored:           { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'low' },
+    lineup_settings_updated:  { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'med' },
+    game_locked:              { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'low' },
+    game_unlocked:            { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'low' },
+    type_converted:           { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'med' },
+    star_rating_auto_updated: { cat: 'ops', sub: 'settings', actor: 'system', sev: 'low' },
+    teams_generated:          { cat: 'ops', sub: 'teams',    actor: 'admin', sev: 'med' },
+    teams_confirmed:          { cat: 'ops', sub: 'teams',    actor: 'admin', sev: 'med' },
+    teams_deleted:            { cat: 'ops', sub: 'teams',    actor: 'admin', sev: 'med' },
+    avg_team_ratings:         { cat: 'ops', sub: 'teams',    actor: 'system', sev: 'low' },
+    game_confirmed:           { cat: 'ops', sub: 'status',   actor: 'admin', sev: 'med' },
+    game_completed:           { cat: 'ops', sub: 'status',   actor: 'admin', sev: 'med' },
+    game_deleted:             { cat: 'ops', sub: 'deleted',  actor: 'admin', sev: 'high' },
+
+    // ─── RESULTS & RECOGNITION ─────────────────────────────────────────────
+    motm_voting_started:      { cat: 'results', sub: 'motm',    actor: 'admin',  sev: 'low' },
+    motm_finalized:           { cat: 'results', sub: 'motm',    actor: 'admin',  sev: 'med' },
+    motm_vote:                { cat: 'results', sub: 'motm',    actor: 'player', sev: 'low' },
+    motm_vote_cast:           { cat: 'results', sub: 'motm',    actor: 'player', sev: 'low' },
+    motm_vote_tally:          { cat: 'results', sub: 'motm',    actor: 'system', sev: 'low' },
+    motm_received:            { cat: 'results', sub: 'motm',    actor: 'system', sev: 'low' },
+    award_vote_cast:          { cat: 'results', sub: 'awards',  actor: 'player', sev: 'low' },
+    award_vote_received:      { cat: 'results', sub: 'awards',  actor: 'system', sev: 'low' },
+    awards_auto_closed:       { cat: 'results', sub: 'awards',  actor: 'system', sev: 'low' },
+    awards_closed_manually:   { cat: 'results', sub: 'awards',  actor: 'admin',  sev: 'med' },
+    win_awarded:              { cat: 'results', sub: 'results', actor: 'system', sev: 'low' },
+    draw_recorded:            { cat: 'results', sub: 'results', actor: 'system', sev: 'low' },
+    tournament_result_added:    { cat: 'results', sub: 'results', actor: 'admin', sev: 'med' },
+    tournament_result_updated:  { cat: 'results', sub: 'results', actor: 'admin', sev: 'med' },
+    tournament_result_deleted:  { cat: 'results', sub: 'results', actor: 'admin', sev: 'med' },
+    badges_updated:           { cat: 'results', sub: 'badges',  actor: 'admin',  sev: 'med' },
+    badge_auto_awarded:       { cat: 'results', sub: 'badges',  actor: 'system', sev: 'low' },
+    badge_auto_removed:       { cat: 'results', sub: 'badges',  actor: 'system', sev: 'low' },
+
+    // ─── RATING & STATS ────────────────────────────────────────────────────
+    player_stats_updated:     { cat: 'rating', sub: 'per_game',  actor: 'system', sev: 'low' },
+    stats_updated:            { cat: 'rating', sub: 'override',  actor: 'admin',  sev: 'med' },
+    tier_recalculated:        { cat: 'rating', sub: 'auto',      actor: 'system', sev: 'low' },
+
+    // ─── DISCIPLINE ────────────────────────────────────────────────────────
+    discipline_added:         { cat: 'discipline', sub: 'points', actor: 'admin',  sev: 'med' },
+    discipline_recorded:      { cat: 'discipline', sub: 'points', actor: 'system', sev: 'med' },
+    discipline_removed:       { cat: 'discipline', sub: 'points', actor: 'admin',  sev: 'med' },
+    ban_served:               { cat: 'discipline', sub: 'bans',   actor: 'system', sev: 'med' },
+    ban_lifted:               { cat: 'discipline', sub: 'bans',   actor: 'system', sev: 'med' },
+    player_unbanned:          { cat: 'discipline', sub: 'bans',   actor: 'admin',  sev: 'high' },
+
+    // ─── FINANCE ───────────────────────────────────────────────────────────
+    game_fee:                 { cat: 'finance', sub: 'ledger',   actor: 'player', sev: 'low'  },
+    refund:                   { cat: 'finance', sub: 'ledger',   actor: 'system', sev: 'low'  },
+    free_credit:              { cat: 'finance', sub: 'grants',   actor: 'system', sev: 'low'  },
+    free_credit_grant:        { cat: 'finance', sub: 'grants',   actor: 'admin',  sev: 'med'  },
+    raf_reward:               { cat: 'finance', sub: 'grants',   actor: 'system', sev: 'low'  },
+    shop_order:               { cat: 'finance', sub: 'grants',   actor: 'player', sev: 'low'  },
+    wonderful_initiated:      { cat: 'finance', sub: 'payment',  actor: 'player', sev: 'med'  },
+    wonderful_credited:       { cat: 'finance', sub: 'payment',  actor: 'system', sev: 'med'  },
+    balance_adjustment:       { cat: 'finance', sub: 'admin',    actor: 'admin',  sev: 'high' },
+    credit_adjustment:        { cat: 'finance', sub: 'admin',    actor: 'admin',  sev: 'high' },
+    admin_adjustment:         { cat: 'finance', sub: 'admin',    actor: 'admin',  sev: 'high' },
+
+    // ─── REFEREES ──────────────────────────────────────────────────────────
+    ref_applied:              { cat: 'refs', sub: 'lifecycle', actor: 'player', sev: 'low' },
+    ref_application_submitted:{ cat: 'refs', sub: 'lifecycle', actor: 'player', sev: 'low' },
+    ref_admin_added:          { cat: 'refs', sub: 'lifecycle', actor: 'admin',  sev: 'med' },
+    ref_confirmed:            { cat: 'refs', sub: 'lifecycle', actor: 'admin',  sev: 'med' },
+    ref_unconfirmed:          { cat: 'refs', sub: 'lifecycle', actor: 'admin',  sev: 'med' },
+    ref_withdrawn:            { cat: 'refs', sub: 'lifecycle', actor: 'player', sev: 'low' },
+    ref_removed:              { cat: 'refs', sub: 'lifecycle', actor: 'admin',  sev: 'med' },
+    external_ref_created:     { cat: 'refs', sub: 'lifecycle', actor: 'admin',  sev: 'low' },
+    referee_invite_created:   { cat: 'refs', sub: 'lifecycle', actor: 'admin',  sev: 'low' },
+    ref_review_comment:       { cat: 'refs', sub: 'reviews',   actor: 'player', sev: 'low' },
+    ref_score_updated:        { cat: 'refs', sub: 'reviews',   actor: 'system', sev: 'low' },
+    ref_score_finalised:      { cat: 'refs', sub: 'reviews',   actor: 'system', sev: 'low' },
+
+    // ─── COMMS ─────────────────────────────────────────────────────────────
+    comms_campaign_sent:      { cat: 'comms', sub: 'campaigns', actor: 'admin', sev: 'med' },
+    dm_reported:              { cat: 'comms', sub: 'reports',   actor: 'player', sev: 'med' },
+
+    // ─── SERIES ────────────────────────────────────────────────────────────
+    series_recreated:                { cat: 'series', sub: 'managed', actor: 'admin', sev: 'med' },
+    series_lineup_editors_updated:   { cat: 'series', sub: 'managed', actor: 'admin', sev: 'low' },
+    series_scoreline_overridden:     { cat: 'series', sub: 'managed', actor: 'admin', sev: 'med' },
+
+    // ─── ACCESS ────────────────────────────────────────────────────────────
+    page_view:                { cat: 'access', sub: 'views', actor: 'player', sev: 'low' }
+};
+
+// Lookup an audit tag for an action code. Falls back to a generic admin/med tag
+// if the code is unknown — keeps the frontend filter logic working for codes
+// the table hasn't seen yet (rather than erroring).
+function getAuditTag(actionCode) {
+    return AUDIT_TAG_TABLE[actionCode] || { cat: 'account', sub: 'profile', actor: 'admin', sev: 'med' };
+}
+
+// Enrich a single event row with the four tag fields. Returns a new object
+// (does not mutate input). Pass through any pre-set actor (e.g. when the
+// caller knows from context — like the player audit endpoint knowing balance
+// rows had an admin if `admin_id` was set).
+function enrichAuditRow(row, actionCode, opts = {}) {
+    const tag = getAuditTag(actionCode);
+    return {
+        ...row,
+        _action:    actionCode,
+        _category:  opts.cat   || tag.cat,
+        _subCategory: opts.sub || tag.sub,
+        _actor:     opts.actor || tag.actor,
+        _severity:  opts.sev   || tag.sev
+    };
+}
+
 async function statHistory(pool, playerId, changedBy, stats, tier = null) {
     try {
         await pool.query(
@@ -315,6 +495,103 @@ async function statHistory(pool, playerId, changedBy, stats, tier = null) {
 }
 
 
+
+// ── P3 (default organiser) — auto-add helper ────────────────────────────────
+// Auto-registers the default organiser as a confirmed, comped player on a game.
+// Call AFTER the game INSERT, with the same db client (transaction-aware).
+// Idempotent — silently skips if a registration already exists for that player+game.
+// Silently skips if the organiser is no longer flagged is_organiser (defensive).
+// Returns true on success, false if skipped (with reason logged).
+//   db        — pool or active client
+//   gameId    — UUID of the newly-created game
+//   organiserId — UUID of the player flagged as default organiser (may be null/undefined)
+//   actorId   — admin who triggered the create (used in audit log)
+async function autoAddDefaultOrganiser(db, gameId, organiserId, actorId) {
+    if (!organiserId) return false;
+    try {
+        // Defensive: confirm the player still exists and is still an organiser.
+        // Stops auto-add silently if admin removed the flag between game-create
+        // submission and this code running.
+        const check = await db.query(
+            `SELECT id, is_organiser FROM players WHERE id = $1`,
+            [organiserId]
+        );
+        if (!check.rows.length) {
+            console.warn(`[autoAddOrganiser] player ${organiserId} not found — skip`);
+            return false;
+        }
+        if (!check.rows[0].is_organiser) {
+            console.warn(`[autoAddOrganiser] player ${organiserId} is no longer an organiser — skip`);
+            return false;
+        }
+
+        // Idempotency — if a registration row already exists, skip cleanly.
+        const existing = await db.query(
+            `SELECT id, status FROM registrations WHERE game_id = $1 AND player_id = $2`,
+            [gameId, organiserId]
+        );
+        if (existing.rows.length > 0) {
+            return false;   // already registered, nothing to do
+        }
+
+        // Capacity guard — don't push past max_players. If the game is full,
+        // skip silently with a console warning rather than breaking team-gen.
+        // Admin can manually drop someone first if they really want this organiser.
+        // IMPORTANT: capacity = confirmed registrations + game_guests (the same
+        // formula used everywhere else in the codebase as "current_players").
+        const cap = await db.query(
+            `SELECT
+                g.max_players,
+                (
+                    (SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed')
+                  + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)
+                ) AS current_count
+             FROM games g WHERE g.id = $1`,
+            [gameId]
+        );
+        if (cap.rows.length) {
+            const maxP = parseInt(cap.rows[0].max_players) || 0;
+            const cur  = parseInt(cap.rows[0].current_count) || 0;
+            if (maxP > 0 && cur >= maxP) {
+                console.warn(`[autoAddOrganiser] game ${gameId} at capacity (${cur}/${maxP}) — skip`);
+                return false;
+            }
+        }
+
+        // Insert as confirmed + comped. £0 paid, no payment due, no credit move.
+        // The SELECT-then-INSERT above has a TOCTOU race window — if a parallel
+        // tab registered the player between checks, we'd hit a unique-violation.
+        // Catch 23505 (unique_violation) and treat it the same as "already registered".
+        try {
+            await db.query(
+                `INSERT INTO registrations
+                    (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, is_comped)
+                 VALUES ($1, $2, 'confirmed', NULL, 0, 0, TRUE)`,
+                [gameId, organiserId]
+            );
+        } catch (insertErr) {
+            if (insertErr.code === '23505') {
+                // Another path registered them first — fine, idempotency preserved.
+                return false;
+            }
+            throw insertErr;
+        }
+
+        // Audit trail — both player-level (so it shows on their audit) and game-level
+        setImmediate(() => {
+            registrationEvent(pool, gameId, organiserId, 'default_organiser_auto_added',
+                `Auto-added as default organiser for this game`).catch(() => {});
+            gameAuditLog(pool, gameId, actorId || null, 'default_organiser_auto_added',
+                `Default organiser ${organiserId} auto-registered (comped)`).catch(() => {});
+        });
+
+        return true;
+    } catch (e) {
+        // Don't throw — we never want to fail game creation because of this.
+        console.error('[autoAddOrganiser] failed (non-fatal):', e.message);
+        return false;
+    }
+}
 
 // ── CREDIT TRANSACTION HELPER ────────────────────────────────────────────────
 // Records a credit_transactions row with balance_before / balance_after.
@@ -413,6 +690,27 @@ function getEffectivePrice(game) {
     return { price: standard, tier: 'standard' };
 }
 
+// EB-AUDIT: Retroactive variant — what was the effective price for this game at
+// the moment a given player signed up? Used by finance breakdowns to split the
+// "shortfall" (cost - paid) into actual early bird savings vs other discounts.
+// Inputs:
+//   game        — must have game_date, cost_per_player, early_bird_price, super_early_bird_price
+//   signupTs    — ISO string or Date the registration was created
+// Returns same shape as getEffectivePrice.
+function getEffectivePriceAtSignup(game, signupTs) {
+    const standard = parseFloat(game.cost_per_player || 0);
+    const early    = game.early_bird_price       != null ? parseFloat(game.early_bird_price)       : null;
+    const superEB  = game.super_early_bird_price != null ? parseFloat(game.super_early_bird_price) : null;
+    if (!signupTs || !game.game_date) return { price: standard, tier: 'standard' };
+    const signup   = new Date(signupTs).getTime();
+    const kickoff  = new Date(game.game_date).getTime();
+    if (isNaN(signup) || isNaN(kickoff)) return { price: standard, tier: 'standard' };
+    const daysLeftAtSignup = (kickoff - signup) / (1000 * 60 * 60 * 24);
+    if (daysLeftAtSignup >= 7 && superEB !== null) return { price: superEB,  tier: 'super'    };
+    if (daysLeftAtSignup >= 3 && early   !== null) return { price: early,    tier: 'early'    };
+    return { price: standard, tier: 'standard' };
+}
+
 // ── RAF (REFER A FRIEND) HELPERS ─────────────────────────────────────────────
 
 async function getRafEnabled() {
@@ -427,9 +725,16 @@ async function triggerRafActivation(referredPlayerId) {
     try {
         const enabled = await getRafEnabled();
         if (!enabled) return;
-        const ref = await pool.query('SELECT referred_by FROM players WHERE id = $1', [referredPlayerId]);
-        if (!ref.rows[0]?.referred_by) return;
-        const referrerId = ref.rows[0].referred_by;
+        // A2: suppress RAF activation if this player signed up via a guest_invite token.
+        // The £2 cashback path replaces the £1 RAF bonus (not stacked).
+        const playerRow = await pool.query(
+            'SELECT referred_by, COALESCE(signed_up_via_guest_invite, FALSE) AS via_guest_invite FROM players WHERE id = $1',
+            [referredPlayerId]
+        );
+        if (!playerRow.rows[0]) return;
+        if (playerRow.rows[0].via_guest_invite) return;   // A2: skip RAF for guest-invite signups
+        if (!playerRow.rows[0].referred_by) return;
+        const referrerId = playerRow.rows[0].referred_by;
         await pool.query(
             'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
             [referrerId, referredPlayerId]
@@ -484,8 +789,14 @@ async function triggerRafGameCredit(referredPlayerId) {
     try {
         const enabled = await getRafEnabled();
         if (!enabled) return;
-        const ref = await pool.query('SELECT referred_by, created_at FROM players WHERE id=$1', [referredPlayerId]);
+        // A2-A131: also suppress 50p game credits for guest_invite signups
+        // (consistent with triggerRafActivation suppression — guest invite REPLACES RAF entirely).
+        const ref = await pool.query(
+            'SELECT referred_by, created_at, COALESCE(signed_up_via_guest_invite, FALSE) AS via_guest_invite FROM players WHERE id=$1',
+            [referredPlayerId]
+        );
         if (!ref.rows[0]?.referred_by) return;
+        if (ref.rows[0].via_guest_invite) return;   // A2: skip RAF for guest-invite signups
         const referrerId = ref.rows[0].referred_by;
         const joinedAt   = ref.rows[0].created_at;
         const windowEnd  = new Date(joinedAt);
@@ -613,8 +924,9 @@ function starClassFromRating(starRating) {
 // reviewDynamicStarRating: recalculate star_rating for a game based on avg OVR.
 // Rules:
 //   - Only runs if star_rating_locked = FALSE.
-//     Games are locked when admin creates/edits with 0★, 4★, or 5★ (explicit quality statements).
-//     1-3★ stays dynamic; admin may have under/over-estimated at creation.
+//     Games are locked when admin creates/edits with 4★ or 5★ (explicit "good game" calls).
+//     0★ / 1★ / 2★ / 3★ stay dynamic — admin may have under-estimated at creation,
+//     and a 0★ game should be able to recover to 0.5★+ once the squad fills out.
 //   - Only runs once ≥ 8 confirmed players are signed up
 //   - Uniform half-star boundaries (0.5 OVR = 0.5 star):
 //       <84        → 0★
@@ -676,6 +988,36 @@ async function reviewDynamicStarRating(pool, gameId) {
         }
     } catch (e) {
         console.warn(`reviewDynamicStarRating failed for game ${gameId} (non-critical):`, e.message);
+    }
+}
+
+// DYNSTAR-C: after a player's overall_rating changes (post-game stats, admin edit, etc.),
+// every upcoming game that player is confirmed in has a stale avg OVR — and therefore
+// a potentially stale dynamic star rating. This helper finds those games and fires
+// reviewDynamicStarRating on each. Locked games and past games are skipped.
+//
+// Called fire-and-forget from OVR-writing endpoints. Never throws.
+async function reviewStarsForPlayers(pool, playerIds) {
+    if (!playerIds || !playerIds.length) return;
+    try {
+        const rows = await pool.query(
+            `SELECT DISTINCT g.id
+             FROM registrations r
+             JOIN games g ON g.id = r.game_id
+             WHERE r.player_id = ANY($1)
+               AND r.status = 'confirmed'
+               AND g.game_status = 'available'
+               AND g.game_date > NOW()
+               AND g.star_rating_locked = FALSE`,
+            [playerIds]
+        );
+        // Sequential to avoid load spike when a batch of post-game stats updates
+        // 20+ players × 3 upcoming games each.
+        for (const { id } of rows.rows) {
+            await reviewDynamicStarRating(pool, id);
+        }
+    } catch (e) {
+        console.warn('reviewStarsForPlayers failed (non-critical):', e.message);
     }
 }
 
@@ -1029,6 +1371,11 @@ const NOTIF_TEMPLATES = {
     award_engine_badge:   _d => ({ title: '🔋 Engine Badge Earned!',      body: '5 Best Engine awards — the Engine Badge is now on your profile.' }),
     award_wall_badge:     _d => ({ title: '🧱 Brick Wall Badge Earned!',  body: '5 Brick Wall awards — the Brick Wall Badge is now on your profile.' }),
     award_donkey_badge:   _d => ({ title: '🐴 Donkey Badge Earned!',      body: '5 Donkey Awards — the Donkey Badge is now on your profile. A bad smell that won\'t go away.' }),
+    // P2.3 — alert to GAFFA on late drop-out
+    late_dropout_alert: d => ({
+        title: '🚨 Late drop-out',
+        body:  `${d.alias} dropped from ${d.venue} (${d.reason}). £${d.amount} kept.`
+    }),
 };
 
 // sendNotification: send an Expo push notification to a player's registered devices.
@@ -1435,7 +1782,57 @@ app.post('/api/auth/register', async (req, res) => {
             decent:   { gk: 88, def: 12, str: 12, fit: 13, pac: 12, dec: 13, ast: 13, sht: 13, overall: 88 },
         };
         // Skipped = casual. Same overall (84), same GK (86). skill_level stored as null.
-        const stats = SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
+        let stats = SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
+
+        // ── A2: guest invite stat inheritance ──────────────────────────────
+        // If signup came via ?guest_invite=TOKEN, fetch the guest record's
+        // already-derived stats (host as parent + slider) and use those
+        // instead of skill-level defaults. The token is validated + claimed
+        // separately later (POST /api/guest-invite/:token/claim) — here we
+        // only READ for stat inheritance and set the flag for RAF suppression.
+        const guestInviteToken = req.body.guest_invite || req.body.guestInvite || null;
+        let _signedUpViaGuestInvite = false;
+        if (guestInviteToken && /^[a-f0-9]{32}$/.test(guestInviteToken)) {
+            try {
+                const tokRes = await pool.query(
+                    `SELECT t.game_guest_id, t.claimed_by_player_id,
+                            gg.overall_rating, gg.goalkeeper_rating, gg.defending_rating,
+                            gg.strength_rating, gg.fitness_rating, gg.pace_rating,
+                            gg.decisions_rating, gg.assisting_rating, gg.shooting_rating
+                     FROM guest_invite_tokens t
+                     LEFT JOIN game_guests gg ON gg.id = t.game_guest_id
+                     WHERE t.token = $1`,
+                    [guestInviteToken]
+                );
+                if (tokRes.rows.length > 0 && !tokRes.rows[0].claimed_by_player_id && tokRes.rows[0].game_guest_id) {
+                    const gs = tokRes.rows[0];
+                    // A2-A58 + A2-A66: use ?? (nullish coalescing) not || so legitimate 0 values
+                    // from guest record (e.g. goalkeeper_rating=0 for outfield guests) aren't
+                    // silently replaced with skill-level defaults. _toInt also returns null for
+                    // NaN/undefined to keep the ?? fallback behaviour consistent.
+                    const _toInt = v => {
+                        if (v === null || v === undefined) return null;
+                        const n = parseInt(v);
+                        return isNaN(n) ? null : n;
+                    };
+                    stats = {
+                        gk:  _toInt(gs.goalkeeper_rating) ?? stats.gk,
+                        def: _toInt(gs.defending_rating)  ?? stats.def,
+                        str: _toInt(gs.strength_rating)   ?? stats.str,
+                        fit: _toInt(gs.fitness_rating)    ?? stats.fit,
+                        pac: _toInt(gs.pace_rating)       ?? stats.pac,
+                        dec: _toInt(gs.decisions_rating)  ?? stats.dec,
+                        ast: _toInt(gs.assisting_rating)  ?? stats.ast,
+                        sht: _toInt(gs.shooting_rating)   ?? stats.sht,
+                        overall: _toInt(gs.overall_rating) ?? stats.overall
+                    };
+                    _signedUpViaGuestInvite = true;
+                }
+                // If token claimed/missing/etc: fall through to default skill stats (silent — claim endpoint will show error).
+            } catch (e) {
+                console.warn('[A2 signup stat inherit] failed (non-fatal):', e.message);
+            }
+        }
 
         // Validate age range — required for insurance purposes
         // Validate region
@@ -1482,40 +1879,71 @@ app.post('/api/auth/register', async (req, res) => {
         const playerAlias = alias?.trim() || firstName;
 
         // Create player with skill-level-seeded stats. New players start on gold tier.
-        const playerResult = await pool.query(
-            `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
-                goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
-                pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
-                skill_level, age_range, region_code, coachable)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
-                     $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) RETURNING id`,
-            [
-                userId,               // $1
-                fullName.trim(),      // $2
-                firstName,            // $3
-                lastName,             // $4
-                playerAlias,          // $5
-                phone.trim(),         // $6
-                'outfield',           // $7
-                stats.gk,             // $8  goalkeeper_rating
-                stats.def,            // $9  defending_rating
-                stats.str,            // $10 strength_rating
-                stats.fit,            // $11 fitness_rating
-                stats.pac,            // $12 pace_rating
-                stats.dec,            // $13 decisions_rating
-                stats.ast,            // $14 assisting_rating
-                stats.sht,            // $15 shooting_rating
-                stats.overall,        // $16 overall_rating
-                validatedSkillLevel,  // $17 skill_level (null if skipped)
-                ageRange,             // $18 age_range
-                validatedRegion,      // $19 region_code (null if not selected)
-                validatedInterests.includes('coaching')  // $20 coachable
-            ]
-        );
+        // A2-A42: Try the new 21-column INSERT (with signed_up_via_guest_invite).
+        // If that fails because the column doesn't exist (pre-migration),
+        // fall back to the legacy 20-column INSERT so signups still work.
+        let playerResult;
+        const _basePlayerArgs = [
+            userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield',
+            stats.gk, stats.def, stats.str, stats.fit, stats.pac, stats.dec, stats.ast, stats.sht, stats.overall,
+            validatedSkillLevel, ageRange, validatedRegion, validatedInterests.includes('coaching')
+        ];
+        try {
+            playerResult = await pool.query(
+                `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
+                    goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
+                    skill_level, age_range, region_code, coachable, signed_up_via_guest_invite)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
+                         $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING id`,
+                [..._basePlayerArgs, _signedUpViaGuestInvite]
+            );
+        } catch (e) {
+            // Pre-migration fallback: column missing → legacy INSERT
+            if (e.code === '42703' /* undefined_column */) {
+                console.warn('[A2 signup] signed_up_via_guest_invite column missing — using legacy INSERT. Run a2-migration.sql to enable RAF suppression.');
+                playerResult = await pool.query(
+                    `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
+                        goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+                        pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
+                        skill_level, age_range, region_code, coachable)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
+                             $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) RETURNING id`,
+                    _basePlayerArgs
+                );
+            } else {
+                throw e;
+            }
+        }
         const playerId = playerResult.rows[0].id;
 
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
+
+        // ── A2-A83: Auto-claim the guest invite token at signup time ──────
+        // Without this, a friend who signs up via the link but never returns to
+        // log in (token not in sessionStorage) leaves the token unclaimed forever
+        // and the host never gets the £2 cashback. Doing it here closes that gap.
+        // SAFE: only runs if guestInviteToken is valid and the inheritance flag was set
+        // (meaning we already confirmed token exists + unclaimed earlier).
+        if (_signedUpViaGuestInvite && guestInviteToken) {
+            try {
+                await pool.query(
+                    `UPDATE guest_invite_tokens
+                        SET claimed_by_player_id = $1,
+                            claimed_at = NOW(),
+                            claim_was_new_user = TRUE,
+                            cashback_status = CASE
+                                WHEN cashback_status = 'admin_invite' THEN 'admin_invite'
+                                ELSE 'new_user_pending'
+                            END
+                      WHERE token = $2 AND claimed_by_player_id IS NULL`,
+                    [playerId, guestInviteToken]
+                );
+            } catch (e) {
+                console.warn('[A2 signup auto-claim] failed (non-fatal):', e.message);
+            }
+        }
 
         // Auto-assign Youth badge for 16-18 players (non-public, for insurance tracking)
         if (ageRange === '16_18') {
@@ -2231,6 +2659,25 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
 // ==========================================
 // ADMIN PLAYERS GRID — all data for manage-players.html
 // ==========================================
+// ─── P3 (default organiser) — list endpoint for the dropdown ───────────────
+// Returns players flagged is_organiser. Used by Add Game / Edit Game / Edit Series
+// forms to populate the "default organiser" dropdown. requireCLMAdmin matches
+// the gates on the forms that consume it.
+app.get('/api/players/organisers', authenticateToken, requireCLMAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT p.id, p.full_name, p.alias, p.squad_number
+            FROM players p
+            WHERE p.is_organiser = TRUE
+            ORDER BY COALESCE(NULLIF(p.alias, ''), p.full_name) ASC
+        `);
+        res.json({ organisers: result.rows });
+    } catch (error) {
+        console.error('Organisers list error:', error);
+        res.status(500).json({ error: 'Failed to load organisers' });
+    }
+});
+
 app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -3500,6 +3947,10 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, as
                 `GK:${b.goalkeeper_rating ?? '?'}→${goalkeeper}`,
             ].join(' ');
             await auditLog(pool, req.user.playerId, 'stats_updated', req.params.id, detail);
+            // DYNSTAR-C: if OVR changed, upcoming games this player is in need recalc
+            if ((b.overall_rating ?? null) !== (overall ?? null)) {
+                reviewStarsForPlayers(pool, [req.params.id]).catch(() => {});
+            }
         });
     } catch (error) {
         console.error('Update stats error:', error);
@@ -3671,6 +4122,9 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         }
 
         // Update player ratings and stats
+        // DYNSTAR-C: capture old OVR so we only fire recalc when it actually changed.
+        const prevOvrRow = await pool.query('SELECT overall_rating FROM players WHERE id = $1', [playerId]);
+        const prevOverall = prevOvrRow.rows[0]?.overall_rating ?? null;
         await pool.query(`
             UPDATE players SET
                 goalkeeper_rating = $1,
@@ -3710,6 +4164,11 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 'UPDATE players SET player_number = $1 WHERE id = $2',
                 [squad_number, playerId]
             );
+        }
+
+        // DYNSTAR-C: if OVR changed, fire recalc for player's upcoming games
+        if (prevOverall !== overall_rating) {
+            reviewStarsForPlayers(pool, [playerId]).catch(() => {});
         }
 
         // FIX-053: Update balance with audit trail if changed
@@ -4105,15 +4564,379 @@ app.put('/api/admin/players/:playerId/referral', authenticateToken, requireAdmin
 
 app.get('/api/venues', authenticateToken, async (req, res) => {
     try {
+        // P5: filter to active venues only by default. Includes new defaults so
+        // Add Game form can pre-fill max_players / format / position_type when a
+        // venue is picked. background_image_filename is intentionally omitted —
+        // not needed for the admin's pick-a-venue dropdown.
         const result = await pool.query(
-            'SELECT id, name, address, pitch_location, facilities, notes FROM venues ORDER BY name ASC'
+            `SELECT id, name, address, pitch_location, facilities, notes,
+                    default_pitch_cost,
+                    default_max_players,
+                    default_format,
+                    default_position_type
+             FROM venues
+             WHERE COALESCE(is_active, TRUE) = TRUE
+             ORDER BY name ASC`
         );
         res.json(result.rows);
     } catch (error) {
+        // Pre-migration fallback — strip new columns if missing
+        if (error.code === '42703') {
+            try {
+                const fallback = await pool.query(
+                    `SELECT id, name, address, pitch_location, facilities, notes,
+                            NULL AS default_pitch_cost,
+                            NULL AS default_max_players,
+                            NULL AS default_format,
+                            NULL AS default_position_type
+                     FROM venues ORDER BY name ASC`
+                );
+                return res.json(fallback.rows);
+            } catch (_) { /* fall through */ }
+        }
         console.error('Error fetching venues:', error);
         res.status(500).json({ error: 'Failed to fetch venues' });
     }
 });
+
+// ─── P5 (Manage Venues) — admin endpoints ──────────────────────────────────
+// Validation patterns + helper for the filename-on-Namecheap image strategy.
+//
+// Filename rules:
+//   • lowercase letters, digits, hyphens
+//   • extension: .jpg / .jpeg / .png / .webp
+//   • max length 100 chars
+//   • no path traversal (no slashes, no '..')
+const VENUE_IMAGE_FILENAME_RE = /^[a-z0-9-]+\.(jpe?g|png|webp)$/;
+
+// HEAD-check the file exists on Namecheap. Returns:
+//   true  — file confirmed present (HTTP 200)
+//   false — file confirmed missing (HTTP 404)
+//   null  — uncertain (timeout / network error / non-2xx-non-404)
+// 4-second timeout so a slow CDN doesn't stall the admin's save.
+// Cache-Control: no-cache header tells Cloudflare to revalidate against origin —
+// otherwise we'd see stale 404s for files just uploaded in the last few minutes.
+async function checkVenueImageExists(filename) {
+    if (!filename) return true;   // empty is fine — image is optional
+    const url = `https://totalfooty.co.uk/assets/venues/${filename}`;
+    try {
+        const ctl = new AbortController();
+        const t = setTimeout(() => ctl.abort(), 4000);
+        const r = await fetch(url, {
+            method: 'HEAD',
+            signal: ctl.signal,
+            headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
+        });
+        clearTimeout(t);
+        if (r.status === 200) return true;
+        if (r.status === 404) return false;
+        return null;   // ambiguous — don't block the save
+    } catch (_) {
+        return null;   // network/timeout — don't block the save
+    }
+}
+
+// Validate + normalise a venue payload from the admin form.
+// Returns { ok: true, data } or { ok: false, status, error }.
+// Used by both POST and PUT so validation rules can't drift.
+function validateVenuePayload(body) {
+    const name = (body.name || '').trim();
+    if (!name) return { ok: false, status: 400, error: 'Name is required' };
+    if (name.length > 200) return { ok: false, status: 400, error: 'Name too long (max 200 chars)' };
+
+    // Optional fields — validate when present
+    const num = (v) => (v === null || v === undefined || v === '') ? null : parseFloat(v);
+    const intOrNull = (v) => (v === null || v === undefined || v === '') ? null : parseInt(v);
+
+    const default_pitch_cost = num(body.default_pitch_cost);
+    if (default_pitch_cost !== null && (isNaN(default_pitch_cost) || default_pitch_cost < 0)) {
+        return { ok: false, status: 400, error: 'Default pitch cost must be a number ≥ 0' };
+    }
+    const default_max_players = intOrNull(body.default_max_players);
+    if (default_max_players !== null && (isNaN(default_max_players) || default_max_players < 1 || default_max_players > 50)) {
+        return { ok: false, status: 400, error: 'Default max players must be between 1 and 50' };
+    }
+    const default_format = body.default_format ? String(body.default_format).trim().slice(0, 20) : null;
+    const default_position_type = body.default_position_type ? String(body.default_position_type).trim().slice(0, 30) : null;
+    if (default_position_type !== null && !['outfield_gk', 'outfield_only'].includes(default_position_type)) {
+        return { ok: false, status: 400, error: "Default position type must be 'outfield_gk' or 'outfield_only'" };
+    }
+
+    // Image filename — pattern check only here; existence check is async, runs separately.
+    let background_image_filename = body.background_image_filename;
+    if (background_image_filename !== undefined && background_image_filename !== null && background_image_filename !== '') {
+        background_image_filename = String(background_image_filename).trim().toLowerCase();
+        if (background_image_filename.length > 100) return { ok: false, status: 400, error: 'Image filename too long (max 100 chars)' };
+        if (!VENUE_IMAGE_FILENAME_RE.test(background_image_filename)) {
+            return { ok: false, status: 400, error: 'Image filename must be lowercase letters/digits/hyphens with .jpg, .jpeg, .png, or .webp extension' };
+        }
+    } else {
+        background_image_filename = null;
+    }
+
+    // Free-text fields — clip to safe lengths
+    const trim = (v, max) => (v === null || v === undefined) ? null : String(v).trim().slice(0, max) || null;
+
+    return {
+        ok: true,
+        data: {
+            name,
+            address:               trim(body.address, 500),
+            region:                trim(body.region, 100),
+            postcode:              trim(body.postcode, 20),
+            pitch_location:        trim(body.pitch_location, 1000),
+            pitch_name:            trim(body.pitch_name, 100),
+            facilities:            trim(body.facilities, 1000),
+            notes:                 trim(body.notes, 2000),
+            special_instructions:  trim(body.special_instructions, 2000),
+            parking_pin:           trim(body.parking_pin, 200),
+            pitch_pin:             trim(body.pitch_pin, 200),
+            boot_type:             trim(body.boot_type, 50),
+            availability_rule:     trim(body.availability_rule, 200),
+            coaching_suitable:     body.coaching_suitable === true || body.coaching_suitable === 'true',
+            coaching_cost_per_hour:    num(body.coaching_cost_per_hour),
+            pay_and_play_coach_hourly: num(body.pay_and_play_coach_hourly),
+            pay_and_play_player_hourly: num(body.pay_and_play_player_hourly),
+            default_pitch_cost,
+            default_max_players,
+            default_format,
+            default_position_type,
+            background_image_filename
+        }
+    };
+}
+
+// GET — admin venue list. Defaults to active-only; pass ?include_inactive=true
+// to include archived venues (for the Manage Venues "show archived" toggle).
+app.get('/api/admin/venues', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const includeInactive = req.query.include_inactive === 'true';
+        const sql = `
+            SELECT v.*,
+                   (SELECT COUNT(*)::int FROM games WHERE venue_id = v.id) AS game_count,
+                   (SELECT COUNT(*)::int FROM games WHERE venue_id = v.id AND game_status = 'completed') AS completed_count
+            FROM venues v
+            ${includeInactive ? '' : 'WHERE COALESCE(v.is_active, TRUE) = TRUE'}
+            ORDER BY v.name ASC
+        `;
+        const result = await pool.query(sql).catch(async (err) => {
+            // Pre-migration: is_active column missing
+            if (err.code === '42703') {
+                return await pool.query(`
+                    SELECT v.*,
+                           (SELECT COUNT(*)::int FROM games WHERE venue_id = v.id) AS game_count,
+                           (SELECT COUNT(*)::int FROM games WHERE venue_id = v.id AND game_status = 'completed') AS completed_count
+                    FROM venues v ORDER BY v.name ASC`);
+            }
+            throw err;
+        });
+        res.json({ venues: result.rows });
+    } catch (error) {
+        console.error('Admin venues list error:', error);
+        res.status(500).json({ error: 'Failed to load venues' });
+    }
+});
+
+// GET single venue
+app.get('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
+        const result = await pool.query('SELECT * FROM venues WHERE id = $1', [id]);
+        if (!result.rows.length) return res.status(404).json({ error: 'Venue not found' });
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Admin venue fetch error:', error);
+        res.status(500).json({ error: 'Failed to load venue' });
+    }
+});
+
+// POST — create venue
+app.post('/api/admin/venues', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const v = validateVenuePayload(req.body);
+        if (!v.ok) return res.status(v.status).json({ error: v.error });
+
+        // HEAD-check the image (if provided) before write — catches typos early.
+        // Tri-state: true = exists, false = confirmed 404, null = uncertain.
+        // We only block on confirmed 404; uncertain results pass through with a
+        // server log. This avoids blocking saves due to transient network issues.
+        if (v.data.background_image_filename) {
+            const exists = await checkVenueImageExists(v.data.background_image_filename);
+            if (exists === false) {
+                return res.status(400).json({
+                    error: `Image file '${v.data.background_image_filename}' not found at /assets/venues/. Upload it to Namecheap first, then save.`
+                });
+            }
+            if (exists === null) {
+                console.warn(`[venue create] image existence check inconclusive for ${v.data.background_image_filename} — allowing save`);
+            }
+        }
+
+        const cols = [
+            'name','address','region','postcode','pitch_location','pitch_name',
+            'facilities','notes','special_instructions','parking_pin','pitch_pin',
+            'boot_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
+            'pay_and_play_coach_hourly','pay_and_play_player_hourly',
+            'default_pitch_cost','default_max_players','default_format','default_position_type',
+            'background_image_filename'
+        ];
+        const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+        const values = cols.map(c => v.data[c]);
+        const result = await pool.query(
+            `INSERT INTO venues (${cols.join(', ')}) VALUES (${placeholders}) RETURNING id, name`,
+            values
+        ).catch(async (err) => {
+            // Pre-migration: some new cols missing. Strip them and retry once.
+            if (err.code === '42703') {
+                const baseCols = ['name','address','region','postcode','pitch_location','pitch_name',
+                                  'facilities','notes','special_instructions','parking_pin','pitch_pin',
+                                  'boot_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
+                                  'pay_and_play_coach_hourly','pay_and_play_player_hourly'];
+                const ph = baseCols.map((_, i) => `$${i + 1}`).join(', ');
+                const vals = baseCols.map(c => v.data[c]);
+                return await pool.query(
+                    `INSERT INTO venues (${baseCols.join(', ')}) VALUES (${ph}) RETURNING id, name`,
+                    vals
+                );
+            }
+            throw err;
+        });
+
+        const newVenue = result.rows[0];
+        setImmediate(() => auditLog(pool, req.user.playerId, 'venue_created', newVenue.id,
+            `Created venue "${newVenue.name}"`).catch(() => {}));
+
+        res.json({ ok: true, id: newVenue.id, name: newVenue.name });
+    } catch (error) {
+        console.error('Create venue error:', error);
+        res.status(500).json({ error: 'Failed to create venue', detail: error.message });
+    }
+});
+
+// PUT — update venue
+app.put('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
+
+        const exists = await pool.query('SELECT id FROM venues WHERE id = $1', [id]);
+        if (!exists.rows.length) return res.status(404).json({ error: 'Venue not found' });
+
+        const v = validateVenuePayload(req.body);
+        if (!v.ok) return res.status(v.status).json({ error: v.error });
+
+        // HEAD-check on image if provided. Same tri-state logic as POST —
+        // only block on confirmed 404, allow uncertain through.
+        if (v.data.background_image_filename) {
+            const fileOk = await checkVenueImageExists(v.data.background_image_filename);
+            if (fileOk === false) {
+                return res.status(400).json({
+                    error: `Image file '${v.data.background_image_filename}' not found at /assets/venues/. Upload it to Namecheap first, then save.`
+                });
+            }
+            if (fileOk === null) {
+                console.warn(`[venue update ${id}] image existence check inconclusive for ${v.data.background_image_filename} — allowing save`);
+            }
+        }
+
+        const cols = [
+            'name','address','region','postcode','pitch_location','pitch_name',
+            'facilities','notes','special_instructions','parking_pin','pitch_pin',
+            'boot_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
+            'pay_and_play_coach_hourly','pay_and_play_player_hourly',
+            'default_pitch_cost','default_max_players','default_format','default_position_type',
+            'background_image_filename'
+        ];
+        const setClause = cols.map((c, i) => `${c} = $${i + 1}`).join(', ');
+        const values = [...cols.map(c => v.data[c]), id];
+        await pool.query(
+            `UPDATE venues SET ${setClause} WHERE id = $${cols.length + 1}`,
+            values
+        ).catch(async (err) => {
+            if (err.code === '42703') {
+                // Pre-migration — drop new columns and retry
+                const baseCols = ['name','address','region','postcode','pitch_location','pitch_name',
+                                  'facilities','notes','special_instructions','parking_pin','pitch_pin',
+                                  'boot_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
+                                  'pay_and_play_coach_hourly','pay_and_play_player_hourly'];
+                const setClauseLite = baseCols.map((c, i) => `${c} = $${i + 1}`).join(', ');
+                const valsLite = [...baseCols.map(c => v.data[c]), id];
+                return await pool.query(
+                    `UPDATE venues SET ${setClauseLite} WHERE id = $${baseCols.length + 1}`,
+                    valsLite
+                );
+            }
+            throw err;
+        });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'venue_updated', id,
+            `Updated venue "${v.data.name}"`).catch(() => {}));
+
+        res.json({ ok: true, id });
+    } catch (error) {
+        console.error('Update venue error:', error);
+        res.status(500).json({ error: 'Failed to update venue', detail: error.message });
+    }
+});
+
+// DELETE — soft-delete (sets is_active=false). Hard-delete avoided to preserve
+// historical games' venue references.
+app.delete('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
+
+        const r = await pool.query('SELECT name FROM venues WHERE id = $1', [id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Venue not found' });
+
+        await pool.query('UPDATE venues SET is_active = FALSE WHERE id = $1', [id])
+            .catch(err => {
+                if (err.code === '42703') {
+                    // Pre-migration — column doesn't exist. We can't soft-delete cleanly.
+                    // Reject rather than risk a hard delete.
+                    throw Object.assign(new Error('is_active column missing — run p5-migration.sql first'), { code: 'MIGRATION_NEEDED' });
+                }
+                throw err;
+            });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'venue_archived', id,
+            `Archived venue "${r.rows[0].name}" (soft-delete)`).catch(() => {}));
+
+        res.json({ ok: true });
+    } catch (error) {
+        if (error.code === 'MIGRATION_NEEDED') {
+            return res.status(503).json({ error: error.message });
+        }
+        console.error('Delete venue error:', error);
+        res.status(500).json({ error: 'Failed to delete venue' });
+    }
+});
+
+// POST — restore archived venue
+app.post('/api/admin/venues/:id/restore', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
+        const r = await pool.query('SELECT name FROM venues WHERE id = $1', [id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Venue not found' });
+
+        await pool.query('UPDATE venues SET is_active = TRUE WHERE id = $1', [id])
+            .catch(err => {
+                if (err.code === '42703') throw Object.assign(new Error('is_active column missing — run p5-migration.sql first'), { code: 'MIGRATION_NEEDED' });
+                throw err;
+            });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'venue_restored', id,
+            `Restored venue "${r.rows[0].name}"`).catch(() => {}));
+        res.json({ ok: true });
+    } catch (error) {
+        if (error.code === 'MIGRATION_NEEDED') return res.status(503).json({ error: error.message });
+        console.error('Restore venue error:', error);
+        res.status(500).json({ error: 'Failed to restore venue' });
+    }
+});
+
 
 // ==========================================
 // GAMES API
@@ -4177,6 +5000,9 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1) as registration_status,
                    (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $1) as my_backup_type,
+                   -- P2.3: amount paid by current user (drives drop-out "you'll lose £X" dialog)
+                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $1), 0) as my_amount_paid,
+                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $1), 0) as my_amount_paid_free,
                    motm_p.alias as motm_winner_alias, motm_p.full_name as motm_winner_name,
                    opp_list.logo_url AS opponent_logo_url, opp_list.star_rating AS opponent_star_rating
             FROM games g
@@ -4409,7 +5235,10 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2) as registration_status,
-                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2) as my_backup_type
+                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2) as my_backup_type,
+                   -- P2.3: amount paid by current user (drives drop-out penalty dialog in game.html)
+                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $2), 0) as my_amount_paid,
+                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $2), 0) as my_amount_paid_free
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
@@ -4723,10 +5552,35 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             isVenueClash, venueClashTeam1Name, venueClashTeam2Name,
             maxReferees, refereeFee, requiresOrganiser,
             earlyBirdPrice, superEarlyBirdPrice,
-            opponentId
+            opponentId,
+            pitchCost,   // P2.1
+            defaultOrganiserId   // P3 — auto-add this player as comped organiser on each created game
         } = req.body;
         const parsedEarlyBird      = earlyBirdPrice      != null && earlyBirdPrice      !== '' ? parseFloat(earlyBirdPrice)      : null;
         const parsedSuperEarlyBird = superEarlyBirdPrice != null && superEarlyBirdPrice !== '' ? parseFloat(superEarlyBirdPrice) : null;
+        // P2.1: pitch_cost validation. Optional in this server release — frontend
+        // will start sending it in P2b-frontend turn. Once all forms are updated,
+        // change the check below back to REQUIRED (uncomment the rejection line).
+        const parsedPitchCost = (pitchCost === null || pitchCost === undefined || pitchCost === '')
+            ? null
+            : parseFloat(pitchCost);
+        if (parsedPitchCost !== null && (isNaN(parsedPitchCost) || parsedPitchCost < 0)) {
+            return res.status(400).json({ error: 'Pitch cost must be a number ≥ 0' });
+        }
+        // P3 — validate defaultOrganiserId: must be valid UUID + flagged is_organiser
+        const parsedOrganiserId = (defaultOrganiserId === null || defaultOrganiserId === undefined || defaultOrganiserId === '')
+            ? null
+            : String(defaultOrganiserId).trim();
+        if (parsedOrganiserId && !isValidUuid(parsedOrganiserId)) {
+            return res.status(400).json({ error: 'Default organiser id must be a valid player UUID' });
+        }
+        if (parsedOrganiserId) {
+            const orgCheck = await pool.query('SELECT is_organiser FROM players WHERE id = $1', [parsedOrganiserId]);
+            if (!orgCheck.rows.length) return res.status(404).json({ error: 'Default organiser not found' });
+            if (!orgCheck.rows[0].is_organiser) return res.status(400).json({ error: 'Selected player is not flagged as an organiser' });
+        }
+        // TODO P2b-finalise: uncomment to enforce required pitch_cost once frontend ships:
+        // if (parsedPitchCost === null) return res.status(400).json({ error: 'Pitch cost is required' });
         // DYNSTAR: normalise star rating so explicit 0★ isn't stripped to null by `|| null`.
         // Admin sends starRating as a number (0, 1, 2, 3, 4, 5) or null/undefined when unset.
         const starRatingForDb = (starRating === null || starRating === undefined || starRating === '')
@@ -4755,8 +5609,19 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         if (!['weekly', 'one-off'].includes(regularity)) return res.status(400).json({ error: 'Regularity must be weekly or one-off' });
 
         // FIX-084: Validate venue exists before creating games (prevents FK violation 500 error)
-        const venueCheck = await pool.query('SELECT id FROM venues WHERE id = $1', [venueId]);
+        // P5: also reject archived venues. Frontend dropdown filters them out, but
+        // we defend server-side too. is_active may be missing pre-migration → COALESCE.
+        const venueCheck = await pool.query(
+            'SELECT id, COALESCE(is_active, TRUE) AS is_active FROM venues WHERE id = $1',
+            [venueId]
+        ).catch(async (err) => {
+            if (err.code === '42703') {
+                return await pool.query('SELECT id, TRUE AS is_active FROM venues WHERE id = $1', [venueId]);
+            }
+            throw err;
+        });
         if (venueCheck.rows.length === 0) return res.status(400).json({ error: 'Invalid venue' });
+        if (!venueCheck.rows[0].is_active) return res.status(400).json({ error: 'Cannot create games on an archived venue. Restore it first if needed.' });
         
         // CLM admins can only create CLM-exclusive games
         const isCLMAdminOnly = req.user.role !== 'admin' && req.user.role !== 'superadmin';
@@ -4823,8 +5688,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             tournament_team_count, tournament_name, star_rating, star_rating_locked,
                             is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                             refs_required, ref_pay, requires_organiser,
-                            early_bird_price, super_early_bird_price, opponent_id
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                            early_bird_price, super_early_bird_price, opponent_id,
+                            pitch_cost,
+                            default_organiser_id
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -4833,7 +5700,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                             selType === 'tournament' ? (tournamentName || null) : null,
                             starRatingForDb,
-                            [0, 4, 5].includes(starRatingForDb), // DYNSTAR: lock if 0★ (admin says "bad game"), 4★, or 5★
+                            [4, 5].includes(starRatingForDb), // DYNSTAR: lock only on 4★ / 5★ (admin's explicit "good game" calls). 0★ stays dynamic so it can recover to 0.5★ as avg OVR rises.
                             vcEnabled || false,
                             vcEnabled ? venueClashTeam1Name.trim() : null,
                             vcEnabled ? venueClashTeam2Name.trim() : null,
@@ -4842,9 +5709,49 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             requiresOrganiser === true || requiresOrganiser === 'true' || false,
                             parsedEarlyBird,
                             parsedSuperEarlyBird,
-                            resolvedOpponentId
+                            resolvedOpponentId,
+                            parsedPitchCost,   // P2.1
+                            parsedOrganiserId  // P3
                         ]
-                    );
+                    ).catch(async (err) => {
+                        // P3 — Pre-migration safety: default_organiser_id column missing? Re-run without it.
+                        // (pitch_cost is assumed present since P2 migration shipped first)
+                        if (err.code === '42703') {
+                            return await wClient.query(
+                                `INSERT INTO games (
+                                    venue_id, game_date, max_players, cost_per_player, format, regularity, 
+                                    exclusivity, position_type, game_url, series_id, 
+                                    team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
+                                    tournament_team_count, tournament_name, star_rating, star_rating_locked,
+                                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
+                                    refs_required, ref_pay, requires_organiser,
+                                    early_bird_price, super_early_bird_price, opponent_id,
+                                    pitch_cost
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+                                RETURNING id`,
+                                [
+                                    venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly',
+                                    gameExclusivity, positionType || 'outfield_gk', gameUrl,
+                                    seriesUuid, selType, resolvedOpponentName, tfKitColor || null, oppKitColor || null,
+                                    selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
+                                    selType === 'tournament' ? (tournamentName || null) : null,
+                                    starRatingForDb,
+                                    [4, 5].includes(starRatingForDb),
+                                    vcEnabled || false,
+                                    vcEnabled ? venueClashTeam1Name.trim() : null,
+                                    vcEnabled ? venueClashTeam2Name.trim() : null,
+                                    parseInt(maxReferees) || 0,
+                                    parseFloat(refereeFee) || 0.00,
+                                    requiresOrganiser === true || requiresOrganiser === 'true' || false,
+                                    parsedEarlyBird,
+                                    parsedSuperEarlyBird,
+                                    resolvedOpponentId,
+                                    parsedPitchCost
+                                ]
+                            );
+                        }
+                        throw err;
+                    });
                     
                     createdGames.push({ id: result.rows[0].id, gameUrl, date: weekDate, seriesId: fullSeriesId });
                 }
@@ -4859,6 +5766,15 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     gameAuditLog(pool, g.id, req.user.playerId, 'game_created',
                         `format:${format} type:${selType} cost:£${costPerPlayer} max:${maxPlayers} series:${seriesIdValue}`)
                 ));
+                // P3 — auto-add the default organiser to every created game in the series.
+                // Done in setImmediate so it doesn't block the response. Each call is
+                // idempotent + non-throwing, so a failure on one game won't affect others.
+                if (parsedOrganiserId) {
+                    setImmediate(() => createdGames.forEach(g =>
+                        autoAddDefaultOrganiser(pool, g.id, parsedOrganiserId, req.user.playerId)
+                            .catch(err => console.error('[autoAddOrganiser weekly]', err.message))
+                    ));
+                }
             } catch (e) {
                 await wClient.query('ROLLBACK').catch(() => {});
                 throw e;
@@ -4891,8 +5807,10 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     tournament_team_count, tournament_name, star_rating, star_rating_locked,
                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                     refs_required, ref_pay, requires_organiser,
-                    early_bird_price, super_early_bird_price, opponent_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                    early_bird_price, super_early_bird_price, opponent_id,
+                    pitch_cost,
+                    default_organiser_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -4901,7 +5819,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
                     selType === 'tournament' ? (tournamentName || null) : null,
                     starRatingForDb,
-                    [0, 4, 5].includes(starRatingForDb), // DYNSTAR: lock if 0★ (admin says "bad game"), 4★, or 5★
+                    [4, 5].includes(starRatingForDb), // DYNSTAR: lock only on 4★ / 5★ (admin's explicit "good game" calls). 0★ stays dynamic so it can recover to 0.5★ as avg OVR rises.
                     vcEnabled || false,
                     vcEnabled ? venueClashTeam1Name.trim() : null,
                     vcEnabled ? venueClashTeam2Name.trim() : null,
@@ -4910,10 +5828,52 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     requiresOrganiser === true || requiresOrganiser === 'true' || false,
                     parsedEarlyBird,
                     parsedSuperEarlyBird,
-                    resolvedOpponentId
+                    resolvedOpponentId,
+                    parsedPitchCost,   // P2.1
+                    parsedOrganiserId  // P3
                 ]
-            );
-            
+            ).catch(async (err) => {
+                // Pre-migration safety: default_organiser_id column missing? Re-run without it.
+                if (err.code === '42703') {
+                    return await pool.query(
+                        `INSERT INTO games (
+                            venue_id, game_date, max_players, cost_per_player, format, regularity, 
+                            exclusivity, position_type, game_url, series_id,
+                            team_selection_type, external_opponent, tf_kit_color, opp_kit_color,
+                            tournament_team_count, tournament_name, star_rating, star_rating_locked,
+                            is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
+                            refs_required, ref_pay, requires_organiser,
+                            early_bird_price, super_early_bird_price, opponent_id,
+                            pitch_cost
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+                        RETURNING id`,
+                        [
+                            venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
+                            gameExclusivity, positionType || 'outfield_gk', gameUrl,
+                            seriesUuid, selType, resolvedOpponentName, tfKitColor || null, oppKitColor || null,
+                            selType === 'tournament' ? parseInt(tournamentTeamCount) : null,
+                            selType === 'tournament' ? (tournamentName || null) : null,
+                            starRatingForDb,
+                            [4, 5].includes(starRatingForDb),
+                            vcEnabled || false,
+                            vcEnabled ? venueClashTeam1Name.trim() : null,
+                            vcEnabled ? venueClashTeam2Name.trim() : null,
+                            parseInt(maxReferees) || 0,
+                            parseFloat(refereeFee) || 0.00,
+                            requiresOrganiser === true || requiresOrganiser === 'true' || false,
+                            parsedEarlyBird,
+                            parsedSuperEarlyBird,
+                            resolvedOpponentId,
+                            parsedPitchCost
+                        ]
+                    );
+                }
+                throw err;
+            });
+
+            // P3 — auto-add the default organiser as a comped registration
+            await autoAddDefaultOrganiser(pool, result.rows[0].id, parsedOrganiserId, req.user.playerId);
+
             res.json({ id: result.rows[0].id, gameUrl });
             setImmediate(() => gameAuditLog(pool, result.rows[0].id, req.user.playerId, 'game_created',
                 `format:${format} type:${selType} cost:£${costPerPlayer} max:${maxPlayers}`));
@@ -5073,7 +6033,9 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
                 game_template.tf_kit_color || null,
                 game_template.opp_kit_color || null,
                 (game_template.star_rating === null || game_template.star_rating === undefined ? null : game_template.star_rating),
-                !!game_template.star_rating_locked,
+                // DYNSTAR: derive lock from the star value (same rule as create flow) instead
+                // of copying the template's flag — avoids propagating stale/incorrect locks.
+                [4, 5].includes(Number(game_template.star_rating)),
                 parseInt(game_template.refs_required) || 0,
                 parseFloat(game_template.ref_pay) || 0,
                 !!game_template.requires_organiser,
@@ -6149,7 +7111,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
                parseInt(parent.shooting_rating || 0));
 
         // Insert guest record with full derived stat set
-        await client.query(
+        const _guestInsertRes = await client.query(
             `INSERT INTO game_guests (
                 game_id, invited_by, guest_name, overall_rating, amount_paid, amount_paid_free, guest_number,
                 tournament_team_preference,
@@ -6157,7 +7119,8 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
                 defending_rating, strength_rating, fitness_rating,
                 pace_rating, shooting_rating, assisting_rating, decisions_rating,
                 goalkeeper_rating, is_admin_override, derived_from_parent_ovr
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+             RETURNING id`,
             [gameId, playerId, guestName.trim(), derived.overall_rating,
              _guestRealCharged, _guestFreeCharged, nextGuestNumber,
              tournamentTeamPreference || null,
@@ -6166,6 +7129,38 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
              derived.pace_rating, derived.shooting_rating, derived.assisting_rating, derived.decisions_rating,
              derived.goalkeeper_rating, false, parentOverall]
         );
+        const _newGuestId = _guestInsertRes.rows[0]?.id;
+
+        // ── A2: generate guest invite token for this guest record ──────────
+        // Each game_guests row gets a unique link the host can send to the
+        // named person, encouraging them to claim a TF account inheriting
+        // these stats. Cashback (£2 free credit) fires on game completion if
+        // the link was claimed by a NEW account and guest didn't drop out.
+        // For admin-invites (host didn't pay), token still issued but
+        // cashback_status pre-set to 'admin_invite' (never pays out).
+        //
+        // Wrapped in SAVEPOINT so a failure (e.g. pre-migration: table missing)
+        // doesn't abort the parent transaction and break add-guest entirely.
+        let _a2InviteUrl = null;
+        try {
+            await client.query('SAVEPOINT a2_token');
+            const _a2Token = crypto.randomBytes(16).toString('hex');
+            await client.query(
+                `INSERT INTO guest_invite_tokens
+                 (token, game_guest_id, host_player_id, game_id, guest_name, cashback_status)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [_a2Token, _newGuestId, playerId, gameId, guestName.trim(),
+                 _isAdminInvite ? 'admin_invite' : null]
+            );
+            await client.query('RELEASE SAVEPOINT a2_token');
+            _a2InviteUrl = `https://totalfooty.co.uk/?guest_invite=${_a2Token}`;
+        } catch (e) {
+            // Roll back JUST the A2 token insert. Parent transaction continues.
+            try { await client.query('ROLLBACK TO SAVEPOINT a2_token'); } catch (_) {}
+            try { await client.query('RELEASE SAVEPOINT a2_token'); } catch (_) {}
+            console.warn('[A2 token] generate failed (non-fatal, parent tx preserved):', e.message);
+        }
+
 
         // Get player's referral code — generate one on the fly if missing (legacy accounts)
         const refResult = await client.query(
@@ -6194,7 +7189,12 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             totalGuests: nextGuestNumber,
             amountCharged: cost,
             referralLink: referralCode ? `https://totalfooty.co.uk/?ref=${referralCode}` : null,
-            referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!'
+            referralPrompt: 'Refer a friend for future rewards as they join and play with Total Footy! Here is your personalised link - send it to them now!',
+            // A2: per-guest invite link. NULL if token generation failed (pre-migration safety).
+            guestInviteUrl: _a2InviteUrl,
+            guestInvitePrompt: _a2InviteUrl
+                ? `Send this to ${guestName.trim()} so they can claim their TotalFooty account — you'll earn £2 free credit when the game completes if they sign up and play!`
+                : null
         });
         setImmediate(async () => {
             const _hostRow = await pool.query('SELECT full_name, alias FROM players WHERE id = $1', [req.user.playerId]).catch(() => ({ rows: [] }));
@@ -6227,6 +7227,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
     }
 });
 
+
 // ── Batch 8 — GET /api/games/:id/my-guests ───────────────────────────
 // Returns the authenticated player's own guest rows for a given game.
 // Used by game.html's add-guest modal to render a "your guests" remove list.
@@ -6246,6 +7247,296 @@ app.get('/api/games/:id/my-guests', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Get my guests error:', error);
         res.status(500).json({ error: 'Failed to get your guests' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// A2 — Guest invite token endpoints
+//
+// Token is auto-created when host adds a guest. Two endpoints:
+//   GET  /api/guest-invite/:token        — landing page metadata (public)
+//   POST /api/guest-invite/:token/claim  — friend claims (authenticated)
+//
+// Cashback to host is paid out separately by the game-completion hook;
+// these endpoints just mark state.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const A2_CASHBACK_AMOUNT = 2.00;
+
+// A2-A61: Pay £2 cashback to hosts whose guest invite tokens were claimed by NEW users.
+// Reusable helper called from BOTH /complete (standard) AND /finalise-tournament endpoints.
+// Runs in setImmediate-style async loop with per-token transactions for isolation.
+// Idempotent: only acts on tokens with cashback_status = 'new_user_pending'.
+async function _a2PayPendingCashbacks(gameId) {
+    try {
+        const pending = await pool.query(
+            `SELECT t.token, t.host_player_id, t.guest_name
+               FROM guest_invite_tokens t
+              WHERE t.game_id = $1
+                AND t.cashback_status = 'new_user_pending'
+              LIMIT 100`,
+            [gameId]
+        );
+        for (const tok of pending.rows) {
+            const cbClient = await pool.connect();
+            try {
+                await cbClient.query('BEGIN');
+                const lockRes = await cbClient.query(
+                    `SELECT cashback_status FROM guest_invite_tokens WHERE token = $1 FOR UPDATE`,
+                    [tok.token]
+                );
+                if (lockRes.rows[0]?.cashback_status !== 'new_user_pending') {
+                    await cbClient.query('ROLLBACK');
+                    continue;
+                }
+                await cbClient.query(
+                    `INSERT INTO credits (player_id, balance, free_credit_balance, last_updated)
+                     VALUES ($2, 0, $1, NOW())
+                     ON CONFLICT (player_id) DO UPDATE
+                        SET free_credit_balance = COALESCE(credits.free_credit_balance, 0) + $1,
+                            last_updated = NOW()`,
+                    [A2_CASHBACK_AMOUNT, tok.host_player_id]
+                );
+                await recordCreditTransaction(cbClient, tok.host_player_id, A2_CASHBACK_AMOUNT, 'free_credit',
+                    `Guest invite cashback — ${tok.guest_name} signed up & played`);
+                await cbClient.query(
+                    `UPDATE guest_invite_tokens
+                        SET cashback_paid_at = NOW(),
+                            cashback_amount = $1,
+                            cashback_status = 'paid'
+                      WHERE token = $2`,
+                    [A2_CASHBACK_AMOUNT, tok.token]
+                );
+                await cbClient.query('COMMIT');
+                console.log(`✅ A2: Paid £${A2_CASHBACK_AMOUNT} cashback to host ${tok.host_player_id} (guest: ${tok.guest_name}, game: ${gameId})`);
+            } catch (e) {
+                await cbClient.query('ROLLBACK').catch(() => {});
+                console.error(`✗ A2: Cashback failed for token ${tok.token.substring(0,8)}... game ${gameId}:`, e.message);
+            } finally {
+                cbClient.release();
+            }
+        }
+    } catch (e) {
+        // Pre-migration: table missing → 42P01. Caught here, game completion unaffected.
+        console.error('A2 cashback batch error (non-fatal):', e.message);
+    }
+}
+
+// Landing endpoint — anyone can call (rate-limited).
+// Returns: host name, guest name, game info, claim status.
+// Does NOT trigger any state change.
+app.get('/api/guest-invite/:token', publicEndpointLimiter, async (req, res) => {
+    try {
+        const { token } = req.params;
+        if (!token || !/^[a-f0-9]{32}$/.test(token)) {
+            return res.status(400).json({ valid: false, error: 'Invalid token format' });
+        }
+
+        const r = await pool.query(`
+            SELECT
+                t.token,
+                t.guest_name,
+                t.claimed_by_player_id,
+                t.claimed_at,
+                p.alias        AS host_alias,
+                p.full_name    AS host_full_name,
+                g.id           AS game_id,
+                g.game_date,
+                g.game_status,
+                v.name         AS venue_name
+            FROM guest_invite_tokens t
+            JOIN players p ON p.id = t.host_player_id
+            JOIN games   g ON g.id = t.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE t.token = $1
+        `, [token]);
+
+        if (r.rows.length === 0) {
+            return res.status(404).json({ valid: false, error: 'Invite not found' });
+        }
+        const row = r.rows[0];
+
+        return res.json({
+            valid: !row.claimed_by_player_id,
+            already_claimed: !!row.claimed_by_player_id,
+            host: {
+                alias: row.host_alias || row.host_full_name,
+                full_name: row.host_full_name
+            },
+            guest_name: row.guest_name,
+            game: {
+                id:          row.game_id,
+                game_date:   row.game_date,
+                game_status: row.game_status,
+                venue_name:  row.venue_name
+            }
+        });
+    } catch (e) {
+        console.error('guest-invite/get:', e);
+        return res.status(500).json({ valid: false, error: 'Failed to load invite' });
+    }
+});
+
+// Claim endpoint — friend (authenticated) claims their guest record.
+// Two paths:
+//   1. Friend just signed up (brand new account): mark claim, set
+//      claim_was_new_user=TRUE, set cashback_status='new_user_pending'.
+//      Cashback fires on game completion.
+//   2. Friend was already a TF member: mark claim, set
+//      claim_was_new_user=FALSE, set cashback_status='existing_user'.
+//      Game result/awards still flow into their stats normally; OVR unchanged.
+//
+// Stat inheritance for NEW users happens at signup time, not here. The
+// signup endpoint reads guest_invite token from the URL param and copies
+// stats over before this claim endpoint is hit.
+app.post('/api/guest-invite/:token/claim', authenticateToken, async (req, res) => {
+    const { token } = req.params;
+    const friendId = req.user.playerId;
+    if (!token || !/^[a-f0-9]{32}$/.test(token)) {
+        return res.status(400).json({ error: 'Invalid token format' });
+    }
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Lock token row
+        const tRes = await client.query(
+            `SELECT * FROM guest_invite_tokens WHERE token = $1 FOR UPDATE`,
+            [token]
+        );
+        if (tRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Invite not found' });
+        }
+        const t = tRes.rows[0];
+        if (t.claimed_by_player_id) {
+            // A2-A85: if THIS user already claimed it (e.g. via signup auto-claim),
+            // return success with game info so the confirmation modal still shows.
+            // Other users → 400 (truly already claimed by someone else).
+            if (t.claimed_by_player_id === friendId) {
+                await client.query('ROLLBACK');
+                // Fetch game info for the same response shape as a fresh claim
+                const gRes = await pool.query(
+                    `SELECT g.game_date, g.game_status, v.name AS venue_name,
+                            p.alias AS host_alias, p.full_name AS host_full_name
+                       FROM games g
+                       LEFT JOIN venues v ON v.id = g.venue_id
+                       JOIN players p ON p.id = $1
+                      WHERE g.id = $2`,
+                    [t.host_player_id, t.game_id]
+                );
+                const g = gRes.rows[0] || {};
+                const hostName = g.host_alias || g.host_full_name || 'host';
+                return res.json({
+                    success: true,
+                    already_claimed_by_self: true,
+                    game_id: t.game_id,
+                    game_date: g.game_date,
+                    game_status: g.game_status,
+                    venue_name: g.venue_name,
+                    host_alias: hostName,
+                    is_new_user: t.claim_was_new_user,
+                    cashback_status: t.cashback_status,
+                    message: `Already linked to ${hostName}.`
+                });
+            }
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This invite has already been claimed' });
+        }
+        if (friendId === t.host_player_id) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "You can't claim your own invite" });
+        }
+
+        // Determine if friend was a brand new account (signed_up_via_guest_invite=TRUE)
+        // or an existing user. The signup endpoint sets the flag on new accounts only.
+        // A2-A56: SAVEPOINT around column read so pre-migration `42703` doesn't poison
+        // the parent transaction. If column missing → treat friend as existing user
+        // (so cashback won't fire — safe default).
+        let isNewUser = false;
+        try {
+            await client.query('SAVEPOINT a2_col_check');
+            const fpRes = await client.query(
+                `SELECT signed_up_via_guest_invite FROM players WHERE id = $1`,
+                [friendId]
+            );
+            isNewUser = !!fpRes.rows[0]?.signed_up_via_guest_invite;
+            await client.query('RELEASE SAVEPOINT a2_col_check');
+        } catch (e) {
+            try { await client.query('ROLLBACK TO SAVEPOINT a2_col_check'); } catch (_) {}
+            try { await client.query('RELEASE SAVEPOINT a2_col_check'); } catch (_) {}
+            if (e.code === '42703') {
+                console.warn('[A2 claim] signed_up_via_guest_invite column missing — treating as existing user (safe default).');
+                isNewUser = false;
+            } else {
+                throw e;  // unexpected error → bubble up
+            }
+        }
+
+        // Determine cashback status:
+        //   - If admin invite: stays 'admin_invite' (host didn't pay, no cashback)
+        //   - If new user:     'new_user_pending' (cashback fires on game completion)
+        //   - If existing:     'existing_user' (no cashback ever)
+        let newCashbackStatus;
+        if (t.cashback_status === 'admin_invite') {
+            newCashbackStatus = 'admin_invite';
+        } else if (isNewUser) {
+            newCashbackStatus = 'new_user_pending';
+        } else {
+            newCashbackStatus = 'existing_user';
+        }
+
+        await client.query(
+            `UPDATE guest_invite_tokens
+                SET claimed_by_player_id = $1,
+                    claimed_at = NOW(),
+                    claim_was_new_user = $2,
+                    cashback_status = $3
+              WHERE token = $4`,
+            [friendId, isNewUser, newCashbackStatus, token]
+        );
+
+        await client.query('COMMIT');
+
+        // A2-A34: audit log fires AFTER commit on a separate connection (pool, not client).
+        // Inside-transaction logging risks aborting the whole claim if the audit insert
+        // fails — and the token update is the source of truth, audit is bookkeeping.
+        setImmediate(() => {
+            gameAuditLog(pool, t.game_id, null, 'guest_invite_claimed',
+                `Token: ${token.substring(0, 8)}... | Guest: ${t.guest_name} | Claimed by: ${friendId} | New user: ${isNewUser} | Cashback: ${newCashbackStatus}`)
+                .catch(() => { /* non-critical */ });
+        });
+
+        // Fetch game info for the confirmation message
+        const gRes = await pool.query(
+            `SELECT g.game_date, g.game_status, v.name AS venue_name,
+                    p.alias AS host_alias, p.full_name AS host_full_name
+               FROM games g
+               LEFT JOIN venues v ON v.id = g.venue_id
+               JOIN players p ON p.id = $1
+              WHERE g.id = $2`,
+            [t.host_player_id, t.game_id]
+        );
+        const g = gRes.rows[0] || {};
+        const hostName = g.host_alias || g.host_full_name || 'host';
+
+        return res.json({
+            success: true,
+            game_id: t.game_id,
+            game_date: g.game_date,
+            game_status: g.game_status,
+            venue_name: g.venue_name,
+            host_alias: hostName,
+            is_new_user: isNewUser,
+            cashback_status: newCashbackStatus,
+            message: `You've been signed up by ${hostName}.`
+        });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('guest-invite/claim:', e);
+        return res.status(500).json({ error: 'Failed to claim invite' });
+    } finally {
+        client.release();
     }
 });
 
@@ -6726,6 +8017,9 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
         // Audit
         setImmediate(() => gameAuditLog(pool, gameId, playerId, 'spot_claimed',
             `Player claimed open spot via race mechanic`).catch(() => {}));
+
+        // DYNSTAR: waitlist → confirmed promotion changes avg OVR — trigger review
+        reviewDynamicStarRating(pool, gameId).catch(() => {});
 
         res.json({ success: true, message: `Spot claimed! You're in.` });
     } catch (e) {
@@ -7644,55 +8938,113 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         const wasComped = !!droppingReg.is_comped;
         // If someone else paid for this registration, refund them — not the dropping player
         const refundTargetId = droppingReg.registered_by_player_id || req.user.playerId;
-        
-        // Refund if they paid (confirmed players or confirmed backups) — skip if comped (£0 was taken)
+
+        // ─── P2.3 — Penalty-window detection ───────────────────────────────
+        // Two conditions trigger no-refund retention:
+        //   1. Less than 2 hours to kickoff
+        //   2. Teams already generated (and not draft_memory which allows late changes)
+        // Either one keeps the money. Stacks with existing late-drop discipline points.
+        // Admins-on-behalf-of bypass the penalty (they're typically processing legitimate drops).
+        const _seriesType = gameCheck.rows[0].team_selection_type;
+        const _teamsLockedForDrop = teamsWereGenerated && _seriesType !== 'draft_memory';
+        const _inPenaltyWindow = (_isLateWindow || _teamsLockedForDrop) && wasConfirmed && !wasComped && !isAdminDroppingOut;
+        const _penaltyReason = _teamsLockedForDrop
+            ? 'late_drop_teams_generated'
+            : 'late_drop_2hr_window';
+
+        // Refund if they paid (confirmed players or confirmed backups) — skip if comped (£0 was taken).
+        // P2.3: also skip if in penalty window — money is retained as revenue.
         let totalRefunded = 0;
+        let _keptReal = 0;
+        let _keptFree = 0;
         if (!wasComped && (wasConfirmed || wasConfirmedBackup)) {
             // Use stored amount_paid + amount_paid_free directly — exact refund regardless of
             // current EB tier. Legacy rows with NULL amount_paid_free default to 0 which means
             // refund is capped at amount_paid (safe — never over-refunds).
             const paidAmt = parseFloat(droppingReg.amount_paid ?? 0);
             const freeAmt = parseFloat(droppingReg.amount_paid_free ?? 0);
-            totalRefunded = paidAmt + freeAmt;
-            const refundDesc = refundTargetId !== req.user.playerId
-                ? `Dropout refund for ${req.user.playerId} (paid by you)`
-                : 'Dropped out of game - refund';
-            if (paidAmt > 0) {
-                await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [paidAmt, refundTargetId]);
-                await recordCreditTransaction(client, refundTargetId, paidAmt, 'refund', refundDesc);
-            }
-            if (freeAmt > 0) {
-                await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [freeAmt, refundTargetId]);
-                await recordCreditTransaction(client, refundTargetId, freeAmt, 'free_credit', `Free credit restored — dropped out of game ${droppingReg.id}`);
+
+            if (_inPenaltyWindow) {
+                // P2.3: NO refund. Record the kept amount for finance reporting.
+                _keptReal = paidAmt;
+                _keptFree = freeAmt;
+                if (paidAmt > 0 || freeAmt > 0) {
+                    await client.query(
+                        `INSERT INTO dropped_no_refund (game_id, player_id, amount_paid_real, amount_paid_free, reason, recorded_by)
+                         VALUES ($1, $2, $3, $4, $5, NULL)`,
+                        [gameId, droppingReg.player_id, paidAmt, freeAmt, _penaltyReason]
+                    ).catch(err => {
+                        // Schema not migrated yet — degrade gracefully (still no refund, just no audit row)
+                        if (err.code !== '42P01') throw err;
+                        console.warn('dropped_no_refund table missing — skip audit row');
+                    });
+                }
+                // Skip credit_transactions entirely — no money moves.
+            } else {
+                totalRefunded = paidAmt + freeAmt;
+                const refundDesc = refundTargetId !== req.user.playerId
+                    ? `Dropout refund for ${req.user.playerId} (paid by you)`
+                    : 'Dropped out of game - refund';
+                if (paidAmt > 0) {
+                    await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [paidAmt, refundTargetId]);
+                    await recordCreditTransaction(client, refundTargetId, paidAmt, 'refund', refundDesc);
+                }
+                if (freeAmt > 0) {
+                    await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [freeAmt, refundTargetId]);
+                    await recordCreditTransaction(client, refundTargetId, freeAmt, 'free_credit', `Free credit restored — dropped out of game ${droppingReg.id}`);
+                }
             }
         }
         
         // Remove ALL guests if this player had any, and refund guest fees
         const guestCheck = await client.query(
-            'DELETE FROM game_guests WHERE game_id = $1 AND invited_by = $2 RETURNING guest_name, amount_paid, amount_paid_free',
+            'DELETE FROM game_guests WHERE game_id = $1 AND invited_by = $2 RETURNING guest_name, amount_paid, amount_paid_free, invited_by',
             [gameId, req.user.playerId]
         );
         let guestRefunded = null;
+        let _guestKeptReal = 0;
+        let _guestKeptFree = 0;
         if (guestCheck.rows.length > 0) {
             // Split aggregate refund into real + free buckets.
             const totalGuestRefund     = guestCheck.rows.reduce((sum, g) => sum + parseFloat(g.amount_paid || 0), 0);
             const totalGuestFreeRefund = guestCheck.rows.reduce((sum, g) => sum + parseFloat(g.amount_paid_free || 0), 0);
             const guestNames = guestCheck.rows.map(g => g.guest_name).join(', ');
-            if (totalGuestRefund > 0) {
-                await client.query(
-                    'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
-                    [totalGuestRefund, req.user.playerId]
-                );
-                await recordCreditTransaction(client, req.user.playerId, totalGuestRefund, 'refund', `${guestCheck.rows.length} guest(s) removed - dropout refund`);
+
+            // P2.3: same penalty rule applies to guests of a player dropping in penalty window.
+            // Each guest with non-zero payment becomes a dropped_no_refund row.
+            if (_inPenaltyWindow && (totalGuestRefund > 0 || totalGuestFreeRefund > 0)) {
+                _guestKeptReal = totalGuestRefund;
+                _guestKeptFree = totalGuestFreeRefund;
+                for (const g of guestCheck.rows) {
+                    const gReal = parseFloat(g.amount_paid || 0);
+                    const gFree = parseFloat(g.amount_paid_free || 0);
+                    if (gReal === 0 && gFree === 0) continue; // skip admin-invite guests — nothing to keep
+                    await client.query(
+                        `INSERT INTO dropped_no_refund (game_id, player_id, amount_paid_real, amount_paid_free, reason, recorded_by)
+                         VALUES ($1, $2, $3, $4, 'guest_of_dropped_player', NULL)`,
+                        [gameId, req.user.playerId, gReal, gFree]
+                    ).catch(err => {
+                        if (err.code !== '42P01') throw err;
+                    });
+                }
+                guestRefunded = { names: guestNames, count: guestCheck.rows.length, amount: 0, kept: totalGuestRefund + totalGuestFreeRefund };
+            } else {
+                if (totalGuestRefund > 0) {
+                    await client.query(
+                        'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
+                        [totalGuestRefund, req.user.playerId]
+                    );
+                    await recordCreditTransaction(client, req.user.playerId, totalGuestRefund, 'refund', `${guestCheck.rows.length} guest(s) removed - dropout refund`);
+                }
+                if (totalGuestFreeRefund > 0) {
+                    await client.query(
+                        'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
+                        [totalGuestFreeRefund, req.user.playerId]
+                    );
+                    await recordCreditTransaction(client, req.user.playerId, totalGuestFreeRefund, 'free_credit', `${guestCheck.rows.length} guest(s) removed - dropout free credit restored`);
+                }
+                guestRefunded = { names: guestNames, count: guestCheck.rows.length, amount: totalGuestRefund };
             }
-            if (totalGuestFreeRefund > 0) {
-                await client.query(
-                    'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                    [totalGuestFreeRefund, req.user.playerId]
-                );
-                await recordCreditTransaction(client, req.user.playerId, totalGuestFreeRefund, 'free_credit', `${guestCheck.rows.length} guest(s) removed - dropout free credit restored`);
-            }
-            guestRefunded = { names: guestNames, count: guestCheck.rows.length, amount: totalGuestRefund };
         }
         
         // Late-dropout discipline: apply BEFORE deleting the registration so we can
@@ -7939,6 +9291,10 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         if (wasConfirmed || wasConfirmedBackup) {
             if (wasComped) {
                 message = 'Successfully dropped out.';
+            } else if (_inPenaltyWindow) {
+                // P2.3: explicit penalty messaging when no refund issued.
+                const _kept = (_keptReal + _keptFree + _guestKeptReal + _guestKeptFree).toFixed(2);
+                message = `Dropped out. £${_kept} retained — late drop / teams generated.`;
             } else if (refundTargetId !== req.user.playerId) {
                 message = `Successfully dropped out. £${totalRefunded.toFixed(2)} refunded to the player who signed you up.`;
             } else {
@@ -7967,9 +9323,70 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             message,
             lateDropout: !!_appliedLateDropout,
             disciplinePoints: _appliedLateDropout ? _appliedLateDropout.points : 0,
+            // P2.3: surface penalty info to clients so the dropout flow can show "you lost £X" message
+            inPenaltyWindow: _inPenaltyWindow,
+            penaltyReason: _inPenaltyWindow ? _penaltyReason : null,
+            amountKept: _inPenaltyWindow ? Number((_keptReal + _keptFree + _guestKeptReal + _guestKeptFree).toFixed(2)) : 0,
             promotedPlayer: promotedPlayer ? { name: promotedPlayer.alias || promotedPlayer.full_name } : null,
             promotedOrganiser: promotedOrganiser ? { name: promotedOrganiser.alias || promotedOrganiser.full_name } : null
         });
+
+        // P2.3 — Fire-and-forget GAFFA alert (push + email) when penalty triggered.
+        // Stacks with the existing late-dropout discipline notification block below.
+        if (_inPenaltyWindow) {
+            setImmediate(async () => {
+                try {
+                    const playerInfo = await pool.query(
+                        'SELECT alias, full_name FROM players WHERE id = $1', [droppingReg.player_id]
+                    );
+                    const venueQ = await pool.query(
+                        'SELECT v.name AS venue_name, g.game_url FROM games g LEFT JOIN venues v ON v.id = g.venue_id WHERE g.id = $1',
+                        [gameId]
+                    );
+                    const alias    = playerInfo.rows[0]?.alias || 'Unknown';
+                    const fullName = playerInfo.rows[0]?.full_name || '';
+                    const venue    = venueQ.rows[0]?.venue_name || 'Unknown venue';
+                    const gameUrl  = venueQ.rows[0]?.game_url || '';
+                    const totalKept = (_keptReal + _keptFree + _guestKeptReal + _guestKeptFree).toFixed(2);
+                    const reasonText = _teamsLockedForDrop
+                        ? `teams already generated, ${_hoursUntilKickoff.toFixed(1)}hr to kickoff`
+                        : `${_hoursUntilKickoff.toFixed(1)}hr to kickoff`;
+                    const playerReason = (dropoutReason || '').trim() || '(none provided)';
+                    const kickoffStr = new Date(gameCheck.rows[0].game_date).toLocaleString('en-GB',
+                        { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+                    // Push to all superadmins
+                    const superadmins = await pool.query(
+                        "SELECT id FROM players WHERE id IN (SELECT player_id FROM users WHERE role = 'superadmin')"
+                    ).catch(async () => {
+                        // Fallback if users-players linkage differs in this DB schema
+                        return await pool.query("SELECT p.id FROM players p WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = p.user_id AND u.role = 'superadmin')");
+                    });
+                    for (const row of superadmins.rows) {
+                        sendNotification('late_dropout_alert', row.id, {
+                            gameId,
+                            alias,
+                            venue,
+                            amount: totalKept,
+                            reason: reasonText
+                        }).catch(() => {});
+                    }
+
+                    // Email backup
+                    notifyAdmin(`🚨 Late drop-out: ${alias}`, [
+                        ['Player',         `${alias} (${fullName})`],
+                        ['Game',           `${venue} — ${kickoffStr}`],
+                        ['Trigger',        reasonText],
+                        ['Money kept',     `£${totalKept} (£${(_keptReal + _guestKeptReal).toFixed(2)} real + £${(_keptFree + _guestKeptFree).toFixed(2)} FC)`],
+                        ['Their reason',   playerReason],
+                        ['Discipline',     _appliedLateDropout ? `${_appliedLateDropout.points} points applied` : 'n/a'],
+                        ['Game admin URL', `https://totalfooty.co.uk/game.html?url=${gameUrl}`]
+                    ]).catch(() => {});
+                } catch (e) {
+                    console.warn('Late-drop GAFFA alert failed (non-critical):', e.message);
+                }
+            });
+        }
 
         // Non-critical: fire notifications after response
         setImmediate(async () => {
@@ -8330,11 +9747,6 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         if (tournCheck.rows[0]?.team_selection_type === 'vs_external') {
             return res.status(400).json({ error: 'External games do not use team generation — use Confirm Game to assign the full squad to the TF team.' });
         }
-        // A "regeneration" is when the game had teams previously AND a snapshot exists
-        // (meaning emails have been sent before). The first-ever generate-teams hits the
-        // immediate-email path; every subsequent call goes through the debounce.
-        const isRegeneration = !!(tournCheck.rows[0]?.teams_generated && tournCheck.rows[0]?.has_snapshot);
-        
         // Get all confirmed registrations with player stats
         const playersResult = await pool.query(`
             SELECT 
@@ -9335,7 +10747,52 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name, early_bird_price, super_early_bird_price, opponent_id: edit_opp_id } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name, early_bird_price, super_early_bird_price, opponent_id: edit_opp_id, pitch_cost, default_organiser_id } = req.body;
+        // P2.1: pitch_cost — undefined = leave unchanged; null/empty = clear; number = set
+        const parsedPitchCostEdit = pitch_cost === undefined
+            ? null   // sentinel: COALESCE keeps existing
+            : (pitch_cost === null || pitch_cost === '' ? null : parseFloat(pitch_cost));
+        const pitchCostUpdateMode = pitch_cost === undefined ? 'unchanged' : (parsedPitchCostEdit !== null && !isNaN(parsedPitchCostEdit) && parsedPitchCostEdit >= 0 ? 'set' : 'invalid');
+        if (pitchCostUpdateMode === 'invalid') {
+            return res.status(400).json({ error: 'Pitch cost must be a number ≥ 0' });
+        }
+        // P3 (default organiser): same tri-state pattern as pitch_cost
+        //   undefined = leave unchanged
+        //   null / '' = clear (set to NULL)
+        //   UUID string = set (validated below)
+        // To avoid blocking unrelated edits: if the new value matches the current
+        // value (e.g. admin opened Edit Game and submitted without touching the
+        // dropdown), we treat it as unchanged. Validation only runs when the value
+        // is genuinely new.
+        let parsedOrganiserIdEdit = null;
+        let organiserUpdateMode = 'unchanged';
+        if (default_organiser_id !== undefined) {
+            // Snapshot current value first so we can short-circuit no-op submits
+            const _curRow = await pool.query('SELECT default_organiser_id FROM games WHERE id = $1', [gameId])
+                .catch(err => err.code === '42703' ? { rows: [{ default_organiser_id: null }] } : Promise.reject(err));
+            const _curOrgId = _curRow.rows[0]?.default_organiser_id || null;
+
+            if (default_organiser_id === null || default_organiser_id === '') {
+                if (_curOrgId === null) {
+                    organiserUpdateMode = 'unchanged';      // already empty, nothing to do
+                } else {
+                    organiserUpdateMode = 'clear';
+                }
+            } else {
+                parsedOrganiserIdEdit = String(default_organiser_id).trim();
+                if (parsedOrganiserIdEdit === String(_curOrgId || '')) {
+                    organiserUpdateMode = 'unchanged';      // same value resubmitted — no validation needed
+                } else {
+                    if (!isValidUuid(parsedOrganiserIdEdit)) {
+                        return res.status(400).json({ error: 'Default organiser id must be a valid player UUID' });
+                    }
+                    const orgCheck = await pool.query('SELECT is_organiser FROM players WHERE id = $1', [parsedOrganiserIdEdit]);
+                    if (!orgCheck.rows.length) return res.status(404).json({ error: 'Default organiser not found' });
+                    if (!orgCheck.rows[0].is_organiser) return res.status(400).json({ error: 'Selected player is not flagged as an organiser' });
+                    organiserUpdateMode = 'set';
+                }
+            }
+        }
         // DYNSTAR: explicit 0★ must not be stripped to null by `|| null`.
         const starRatingForDb = (star_rating === null || star_rating === undefined || star_rating === '')
             ? null
@@ -9396,7 +10853,11 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $3, 
                     cost_per_player = $4,
                     star_rating = $5,
-                    star_rating_locked = CASE WHEN $5::numeric IN (0,4,5) THEN TRUE ELSE star_rating_locked END,
+                    star_rating_locked = CASE
+                        WHEN $5::numeric IS NOT NULL AND star_rating IS NOT NULL AND $5::numeric = FLOOR(star_rating) THEN star_rating_locked
+                        WHEN $5::numeric IS NOT DISTINCT FROM star_rating THEN star_rating_locked
+                        ELSE COALESCE($5::numeric IN (4,5), FALSE)
+                    END,
                     tournament_team_count = COALESCE($6, tournament_team_count),
                     min_rating_enabled = COALESCE($7, min_rating_enabled),
                     refs_required = COALESCE($9, refs_required),
@@ -9412,9 +10873,10 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     tournament_name = COALESCE($19, tournament_name),
                     early_bird_price = $20,
                     super_early_bird_price = $21,
-                    opponent_id = $22
+                    opponent_id = $22,
+                    pitch_cost = COALESCE($23, pitch_cost)   -- P2.1
                 WHERE id = $8
-            `, [game_date, venue_id, max_players, cost_per_player, starRatingForDb, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId]);
+            `, [game_date, venue_id, max_players, cost_per_player, starRatingForDb, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resetMinRatingFlag, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId, pitchCostUpdateMode === 'set' ? parsedPitchCostEdit : null]);
         } else {
             await pool.query(`
                 UPDATE games 
@@ -9422,7 +10884,11 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     max_players = $2, 
                     cost_per_player = $3,
                     star_rating = $4,
-                    star_rating_locked = CASE WHEN $4::numeric IN (0,4,5) THEN TRUE ELSE star_rating_locked END,
+                    star_rating_locked = CASE
+                        WHEN $4::numeric IS NOT NULL AND star_rating IS NOT NULL AND $4::numeric = FLOOR(star_rating) THEN star_rating_locked
+                        WHEN $4::numeric IS NOT DISTINCT FROM star_rating THEN star_rating_locked
+                        ELSE COALESCE($4::numeric IN (4,5), FALSE)
+                    END,
                     tournament_team_count = COALESCE($5, tournament_team_count),
                     min_rating_enabled = COALESCE($6, min_rating_enabled),
                     refs_required = COALESCE($8, refs_required),
@@ -9437,9 +10903,36 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
                     tournament_name = COALESCE($17, tournament_name),
                     early_bird_price = $18,
                     super_early_bird_price = $19,
-                    opponent_id = $20
+                    opponent_id = $20,
+                    pitch_cost = COALESCE($21, pitch_cost)   -- P2.1
                 WHERE id = $7
-            `, [venue_id, max_players, cost_per_player, starRatingForDb, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId]);
+            `, [venue_id, max_players, cost_per_player, starRatingForDb, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId, pitchCostUpdateMode === 'set' ? parsedPitchCostEdit : null]);
+        }
+
+        // P3 (default organiser) — separate UPDATE so we don't have to refactor
+        // the existing big UPDATE statements. Spec: leave-old behavior — we do NOT
+        // remove the previous organiser's registration when the value changes.
+        // (No-op submits are short-circuited at validation time above so this only
+        // runs when the value is actually changing.)
+        if (organiserUpdateMode !== 'unchanged') {
+            const newOrgId = organiserUpdateMode === 'set' ? parsedOrganiserIdEdit : null;
+            await pool.query('UPDATE games SET default_organiser_id = $1 WHERE id = $2', [newOrgId, gameId])
+                .catch(err => {
+                    // Pre-migration: column doesn't exist. Silently skip — feature degrades gracefully.
+                    if (err.code === '42703') {
+                        console.warn('[edit-settings] default_organiser_id column missing — skipping update');
+                        return;
+                    }
+                    throw err;
+                });
+
+            // Audit + auto-add only fires when the value actually changed (always true here)
+            setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'default_organiser_set',
+                `Default organiser changed to ${newOrgId || 'none'}`).catch(() => {}));
+            if (newOrgId) {
+                // Helper is idempotent — skips if already registered.
+                autoAddDefaultOrganiser(pool, gameId, newOrgId, req.user.playerId).catch(() => {});
+            }
         }
 
         // If tournament_team_count changed, wipe existing team assignments and
@@ -9473,6 +10966,12 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
             }
         }
 
+        // DYNSTAR-B: admin edit writes star_rating directly; without this, a dynamic
+        // game that was edited will sit at whatever admin wrote until the next
+        // register/dropout event — which for a full game may be "never". Fire the
+        // recalc now so it immediately reflects current avg OVR. No-op if locked.
+        reviewDynamicStarRating(pool, gameId).catch(() => {});
+
         // FIX-098: Notify confirmed players if cost changed
         const newCost = parseFloat(cost_per_player);
         if (oldCost !== newCost) {
@@ -9505,12 +11004,470 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
     }
 });
 
+// ─── P1.5 — Per-player revenue breakdown for the click-through modal ────────
+// Returns the full player-by-player list so the admin can see exactly who paid
+// what. Superadmin only — revenue data must not leak to lower roles.
+app.get('/api/admin/games/:gameId/revenue-breakdown', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        if (!isValidUuid(gameId)) return res.status(400).json({ error: 'Invalid game id' });
+
+        // EB-AUDIT: fetch full game data so we can compute the effective price at
+        // each player's signup time. Need cost_per_player + the two early bird
+        // tiers + game_date.
+        const gameRes = await pool.query(
+            `SELECT id, cost_per_player, early_bird_price, super_early_bird_price, game_date
+             FROM games WHERE id = $1`,
+            [gameId]
+        );
+        if (gameRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        const game = gameRes.rows[0];
+        const cost = parseFloat(game.cost_per_player) || 0;
+
+        // Confirmed registrations — joined to players to surface is_organiser.
+        // signup_date used for retroactive early-bird calculation.
+        const regsRes = await pool.query(`
+            SELECT
+                r.id              AS registration_id,
+                p.id              AS player_id,
+                p.alias,
+                p.full_name,
+                COALESCE(p.is_organiser, FALSE) AS is_organiser,
+                r.position_preference,
+                r.is_comped,
+                COALESCE(r.amount_paid, 0)      AS amount_paid_real,
+                COALESCE(r.amount_paid_free, 0) AS amount_paid_free,
+                COALESCE(r.registered_at, r.signup_date) AS signup_date
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'confirmed'
+            ORDER BY LOWER(COALESCE(p.alias, p.full_name))
+        `, [gameId]);
+
+        const registrations = regsRes.rows.map(r => {
+            const realAmt = parseFloat(r.amount_paid_real) || 0;
+            const freeAmt = parseFloat(r.amount_paid_free) || 0;
+            const total   = realAmt + freeAmt;
+            // EB-AUDIT: retroactive effective price at this player's signup
+            const { price: effectiveAtSignup, tier: pricingTier } =
+                getEffectivePriceAtSignup(game, r.signup_date);
+            // EB savings only applies to players who actually paid something.
+            // RAF-free players (total=0, not comped) don't get a phantom EB saving
+            // because they didn't pay any money to "save" against.
+            const ebSaving = (!r.is_comped && total > 0)
+                ? Math.max(0, cost - effectiveAtSignup)
+                : 0;
+            // Genuine discount = standard price minus what they actually paid,
+            // minus the early-bird saving they were entitled to. Floor at 0
+            // so RAF-free / partial-pay shows positive.
+            const otherDiscount = (!r.is_comped && total > 0 && total < cost)
+                ? Math.max(0, cost - total - ebSaving)
+                : 0;
+            let status;
+            if (r.is_comped)                            status = 'Comped';
+            else if (total === 0)                       status = 'RAF Free';
+            else if (otherDiscount > 0)                 status = 'Discount';
+            else if (ebSaving > 0 && total < cost)      status = 'Early Bird';
+            else                                        status = 'Paid';
+            return {
+                player_id:        r.player_id,
+                alias:            r.alias,
+                full_name:        r.full_name,
+                is_organiser:     !!r.is_organiser,
+                position:         r.position_preference,
+                status,
+                amount_paid_real: realAmt,
+                amount_paid_free: freeAmt,
+                total_paid:       total,
+                early_bird_saving: ebSaving,
+                pricing_tier:     pricingTier,        // 'super' | 'early' | 'standard'
+                discount_given:   otherDiscount,      // genuine discount (RAF / admin) only
+                signup_date:      r.signup_date
+            };
+        });
+
+        // Guests — split into paid vs admin-invite for the modal sections
+        const guestsRes = await pool.query(`
+            SELECT
+                gg.id,
+                gg.guest_name,
+                gg.invited_by_player_id,
+                p.alias AS inviter_alias,
+                COALESCE(gg.amount_paid, 0)      AS amount_paid_real,
+                COALESCE(gg.amount_paid_free, 0) AS amount_paid_free,
+                gg.created_at
+            FROM game_guests gg
+            LEFT JOIN players p ON p.id = gg.invited_by_player_id
+            WHERE gg.game_id = $1
+            ORDER BY LOWER(gg.guest_name)
+        `, [gameId]);
+
+        const guestsPaid = [];
+        const guestsAdminInvite = [];
+        for (const gg of guestsRes.rows) {
+            const realAmt = parseFloat(gg.amount_paid_real) || 0;
+            const freeAmt = parseFloat(gg.amount_paid_free) || 0;
+            const row = {
+                id:               gg.id,
+                guest_name:       gg.guest_name,
+                inviter_alias:    gg.inviter_alias,
+                amount_paid_real: realAmt,
+                amount_paid_free: freeAmt,
+                total_paid:       realAmt + freeAmt,
+                created_at:       gg.created_at
+            };
+            if (realAmt === 0 && freeAmt === 0) guestsAdminInvite.push(row);
+            else                                guestsPaid.push(row);
+        }
+
+        // Drop-out-no-refund rows (will be empty until P2.3 ships, but expose now for forward-compat)
+        let droppedNoRefund = [];
+        try {
+            const dnrRes = await pool.query(`
+                SELECT
+                    dnr.id,
+                    dnr.player_id,
+                    p.alias,
+                    p.full_name,
+                    COALESCE(dnr.amount_paid_real, 0) AS amount_paid_real,
+                    COALESCE(dnr.amount_paid_free, 0) AS amount_paid_free,
+                    dnr.dropped_at,
+                    dnr.reason
+                FROM dropped_no_refund dnr
+                JOIN players p ON p.id = dnr.player_id
+                WHERE dnr.game_id = $1
+                ORDER BY dnr.dropped_at DESC
+            `, [gameId]);
+            droppedNoRefund = dnrRes.rows.map(r => ({
+                ...r,
+                amount_paid_real: parseFloat(r.amount_paid_real) || 0,
+                amount_paid_free: parseFloat(r.amount_paid_free) || 0,
+                total_paid:       (parseFloat(r.amount_paid_real) || 0) + (parseFloat(r.amount_paid_free) || 0)
+            }));
+        } catch (e) {
+            // Table doesn't exist yet — P2.3 hasn't shipped. Treat as empty list.
+            if (e.code !== '42P01') throw e;
+        }
+
+        // Aggregate totals — match what the dashboard tile shows.
+        const totals = {
+            registration_real: registrations.reduce((s, r) => s + r.amount_paid_real, 0),
+            registration_free: registrations.reduce((s, r) => s + r.amount_paid_free, 0),
+            guest_real:        guestsPaid.reduce((s, r) => s + r.amount_paid_real, 0),
+            guest_free:        guestsPaid.reduce((s, r) => s + r.amount_paid_free, 0),
+            dropped_real:      droppedNoRefund.reduce((s, r) => s + r.amount_paid_real, 0),
+            dropped_free:      droppedNoRefund.reduce((s, r) => s + r.amount_paid_free, 0),
+            comped_count:      registrations.filter(r => r.status === 'Comped').length,
+            admin_invite_count: guestsAdminInvite.length,
+            // EB-AUDIT: separate totals for early bird savings (a pricing tier
+            // outcome, not a discount) and true discounts (RAF / partial pay).
+            early_bird_savings_total: registrations.reduce((s, r) => s + (r.early_bird_saving || 0), 0),
+            true_discount_total:      registrations.reduce((s, r) => s + (r.discount_given || 0), 0),
+        };
+        totals.total_real = totals.registration_real + totals.guest_real + totals.dropped_real;
+        totals.total_free = totals.registration_free + totals.guest_free + totals.dropped_free;
+        totals.total_revenue = totals.total_real + totals.total_free;
+
+        res.json({
+            game_id: gameId,  // UUID, not int
+            cost_per_player: cost,
+            registrations,
+            guests_paid:        guestsPaid,
+            guests_admin_invite: guestsAdminInvite,
+            dropped_no_refund:  droppedNoRefund,
+            totals
+        });
+    } catch (error) {
+        console.error('Revenue breakdown error:', error);
+        res.status(500).json({ error: 'Failed to load revenue breakdown', detail: error.message });
+    }
+});
+
+// ─── P3.2 — Per-game finance summary ────────────────────────────────────────
+// Aggregates revenue + costs + summary metrics for one game. Powers:
+//   • audit.html "Finance" card
+//   • the finance section appended below the revenue-breakdown modal
+// Superadmin only. Read-only.
+app.get('/api/admin/games/:gameId/finance', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        if (!isValidUuid(gameId)) return res.status(400).json({ error: 'Invalid game id' });
+
+        // Fetch the game itself + venue
+        const gameRes = await pool.query(
+            `SELECT g.id, g.game_status, g.cost_per_player, g.pitch_cost, g.ref_pay,
+                    g.game_date, v.name AS venue_name, g.format,
+                    g.team_selection_type
+             FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE g.id = $1`,
+            [gameId]
+        ).catch(async (err) => {
+            // Pre-migration safety: pitch_cost column missing? Re-query without it.
+            if (err.code === '42703') {
+                return await pool.query(
+                    `SELECT g.id, g.game_status, g.cost_per_player, NULL AS pitch_cost, g.ref_pay,
+                            g.game_date, v.name AS venue_name, g.format,
+                            g.team_selection_type
+                     FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+                     WHERE g.id = $1`,
+                    [gameId]
+                );
+            }
+            throw err;
+        });
+        if (gameRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const g = gameRes.rows[0];
+        const cost = parseFloat(g.cost_per_player) || 0;
+        const pitchCost = g.pitch_cost != null ? parseFloat(g.pitch_cost) : null;
+        const gameRefPay = parseFloat(g.ref_pay) || 0;
+
+        // ─── Headcount + registration revenue ──────────────────────────────
+        const regsAgg = await pool.query(`
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'confirmed')                                 AS confirmed_count,
+                COUNT(*) FILTER (WHERE status = 'confirmed' AND is_comped = TRUE)            AS comped_count,
+                COALESCE(SUM(CASE
+                    WHEN status = 'confirmed' AND NOT is_comped THEN COALESCE(amount_paid, 0)
+                    ELSE 0 END), 0) AS reg_real,
+                COALESCE(SUM(CASE
+                    WHEN status = 'confirmed' AND NOT is_comped THEN COALESCE(amount_paid_free, 0)
+                    ELSE 0 END), 0) AS reg_free
+            FROM registrations
+            WHERE game_id = $1
+        `, [gameId]);
+        const r0 = regsAgg.rows[0];
+        const confirmedCount = parseInt(r0.confirmed_count) || 0;
+        const compedCount    = parseInt(r0.comped_count) || 0;
+        const regReal        = parseFloat(r0.reg_real) || 0;
+        const regFree        = parseFloat(r0.reg_free) || 0;
+
+        // ─── Guests revenue (split paid vs admin-invite) ────────────────────
+        const guestsAgg = await pool.query(`
+            SELECT
+                COUNT(*) FILTER (WHERE COALESCE(amount_paid,0) > 0 OR COALESCE(amount_paid_free,0) > 0) AS paid_count,
+                COUNT(*) FILTER (WHERE COALESCE(amount_paid,0) = 0 AND COALESCE(amount_paid_free,0) = 0) AS admin_invite_count,
+                COALESCE(SUM(CASE WHEN COALESCE(amount_paid,0) > 0 OR COALESCE(amount_paid_free,0) > 0
+                                  THEN COALESCE(amount_paid, 0) ELSE 0 END), 0) AS guest_real,
+                COALESCE(SUM(CASE WHEN COALESCE(amount_paid,0) > 0 OR COALESCE(amount_paid_free,0) > 0
+                                  THEN COALESCE(amount_paid_free, 0) ELSE 0 END), 0) AS guest_free
+            FROM game_guests
+            WHERE game_id = $1
+        `, [gameId]);
+        const g0 = guestsAgg.rows[0];
+        const guestPaidCount  = parseInt(g0.paid_count) || 0;
+        const guestAdminCount = parseInt(g0.admin_invite_count) || 0;
+        const guestReal       = parseFloat(g0.guest_real) || 0;
+        const guestFree       = parseFloat(g0.guest_free) || 0;
+
+        // ─── Drop-out kept revenue ──────────────────────────────────────────
+        let droppedCount = 0, droppedReal = 0, droppedFree = 0;
+        try {
+            const dnrAgg = await pool.query(`
+                SELECT
+                    COUNT(*)::int AS cnt,
+                    COALESCE(SUM(amount_paid_real), 0) AS dropped_real,
+                    COALESCE(SUM(amount_paid_free), 0) AS dropped_free
+                FROM dropped_no_refund
+                WHERE game_id = $1
+            `, [gameId]);
+            droppedCount = parseInt(dnrAgg.rows[0].cnt) || 0;
+            droppedReal  = parseFloat(dnrAgg.rows[0].dropped_real) || 0;
+            droppedFree  = parseFloat(dnrAgg.rows[0].dropped_free) || 0;
+        } catch (e) {
+            if (e.code !== '42P01') throw e;
+            // Table missing — pre-migration. Treat as zero.
+        }
+
+        // ─── Ref cost ───────────────────────────────────────────────────────
+        // Use stored pay_amount where set, else fall back to game.ref_pay × headcount.
+        let refCount = 0, refCostExplicit = 0, refCostFallback = 0, refsMissingPay = 0;
+        try {
+            const refAgg = await pool.query(`
+                SELECT
+                    COUNT(*)::int AS cnt,
+                    COUNT(*) FILTER (WHERE pay_amount IS NULL)::int AS missing_pay_count,
+                    COALESCE(SUM(COALESCE(pay_amount, 0)), 0) AS pay_explicit
+                FROM game_referees
+                WHERE game_id = $1 AND status = 'confirmed'
+            `, [gameId]);
+            refCount         = parseInt(refAgg.rows[0].cnt) || 0;
+            refsMissingPay   = parseInt(refAgg.rows[0].missing_pay_count) || 0;
+            refCostExplicit  = parseFloat(refAgg.rows[0].pay_explicit) || 0;
+            refCostFallback  = refsMissingPay * gameRefPay;
+        } catch (e) {
+            // pay_amount column missing? Fall back to game.ref_pay × confirmed-count.
+            if (e.code !== '42703') throw e;
+            const refAgg = await pool.query(
+                `SELECT COUNT(*)::int AS cnt FROM game_referees WHERE game_id = $1 AND status = 'confirmed'`,
+                [gameId]
+            );
+            refCount = parseInt(refAgg.rows[0].cnt) || 0;
+            refCostFallback = refCount * gameRefPay;
+        }
+        const refCost = refCostExplicit + refCostFallback;
+
+        // ─── Comp opportunity cost ──────────────────────────────────────────
+        const compCostLost = compedCount * cost;
+
+        // ─── Aggregates ─────────────────────────────────────────────────────
+        const totalReal = regReal + guestReal + droppedReal;
+        const totalFree = regFree + guestFree + droppedFree;
+        const totalRevenue = totalReal + totalFree;
+        const totalCost = (pitchCost != null ? pitchCost : 0) + refCost;
+        const totalBillable = confirmedCount + guestPaidCount + droppedCount;
+
+        // ─── Warnings ───────────────────────────────────────────────────────
+        const warnings = [];
+        if (pitchCost == null) warnings.push('Pitch cost not set — costs will under-report');
+        if (refsMissingPay > 0 && refCount > 0) warnings.push(`${refsMissingPay} of ${refCount} ref(s) have no pay_amount set — using game default £${gameRefPay.toFixed(2)}`);
+
+        res.json({
+            game_id: gameId,  // UUID, not int
+            game_status: g.game_status,
+            game_date: g.game_date,
+            venue_name: g.venue_name,
+            format: g.format,
+            cost_per_player: cost,
+            headcount: {
+                confirmed_players:    confirmedCount,
+                guests_paid:          guestPaidCount,
+                guests_admin_invite:  guestAdminCount,
+                comped:               compedCount,
+                dropped_no_refund:    droppedCount,
+                total_billable:       totalBillable
+            },
+            revenue: {
+                registration_real:               regReal,
+                registration_free_credits:       regFree,
+                guest_real:                      guestReal,
+                guest_free_credits:              guestFree,
+                dropped_no_refund_real:          droppedReal,
+                dropped_no_refund_free_credits:  droppedFree,
+                total_real:                      totalReal,
+                total_free_credits:              totalFree,
+                total_revenue:                   totalRevenue
+            },
+            costs: {
+                pitch_cost:       pitchCost,
+                ref_cost:         refCost,
+                ref_count:        refCount,
+                refs_missing_pay: refsMissingPay,
+                comp_cost_lost:   compCostLost,
+                total_cost:       totalCost
+            },
+            summary: {
+                gross_profit:        totalReal - totalCost,
+                gross_profit_inc_fc: totalRevenue - totalCost,
+                per_player_spend:    totalBillable > 0 ? totalCost / totalBillable : 0,
+                per_player_revenue:  totalBillable > 0 ? totalReal / totalBillable : 0
+            },
+            warnings
+        });
+    } catch (error) {
+        console.error('Game finance error:', error);
+        res.status(500).json({ error: 'Failed to load finance', detail: error.message });
+    }
+});
+
+// ─── P3.4 — Admin retroactive drop-no-refund (no-show marking) ──────────────
+// Marks an existing registration as dropped-without-refund. Used when an admin
+// needs to record a no-show or similar after the fact. Money stays in the till
+// (no refund issued) and the registration row is removed so headcount lines up.
+app.post('/api/admin/games/:gameId/registrations/:regId/drop-no-refund', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { gameId, regId } = req.params;
+    if (!isValidUuid(gameId) || !isValidUuid(regId)) {
+        return res.status(400).json({ error: 'Invalid game or registration id' });
+    }
+    const reason = (req.body?.reason || 'admin_retroactive').toString().slice(0, 200);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Lock registration row + verify it belongs to this game
+        const regRes = await client.query(
+            `SELECT r.id, r.player_id, r.is_comped,
+                    COALESCE(r.amount_paid, 0)      AS amount_paid_real,
+                    COALESCE(r.amount_paid_free, 0) AS amount_paid_free
+             FROM registrations r
+             WHERE r.id = $1 AND r.game_id = $2 FOR UPDATE`,
+            [regId, gameId]
+        );
+        if (regRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Registration not found for this game' });
+        }
+        const reg = regRes.rows[0];
+        const realAmt = parseFloat(reg.amount_paid_real) || 0;
+        const freeAmt = parseFloat(reg.amount_paid_free) || 0;
+
+        // Write the dropped_no_refund row — recorded_by tracks the admin who did this
+        await client.query(
+            `INSERT INTO dropped_no_refund (game_id, player_id, amount_paid_real, amount_paid_free, reason, recorded_by)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [gameId, reg.player_id, realAmt, freeAmt, reason, req.user.playerId]
+        ).catch(err => {
+            // Pre-migration: table missing. We can still delete the registration but won't have an audit row.
+            if (err.code !== '42P01') throw err;
+            console.warn('dropped_no_refund table missing — skip audit row (admin retroactive)');
+        });
+
+        // Delete the registration (same as a normal drop-out, but without refund credit moves)
+        await client.query('DELETE FROM registrations WHERE id = $1', [regId]);
+
+        await client.query('COMMIT');
+
+        // Audit trail
+        setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'admin_drop_no_refund',
+            `Player ${reg.player_id} marked dropped no-refund. Kept £${(realAmt + freeAmt).toFixed(2)}. Reason: ${reason}`));
+
+        res.json({
+            ok: true,
+            kept_real: realAmt,
+            kept_free: freeAmt,
+            kept_total: realAmt + freeAmt,
+            reason
+        });
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Admin drop-no-refund error:', error);
+        res.status(500).json({ error: 'Failed to record drop-no-refund', detail: error.message });
+    } finally {
+        client.release();
+    }
+});
+
 // Update ALL future games in a weekly series (venue, players, cost, star rating, time)
 app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCLMAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser, format, position_type, refs_required, ref_pay, early_bird_price: eb_s, super_early_bird_price: seb_s, opponent_id: series_opp_id } = req.body;
+        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser, format, position_type, refs_required, ref_pay, early_bird_price: eb_s, super_early_bird_price: seb_s, opponent_id: series_opp_id, pitch_cost: pitch_cost_s, default_organiser_id: organiser_s } = req.body;
+        // P2.1: pitch_cost — undefined = leave unchanged; null/empty/invalid handled by COALESCE
+        const parsedPitchCostSeries = pitch_cost_s === undefined
+            ? null
+            : (pitch_cost_s === null || pitch_cost_s === '' ? null : parseFloat(pitch_cost_s));
+        if (pitch_cost_s !== undefined && pitch_cost_s !== null && pitch_cost_s !== '' && (isNaN(parsedPitchCostSeries) || parsedPitchCostSeries < 0)) {
+            return res.status(400).json({ error: 'Pitch cost must be a number ≥ 0' });
+        }
+        // P3 (default organiser) — same tri-state pattern as pitch_cost
+        let parsedOrganiserIdSeries = null;
+        let organiserSeriesUpdateMode = 'unchanged';
+        if (organiser_s !== undefined) {
+            if (organiser_s === null || organiser_s === '') {
+                organiserSeriesUpdateMode = 'clear';
+            } else {
+                parsedOrganiserIdSeries = String(organiser_s).trim();
+                if (!isValidUuid(parsedOrganiserIdSeries)) {
+                    return res.status(400).json({ error: 'Default organiser id must be a valid player UUID' });
+                }
+                const orgCheck = await pool.query('SELECT is_organiser FROM players WHERE id = $1', [parsedOrganiserIdSeries]);
+                if (!orgCheck.rows.length) return res.status(404).json({ error: 'Default organiser not found' });
+                if (!orgCheck.rows[0].is_organiser) return res.status(400).json({ error: 'Selected player is not flagged as an organiser' });
+                organiserSeriesUpdateMode = 'set';
+            }
+        }
         // DYNSTAR: explicit 0★ must not be stripped to null by `|| null`.
         const starRatingForDb = (star_rating === null || star_rating === undefined || star_rating === '')
             ? null
@@ -9562,19 +11519,59 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
                 const utcDate = new Date(new Date(londonLocal).getTime() - offset);
 
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IN (0,4,5) THEN TRUE ELSE star_rating_locked END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay), early_bird_price=$13, super_early_bird_price=$14, opponent_id=COALESCE($15, opponent_id), external_opponent=COALESCE($16, external_opponent) WHERE id=$7',
-                    [venue_id, max_players, cost_per_player, starRatingForDb, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IS NOT NULL AND star_rating IS NOT NULL AND $4::numeric = FLOOR(star_rating) THEN star_rating_locked WHEN $4::numeric IS NOT DISTINCT FROM star_rating THEN star_rating_locked ELSE COALESCE($4::numeric IN (4,5), FALSE) END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay), early_bird_price=$13, super_early_bird_price=$14, opponent_id=COALESCE($15, opponent_id), external_opponent=COALESCE($16, external_opponent), pitch_cost=COALESCE($17, pitch_cost) WHERE id=$7',
+                    [venue_id, max_players, cost_per_player, starRatingForDb, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName, parsedPitchCostSeries]
                 );
             } else {
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IN (0,4,5) THEN TRUE ELSE star_rating_locked END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay), early_bird_price=$12, super_early_bird_price=$13, opponent_id=COALESCE($14, opponent_id), external_opponent=COALESCE($15, external_opponent) WHERE id=$6',
-                    [venue_id, max_players, cost_per_player, starRatingForDb, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName]
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IS NOT NULL AND star_rating IS NOT NULL AND $4::numeric = FLOOR(star_rating) THEN star_rating_locked WHEN $4::numeric IS NOT DISTINCT FROM star_rating THEN star_rating_locked ELSE COALESCE($4::numeric IN (4,5), FALSE) END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay), early_bird_price=$12, super_early_bird_price=$13, opponent_id=COALESCE($14, opponent_id), external_opponent=COALESCE($15, external_opponent), pitch_cost=COALESCE($16, pitch_cost) WHERE id=$6',
+                    [venue_id, max_players, cost_per_player, starRatingForDb, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName, parsedPitchCostSeries]
                 );
             }
         }
 
         await client.query('COMMIT');
         res.json({ message: `Updated ${futureGames.rows.length} future games in series`, updated: futureGames.rows.length });
+
+        // P3 (default organiser) — outside the transaction; applied to all future games.
+        // Done after COMMIT so failures here don't roll back the main settings update.
+        if (organiserSeriesUpdateMode !== 'unchanged') {
+            const newOrgId = organiserSeriesUpdateMode === 'set' ? parsedOrganiserIdSeries : null;
+            for (const g of futureGames.rows) {
+                try {
+                    const oldRow = await pool.query('SELECT default_organiser_id FROM games WHERE id = $1', [g.id])
+                        .catch(err => err.code === '42703' ? { rows: [{ default_organiser_id: null }] } : Promise.reject(err));
+                    const oldOrgId = oldRow.rows[0]?.default_organiser_id || null;
+
+                    await pool.query('UPDATE games SET default_organiser_id = $1 WHERE id = $2', [newOrgId, g.id])
+                        .catch(err => {
+                            if (err.code === '42703') return; // pre-migration — silently degrade
+                            throw err;
+                        });
+
+                    if (String(oldOrgId || '') !== String(newOrgId || '')) {
+                        setImmediate(() => gameAuditLog(pool, g.id, req.user.playerId, 'default_organiser_set',
+                            `[series] Default organiser changed from ${oldOrgId || 'none'} to ${newOrgId || 'none'}`).catch(() => {}));
+                        if (newOrgId) {
+                            // Idempotent — auto-add helper skips if already registered
+                            autoAddDefaultOrganiser(pool, g.id, newOrgId, req.user.playerId).catch(() => {});
+                        }
+                    }
+                } catch (e) {
+                    console.error(`[series default_organiser] failed for game ${g.id}:`, e.message);
+                    // Continue to other games — one failure shouldn't block the rest
+                }
+            }
+        }
+
+        // DYNSTAR-B: series edit writes star_rating to every future game directly.
+        // Fire recalc for each so any that should be dynamic-adjusted pick up the
+        // current avg OVR. No-op if locked. Fire-and-forget after response sent.
+        setImmediate(async () => {
+            for (const g of futureGames.rows) {
+                try { await reviewDynamicStarRating(pool, g.id); } catch (_) {}
+            }
+        });
 
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
@@ -10577,6 +12574,45 @@ app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameM
         console.warn(`player-stats: skipped non-participants: ${errors.join(', ')}`);
     }
 
+    // DYNSTAR-C: post-game stat entry is the single biggest driver of OVR drift.
+    // Every player whose OVR actually changed has potentially stale dynamic star
+    // ratings on their upcoming games. Fire-and-forget recalc for all of them.
+    const ovrChangedIds = statChanges
+        .filter(c => c.newOverall !== c.oldOverall)
+        .map(c => c.playerId);
+    if (ovrChangedIds.length > 0) {
+        reviewStarsForPlayers(pool, ovrChangedIds).catch(() => {});
+    }
+
+    // DYNSTAR-D: Persist a player_stat_history row for each player whose OVR
+    // (outfield) or goalkeeper_rating changed. The Performance tab and the
+    // /stats-graph endpoint rely on this history to attribute each game to the
+    // rating that was in effect when it was played. Without this write, post-
+    // game-driven OVR drift leaves no trail and the Performance grid shows
+    // empty buckets even after the SQL parse fix. statHistory has internal
+    // try/catch so individual row failures don't propagate.
+    setImmediate(async () => {
+        for (const c of statChanges) {
+            // Outfield OVR change OR GK rating change → new history snapshot.
+            // (Stat-only changes that don't affect OVR are mathematically
+            // impossible since OVR is the sum of the seven outfield stats.)
+            if (c.newOverall === c.oldOverall && c.newGk === c.oldGk) continue;
+            try {
+                await statHistory(pool, c.playerId, req.user.playerId, {
+                    overall:    c.newOverall,
+                    defending:  c.newDef,
+                    strength:   c.newStr,
+                    fitness:    c.newFit,
+                    pace:       c.newPac,
+                    decisions:  c.newDec,
+                    assisting:  c.newAss,
+                    shooting:   c.newSho,
+                    goalkeeper: c.newGk
+                });
+            } catch (_) { /* non-critical */ }
+        }
+    });
+
     // Per-player individual audit entries for actual stat changes
     setImmediate(async () => {
         try {
@@ -10877,6 +12913,10 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         await client.query('COMMIT');
         // FIX-063: Single summary log replacing all step-by-step debug logs
         console.log(`Game ${gameId} completed. Winner: ${winningTeam}. MOTM nominees: ${nomineesInserted}`);
+
+        // ── A2: Pay £2 cashback to hosts whose guest invite tokens were claimed by NEW users ──
+        // Helper handles per-token transactions, pre-migration safety, and idempotency.
+        setImmediate(() => { _a2PayPendingCashbacks(gameId).catch(() => {}); });
 
         // FIX-099: Refund confirmed backups who were never promoted when game completes
         // Runs after COMMIT in setImmediate — uses its own client per player to avoid blocking the response
@@ -12902,6 +14942,8 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             registrationEvent(pool, gameId, playerId, 'admin_removed', `Removed by admin ${req.user.playerId}${promotedPlayer ? ' | ' + (promotedPlayer.alias || promotedPlayer.full_name) + ' promoted' : ''}`);
             gameAuditLog(pool, gameId, req.user.playerId, 'admin_player_removed', `Player ID: ${playerId}${promotedPlayer ? ' | Promoted: ' + (promotedPlayer.alias || promotedPlayer.full_name) : ''}`);
         });
+        // DYNSTAR: removing a confirmed player (and any backup promotion) changes avg OVR
+        reviewDynamicStarRating(pool, gameId).catch(() => {});
     } catch (error) {
         console.error('Remove player error:', error);
         res.status(500).json({ error: 'Failed to remove player' });
@@ -13222,9 +15264,6 @@ async function closeAwards(gameId) {
                 // Send notification + email (non-critical, async)
                 setImmediate(async () => {
                     try {
-                        const notifTypeMap = {
-                            motm: 'motm_winner', best_engine: 'teams_created',
-                        };
                         await sendAwardEmail(winner.playerId, awardType, {
                             day: dayName, venue: venueName, gameUrl
                         });
@@ -14516,17 +16555,35 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                           WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0)
                   as confirmed_organiser_count,
                 motm_p.alias as motm_winner_alias,
-                COALESCE((SELECT SUM(COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
+                COALESCE((SELECT SUM(CASE
+                  WHEN r.is_comped                THEN 0
+                  WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), g.cost_per_player)
+                  ELSE                                  COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)
+                END)
                  FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
-                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
+                -- P1.1: real-money portion only (the £X in "£X + £Y FC")
+                COALESCE((SELECT SUM(CASE
+                  WHEN r.is_comped                THEN 0
+                  WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), g.cost_per_player)
+                  ELSE                                  COALESCE(r.amount_paid, 0)
+                END)
+                 FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue_real,
+                -- P1.1: free-credit portion only
+                COALESCE((SELECT SUM(COALESCE(r.amount_paid_free, 0))
+                 FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed' AND NOT r.is_comped), 0) as confirmed_revenue_free,
+                -- P1.2: guest_revenue excludes admin-invite guests (amount_paid=0 AND amount_paid_free=0)
+                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id
+                  AND NOT (COALESCE(gg.amount_paid, 0) = 0 AND COALESCE(gg.amount_paid_free, 0) = 0)), 0) as guest_revenue,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count,
                 (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'pending')   AS pending_referee_applications,
                 (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_referees,
-                COALESCE((SELECT SUM(g.cost_per_player - r.amount_paid)
+                -- P1.6: discount_gap now uses real+free (was just amount_paid). Excludes comped + zero-paid (RAF-free counts as free signup, not discount).
+                COALESCE((SELECT SUM(g.cost_per_player - (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)))
                  FROM registrations r
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
-                 AND r.is_comped = FALSE AND r.amount_paid IS NOT NULL
-                 AND r.amount_paid > 0 AND r.amount_paid < g.cost_per_player), 0) as discount_gap,
+                 AND r.is_comped = FALSE
+                 AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) > 0
+                 AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) < g.cost_per_player), 0) as discount_gap,
                 ROUND((SELECT AVG(p.overall_rating)
                  FROM registrations r JOIN players p ON p.id = r.player_id
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
@@ -14558,17 +16615,35 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                           WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0)
                   as confirmed_organiser_count,
                 motm_p.alias as motm_winner_alias,
-                COALESCE((SELECT SUM(COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
+                COALESCE((SELECT SUM(CASE
+                  WHEN r.is_comped                THEN 0
+                  WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), g.cost_per_player)
+                  ELSE                                  COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)
+                END)
                  FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
-                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as guest_revenue,
+                -- P1.1: real-money portion only
+                COALESCE((SELECT SUM(CASE
+                  WHEN r.is_comped                THEN 0
+                  WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), g.cost_per_player)
+                  ELSE                                  COALESCE(r.amount_paid, 0)
+                END)
+                 FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue_real,
+                -- P1.1: free-credit portion only
+                COALESCE((SELECT SUM(COALESCE(r.amount_paid_free, 0))
+                 FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed' AND NOT r.is_comped), 0) as confirmed_revenue_free,
+                -- P1.2: guest_revenue excludes admin-invite guests
+                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id
+                  AND NOT (COALESCE(gg.amount_paid, 0) = 0 AND COALESCE(gg.amount_paid_free, 0) = 0)), 0) as guest_revenue,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.is_comped = TRUE AND r.status = 'confirmed'), 0) as comped_count,
                 (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'pending')   AS pending_referee_applications,
                 (SELECT COUNT(*) FROM game_referees gr WHERE gr.game_id = g.id AND gr.status = 'confirmed') AS confirmed_referees,
-                COALESCE((SELECT SUM(g.cost_per_player - r.amount_paid)
+                -- P1.6: discount_gap now uses real+free
+                COALESCE((SELECT SUM(g.cost_per_player - (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)))
                  FROM registrations r
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
-                 AND r.is_comped = FALSE AND r.amount_paid IS NOT NULL
-                 AND r.amount_paid > 0 AND r.amount_paid < g.cost_per_player), 0) as discount_gap,
+                 AND r.is_comped = FALSE
+                 AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) > 0
+                 AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) < g.cost_per_player), 0) as discount_gap,
                 ROUND((SELECT AVG(p.overall_rating)
                  FROM registrations r JOIN players p ON p.id = r.player_id
                  WHERE r.game_id = g.id AND r.status = 'confirmed'
@@ -14585,9 +16660,77 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
         }
         
         const result = await pool.query(query, params);
+        // P1.4: revenue fields are superadmin-only. Strip them from non-superadmin callers
+        // for defence-in-depth (frontend hides the tile, but server enforces too).
+        const isSuperadmin = req.user.role === 'superadmin';
+        const REVENUE_FIELDS = [
+            'confirmed_revenue', 'confirmed_revenue_real', 'confirmed_revenue_free',
+            'guest_revenue', 'discount_gap', 'early_bird_savings'
+        ];
+
+        // EB-AUDIT: Compute early_bird_savings per game using getEffectivePriceAtSignup.
+        // For each confirmed, non-comped registration with non-zero payment: the EB saving is
+        // (cost_per_player − effective_price_at_signup). Sum across all such regs.
+        // RAF-free players (paid £0 total, but not flagged comped) are excluded — they
+        // didn't pay so there's no "saving" to claim against any pricing tier.
+        // Only do this for superadmins (it's revenue data) and only for games we're
+        // returning. One small query per game; for the typical 10-50 manage-games
+        // payload, that's a few ms total.
+        let ebByGameId = {};
+        if (isSuperadmin && result.rows.length > 0) {
+            const gameIds = result.rows.map(r => r.id);
+            const regsRes = await pool.query(
+                `SELECT r.game_id, r.registered_at,
+                        COALESCE(r.amount_paid, 0) AS amount_paid,
+                        COALESCE(r.amount_paid_free, 0) AS amount_paid_free,
+                        g.game_date, g.cost_per_player, g.early_bird_price, g.super_early_bird_price
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.game_id = ANY($1::uuid[])
+                   AND r.status = 'confirmed'
+                   AND r.is_comped = FALSE
+                   AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) > 0`,
+                [gameIds]
+            ).catch(err => {
+                console.warn('[manage-games EB calc] failed:', err.message);
+                return { rows: [] };
+            });
+            for (const r of regsRes.rows) {
+                const standard = parseFloat(r.cost_per_player || 0);
+                const { price: effective } = getEffectivePriceAtSignup(r, r.registered_at);
+                const saving = Math.max(0, standard - effective);
+                if (saving > 0) {
+                    ebByGameId[r.game_id] = (ebByGameId[r.game_id] || 0) + saving;
+                }
+            }
+        }
+
+        const sanitisedRows = result.rows.map(g => {
+            const { price: ep, tier: pt } = getEffectivePrice(g);
+            const ebSavings = ebByGameId[g.id] || 0;
+            // EB-AUDIT: discount_gap was previously a single number that mixed
+            // early-bird savings with genuine partial-pay discounts. Now we expose
+            // both — early_bird_savings (a normal pricing-tier outcome, not a real
+            // discount) and discount_gap minus EB (the residual genuine discount).
+            const rawGap = parseFloat(g.discount_gap || 0);
+            const trueDiscount = Math.max(0, rawGap - ebSavings);
+            const out = {
+                ...g,
+                effective_price: ep,
+                pricing_tier: pt,
+                early_bird_savings: ebSavings,
+                discount_gap: trueDiscount   // overwrite with genuine-discount-only number
+            };
+            if (!isSuperadmin) {
+                for (const f of REVENUE_FIELDS) delete out[f];
+            }
+            return out;
+        });
+
         res.json({
-            games: result.rows.map(g => { const { price: ep, tier: pt } = getEffectivePrice(g); return { ...g, effective_price: ep, pricing_tier: pt }; }), // opponent_logo_url already in g via SELECT
+            games: sanitisedRows,
             managerRole: isFullAdmin ? 'admin' : (player.is_clm_admin && player.is_organiser) ? 'clm_organiser' : player.is_clm_admin ? 'clm_admin' : 'organiser',
+            is_superadmin: isSuperadmin,
             permissions: {
                 canCreate: isFullAdmin || player.is_clm_admin,
                 canDelete: isFullAdmin || player.is_clm_admin,
@@ -14596,7 +16739,8 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 canGenerateTeams: true,
                 canComplete: true,
                 canAccessCredits: isFullAdmin,
-                canSendWhatsApp: isFullAdmin
+                canSendWhatsApp: isFullAdmin,
+                canSeeRevenue: isSuperadmin
             }
         });
     } catch (error) {
@@ -15171,7 +17315,11 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
         }
         
         await client.query('COMMIT');
-        
+
+        // ── A2: Pay £2 cashback to hosts whose guest invite tokens were claimed by NEW users ──
+        // Same hook as standard /complete — tournament games can have guests too.
+        setImmediate(() => { _a2PayPendingCashbacks(gameId).catch(() => {}); });
+
         // Auto-allocate badges (non-critical, outside transaction)
         for (const playerId of allPlayerIds) {
             try {
@@ -15545,17 +17693,27 @@ app.get('/api/admin/players/analysis', authenticateToken, requireAdmin, async (r
 // overall_rating (same pattern as Analysis tab).
 app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async (req, res) => {
     try {
+        // Filter toggles from frontend. Defaults match the original "filter out bad data"
+        // behaviour: standard-only games AND unfair games excluded. Admin can untick a
+        // toggle to widen the dataset (e.g. include tournaments, or include legacy
+        // NULL-score games marked unfair).
+        //
+        // filter_non_standard=true  → restrict to standard, non-venue-clash games
+        // filter_unfair=true        → exclude games where admin_marked_unfair = TRUE
+        const filterNonStandard = req.query.filter_non_standard !== 'false';
+        const filterUnfair      = req.query.filter_unfair      !== 'false';
+
         const result = await pool.query(`
             WITH
             eligible_games AS (
                 SELECT id, game_date, winning_team, team_balance_score
                 FROM games
                 WHERE game_status = 'completed'
-                  -- Standard games only (per GAFFA) — no tournament/external/draft-memory
-                  AND COALESCE(team_selection_type, 'standard') IN ('normal', 'standard')
-                  AND COALESCE(is_venue_clash, false) = false
-                  -- Skip games admin marked unfair (explicit tick OR pre-slider legacy)
-                  AND COALESCE(admin_marked_unfair, false) = false
+                  -- $1 = filterNonStandard: when true, restrict to standard, non-venue-clash games
+                  AND (NOT $1::boolean OR COALESCE(team_selection_type, 'standard') IN ('normal', 'standard'))
+                  AND (NOT $1::boolean OR COALESCE(is_venue_clash, false) = false)
+                  -- $2 = filterUnfair: when true, exclude games admin marked unfair
+                  AND (NOT $2::boolean OR COALESCE(admin_marked_unfair, false) = false)
             ),
             -- Player + game pairs where they were rostered onto a team.
             -- Same "backups don't count" rule used elsewhere in this session.
@@ -15581,43 +17739,57 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
             --
             -- GK players: use goalkeeper_rating column from history instead of overall_rating.
             -- If player_stat_history doesn't track GK rating explicitly, fall back to overall.
+            --
+            -- Implementation note: avoid ORDER BY inside UNION arms (caused parse failures
+            -- in the previous version — the alias 'psh' from one arm isn't visible to the
+            -- UNION as a whole). Use ROW_NUMBER for the "earliest row per player" subselect.
             rating_periods AS (
-                SELECT
-                    psh.player_id,
-                    COALESCE(
+                SELECT * FROM (
+                    -- Forward periods: one per history row, ending at next change (or 2099)
+                    SELECT
+                        psh.player_id,
+                        COALESCE(
+                            CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
+                            psh.overall_rating
+                        ) AS ovr_in_period,
+                        psh.created_at AS period_start,
+                        COALESCE(
+                            LEAD(psh.created_at) OVER (PARTITION BY psh.player_id ORDER BY psh.created_at),
+                            '2099-01-01'::timestamp
+                        ) AS period_end
+                    FROM player_stat_history psh
+                    JOIN players p ON p.id = psh.player_id
+                    WHERE COALESCE(
                         CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
                         psh.overall_rating
-                    ) AS ovr_in_period,
-                    psh.created_at AS period_start,
-                    COALESCE(
-                        LEAD(psh.created_at) OVER (PARTITION BY psh.player_id ORDER BY psh.created_at),
-                        '2099-01-01'::timestamp
-                    ) AS period_end
-                FROM player_stat_history psh
-                JOIN players p ON p.id = psh.player_id
-                WHERE COALESCE(
-                    CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
-                    psh.overall_rating
-                ) IS NOT NULL
+                    ) IS NOT NULL
 
-                UNION ALL
+                    UNION ALL
 
-                -- Retroactive period: each player's earliest rating applied back to epoch
-                SELECT DISTINCT ON (psh.player_id)
-                    psh.player_id,
-                    COALESCE(
-                        CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
-                        psh.overall_rating
-                    ) AS ovr_in_period,
-                    '1970-01-01'::timestamp AS period_start,
-                    psh.created_at          AS period_end
-                FROM player_stat_history psh
-                JOIN players p ON p.id = psh.player_id
-                WHERE COALESCE(
-                    CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
-                    psh.overall_rating
-                ) IS NOT NULL
-                ORDER BY psh.player_id, psh.created_at ASC
+                    -- Retroactive period: each player's earliest rating, applied [epoch → first_at)
+                    SELECT
+                        player_id,
+                        ovr_in_period,
+                        '1970-01-01'::timestamp AS period_start,
+                        first_at                AS period_end
+                    FROM (
+                        SELECT
+                            psh.player_id,
+                            COALESCE(
+                                CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
+                                psh.overall_rating
+                            ) AS ovr_in_period,
+                            psh.created_at AS first_at,
+                            ROW_NUMBER() OVER (PARTITION BY psh.player_id ORDER BY psh.created_at ASC) AS rn
+                        FROM player_stat_history psh
+                        JOIN players p ON p.id = psh.player_id
+                        WHERE COALESCE(
+                            CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
+                            psh.overall_rating
+                        ) IS NOT NULL
+                    ) earliest
+                    WHERE rn = 1
+                ) all_periods
             ),
             -- Assign each player-game to the rating that was in effect when they played.
             -- Strict inequality on period_end handles the "same instant as wizard change"
@@ -15637,13 +17809,6 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
                    AND pg.game_date     <  rp.period_end
             ),
             -- Aggregate per (player, rating). Wins via case-insensitive team_name match.
-            --
-            -- fair_apps: subset of apps where team_balance_score IS NOT NULL AND <> 0.
-            -- This is the "reliable sample" count — standard games where admin set the
-            -- slider to a real value (balanced OR uneven). Games with NULL score that
-            -- pass the unfair filter are rare (would only be NULL score + NOT marked unfair,
-            -- a race condition). Frontend uses fair_apps > 5 as the threshold for bolding
-            -- the cell (strong signal, large enough sample).
             agg AS (
                 SELECT
                     player_id,
@@ -15685,12 +17850,21 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
                      ELSE p.overall_rating
                 END DESC NULLS LAST,
                 p.squad_number NULLS LAST, p.full_name
-        `);
+        `, [filterNonStandard, filterUnfair]);
 
-        res.json({ players: result.rows });
+        res.json({
+            players: result.rows,
+            filters: { filter_non_standard: filterNonStandard, filter_unfair: filterUnfair }
+        });
     } catch (error) {
         console.error('Players performance error:', error);
-        res.status(500).json({ error: 'Failed to load performance data' });
+        // Surface the actual DB error to the admin caller — this is a superadmin-only
+        // endpoint, no PII leak risk, and saves a round-trip of "what does the server log say?"
+        res.status(500).json({
+            error: 'Failed to load performance data',
+            detail: error.message,
+            hint: error.code ? `pg code ${error.code}` : undefined
+        });
     }
 });
 
@@ -16048,19 +18222,62 @@ app.get('/api/admin/audit/player/:id', authenticateToken, requireAdmin, async (r
             ORDER BY gsc.created_at DESC
         `, [id]).catch(() => ({ rows: [] }));
 
+        // ─── Phase A — Tag every row with category/sub/actor/severity ─────
+        // The frontend uses these for the new filter axes. The mapping for
+        // each row source is informed by the table it came from, since some
+        // rows (like balance ledger entries) don't carry an action code in
+        // the same way audit_logs do.
+        const tag = (rows, codeOf) => rows.map(r => enrichAuditRow(r, codeOf(r)));
+
+        // Balance — credit_transactions.type is the action code (game_fee, refund, etc.)
+        const balanceTagged = balance.rows.map(r => {
+            // If admin_id was set on the transaction, override actor to 'admin'
+            const actor = r.admin_alias || r.admin_name ? 'admin' : undefined;
+            return enrichAuditRow(r, r.type || 'admin_adjustment', actor ? { actor } : {});
+        });
+
+        // Stat history — synthetic action code: admin override if changed_by present, else system
+        const statsTagged = stats.rows.map(r => enrichAuditRow(r,
+            r.changed_by_alias || r.changed_by_name ? 'stats_updated' : 'player_stats_updated'));
+
+        // Registrations / regEvents use event_type
+        const regEventsTagged = regEvents.rows.map(r => enrichAuditRow(r, r.event_type || 'signed_up'));
+
+        // MOTM
+        const motmReceivedTagged = motmReceived.rows.map(r => enrichAuditRow(r, 'motm_received'));
+        const motmVotesTagged    = motmVotes.rows.map(r    => enrichAuditRow(r, 'motm_vote_cast'));
+
+        // Awards
+        const awardCastTagged     = awardVotesCast.rows.map(r => enrichAuditRow(r, 'award_vote_cast'));
+        const awardReceivedTagged = awardVotesReceived.rows.map(r => enrichAuditRow(r, 'award_vote_received'));
+
+        // Admin actions: use the .action field
+        const adminActionsTagged = adminActions.rows.map(r => enrichAuditRow(r, r.action || 'player_updated'));
+
+        // Login events
+        const loginTagged = loginEvents.rows.map(r => enrichAuditRow(r, 'login'));
+
+        // Discipline records (separate table, conceptually a discipline event)
+        const disciplineTagged = disciplineRecords.rows.map(r =>
+            enrichAuditRow(r, r.recorded_by_name ? 'discipline_added' : 'discipline_recorded'));
+
+        // Game stat changes (from bulk completion wizard)
+        const gameStatChangesTagged = gameStatChanges.rows.map(r =>
+            enrichAuditRow(r, r.changed_by_alias || r.changed_by_name ? 'stats_updated' : 'player_stats_updated'));
+
         res.json({
-            balance: balance.rows,
-            stats: stats.rows,
-            registrations: regEvents.rows,
-            registrationPreferences: regPreferences.rows,
-            motmReceived: motmReceived.rows,
-            motmVotesCast: motmVotes.rows,
-            awardVotesCast: awardVotesCast.rows,
-            awardVotesReceived: awardVotesReceived.rows,
-            adminActions: adminActions.rows,
-            loginEvents: loginEvents.rows,
-            disciplineRecords: disciplineRecords.rows,
-            gameStatChanges: gameStatChanges.rows
+            balance: balanceTagged,
+            stats: statsTagged,
+            registrations: regEventsTagged,
+            registrationPreferences: regPreferences.rows,    // not user-facing events
+            motmReceived: motmReceivedTagged,
+            motmVotesCast: motmVotesTagged,
+            awardVotesCast: awardCastTagged,
+            awardVotesReceived: awardReceivedTagged,
+            adminActions: adminActionsTagged,
+            loginEvents: loginTagged,
+            disciplineRecords: disciplineTagged,
+            gameStatChanges: gameStatChangesTagged
         });
     } catch (error) {
         console.error('Player audit error:', error);
@@ -16162,13 +18379,21 @@ app.get('/api/admin/audit/game/:id', authenticateToken, requireAdmin, async (req
             ORDER BY COALESCE(p.alias, p.full_name)
         `, [id]).catch(() => ({ rows: [] })); // graceful if table not yet migrated
 
+        // ─── Phase A — Tag every row with category/sub/actor/severity ─────
+        const gameLogsTagged    = gameLogs.rows.map(r => enrichAuditRow(r, r.action || 'settings_updated'));
+        const regEventsTagged   = regEvents.rows.map(r => enrichAuditRow(r, r.event_type || 'signed_up'));
+        const urlViewsTagged    = urlViews.rows.map(r => enrichAuditRow(r, 'page_view'));
+        const awardVotesTagged  = awardVotes.rows.map(r => enrichAuditRow(r, 'award_vote_cast'));
+        const statChangesTagged = statChanges.rows.map(r =>
+            enrichAuditRow(r, r.changed_by_alias || r.changed_by_name ? 'stats_updated' : 'player_stats_updated'));
+
         res.json({
-            gameLogs: gameLogs.rows,
-            registrationEvents: regEvents.rows,
-            currentRegistrations: currentRegs.rows,
-            urlViews: urlViews.rows,
-            awardVotes: awardVotes.rows,
-            statChanges: statChanges.rows
+            gameLogs: gameLogsTagged,
+            registrationEvents: regEventsTagged,
+            currentRegistrations: currentRegs.rows,   // squad snapshot — not events
+            urlViews: urlViewsTagged,
+            awardVotes: awardVotesTagged,
+            statChanges: statChangesTagged
         });
     } catch (error) {
         console.error('Game audit error:', error);
@@ -16419,6 +18644,53 @@ app.post('/api/push/register', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Push register error:', error);
         res.status(500).json({ error: 'Failed to register push token' });
+    }
+});
+
+// ─── P0 — Push notification diagnostic ─────────────────────────────────────
+// Superadmin-only test endpoint. Lists fcm_tokens for the caller, fires a real
+// push via existing infra, returns a diagnosis string. Helps debug why pushes
+// aren't arriving (no tokens / stale tokens / Expo error).
+app.post('/api/admin/test-push', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const tokens = await pool.query(
+            `SELECT fcm_token, device_name, last_used_at
+             FROM fcm_tokens
+             WHERE player_id = $1
+             ORDER BY last_used_at DESC`,
+            [req.user.playerId]
+        );
+
+        const result = {
+            tokens_found: tokens.rows.length,
+            tokens: tokens.rows.map(r => ({
+                token_preview: (r.fcm_token || '').substring(0, 25) + '...',
+                device:       r.device_name,
+                last_used:    r.last_used_at
+            })),
+            diagnosis: ''
+        };
+
+        if (tokens.rows.length === 0) {
+            result.diagnosis = 'NO_TOKENS — the mobile app has never successfully registered. ' +
+                               'Likely cause: /api/push/register is auth-failing silently. ' +
+                               'Try logging out + back in on the app to force re-registration.';
+            return res.json(result);
+        }
+
+        // Send a real push. Use 'signup' as a known-safe template that always succeeds.
+        try {
+            await sendNotification('signup', req.user.playerId, {});
+            result.diagnosis = 'PUSH_SENT — check your phone now. If nothing arrives within 30 seconds, ' +
+                               'the Expo token is stale (DeviceNotRegistered). Log out and back in to re-register.';
+        } catch (e) {
+            result.diagnosis = 'EXPO_ERROR — ' + (e.message || 'unknown');
+        }
+
+        res.json(result);
+    } catch (error) {
+        console.error('Test push error:', error);
+        res.status(500).json({ error: 'Test push failed', detail: error.message });
     }
 });
 
@@ -17211,8 +19483,24 @@ app.post('/api/admin/games/:gameId/referees/:refPlayerId/confirm', authenticateT
     try {
         await client.query('BEGIN');
         // Lock game row to prevent race condition on slot count
-        const game = await client.query('SELECT refs_required FROM games WHERE id = $1 FOR UPDATE', [gameId]);
+        // P2.2: also fetch ref_pay so we can default the per-ref pay_amount
+        const game = await client.query('SELECT refs_required, ref_pay FROM games WHERE id = $1 FOR UPDATE', [gameId]);
         if (!game.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Game not found' }); }
+
+        // P2.2: pay_amount required. Body wins; falls back to game.ref_pay; otherwise reject.
+        const bodyPay = req.body?.pay_amount;
+        const parsedBodyPay = (bodyPay === null || bodyPay === undefined || bodyPay === '')
+            ? null : parseFloat(bodyPay);
+        if (parsedBodyPay !== null && (isNaN(parsedBodyPay) || parsedBodyPay < 0)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'pay_amount must be a number ≥ 0' });
+        }
+        const gameRefPay = parseFloat(game.rows[0].ref_pay) || 0;
+        const finalPayAmount = parsedBodyPay !== null ? parsedBodyPay : gameRefPay;
+        if (finalPayAmount <= 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Referee pay must be set (either in this confirm request or game-level ref_pay > 0)' });
+        }
 
         const confirmedCount = await client.query(
             'SELECT COUNT(*) AS cnt FROM game_referees WHERE game_id = $1 AND status = $2',
@@ -17223,12 +19511,24 @@ app.post('/api/admin/games/:gameId/referees/:refPlayerId/confirm', authenticateT
             return res.status(400).json({ error: 'Maximum number of referees already confirmed for this game' });
         }
 
+        // P2.2: also write pay_amount on confirm. Falls back gracefully if column missing.
         const result = await client.query(
-            `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW()
+            `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW(), pay_amount = $3
              WHERE game_id = $1 AND player_id = $2
              RETURNING id`,
-            [gameId, refPlayerId]
-        );
+            [gameId, refPlayerId, finalPayAmount]
+        ).catch(async (err) => {
+            // Column doesn't exist yet (pre-migration). Re-run without pay_amount.
+            if (err.code === '42703') {
+                return await client.query(
+                    `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW()
+                     WHERE game_id = $1 AND player_id = $2
+                     RETURNING id`,
+                    [gameId, refPlayerId]
+                );
+            }
+            throw err;
+        });
         if (!result.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Application not found' }); }
         await client.query('COMMIT');
 
@@ -17322,6 +19622,19 @@ app.post('/api/admin/games/:gameId/referees/add', authenticateToken, requireGame
     }
 
     try {
+        // P2.2 — resolve pay_amount up-front. Body wins; falls back to game.ref_pay; rejects if both empty/zero.
+        const bodyPay = req.body?.pay_amount;
+        const parsedBodyPay = (bodyPay === null || bodyPay === undefined || bodyPay === '')
+            ? null : parseFloat(bodyPay);
+        if (parsedBodyPay !== null && (isNaN(parsedBodyPay) || parsedBodyPay < 0)) {
+            return res.status(400).json({ error: 'pay_amount must be a number ≥ 0' });
+        }
+        const refPayLookup = await pool.query('SELECT ref_pay FROM games WHERE id = $1', [gameId]);
+        const gameRefPay = parseFloat(refPayLookup.rows[0]?.ref_pay) || 0;
+        const finalPayAmount = parsedBodyPay !== null ? parsedBodyPay : gameRefPay;
+        if (finalPayAmount <= 0) {
+            return res.status(400).json({ error: 'Referee pay must be set (either in this request as pay_amount, or set game.ref_pay > 0 first)' });
+        }
         // ── External referee path — create or reuse a ghost player profile ───
         if (!playerId) {
             const name = externalName.trim().slice(0, 100);
@@ -17381,16 +19694,34 @@ app.post('/api/admin/games/:gameId/referees/add', authenticateToken, requireGame
 
             if (alreadyOn.rows.length > 0) {
                 await pool.query(
-                    `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW()
+                    `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW(), pay_amount = $3
                      WHERE game_id = $1 AND player_id = $2`,
-                    [gameId, ghostId]
-                );
+                    [gameId, ghostId, finalPayAmount]
+                ).catch(async (err) => {
+                    if (err.code === '42703') {
+                        return await pool.query(
+                            `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW()
+                             WHERE game_id = $1 AND player_id = $2`,
+                            [gameId, ghostId]
+                        );
+                    }
+                    throw err;
+                });
             } else {
                 await pool.query(
-                    `INSERT INTO game_referees (game_id, player_id, external_name, status, applied_at, confirmed_at)
-                     VALUES ($1, $2, $3, 'confirmed', NOW(), NOW())`,
-                    [gameId, ghostId, name]
-                );
+                    `INSERT INTO game_referees (game_id, player_id, external_name, status, applied_at, confirmed_at, pay_amount)
+                     VALUES ($1, $2, $3, 'confirmed', NOW(), NOW(), $4)`,
+                    [gameId, ghostId, name, finalPayAmount]
+                ).catch(async (err) => {
+                    if (err.code === '42703') {
+                        return await pool.query(
+                            `INSERT INTO game_referees (game_id, player_id, external_name, status, applied_at, confirmed_at)
+                             VALUES ($1, $2, $3, 'confirmed', NOW(), NOW())`,
+                            [gameId, ghostId, name]
+                        );
+                    }
+                    throw err;
+                });
             }
 
             setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'ref_admin_added',
@@ -17424,16 +19755,34 @@ app.post('/api/admin/games/:gameId/referees/add', authenticateToken, requireGame
                 return res.status(400).json({ error: `${player.name} is already a confirmed referee for this game` });
             }
             await pool.query(
-                `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW()
+                `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW(), pay_amount = $3
                  WHERE game_id = $1 AND player_id = $2`,
-                [gameId, playerId]
-            );
+                [gameId, playerId, finalPayAmount]
+            ).catch(async (err) => {
+                if (err.code === '42703') {
+                    return await pool.query(
+                        `UPDATE game_referees SET status = 'confirmed', confirmed_at = NOW()
+                         WHERE game_id = $1 AND player_id = $2`,
+                        [gameId, playerId]
+                    );
+                }
+                throw err;
+            });
         } else {
             await pool.query(
-                `INSERT INTO game_referees (game_id, player_id, status, applied_at, confirmed_at)
-                 VALUES ($1, $2, 'confirmed', NOW(), NOW())`,
-                [gameId, playerId]
-            );
+                `INSERT INTO game_referees (game_id, player_id, status, applied_at, confirmed_at, pay_amount)
+                 VALUES ($1, $2, 'confirmed', NOW(), NOW(), $3)`,
+                [gameId, playerId, finalPayAmount]
+            ).catch(async (err) => {
+                if (err.code === '42703') {
+                    return await pool.query(
+                        `INSERT INTO game_referees (game_id, player_id, status, applied_at, confirmed_at)
+                         VALUES ($1, $2, 'confirmed', NOW(), NOW())`,
+                        [gameId, playerId]
+                    );
+                }
+                throw err;
+            });
         }
 
         // In-app notification (non-critical)
@@ -18829,6 +21178,297 @@ app.post('/api/public/contact', async (req, res) => {
 // Rebuilt end-to-end: full column coverage for BY GAME / BY PLAYER / PLAYER × GAME
 // tabs, plus awards + star classes. Uses CTE pattern for performance over 700+ players.
 
+// ─── P4 — Finance reports (superadmin only) ────────────────────────────────
+// Two endpoints powering reporting.html FINANCE tab:
+//   GET /api/admin/finance/games?from=YYYY-MM-DD&to=YYYY-MM-DD   — per-game rows
+//   GET /api/admin/finance/summary?from=YYYY-MM-DD&to=YYYY-MM-DD — aggregate
+//
+// All revenue/cost math mirrors P3.2 (per-game finance) — single source of truth
+// in SQL so per-game and aggregate views never disagree.
+//
+// Date range: required, validated as YYYY-MM-DD. Default to last 90 days if missing.
+function _parseFinanceRange(req) {
+    const today = new Date();
+    const def_from = new Date(today); def_from.setDate(def_from.getDate() - 90);
+    const isISO = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+    const from = isISO(req.query.from) ? req.query.from : def_from.toISOString().slice(0, 10);
+    const to   = isISO(req.query.to)   ? req.query.to   : today.toISOString().slice(0, 10);
+    return { from, to };
+}
+
+// Shared helper — fetches per-game finance rows for a date range.
+// Returns the same object shape that /api/admin/finance/games sends.
+async function _fetchFinanceGames(from, to) {
+    const queryFull = `
+        WITH game_set AS (
+            SELECT g.id, g.game_date, g.cost_per_player, g.pitch_cost, g.ref_pay,
+                   g.format, g.exclusivity, g.team_selection_type, g.game_status,
+                   v.name AS venue_name
+            FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.game_status = 'completed'
+              AND g.game_date >= $1::date
+              AND g.game_date < ($2::date + INTERVAL '1 day')
+        ),
+        reg_agg AS (
+            SELECT r.game_id,
+                   COUNT(*) FILTER (WHERE r.status = 'confirmed')                                  AS confirmed_count,
+                   COUNT(*) FILTER (WHERE r.status = 'confirmed' AND r.is_comped = TRUE)           AS comped_count,
+                   COALESCE(SUM(CASE WHEN r.status = 'confirmed' AND NOT r.is_comped THEN COALESCE(r.amount_paid, 0)      ELSE 0 END), 0) AS reg_real,
+                   COALESCE(SUM(CASE WHEN r.status = 'confirmed' AND NOT r.is_comped THEN COALESCE(r.amount_paid_free, 0) ELSE 0 END), 0) AS reg_free
+            FROM registrations r
+            WHERE r.game_id IN (SELECT id FROM game_set)
+            GROUP BY r.game_id
+        ),
+        guest_agg AS (
+            SELECT gg.game_id,
+                   COUNT(*) FILTER (WHERE COALESCE(gg.amount_paid,0) > 0 OR COALESCE(gg.amount_paid_free,0) > 0)   AS guest_paid_count,
+                   COUNT(*) FILTER (WHERE COALESCE(gg.amount_paid,0) = 0 AND COALESCE(gg.amount_paid_free,0) = 0) AS guest_admin_count,
+                   COALESCE(SUM(CASE WHEN COALESCE(gg.amount_paid,0) > 0 OR COALESCE(gg.amount_paid_free,0) > 0
+                                     THEN COALESCE(gg.amount_paid, 0) ELSE 0 END), 0) AS guest_real,
+                   COALESCE(SUM(CASE WHEN COALESCE(gg.amount_paid,0) > 0 OR COALESCE(gg.amount_paid_free,0) > 0
+                                     THEN COALESCE(gg.amount_paid_free, 0) ELSE 0 END), 0) AS guest_free
+            FROM game_guests gg
+            WHERE gg.game_id IN (SELECT id FROM game_set)
+            GROUP BY gg.game_id
+        ),
+        dnr_agg AS (
+            SELECT dnr.game_id,
+                   COUNT(*)::int AS dropped_count,
+                   COALESCE(SUM(dnr.amount_paid_real), 0) AS dropped_real,
+                   COALESCE(SUM(dnr.amount_paid_free), 0) AS dropped_free
+            FROM dropped_no_refund dnr
+            WHERE dnr.game_id IN (SELECT id FROM game_set)
+            GROUP BY dnr.game_id
+        ),
+        ref_agg AS (
+            SELECT gr.game_id,
+                   COUNT(*) FILTER (WHERE gr.status = 'confirmed')::int                                AS ref_count,
+                   COUNT(*) FILTER (WHERE gr.status = 'confirmed' AND gr.pay_amount IS NULL)::int      AS ref_missing_pay_count,
+                   COALESCE(SUM(CASE WHEN gr.status = 'confirmed' THEN COALESCE(gr.pay_amount, 0) ELSE 0 END), 0) AS ref_pay_explicit
+            FROM game_referees gr
+            WHERE gr.game_id IN (SELECT id FROM game_set)
+            GROUP BY gr.game_id
+        )
+        SELECT g.id, g.game_date, g.format, g.exclusivity, g.venue_name, g.cost_per_player,
+               g.pitch_cost, g.ref_pay, g.team_selection_type,
+               COALESCE(r.confirmed_count, 0) AS confirmed_count,
+               COALESCE(r.comped_count, 0)    AS comped_count,
+               COALESCE(r.reg_real, 0)        AS reg_real,
+               COALESCE(r.reg_free, 0)        AS reg_free,
+               COALESCE(gu.guest_paid_count, 0)  AS guest_paid_count,
+               COALESCE(gu.guest_admin_count, 0) AS guest_admin_count,
+               COALESCE(gu.guest_real, 0)        AS guest_real,
+               COALESCE(gu.guest_free, 0)        AS guest_free,
+               COALESCE(d.dropped_count, 0)   AS dropped_count,
+               COALESCE(d.dropped_real, 0)    AS dropped_real,
+               COALESCE(d.dropped_free, 0)    AS dropped_free,
+               COALESCE(rf.ref_count, 0)              AS ref_count,
+               COALESCE(rf.ref_missing_pay_count, 0)  AS ref_missing_pay_count,
+               COALESCE(rf.ref_pay_explicit, 0)       AS ref_pay_explicit
+        FROM game_set g
+        LEFT JOIN reg_agg r   ON r.game_id  = g.id
+        LEFT JOIN guest_agg gu ON gu.game_id = g.id
+        LEFT JOIN dnr_agg  d  ON d.game_id  = g.id
+        LEFT JOIN ref_agg  rf ON rf.game_id = g.id
+        ORDER BY g.game_date DESC
+    `;
+
+    let rows;
+    try {
+        rows = (await pool.query(queryFull, [from, to])).rows;
+    } catch (err) {
+        // Pre-migration fallback — strip pitch_cost / pay_amount / dropped_no_refund references
+        if (err.code === '42703' || err.code === '42P01') {
+            const queryLite = `
+                SELECT g.id, g.game_date, g.format, g.exclusivity, v.name AS venue_name,
+                       g.cost_per_player, NULL::numeric AS pitch_cost, g.ref_pay, g.team_selection_type,
+                       COALESCE((SELECT COUNT(*)::int FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0)         AS confirmed_count,
+                       COALESCE((SELECT COUNT(*)::int FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed' AND r.is_comped = TRUE), 0) AS comped_count,
+                       COALESCE((SELECT SUM(CASE WHEN NOT is_comped THEN COALESCE(amount_paid, 0) ELSE 0 END) FROM registrations WHERE game_id = g.id AND status = 'confirmed'), 0) AS reg_real,
+                       COALESCE((SELECT SUM(CASE WHEN NOT is_comped THEN COALESCE(amount_paid_free, 0) ELSE 0 END) FROM registrations WHERE game_id = g.id AND status = 'confirmed'), 0) AS reg_free,
+                       COALESCE((SELECT COUNT(*)::int FROM game_guests WHERE game_id = g.id AND (COALESCE(amount_paid,0)>0 OR COALESCE(amount_paid_free,0)>0)), 0) AS guest_paid_count,
+                       COALESCE((SELECT COUNT(*)::int FROM game_guests WHERE game_id = g.id AND COALESCE(amount_paid,0)=0 AND COALESCE(amount_paid_free,0)=0), 0) AS guest_admin_count,
+                       COALESCE((SELECT SUM(amount_paid) FROM game_guests WHERE game_id = g.id AND (COALESCE(amount_paid,0)>0 OR COALESCE(amount_paid_free,0)>0)), 0) AS guest_real,
+                       COALESCE((SELECT SUM(amount_paid_free) FROM game_guests WHERE game_id = g.id AND (COALESCE(amount_paid,0)>0 OR COALESCE(amount_paid_free,0)>0)), 0) AS guest_free,
+                       0::int     AS dropped_count,
+                       0::numeric AS dropped_real,
+                       0::numeric AS dropped_free,
+                       COALESCE((SELECT COUNT(*)::int FROM game_referees WHERE game_id = g.id AND status = 'confirmed'), 0) AS ref_count,
+                       COALESCE((SELECT COUNT(*)::int FROM game_referees WHERE game_id = g.id AND status = 'confirmed'), 0) AS ref_missing_pay_count,
+                       0::numeric AS ref_pay_explicit
+                FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+                WHERE g.game_status = 'completed'
+                  AND g.game_date >= $1::date
+                  AND g.game_date < ($2::date + INTERVAL '1 day')
+                ORDER BY g.game_date DESC
+            `;
+            rows = (await pool.query(queryLite, [from, to])).rows;
+        } else throw err;
+    }
+
+    // EB-AUDIT: Compute early_bird_savings per game using getEffectivePriceAtSignup.
+    // One query for all registrations in scope; aggregated in JS.
+    // RAF-free players (paid £0 total, not comped) are excluded — same logic as
+    // the manage-games endpoint: no payment = no saving to claim.
+    let ebByGame = {};
+    try {
+        const gameIds = rows.map(r => r.id);
+        if (gameIds.length > 0) {
+            const ebRes = await pool.query(
+                `SELECT r.game_id,
+                        COALESCE(r.registered_at, r.signup_date) AS signup_date,
+                        COALESCE(r.amount_paid, 0) AS amount_paid,
+                        COALESCE(r.amount_paid_free, 0) AS amount_paid_free,
+                        g.game_date, g.cost_per_player, g.early_bird_price, g.super_early_bird_price
+                 FROM registrations r
+                 JOIN games g ON g.id = r.game_id
+                 WHERE r.game_id = ANY($1::uuid[])
+                   AND r.status = 'confirmed'
+                   AND r.is_comped = FALSE
+                   AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) > 0`,
+                [gameIds]
+            );
+            for (const row of ebRes.rows) {
+                const standard = parseFloat(row.cost_per_player || 0);
+                const { price: effective } = getEffectivePriceAtSignup(row, row.signup_date);
+                const saving = Math.max(0, standard - effective);
+                if (saving > 0) {
+                    ebByGame[row.game_id] = (ebByGame[row.game_id] || 0) + saving;
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('[finance/games EB calc] failed:', e.message);
+    }
+
+    // Compute derived fields per row (same as P3.2)
+    return rows.map(r => {
+        const cost      = parseFloat(r.cost_per_player) || 0;
+        const pitchCost = r.pitch_cost != null ? parseFloat(r.pitch_cost) : null;
+        const gameRefPay = parseFloat(r.ref_pay) || 0;
+        const refPayExplicit = parseFloat(r.ref_pay_explicit) || 0;
+        const refMissingPay  = parseInt(r.ref_missing_pay_count) || 0;
+        const refCost   = refPayExplicit + (refMissingPay * gameRefPay);
+        const compedCount = parseInt(r.comped_count) || 0;
+        const compCostLost = compedCount * cost;
+        const regReal = parseFloat(r.reg_real) || 0;
+        const regFree = parseFloat(r.reg_free) || 0;
+        const guestReal = parseFloat(r.guest_real) || 0;
+        const guestFree = parseFloat(r.guest_free) || 0;
+        const droppedReal = parseFloat(r.dropped_real) || 0;
+        const droppedFree = parseFloat(r.dropped_free) || 0;
+        const totalReal = regReal + guestReal + droppedReal;
+        const totalFree = regFree + guestFree + droppedFree;
+        const totalCost = (pitchCost != null ? pitchCost : 0) + refCost;
+        const totalBillable = (parseInt(r.confirmed_count) || 0) + (parseInt(r.guest_paid_count) || 0) + (parseInt(r.dropped_count) || 0);
+        const ebSavings = parseFloat(ebByGame[r.id] || 0);
+        return {
+            id: r.id,
+            game_date: r.game_date,
+            venue_name: r.venue_name,
+            format: r.format,
+            exclusivity: r.exclusivity,
+            team_selection_type: r.team_selection_type,
+            confirmed_count:  parseInt(r.confirmed_count) || 0,
+            guest_paid_count: parseInt(r.guest_paid_count) || 0,
+            guest_admin_count: parseInt(r.guest_admin_count) || 0,
+            comped_count:     compedCount,
+            dropped_count:    parseInt(r.dropped_count) || 0,
+            total_billable:   totalBillable,
+            cost_per_player:  cost,
+            pitch_cost:       pitchCost,
+            ref_count:        parseInt(r.ref_count) || 0,
+            ref_cost:         refCost,
+            ref_missing_pay_count: refMissingPay,
+            comp_cost_lost:   compCostLost,
+            total_cost:       totalCost,
+            reg_real: regReal, reg_free: regFree,
+            guest_real: guestReal, guest_free: guestFree,
+            dropped_real: droppedReal, dropped_free: droppedFree,
+            total_real:     totalReal,
+            total_free:     totalFree,
+            total_revenue:  totalReal + totalFree,
+            // EB-AUDIT: early bird savings (sum of cost - effective_at_signup)
+            early_bird_savings: ebSavings,
+            gross_profit:        totalReal - totalCost,
+            gross_profit_inc_fc: (totalReal + totalFree) - totalCost,
+            per_player_revenue:  totalBillable > 0 ? totalReal / totalBillable : 0,
+            per_player_spend:    totalBillable > 0 ? totalCost / totalBillable : 0,
+            pitch_cost_missing:  pitchCost == null,
+            ref_missing_pay:     refMissingPay > 0
+        };
+    });
+}
+
+app.get('/api/admin/finance/games', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { from, to } = _parseFinanceRange(req);
+        const games = await _fetchFinanceGames(from, to);
+        res.json({ from, to, count: games.length, games });
+    } catch (error) {
+        console.error('Finance games report error:', error);
+        res.status(500).json({ error: 'Failed to load finance games report', detail: error.message });
+    }
+});
+
+app.get('/api/admin/finance/summary', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { from, to } = _parseFinanceRange(req);
+        const games = await _fetchFinanceGames(from, to);
+
+        const agg = {
+            game_count:      games.length,
+            confirmed_total: 0, guest_paid_total: 0, guest_admin_total: 0,
+            comped_total:    0, dropped_total: 0, billable_total: 0,
+            reg_real_total: 0, reg_free_total: 0,
+            guest_real_total: 0, guest_free_total: 0,
+            dropped_real_total: 0, dropped_free_total: 0,
+            total_real:    0, total_free: 0, total_revenue: 0,
+            pitch_total:   0, ref_count_total: 0, ref_cost_total: 0,
+            comp_cost_lost_total: 0, total_cost: 0,
+            games_missing_pitch: 0, games_with_ref_missing_pay: 0,
+            early_bird_savings_total: 0    // EB-AUDIT
+        };
+        for (const g of games) {
+            agg.confirmed_total   += g.confirmed_count;
+            agg.guest_paid_total  += g.guest_paid_count;
+            agg.guest_admin_total += g.guest_admin_count;
+            agg.comped_total      += g.comped_count;
+            agg.dropped_total     += g.dropped_count;
+            agg.billable_total    += g.total_billable;
+            agg.reg_real_total    += g.reg_real;
+            agg.reg_free_total    += g.reg_free;
+            agg.guest_real_total  += g.guest_real;
+            agg.guest_free_total  += g.guest_free;
+            agg.dropped_real_total += g.dropped_real;
+            agg.dropped_free_total += g.dropped_free;
+            agg.total_real        += g.total_real;
+            agg.total_free        += g.total_free;
+            agg.total_revenue     += g.total_revenue;
+            agg.pitch_total       += g.pitch_cost != null ? g.pitch_cost : 0;
+            agg.ref_count_total   += g.ref_count;
+            agg.ref_cost_total    += g.ref_cost;
+            agg.comp_cost_lost_total += g.comp_cost_lost;
+            agg.total_cost        += g.total_cost;
+            agg.early_bird_savings_total += parseFloat(g.early_bird_savings || 0);   // EB-AUDIT
+            if (g.pitch_cost_missing) agg.games_missing_pitch++;
+            if (g.ref_missing_pay)    agg.games_with_ref_missing_pay++;
+        }
+        const summary = {
+            ...agg,
+            gross_profit:        agg.total_real - agg.total_cost,
+            gross_profit_inc_fc: agg.total_revenue - agg.total_cost,
+            per_game_avg_profit: agg.game_count > 0 ? (agg.total_real - agg.total_cost) / agg.game_count : 0,
+            avg_billable_per_game: agg.game_count > 0 ? agg.billable_total / agg.game_count : 0
+        };
+        res.json({ from, to, summary });
+    } catch (error) {
+        console.error('Finance summary error:', error);
+        res.status(500).json({ error: 'Failed to load finance summary', detail: error.message });
+    }
+});
+
+
 app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -18842,9 +21482,15 @@ app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) 
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'backup'), 0) as backup_count,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) +
                 COALESCE((SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id), 0) as total_players,
-                COALESCE((SELECT SUM(COALESCE(NULLIF(r.amount_paid,0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END))
+                -- P1.1: revenue formula respects free credits + discount feature
+                COALESCE((SELECT SUM(CASE
+                  WHEN r.is_comped                THEN 0
+                  WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), g.cost_per_player)
+                  ELSE                                  COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)
+                END)
                     FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) +
-                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id), 0) as revenue,
+                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id
+                  AND NOT (COALESCE(gg.amount_paid, 0) = 0 AND COALESCE(gg.amount_paid_free, 0) = 0)), 0) as revenue,
                 COALESCE((SELECT COUNT(*) FROM motm_votes mv WHERE mv.game_id = g.id), 0) as motm_votes_total,
                 COALESCE((SELECT COUNT(*) FROM game_awards ga WHERE ga.game_id = g.id), 0) as awards_total,
                 p.alias as motm_winner
@@ -19060,7 +21706,12 @@ app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async 
                 r.position_preference,
                 r.tournament_team_preference,
                 r.is_comped,
-                COALESCE(NULLIF(r.amount_paid, 0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END) AS amount_paid,
+                -- P1.1: amount_paid reflects total customer charge (real + free credits)
+                CASE
+                  WHEN r.is_comped                THEN 0
+                  WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), CASE WHEN r.is_comped THEN 0 ELSE g.cost_per_player END)
+                  ELSE                                  COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)
+                END AS amount_paid,
                 t.team_name AS player_team,
                 g.winning_team,
 
@@ -19533,15 +22184,33 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
     if (isCoach.rows.length === 0 && req.user.role !== 'superadmin')
         return res.status(403).json({ error: 'Coach badge required' });
 
-    // Validate all venues exist + get coaching data for price calc
+    // Validate all venues exist + get coaching data for price calc.
+    // P5: also reject archived venues — they shouldn't be available for new sessions.
     const venueResult = await pool.query(
         `SELECT id, name, coaching_cost_per_hour, pay_and_play_coach_hourly,
-                pay_and_play_player_hourly, availability_rule, coaching_suitable
+                pay_and_play_player_hourly, availability_rule, coaching_suitable,
+                COALESCE(is_active, TRUE) AS is_active
          FROM venues WHERE id = ANY($1)`,
         [venue_ids]
-    );
+    ).catch(async (err) => {
+        if (err.code === '42703') {
+            // Pre-migration: is_active column missing
+            return await pool.query(
+                `SELECT id, name, coaching_cost_per_hour, pay_and_play_coach_hourly,
+                        pay_and_play_player_hourly, availability_rule, coaching_suitable,
+                        TRUE AS is_active
+                 FROM venues WHERE id = ANY($1)`,
+                [venue_ids]
+            );
+        }
+        throw err;
+    });
     if (venueResult.rows.length !== venue_ids.length)
         return res.status(400).json({ error: 'One or more venue IDs not found' });
+
+    const archived = venueResult.rows.filter(v => !v.is_active);
+    if (archived.length > 0)
+        return res.status(400).json({ error: `Venue(s) archived: ${archived.map(v => v.name).join(', ')}` });
 
     const unsuitable = venueResult.rows.filter(v => !v.coaching_suitable);
     if (unsuitable.length > 0)
@@ -19790,15 +22459,33 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Cannot edit a completed or cancelled session' });
         }
 
-        // Validate venues exist and are coaching-suitable
+        // Validate venues exist and are coaching-suitable.
+        // P5: also reject archived venues — admin shouldn't be able to switch
+        // a session to an archived venue. (Existing sessions on already-archived
+        // venues stay valid via the JOIN — this only blocks NEW assignments.)
         const venueResult = await client.query(
             `SELECT id, name, coaching_cost_per_hour, pay_and_play_coach_hourly,
-                    pay_and_play_player_hourly, coaching_suitable
+                    pay_and_play_player_hourly, coaching_suitable,
+                    COALESCE(is_active, TRUE) AS is_active
              FROM venues WHERE id = ANY($1)`,
             [venue_ids]
-        );
+        ).catch(async (err) => {
+            if (err.code === '42703') {
+                return await client.query(
+                    `SELECT id, name, coaching_cost_per_hour, pay_and_play_coach_hourly,
+                            pay_and_play_player_hourly, coaching_suitable,
+                            TRUE AS is_active
+                     FROM venues WHERE id = ANY($1)`,
+                    [venue_ids]
+                );
+            }
+            throw err;
+        });
         if (venueResult.rows.length !== venue_ids.length)
             { await client.query('ROLLBACK'); return res.status(400).json({ error: 'One or more venue IDs not found' }); }
+        const archivedV = venueResult.rows.filter(v => !v.is_active);
+        if (archivedV.length > 0)
+            { await client.query('ROLLBACK'); return res.status(400).json({ error: `Venue(s) archived: ${archivedV.map(v => v.name).join(', ')}` }); }
         const unsuitable = venueResult.rows.filter(v => !v.coaching_suitable);
         if (unsuitable.length > 0)
             { await client.query('ROLLBACK'); return res.status(400).json({ error: `Venues not suitable: ${unsuitable.map(v => v.name).join(', ')}` }); }
@@ -20812,6 +23499,8 @@ app.get('/api/coaching/venues/available', optionalAuth, publicEndpointLimiter, a
         return res.status(400).json({ error: 'Invalid session_date' });
 
     try {
+        // P5: filter to active venues only — archived venues shouldn't appear
+        // in coaching booking. is_active may be missing pre-migration → COALESCE.
         const result = await pool.query(`
             SELECT id, name, address, coaching_cost_per_hour,
                    pay_and_play_coach_hourly, pay_and_play_player_hourly,
@@ -20819,8 +23508,23 @@ app.get('/api/coaching/venues/available', optionalAuth, publicEndpointLimiter, a
                    parking_pin, pitch_pin, special_instructions
             FROM venues
             WHERE coaching_suitable = TRUE
+              AND COALESCE(is_active, TRUE) = TRUE
             ORDER BY name ASC
-        `);
+        `).catch(async (err) => {
+            // Pre-migration fallback if is_active column missing
+            if (err.code === '42703') {
+                return await pool.query(`
+                    SELECT id, name, address, coaching_cost_per_hour,
+                           pay_and_play_coach_hourly, pay_and_play_player_hourly,
+                           availability_rule, boot_type, pitch_name,
+                           parking_pin, pitch_pin, special_instructions
+                    FROM venues
+                    WHERE coaching_suitable = TRUE
+                    ORDER BY name ASC
+                `);
+            }
+            throw err;
+        });
 
         const filtered = session_date
             ? result.rows.filter(v => isVenueAvailable(v.availability_rule, session_date, dur))
@@ -23492,6 +26196,8 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
                 [r.campaign_id]
             );
             await client.query('COMMIT');
+            // DYNSTAR: comms-claim inserts directly as 'confirmed' — trigger star review
+            reviewDynamicStarRating(pool, gid).catch(() => {});
             return res.json({ outcome: 'registered', gameId: gid,
                 message: "You're confirmed for the game!" });
         }
