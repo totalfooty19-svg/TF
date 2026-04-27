@@ -3699,6 +3699,388 @@ app.delete('/api/player/favourite-series/:seriesId', authenticateToken, async (r
     }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// A4: PLAYER FAVOURITE VENUES — mirrors favourite-series pattern exactly
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/player/favourite-venues — list favourited venues (with venue meta)
+app.get('/api/player/favourite-venues', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT pfv.venue_id, pfv.created_at,
+                    v.name, v.address, v.region, v.pitch_location
+             FROM player_favourite_venues pfv
+             LEFT JOIN venues v ON v.id = pfv.venue_id
+             WHERE pfv.player_id = $1
+             ORDER BY pfv.created_at DESC`,
+            [req.user.playerId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get favourite-venues error:', error);
+        res.status(500).json({ error: 'Failed to get favourites' });
+    }
+});
+
+// POST /api/player/favourite-venues/:venueId — add favourite (idempotent via ON CONFLICT)
+app.post('/api/player/favourite-venues/:venueId', authenticateToken, async (req, res) => {
+    try {
+        const venueId = String(req.params.venueId || '').trim();
+        if (!venueId) {
+            return res.status(400).json({ error: 'Invalid venue id' });
+        }
+        // Confirm venue exists
+        const venueCheck = await pool.query('SELECT id FROM venues WHERE id = $1', [venueId]);
+        if (venueCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Venue not found' });
+        }
+        await pool.query(
+            `INSERT INTO player_favourite_venues (player_id, venue_id)
+             VALUES ($1, $2)
+             ON CONFLICT (player_id, venue_id) DO NOTHING`,
+            [req.user.playerId, venueId]
+        );
+        res.json({ success: true, venue_id: venueId });
+    } catch (error) {
+        console.error('Add favourite-venue error:', error);
+        res.status(500).json({ error: 'Failed to add favourite' });
+    }
+});
+
+// DELETE /api/player/favourite-venues/:venueId — remove favourite
+app.delete('/api/player/favourite-venues/:venueId', authenticateToken, async (req, res) => {
+    try {
+        const venueId = String(req.params.venueId || '').trim();
+        if (!venueId) {
+            return res.status(400).json({ error: 'Invalid venue id' });
+        }
+        await pool.query(
+            `DELETE FROM player_favourite_venues
+             WHERE player_id = $1 AND venue_id = $2`,
+            [req.user.playerId, venueId]
+        );
+        res.json({ success: true, venue_id: venueId });
+    } catch (error) {
+        console.error('Remove favourite-venue error:', error);
+        res.status(500).json({ error: 'Failed to remove favourite' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// A4 DASHBOARD-V2 ENDPOINTS — Region slider + recent games (Mine/All)
+// ════════════════════════════════════════════════════════════════════════════
+// These are the canonical endpoints for the new dashboard. Existing dashboard
+// endpoints (e.g. /api/games) remain untouched so the live dashboard keeps
+// working until v2 is confirmed and replaces it.
+//
+// Region semantics: matches _PREFS_ALLOWED_LOCATIONS — Coventry, Birmingham,
+// Leamington & Warwick, Nuneaton, Manchester. 'ALL' returns all regions
+// (used as the brand-new-player default).
+//
+// Tier visibility: bronze=24h ahead, silver=7d, gold=28d, white/black=banned.
+// Admin override: admins see everything regardless of tier.
+
+// ── Helper: resolve player's effective region for the slider ────────────────
+// Decision (A4): default to ALL regions if region_code is NULL/empty.
+// region_code is the primary home region (single value, set in Preferences).
+// preferred_locations is the multi-region preference list — we use it as a
+// fallback only if region_code is unset (more permissive).
+function _resolveSliderRegion(player, requestedRegion) {
+    // Explicit override from query string takes priority (e.g. user picked from a region dropdown)
+    if (requestedRegion && _PREFS_ALLOWED_LOCATIONS.has(requestedRegion)) {
+        return { region: requestedRegion, source: 'requested' };
+    }
+    if (requestedRegion === 'ALL') {
+        return { region: 'ALL', source: 'requested' };
+    }
+    // Player has a primary region set
+    if (player.region_code && _PREFS_ALLOWED_LOCATIONS.has(player.region_code)) {
+        return { region: player.region_code, source: 'profile' };
+    }
+    // Brand-new player: default to ALL regions
+    return { region: 'ALL', source: 'default' };
+}
+
+// ── GET /api/dashboard/region-slider ────────────────────────────────────────
+// Returns chronological games for a region, with both upcoming (next N) and
+// recently-completed (last N). The frontend renders these as a single slider
+// where left of the cursor = past games, right = upcoming.
+//
+// Query params:
+//   ?region=Coventry|...|ALL    Override player's default region
+//   ?upcoming=20                 How many upcoming games to fetch (default 20, max 50)
+//   ?recent=20                   How many recently-completed games (default 20, max 50)
+//
+// Response:
+//   {
+//     region: 'Coventry' | 'ALL',
+//     region_source: 'profile' | 'default' | 'requested',
+//     tier_visibility_hours: 168,       // null if admin (no limit)
+//     hit_tier_limit: false,            // true if upcoming was truncated by tier
+//     games_completed: [...],           // descending date (most recent first)
+//     games_upcoming: [...],            // ascending date (next first)
+//   }
+app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
+    try {
+        const playerRow = await pool.query(
+            `SELECT region_code, reliability_tier
+             FROM players WHERE id = $1`,
+            [req.user.playerId]
+        );
+        const player = playerRow.rows[0] || {};
+        const tier = player.reliability_tier || 'silver';
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+
+        // Resolve region (priority: explicit query > profile > default ALL)
+        const requestedRegion = req.query.region ? String(req.query.region) : null;
+        const { region, source: regionSource } = _resolveSliderRegion(player, requestedRegion);
+
+        // Tier visibility window in hours
+        let hoursAhead = 168; // silver default = 7 days
+        if (tier === 'gold') hoursAhead = 28 * 24;       // 28 days
+        if (tier === 'bronze') hoursAhead = 24;          // 1 day
+        if (tier === 'white' || tier === 'black') hoursAhead = 0;
+        // Admins bypass tier
+        const effectiveHoursAhead = isAdmin ? null : hoursAhead;
+
+        // Limits (clamped)
+        const upcomingLimit = Math.min(50, Math.max(1, parseInt(req.query.upcoming) || 20));
+        const recentLimit   = Math.min(50, Math.max(1, parseInt(req.query.recent)   || 20));
+
+        // Region filter clause — 'ALL' = no filter
+        const regionClause = (region === 'ALL') ? '' : 'AND v.region = $2';
+        const baseParams   = (region === 'ALL') ? [req.user.playerId] : [req.user.playerId, region];
+
+        // Exclusivity badge visibility — match /api/games behaviour
+        let badgeFilter = '';
+        if (!isAdmin) {
+            // Check player's badges
+            const badges = await pool.query(`
+                SELECT b.name FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','CLM','Misfits')`,
+                [req.user.playerId]
+            );
+            const badgeNames = new Set(badges.rows.map(r => r.name));
+            const exclusions = [];
+            if (!badgeNames.has('TF All Star')) exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'allstars')");
+            if (!badgeNames.has('CLM'))         exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'clm')");
+            if (!badgeNames.has('Misfits'))     exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'misfits')");
+            badgeFilter = exclusions.length ? 'AND ' + exclusions.join(' AND ') : '';
+        }
+
+        // Tier window clause for upcoming
+        const tierClause = (effectiveHoursAhead === null)
+            ? ''
+            : (effectiveHoursAhead === 0)
+                ? 'AND 1 = 0'
+                : `AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL '${effectiveHoursAhead} hours'`;
+
+        // Common SELECT fields (kept lean for slider — matches what game cards need)
+        const selectFields = `
+            g.id, g.game_url, g.game_date, g.game_status, g.format, g.cost_per_player,
+            g.exclusivity, g.star_rating, g.star_rating_locked, g.team_selection_type,
+            g.max_players,
+            v.name AS venue_name, v.region AS venue_region,
+            v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
+            ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+             + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players,
+            ROUND((SELECT AVG(p.overall_rating)
+                   FROM registrations r JOIN players p ON p.id = r.player_id
+                   WHERE r.game_id = g.id AND r.status = 'confirmed'
+                   AND p.overall_rating IS NOT NULL)::numeric, 1) AS live_avg_ovr,
+            EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) AS is_registered`;
+
+        // Upcoming games — ascending (next first)
+        const upcomingRows = await pool.query(`
+            SELECT ${selectFields}
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.game_status IN ('available','confirmed')
+              AND g.game_date >= CURRENT_TIMESTAMP
+              ${regionClause}
+              ${tierClause}
+              ${badgeFilter}
+            ORDER BY g.game_date ASC
+            LIMIT ${upcomingLimit}`,
+            baseParams
+        );
+
+        // Determine if tier limited the upcoming count.
+        // We re-query without the tier clause to count what would have been visible.
+        // Cheap query (count only). Uses its own params array since this query only
+        // references region (no player_id needed for a simple visible-count check).
+        let hitTierLimit = false;
+        if (!isAdmin && effectiveHoursAhead !== null && effectiveHoursAhead > 0) {
+            const broaderRegionClause = (region === 'ALL') ? '' : 'AND v.region = $1';
+            const broaderParams       = (region === 'ALL') ? [] : [region];
+            const broaderCount = await pool.query(`
+                SELECT COUNT(*) AS n
+                FROM games g
+                LEFT JOIN venues v ON v.id = g.venue_id
+                WHERE g.game_status IN ('available','confirmed')
+                  AND g.game_date >= CURRENT_TIMESTAMP
+                  ${broaderRegionClause}
+                  ${badgeFilter}`,
+                broaderParams
+            );
+            const broader = parseInt(broaderCount.rows[0]?.n || 0);
+            hitTierLimit = broader > upcomingRows.rows.length;
+        }
+
+        // Recently-completed games — descending (most recent first)
+        const completedRows = await pool.query(`
+            SELECT ${selectFields}
+            FROM games g
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE g.game_status = 'completed'
+              ${regionClause}
+              ${badgeFilter}
+            ORDER BY g.game_date DESC
+            LIMIT ${recentLimit}`,
+            baseParams
+        );
+
+        res.json({
+            region,
+            region_source: regionSource,
+            tier,
+            tier_visibility_hours: effectiveHoursAhead,
+            hit_tier_limit: hitTierLimit,
+            games_completed: completedRows.rows,
+            games_upcoming: upcomingRows.rows,
+        });
+    } catch (error) {
+        console.error('GET /api/dashboard/region-slider error:', error.message);
+        res.status(500).json({ error: 'Failed to load region slider' });
+    }
+});
+
+
+// ── GET /api/dashboard/recent-games?scope=mine|all ──────────────────────────
+// Returns recently-completed games for the merged Recent/Completed carousel.
+// scope=mine → only games this player participated in (default)
+// scope=all  → site-wide recent completed games
+//
+// Response:
+//   {
+//     scope: 'mine' | 'all',
+//     games: [...]
+//   }
+app.get('/api/dashboard/recent-games', authenticateToken, async (req, res) => {
+    try {
+        const scope = (req.query.scope === 'all') ? 'all' : 'mine';
+        const limit = Math.min(20, Math.max(1, parseInt(req.query.limit) || 10));
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+
+        // Same exclusivity badge filter as the slider (only relevant for scope=all)
+        let badgeFilter = '';
+        if (!isAdmin && scope === 'all') {
+            const badges = await pool.query(`
+                SELECT b.name FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','CLM','Misfits')`,
+                [req.user.playerId]
+            );
+            const badgeNames = new Set(badges.rows.map(r => r.name));
+            const exclusions = [];
+            if (!badgeNames.has('TF All Star')) exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'allstars')");
+            if (!badgeNames.has('CLM'))         exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'clm')");
+            if (!badgeNames.has('Misfits'))     exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'misfits')");
+            badgeFilter = exclusions.length ? 'AND ' + exclusions.join(' AND ') : '';
+        }
+
+        const selectFields = `
+            g.id, g.game_url, g.game_date, g.game_status, g.format,
+            g.exclusivity, g.star_rating, g.team_selection_type,
+            g.winning_team, g.motm_winner_id,
+            v.name AS venue_name, v.region AS venue_region,
+            v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
+            COALESCE(motm_p.alias, motm_p.full_name) AS motm_winner_name,
+            EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) AS is_registered`;
+
+        let result;
+        if (scope === 'mine') {
+            // Only games where current user has a confirmed registration
+            result = await pool.query(`
+                SELECT ${selectFields}
+                FROM games g
+                LEFT JOIN venues v ON v.id = g.venue_id
+                LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+                WHERE g.game_status = 'completed'
+                  AND EXISTS(
+                      SELECT 1 FROM registrations
+                      WHERE game_id = g.id AND player_id = $1 AND status = 'confirmed'
+                  )
+                ORDER BY g.game_date DESC
+                LIMIT ${limit}`,
+                [req.user.playerId]
+            );
+        } else {
+            // All recent completed games
+            result = await pool.query(`
+                SELECT ${selectFields}
+                FROM games g
+                LEFT JOIN venues v ON v.id = g.venue_id
+                LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
+                WHERE g.game_status = 'completed'
+                  ${badgeFilter}
+                ORDER BY g.game_date DESC
+                LIMIT ${limit}`,
+                [req.user.playerId]
+            );
+        }
+
+        res.json({ scope, games: result.rows });
+    } catch (error) {
+        console.error('GET /api/dashboard/recent-games error:', error.message);
+        res.status(500).json({ error: 'Failed to load recent games' });
+    }
+});
+
+
+// ── GET /api/dashboard/my-booked-games ──────────────────────────────────────
+// Row 1 — MY BOOKED GAMES. Includes both confirmed signups AND backups
+// (locked decision: A4 Row 1 = confirmed + waitlist/backup).
+//
+// Returns chronologically ascending (next game first). Excludes completed.
+app.get('/api/dashboard/my-booked-games', authenticateToken, async (req, res) => {
+    try {
+        const limit = Math.min(20, Math.max(1, parseInt(req.query.limit) || 10));
+        const result = await pool.query(`
+            SELECT g.id, g.game_url, g.game_date, g.game_status, g.format,
+                   g.cost_per_player, g.team_selection_type, g.star_rating, g.star_rating_locked,
+                   g.max_players,
+                   v.name AS venue_name, v.region AS venue_region,
+                   v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
+                   r.status AS my_status,
+                   r.backup_type AS my_backup_type,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players,
+                   ROUND((SELECT AVG(p.overall_rating)
+                          FROM registrations r2 JOIN players p ON p.id = r2.player_id
+                          WHERE r2.game_id = g.id AND r2.status = 'confirmed'
+                          AND p.overall_rating IS NOT NULL)::numeric, 1) AS live_avg_ovr
+            FROM registrations r
+            JOIN games g ON g.id = r.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE r.player_id = $1
+              AND r.status IN ('confirmed','backup')
+              AND g.game_status IN ('available','confirmed')
+              AND g.game_date >= CURRENT_TIMESTAMP
+            ORDER BY g.game_date ASC
+            LIMIT ${limit}`,
+            [req.user.playerId]
+        );
+
+        res.json({ games: result.rows });
+    } catch (error) {
+        console.error('GET /api/dashboard/my-booked-games error:', error.message);
+        res.status(500).json({ error: 'Failed to load booked games' });
+    }
+});
+
+
 // POST /api/player/help-guide-seen — marks the dashboard help guide as viewed
 // (used to prevent auto-launch of the tour on subsequent dashboard loads)
 app.post('/api/player/help-guide-seen', authenticateToken, async (req, res) => {
@@ -24538,6 +24920,557 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
     return [];
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// MONTHLY TROPHIES (A3) — calc helper, cron scheduler, admin/player endpoints
+// ════════════════════════════════════════════════════════════════════════════
+// Mirrors series-trophies pattern but scoped by (year, month, region) instead
+// of by series_id. Schema: monthly_trophies / monthly_trophy_results /
+// monthly_trophy_runs (see migration).
+//
+// Metrics covered (locked by A3 decisions):
+//   1  Win %             — calc 'most',          eligibility ≥4 games
+//   2  MOTM Count        — calc 'most',          accumulative (no min)
+//   5  Appearances       — calc 'most',          accumulative (no min)
+//   9  Goals/Game        — calc 'most_per_game', eligibility ≥4 games
+//  13  Donkey Count      — calc 'most',          accumulative (no min)
+//  16  Discipline Points — calc 'most',          accumulative (no min)
+//
+// Regions (locked by A3 decisions):
+//   Coventry · Birmingham · Leamington & Warwick · Nuneaton · Manchester · ALL
+//   ('ALL' is the cross-region leaderboard — matches every game regardless of region)
+//
+// Scheduler (locked by A3 decisions):
+//   Render paid plan, but using setInterval rather than node-cron because that's the
+//   established pattern in this codebase (see recoverPendingTeamSettles, MOTM
+//   finaliser, Wonderful payment reconciler — all setInterval-based).
+//   Tick every hour; if it's the 1st of the month and we haven't processed
+//   the previous month yet, run it. Idempotent via monthly_trophy_runs UNIQUE.
+
+const MONTHLY_METRICS = [
+    { metric_id: 1,  calc_type: 'most',          min_games: 4 },  // Win %
+    { metric_id: 2,  calc_type: 'most',          min_games: 0 },  // MOTM
+    { metric_id: 5,  calc_type: 'most',          min_games: 0 },  // Appearances
+    { metric_id: 9,  calc_type: 'most_per_game', min_games: 4 },  // Goals/Game
+    { metric_id: 13, calc_type: 'most',          min_games: 0 },  // Donkey
+    { metric_id: 16, calc_type: 'most',          min_games: 0 },  // Discipline
+];
+
+const MONTHLY_REGIONS = [
+    'Coventry',
+    'Birmingham',
+    'Leamington & Warwick',
+    'Nuneaton',
+    'Manchester',
+    'ALL',
+];
+
+// ── calcMonthlyLeaderboard ─────────────────────────────────────────────────
+// Returns top 10 (we'll keep top 3) for a given (year, month, region, metric).
+// Region 'ALL' = no region filter. Otherwise filters on v.region = $3.
+// Eligibility: appearances ≥ minGames (only applied to metrics 1 and 9).
+//
+// The SQL pattern mirrors calcSeriesLeaderboard but the scope filter changes
+// from `g.series_id = $1` to a year/month/region triple.
+//
+// Returns array of: { player_id, player_name, appearances, primary_stat, supporting_stat }
+async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, minGames) {
+    const id = parseInt(metricId);
+    const cfg = METRIC_CONFIG[id];
+    if (!cfg) return [];
+
+    // Build the scope filter — used in every CTE/subquery below.
+    // Parameters:
+    //   $1 = year, $2 = month, $3 = region (only used when region !== 'ALL')
+    const isAllRegions = (region === 'ALL');
+    const regionJoin = isAllRegions
+        ? 'JOIN venues v ON v.id = g.venue_id'
+        : 'JOIN venues v ON v.id = g.venue_id AND v.region = $3';
+    const scopeFilter = `
+        EXTRACT(YEAR FROM g.game_date) = $1
+        AND EXTRACT(MONTH FROM g.game_date) = $2
+        AND g.game_status = 'completed'
+    `;
+    const params = isAllRegions ? [year, month] : [year, month, region];
+
+    // Reusable appearances CTE (confirmed players in completed games for this month/region)
+    const appearancesCte = `
+        app_counts AS (
+            SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, COUNT(*) AS appearances
+            FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            JOIN games g ON g.id = r.game_id
+            ${regionJoin}
+            WHERE r.status = 'confirmed' AND ${scopeFilter}
+            GROUP BY r.player_id, COALESCE(p.alias, p.full_name)
+        )`;
+
+    const minGamesFilter = minGames > 0 ? `WHERE ac.appearances >= ${parseInt(minGames)}` : '';
+
+    // ── METRIC 1: Win Percentage ───────────────────────────────────────────
+    if (id === 1) {
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pw AS (
+                SELECT r.player_id, COUNT(*) AS win_count
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                JOIN team_players tp ON tp.player_id = r.player_id
+                JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                ${regionJoin}
+                WHERE r.status = 'confirmed' AND ${scopeFilter}
+                  AND LOWER(t.team_name) = LOWER(g.winning_team)
+                GROUP BY r.player_id
+            )
+            SELECT ac.player_id, ac.player_name, ac.appearances,
+                   ROUND(COALESCE(pw.win_count,0)*100.0/NULLIF(ac.appearances,0),1) AS primary_stat,
+                   COALESCE(pw.win_count,0)::numeric AS supporting_stat
+            FROM app_counts ac LEFT JOIN pw ON pw.player_id = ac.player_id
+            ${minGamesFilter}
+            ORDER BY primary_stat DESC NULLS LAST, ac.appearances DESC
+            LIMIT 10`, params);
+        return r.rows;
+    }
+
+    // ── METRIC 2: MOTM Count ───────────────────────────────────────────────
+    if (id === 2) {
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pm AS (
+                SELECT ga.recipient_player_id AS player_id, COUNT(*) AS motm_count
+                FROM game_awards ga
+                JOIN games g ON g.id = ga.game_id
+                ${regionJoin}
+                WHERE ga.award_type = 'motm' AND ${scopeFilter}
+                GROUP BY ga.recipient_player_id
+            )
+            SELECT ac.player_id, ac.player_name, ac.appearances,
+                   COALESCE(pm.motm_count,0)::numeric AS primary_stat,
+                   ROUND(COALESCE(pm.motm_count,0)*100.0/NULLIF(ac.appearances,0),1) AS supporting_stat
+            FROM app_counts ac LEFT JOIN pm ON pm.player_id = ac.player_id
+            WHERE COALESCE(pm.motm_count,0) > 0
+            ORDER BY primary_stat DESC, ac.appearances ASC
+            LIMIT 10`, params);
+        return r.rows;
+    }
+
+    // ── METRIC 5: Appearances ──────────────────────────────────────────────
+    if (id === 5) {
+        const r = await pool.query(`
+            WITH ${appearancesCte}
+            SELECT player_id, player_name, appearances,
+                   appearances AS primary_stat,
+                   NULL::numeric AS supporting_stat
+            FROM app_counts
+            ORDER BY appearances DESC
+            LIMIT 10`, params);
+        return r.rows;
+    }
+
+    // ── METRIC 9: Goal Scorer (most_per_game) ─────────────────────────────
+    // Mirrors calcSeriesLeaderboard award-metric percentage formula. primary_stat
+    // is the % of games the player won the goalscorer award. supporting_stat is
+    // the raw count. Min-games eligibility filter from A3 decisions.
+    if (id === 9) {
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pg9 AS (
+                SELECT ga.recipient_player_id AS player_id, COUNT(*) AS award_count
+                FROM game_awards ga
+                JOIN games g ON g.id = ga.game_id
+                ${regionJoin}
+                WHERE ga.award_type = 'goalscorer' AND ${scopeFilter}
+                GROUP BY ga.recipient_player_id
+            )
+            SELECT ac.player_id, ac.player_name, ac.appearances,
+                   ROUND(COALESCE(pg9.award_count,0)*100.0/NULLIF(ac.appearances,0),1) AS primary_stat,
+                   COALESCE(pg9.award_count,0)::numeric AS supporting_stat
+            FROM app_counts ac LEFT JOIN pg9 ON pg9.player_id = ac.player_id
+            ${minGamesFilter}
+            ORDER BY primary_stat DESC NULLS LAST, ac.appearances DESC
+            LIMIT 10`, params);
+        return r.rows;
+    }
+
+    // ── METRIC 13: Donkey Count ────────────────────────────────────────────
+    if (id === 13) {
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pd AS (
+                SELECT ga.recipient_player_id AS player_id, COUNT(*) AS award_count
+                FROM game_awards ga
+                JOIN games g ON g.id = ga.game_id
+                ${regionJoin}
+                WHERE ga.award_type = 'donkey' AND ${scopeFilter}
+                GROUP BY ga.recipient_player_id
+            )
+            SELECT ac.player_id, ac.player_name, ac.appearances,
+                   COALESCE(pd.award_count,0)::numeric AS primary_stat,
+                   ROUND(COALESCE(pd.award_count,0)*100.0/NULLIF(ac.appearances,0),1) AS supporting_stat
+            FROM app_counts ac LEFT JOIN pd ON pd.player_id = ac.player_id
+            WHERE COALESCE(pd.award_count,0) > 0
+            ORDER BY primary_stat DESC, ac.appearances ASC
+            LIMIT 10`, params);
+        return r.rows;
+    }
+
+    // ── METRIC 16: Discipline Points ───────────────────────────────────────
+    // Uses discipline_records table (separate from registrations) — matches
+    // calcSeriesLeaderboard's discipline branch exactly.
+    if (id === 16) {
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pdisc AS (
+                SELECT dr.player_id, SUM(dr.points) AS disc_total
+                FROM discipline_records dr
+                JOIN games g ON g.id = dr.game_id
+                ${regionJoin}
+                WHERE ${scopeFilter}
+                GROUP BY dr.player_id
+            )
+            SELECT ac.player_id, ac.player_name, ac.appearances,
+                   COALESCE(pdisc.disc_total,0)::numeric AS primary_stat,
+                   ROUND(COALESCE(pdisc.disc_total,0)*1.0/NULLIF(ac.appearances,0),2) AS supporting_stat
+            FROM app_counts ac LEFT JOIN pdisc ON pdisc.player_id = ac.player_id
+            WHERE COALESCE(pdisc.disc_total,0) > 0
+            ORDER BY primary_stat DESC, ac.appearances ASC
+            LIMIT 10`, params);
+        return r.rows;
+    }
+
+    return [];
+}
+
+
+// ── runMonthlyTrophyJob ─────────────────────────────────────────────────────
+// Process one specific (year, month). Idempotent via monthly_trophy_runs UNIQUE
+// constraint — second run returns the existing run record without touching
+// trophies, unless `force=true` (manual admin action).
+async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Check / claim the run slot
+        const existing = await client.query(
+            `SELECT id, completed_at FROM monthly_trophy_runs WHERE year = $1 AND month = $2`,
+            [year, month]
+        );
+        if (existing.rows.length > 0 && existing.rows[0].completed_at && !force) {
+            await client.query('ROLLBACK');
+            return { ok: true, skipped: true, reason: 'already_processed' };
+        }
+
+        // Force-rerun: wipe previous results for this month before recompute
+        if (existing.rows.length > 0 && force) {
+            await client.query(`
+                DELETE FROM monthly_trophy_results WHERE trophy_id IN (
+                    SELECT id FROM monthly_trophies WHERE year = $1 AND month = $2
+                )`, [year, month]);
+            await client.query(`DELETE FROM monthly_trophies WHERE year = $1 AND month = $2`, [year, month]);
+            await client.query(`DELETE FROM monthly_trophy_runs WHERE year = $1 AND month = $2`, [year, month]);
+        }
+
+        // Create the run record (claims the slot; UNIQUE prevents double-fire)
+        const runRow = await client.query(
+            `INSERT INTO monthly_trophy_runs (year, month, started_at) VALUES ($1, $2, NOW()) RETURNING id`,
+            [year, month]
+        );
+        const runId = runRow.rows[0].id;
+
+        let trophiesCreated = 0;
+        let errorMsg = null;
+
+        try {
+            for (const region of MONTHLY_REGIONS) {
+                for (const m of MONTHLY_METRICS) {
+                    const leaderboard = await calcMonthlyLeaderboard(
+                        year, month, region, m.metric_id, m.calc_type, m.min_games
+                    );
+
+                    // Skip if zero qualifying players
+                    if (!leaderboard || leaderboard.length === 0) continue;
+
+                    // Insert trophy definition
+                    const trophyRow = await client.query(
+                        `INSERT INTO monthly_trophies
+                         (year, month, region, metric_id, calculation_type, eligibility_min_games)
+                         VALUES ($1, $2, $3, $4, $5, $6)
+                         RETURNING id`,
+                        [year, month, region, m.metric_id, m.calc_type, m.min_games]
+                    );
+                    const trophyId = trophyRow.rows[0].id;
+
+                    // Insert top 3 results
+                    for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
+                        const row = leaderboard[i];
+                        await client.query(
+                            `INSERT INTO monthly_trophy_results
+                             (trophy_id, player_id, rank, primary_stat, supporting_stat, games_played)
+                             VALUES ($1, $2, $3, $4, $5, $6)`,
+                            [trophyId, row.player_id, i + 1, row.primary_stat, row.supporting_stat, row.appearances]
+                        );
+                    }
+                    trophiesCreated++;
+                }
+            }
+        } catch (innerErr) {
+            errorMsg = innerErr.message;
+            console.error(`Monthly trophy job inner error (${year}-${month}):`, innerErr);
+        }
+
+        // Mark run complete
+        await client.query(
+            `UPDATE monthly_trophy_runs
+             SET completed_at = NOW(), trophies_created = $1, error_message = $2
+             WHERE id = $3`,
+            [trophiesCreated, errorMsg, runId]
+        );
+
+        await client.query('COMMIT');
+        return { ok: !errorMsg, year, month, trophies_created: trophiesCreated, error: errorMsg };
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(`Monthly trophy job fatal error (${year}-${month}):`, e);
+        return { ok: false, error: e.message };
+    } finally {
+        client.release();
+    }
+}
+
+
+// ── Monthly cron scheduler ─────────────────────────────────────────────────
+// Runs every hour. On the 1st of any month, processes the PREVIOUS month if
+// it hasn't been processed yet. Idempotent: monthly_trophy_runs UNIQUE
+// (year, month) means a second call within the same month is a no-op.
+async function tickMonthlyTrophyCron() {
+    try {
+        const now = new Date();
+        // Only run on day 1 of the month — saves DB queries every other day
+        if (now.getUTCDate() !== 1) return;
+
+        // Process the PREVIOUS month
+        const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+        const targetYear = target.getUTCFullYear();
+        const targetMonth = target.getUTCMonth() + 1; // 1-12
+
+        const result = await runMonthlyTrophyJob(targetYear, targetMonth);
+        if (result.skipped) {
+            // Already processed earlier today — quiet
+            return;
+        }
+        if (result.ok) {
+            console.log(`🏆 Monthly trophies finalised for ${targetYear}-${String(targetMonth).padStart(2,'0')}: ${result.trophies_created} trophies created`);
+        } else {
+            console.error(`🏆 Monthly trophies error for ${targetYear}-${String(targetMonth).padStart(2,'0')}:`, result.error);
+        }
+    } catch (e) {
+        console.error('tickMonthlyTrophyCron error:', e.message);
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// MONTHLY TROPHY ENDPOINTS
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/monthly-trophies/list-months
+// Returns distinct (year, month) pairs that have any trophies recorded.
+// For the admin UI's "select a month" dropdown.
+app.get('/api/monthly-trophies/list-months', async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT DISTINCT year, month
+            FROM monthly_trophies
+            ORDER BY year DESC, month DESC`);
+        res.json({ months: r.rows });
+    } catch (e) {
+        console.error('GET /api/monthly-trophies/list-months error:', e.message);
+        res.status(500).json({ error: 'Failed to load months' });
+    }
+});
+
+// GET /api/monthly-trophies/:year/:month?region=...
+// Returns all trophies for a given (year, month, region). Public-readable.
+// If region omitted, returns all 6 regions in one payload.
+app.get('/api/monthly-trophies/:year/:month', async (req, res) => {
+    try {
+        const year = parseInt(req.params.year);
+        const month = parseInt(req.params.month);
+        const region = req.query.region || null;
+
+        if (!year || !month || month < 1 || month > 12) {
+            return res.status(400).json({ error: 'Invalid year or month' });
+        }
+        if (region && !MONTHLY_REGIONS.includes(region)) {
+            return res.status(400).json({ error: 'Invalid region' });
+        }
+
+        const filter = region ? 'AND mt.region = $3' : '';
+        const params = region ? [year, month, region] : [year, month];
+
+        const trophiesRows = await pool.query(`
+            SELECT mt.id, mt.region, mt.metric_id, mt.calculation_type,
+                   mt.eligibility_min_games, mt.finalized_at
+            FROM monthly_trophies mt
+            WHERE mt.year = $1 AND mt.month = $2 ${filter}
+            ORDER BY mt.region, mt.metric_id`,
+            params
+        );
+
+        const out = [];
+        for (const t of trophiesRows.rows) {
+            const cfg = METRIC_CONFIG[parseInt(t.metric_id)];
+            const resultsRows = await pool.query(`
+                SELECT mtr.rank, mtr.player_id, mtr.primary_stat, mtr.supporting_stat,
+                       mtr.games_played,
+                       COALESCE(p.alias, p.full_name) AS player_name
+                FROM monthly_trophy_results mtr
+                JOIN players p ON p.id = mtr.player_id
+                WHERE mtr.trophy_id = $1
+                ORDER BY mtr.rank`, [t.id]);
+
+            out.push({
+                trophy_id: t.id,
+                region: t.region,
+                metric_id: t.metric_id,
+                metric_name: cfg ? cfg.name : 'Unknown',
+                metric_icon: cfg ? cfg.icon : '',
+                calculation_type: t.calculation_type,
+                primary_label: cfg ? cfg.primaryLabel : '',
+                supporting_label: cfg ? cfg.supportingLabel : '',
+                eligibility_min_games: t.eligibility_min_games,
+                finalized_at: t.finalized_at,
+                results: resultsRows.rows.map(r => ({
+                    rank: r.rank,
+                    player_id: r.player_id,
+                    player_name: r.player_name,
+                    primary_stat: r.primary_stat !== null ? parseFloat(r.primary_stat) : null,
+                    supporting_stat: r.supporting_stat !== null ? parseFloat(r.supporting_stat) : null,
+                    games_played: r.games_played,
+                })),
+            });
+        }
+
+        res.json({ year, month, region: region || 'all', trophies: out });
+    } catch (e) {
+        console.error('GET /api/monthly-trophies error:', e.message);
+        res.status(500).json({ error: 'Failed to load monthly trophies' });
+    }
+});
+
+
+
+// GET /api/players/:playerId/monthly-trophies
+// Player profile history view. Returns every trophy this player has placed in.
+app.get('/api/players/:playerId/monthly-trophies', async (req, res) => {
+    try {
+        const playerId = req.params.playerId;
+        if (!playerId) return res.status(400).json({ error: 'Missing playerId' });
+
+        const r = await pool.query(`
+            SELECT mtr.rank, mtr.primary_stat, mtr.supporting_stat, mtr.games_played,
+                   mt.id AS trophy_id, mt.year, mt.month, mt.region, mt.metric_id,
+                   mt.calculation_type, mt.finalized_at
+            FROM monthly_trophy_results mtr
+            JOIN monthly_trophies mt ON mt.id = mtr.trophy_id
+            WHERE mtr.player_id = $1
+            ORDER BY mt.year DESC, mt.month DESC, mt.region, mt.metric_id`,
+            [playerId]
+        );
+
+        const out = r.rows.map(row => {
+            const cfg = METRIC_CONFIG[parseInt(row.metric_id)];
+            return {
+                trophy_id: row.trophy_id,
+                year: row.year,
+                month: row.month,
+                region: row.region,
+                metric_id: row.metric_id,
+                metric_name: cfg ? cfg.name : 'Unknown',
+                metric_icon: cfg ? cfg.icon : '',
+                calculation_type: row.calculation_type,
+                primary_label: cfg ? cfg.primaryLabel : '',
+                supporting_label: cfg ? cfg.supportingLabel : '',
+                rank: row.rank,
+                primary_stat: row.primary_stat !== null ? parseFloat(row.primary_stat) : null,
+                supporting_stat: row.supporting_stat !== null ? parseFloat(row.supporting_stat) : null,
+                games_played: row.games_played,
+                finalized_at: row.finalized_at,
+            };
+        });
+
+        res.json({ player_id: playerId, trophies: out });
+    } catch (e) {
+        console.error('GET /api/players/:id/monthly-trophies error:', e.message);
+        res.status(500).json({ error: 'Failed to load player monthly trophies' });
+    }
+});
+
+
+// POST /api/admin/monthly-trophies/run-now
+// Body: { year: 2026, month: 4, force: true }
+// Manual trigger — recomputes a specific month's trophies. Used for backfill
+// or testing. force=true wipes existing trophies for that month first.
+app.post('/api/admin/monthly-trophies/run-now', authenticateToken, async (req, res) => {
+    try {
+        if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin')) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+        const year = parseInt(req.body?.year);
+        const month = parseInt(req.body?.month);
+        const force = !!req.body?.force;
+
+        if (!year || !month || month < 1 || month > 12) {
+            return res.status(400).json({ error: 'Invalid year or month' });
+        }
+
+        const result = await runMonthlyTrophyJob(year, month, { force });
+        if (!result.ok) {
+            return res.status(500).json({ error: result.error || 'Unknown error', skipped: result.skipped });
+        }
+        res.json(result);
+    } catch (e) {
+        console.error('POST /api/admin/monthly-trophies/run-now error:', e.message);
+        res.status(500).json({ error: 'Failed to run monthly trophy job' });
+    }
+});
+
+
+// DELETE /api/admin/monthly-trophies/:year/:month
+// Wipes a month's trophies (admin escape hatch — use sparingly).
+app.delete('/api/admin/monthly-trophies/:year/:month', authenticateToken, async (req, res) => {
+    try {
+        if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin')) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+        const year = parseInt(req.params.year);
+        const month = parseInt(req.params.month);
+        if (!year || !month || month < 1 || month > 12) {
+            return res.status(400).json({ error: 'Invalid year or month' });
+        }
+
+        // Cascade DELETE handles monthly_trophy_results via FK.
+        await pool.query(
+            `DELETE FROM monthly_trophies WHERE year = $1 AND month = $2`,
+            [year, month]
+        );
+        await pool.query(
+            `DELETE FROM monthly_trophy_runs WHERE year = $1 AND month = $2`,
+            [year, month]
+        );
+
+        res.json({ ok: true, year, month });
+    } catch (e) {
+        console.error('DELETE /api/admin/monthly-trophies error:', e.message);
+        res.status(500).json({ error: 'Failed to delete monthly trophies' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// END MONTHLY TROPHIES MODULE
+// ════════════════════════════════════════════════════════════════════════════
+
 // Helper: fetch series + leaderboards for a given series_id
 async function _getSeriesTrophyPayload(seriesId, includeIds) {
     const seriesRow = await pool.query(`
@@ -26393,6 +27326,14 @@ app.listen(PORT, () => {
     setTimeout(recoverPendingTeamSettles, 5000);
     // And periodically thereafter
     setInterval(recoverPendingTeamSettles, 2 * 60 * 1000); // every 2 minutes
+
+    // ── Monthly trophies cron ───────────────────────────────────────────────
+    // Tick hourly. tickMonthlyTrophyCron() returns early unless it's the 1st
+    // of the month, then processes the previous month if not already done.
+    // setInterval is the established pattern here (no node-cron dependency).
+    // First tick runs 1 minute after boot to catch a 1st-of-month restart.
+    setTimeout(tickMonthlyTrophyCron, 60 * 1000);
+    setInterval(tickMonthlyTrophyCron, 60 * 60 * 1000); // every hour
 
     // ── Wonderful payment reconciler ────────────────────────────────────────
     // The webhook is the primary credit path but it can fail silently: Render
