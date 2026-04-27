@@ -11127,7 +11127,7 @@ app.get('/api/admin/games/:gameId/revenue-breakdown', authenticateToken, require
                 r.is_comped,
                 COALESCE(r.amount_paid, 0)      AS amount_paid_real,
                 COALESCE(r.amount_paid_free, 0) AS amount_paid_free,
-                COALESCE(r.registered_at, r.signup_date) AS signup_date
+                r.registered_at AS signup_date
             FROM registrations r
             JOIN players p ON p.id = r.player_id
             WHERE r.game_id = $1 AND r.status = 'confirmed'
@@ -21457,7 +21457,7 @@ async function _fetchFinanceGames(from, to) {
         if (gameIds.length > 0) {
             const ebRes = await pool.query(
                 `SELECT r.game_id,
-                        COALESCE(r.registered_at, r.signup_date) AS signup_date,
+                        r.registered_at AS signup_date,
                         COALESCE(r.amount_paid, 0) AS amount_paid,
                         COALESCE(r.amount_paid_free, 0) AS amount_paid_free,
                         g.game_date, g.cost_per_player, g.early_bird_price, g.super_early_bird_price
