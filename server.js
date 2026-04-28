@@ -189,20 +189,7 @@ function _renderCommsBody(template, firstName, claimUrl, expiryDate) {
     const safeName    = (firstName || 'there').replace(/[<>&]/g, '');
     const safeUrl     = String(claimUrl).replace(/[<>"']/g, '');
     const safeExpiry  = String(expiryDate).replace(/[<>&]/g, '');
-    // FIX-118: defence-in-depth XSS strip on admin-supplied body templates.
-    // Admins are trusted today (only superadmin can compose campaigns), but
-    // if comms access is delegated regionally, this strips the most dangerous
-    // vectors before substitution. Removes:
-    //   <script>...</script>, <iframe>...</iframe>
-    //   on*="..." inline event handlers
-    //   javascript: URI scheme
-    const sanitised = (template || '')
-        .replace(/<\s*script\b[\s\S]*?<\s*\/\s*script\s*>/gi, '')
-        .replace(/<\s*iframe\b[\s\S]*?<\s*\/\s*iframe\s*>/gi, '')
-        .replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, '')
-        .replace(/\son[a-z]+\s*=\s*'[^']*'/gi, '')
-        .replace(/javascript\s*:/gi, '');
-    const html = sanitised
+    const html = (template || '')
         .replace(/\{firstName\}/g, safeName)
         .replace(/\{expiryDate\}/g, safeExpiry)
         .replace(/\{claimUrl\}/g, safeUrl)
@@ -678,17 +665,7 @@ async function recordCreditTransaction(db, playerId, amount, type, description, 
             [playerId, amount, type, description, adminId || null, balBefore, balAfter]
         );
     } catch (e) {
-        // FIX-129 (U9): the credits balance UPDATE has already succeeded by the time
-        // we get here (callers always update balance BEFORE calling this). A ledger
-        // failure means the audit trail is missing for a real money move — we want
-        // structured visibility, not silent swallow. Still don't throw (caller's
-        // outer transaction has already committed/will commit independently of ledger).
-        console.error('[CREDIT-LEDGER-FAIL]', JSON.stringify({
-            playerId, amount, type, description,
-            adminId: adminId || null,
-            error: e.message,
-            timestamp: new Date().toISOString(),
-        }));
+        console.error('recordCreditTransaction failed (non-critical):', e.message);
     }
 }
 
@@ -790,52 +767,36 @@ async function getRafEnabled() {
 
 // Trigger £1 activation bonus — called when admin tops up a referred player for the first time
 async function triggerRafActivation(referredPlayerId) {
-    // FIX-120: full pay-out chain (atomic claim + balance UPDATE + ledger row) is now
-    // wrapped in a single transaction. Previously these were three separate pool.query
-    // calls — a connection drop between the claim UPDATE and the credits UPDATE would
-    // mark activation_paid=TRUE without crediting the £1, losing money silently.
-    const client = await pool.connect();
-    let clientReleased = false;  // FIX-120: track so finally doesn't double-release
     try {
         const enabled = await getRafEnabled();
-        if (!enabled) { client.release(); clientReleased = true; return; }
+        if (!enabled) return;
         // A2: suppress RAF activation if this player signed up via a guest_invite token.
         // The £2 cashback path replaces the £1 RAF bonus (not stacked).
-        const playerRow = await client.query(
+        const playerRow = await pool.query(
             'SELECT referred_by, COALESCE(signed_up_via_guest_invite, FALSE) AS via_guest_invite FROM players WHERE id = $1',
             [referredPlayerId]
         );
-        if (!playerRow.rows[0]) { client.release(); clientReleased = true; return; }
-        if (playerRow.rows[0].via_guest_invite) { client.release(); clientReleased = true; return; }   // A2: skip RAF for guest-invite signups
-        if (!playerRow.rows[0].referred_by) { client.release(); clientReleased = true; return; }
+        if (!playerRow.rows[0]) return;
+        if (playerRow.rows[0].via_guest_invite) return;   // A2: skip RAF for guest-invite signups
+        if (!playerRow.rows[0].referred_by) return;
         const referrerId = playerRow.rows[0].referred_by;
-
-        await client.query('BEGIN');
-        await client.query(
+        await pool.query(
             'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
             [referrerId, referredPlayerId]
         );
         // BUG-02: Atomic activation — UPDATE only fires if activation_paid IS FALSE, preventing double-pay race condition
-        const activationClaim = await client.query(
+        const activationClaim = await pool.query(
             `UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+1.00
              WHERE referrer_id=$1 AND referred_id=$2 AND activation_paid=FALSE
              RETURNING referrer_id`,
             [referrerId, referredPlayerId]
         );
-        if (activationClaim.rows.length === 0) {
-            await client.query('ROLLBACK');
-            client.release();
-            clientReleased = true;
-            return; // already paid — nothing to do
-        }
-        await client.query(
+        if (activationClaim.rows.length === 0) return; // already paid — nothing to do
+        await pool.query(
             'UPDATE credits SET balance = balance + 1.00, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
             [referrerId]
         );
-        await recordCreditTransaction(client, referrerId, 1.00, 'raf_reward', `RAF activation bonus — referred player ${referredPlayerId} topped up`);
-        await client.query('COMMIT');
-        client.release();
-        clientReleased = true;  // FIX-120: free client now; emails below use pool
+        await recordCreditTransaction(pool, referrerId, 1.00, 'raf_reward', `RAF activation bonus — referred player ${referredPlayerId} topped up`);
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -865,50 +826,33 @@ async function triggerRafActivation(referredPlayerId) {
             ['Referrer', referrerName], ['Referred Player', referredName],
             ['Amount Credited', '£1.00'], ['Type', 'Activation Bonus']
         ]);
-    } catch (e) {
-        // FIX-120: rollback ONLY if we still hold the client
-        if (!clientReleased) {
-            try { await client.query('ROLLBACK'); } catch (_) {}
-        }
-        console.error('triggerRafActivation error (non-critical):', e.message);
-    } finally {
-        // FIX-120: release only if not already released by happy-path or early-return
-        if (!clientReleased) {
-            try { client.release(); } catch (_) {}
-        }
-    }
+    } catch (e) { console.error('triggerRafActivation error (non-critical):', e.message); }
 }
 
 // Trigger 50p game credit — called on every confirmed self-registration by a referred player
 async function triggerRafGameCredit(referredPlayerId) {
-    // FIX-120: full pay-out chain wrapped in a transaction (same reasoning as triggerRafActivation).
-    const client = await pool.connect();
-    let clientReleased = false;  // FIX-120: guard against double-release in catch path
-    let newCount = 0, capReached = false;
     try {
         const enabled = await getRafEnabled();
-        if (!enabled) { client.release(); clientReleased = true; return; }
+        if (!enabled) return;
         // A2-A131: also suppress 50p game credits for guest_invite signups
         // (consistent with triggerRafActivation suppression — guest invite REPLACES RAF entirely).
-        const ref = await client.query(
+        const ref = await pool.query(
             'SELECT referred_by, created_at, COALESCE(signed_up_via_guest_invite, FALSE) AS via_guest_invite FROM players WHERE id=$1',
             [referredPlayerId]
         );
-        if (!ref.rows[0]?.referred_by) { client.release(); clientReleased = true; return; }
-        if (ref.rows[0].via_guest_invite) { client.release(); clientReleased = true; return; }   // A2: skip RAF for guest-invite signups
+        if (!ref.rows[0]?.referred_by) return;
+        if (ref.rows[0].via_guest_invite) return;   // A2: skip RAF for guest-invite signups
         const referrerId = ref.rows[0].referred_by;
         const joinedAt   = ref.rows[0].created_at;
         const windowEnd  = new Date(joinedAt);
         windowEnd.setFullYear(windowEnd.getFullYear() + 1);
-        if (new Date() > windowEnd) { client.release(); clientReleased = true; return; } // 1-year window expired
-
-        await client.query('BEGIN');
-        await client.query(
+        if (new Date() > windowEnd) return; // 1-year window expired
+        await pool.query(
             'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
             [referrerId, referredPlayerId]
         );
         // BUG-02b: Atomic cap claim — increments counter only if not already capped, prevents race condition double-pay
-        const creditClaim = await client.query(`
+        const creditClaim = await pool.query(`
             UPDATE raf_rewards
             SET game_credits_paid = game_credits_paid + 1,
                 game_credits_total = game_credits_total + 0.50,
@@ -919,26 +863,14 @@ async function triggerRafGameCredit(referredPlayerId) {
               AND cap_reached = FALSE AND game_credits_paid < 26
             RETURNING game_credits_paid AS new_count, (game_credits_paid >= 26) AS cap_reached
         `, [referrerId, referredPlayerId]);
-        if (creditClaim.rows.length === 0) {
-            await client.query('ROLLBACK');
-            client.release();
-            clientReleased = true;
-            return; // cap already reached or row missing — nothing to do
-        }
-        newCount   = parseInt(creditClaim.rows[0].new_count);
-        capReached = creditClaim.rows[0].cap_reached;
-        await client.query(
+        if (creditClaim.rows.length === 0) return; // cap already reached or row missing — nothing to do
+        const newCount   = parseInt(creditClaim.rows[0].new_count);
+        const capReached = creditClaim.rows[0].cap_reached;
+        await pool.query(
             'UPDATE credits SET balance = balance + 0.50, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
             [referrerId]
         );
-        await recordCreditTransaction(client, referrerId, 0.50, 'raf_reward', `RAF game credit (${newCount}/26) — referred player ${referredPlayerId}`);
-        await client.query('COMMIT');
-        client.release();
-        clientReleased = true;
-
-        // FIX-120: continue post-commit work using pool (notifications, emails) — these
-        // failing should NOT roll back the credit. Re-fetch referrerId for the closure scope.
-        const _referrerId = referrerId;
+        await recordCreditTransaction(pool, referrerId, 0.50, 'raf_reward', `RAF game credit (${newCount}/26) — referred player ${referredPlayerId}`);
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -988,14 +920,7 @@ async function triggerRafGameCredit(referredPlayerId) {
                 `)
             }).catch(() => {});
         }
-    } catch (e) {
-        // FIX-120: rollback + release ONLY if we still hold the client
-        if (!clientReleased) {
-            try { await client.query('ROLLBACK'); } catch (_) {}
-            try { client.release(); } catch (_) {}
-        }
-        console.error('triggerRafGameCredit error (non-critical):', e.message);
-    }
+    } catch (e) { console.error('triggerRafGameCredit error (non-critical):', e.message); }
 }
 
 
@@ -1162,16 +1087,11 @@ async function sendAwardsOpenEmails(gameId) {
         if (g.awards_emailed_at) return; // already emailed — throttle
 
         // Get confirmed participants + their emails (skip opt-outs)
-        // FIX-155: was SELECT p.email FROM players — players has no email column.
-        // Emails live on users (joined via user_id). The previous query either threw
-        // 42703 or returned 0 rows because the column was always NULL — either way
-        // the function silently never sent any emails. Now joins users correctly.
         const pRes = await pool.query(`
-            SELECT p.id, u.email, p.alias, p.full_name
+            SELECT p.id, p.email, p.alias, p.full_name
             FROM registrations r
             JOIN players p ON p.id = r.player_id
-            JOIN users u ON u.id = p.user_id
-            WHERE r.game_id = $1 AND r.status = 'confirmed' AND u.email IS NOT NULL`,
+            WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.email IS NOT NULL`,
             [gameId]
         );
         if (!pRes.rows.length) return;
@@ -1522,30 +1442,11 @@ async function sendNotification(type, playerId, data = {}) {
             data: { type, gameId: data.gameId || null, senderId: data.senderId || null, senderName: data.senderName || null },
         }));
 
-        // FIX-150: 10s timeout via AbortController. Without this, a hung Expo push
-        // endpoint could block awaited callers indefinitely (/api/auth/register
-        // awaits sendNotification('signup', …)) or leak promises in setImmediate
-        // callers. Mirrors the wonderfulRequest pattern at line ~26184.
-        const _pushAbort = new AbortController();
-        const _pushTimer = setTimeout(() => _pushAbort.abort(), 10000);
-        let response;
-        try {
-            response = await fetch('https://exp.host/--/api/v2/push/send', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify(messages),
-                signal: _pushAbort.signal,
-            });
-        } catch (fetchErr) {
-            if (fetchErr.name === 'AbortError') {
-                console.warn('Expo push API timeout after 10s for player ' + playerId);
-            } else {
-                console.warn('Expo push fetch failed: ' + fetchErr.message);
-            }
-            return;
-        } finally {
-            clearTimeout(_pushTimer);
-        }
+        const response = await fetch('https://exp.host/--/api/v2/push/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify(messages),
+        });
 
         if (!response.ok) {
             console.warn('Expo push API error: ' + response.status);
@@ -2009,26 +1910,12 @@ app.post('/api/auth/register', async (req, res) => {
         // MED-2: All new accounts start as 'player' — superadmin must be set directly in DB
         const role = 'player';
 
-        // FIX-133: wrap the critical user-identity triple (users + players + credits)
-        // in a transaction. Previously these were three separate pool.query calls —
-        // if step 2 or 3 failed, an orphan user row was created and the email was
-        // reserved permanently (next signup attempt rejected with "email already
-        // registered"). Side effects after the triple (badges, referrals, player
-        // numbers) remain on pool with their existing fail-soft try/catches, since
-        // they're idempotent and not security/identity-critical.
-        const _regClient = await pool.connect();
-        let _regTxOpen = false;
-        let userId, playerId;
-        try {
-            await _regClient.query('BEGIN');
-            _regTxOpen = true;
-
-            // Create user
-            const userResult = await _regClient.query(
-                'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id',
-                [email.toLowerCase(), passwordHash, role]
-            );
-            userId = userResult.rows[0].id;
+        // Create user
+        const userResult = await pool.query(
+            'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id',
+            [email.toLowerCase(), passwordHash, role]
+        );
+        const userId = userResult.rows[0].id;
 
         // Extract first and last name
         const nameParts = fullName.trim().split(/\s+/);
@@ -2040,56 +1927,43 @@ app.post('/api/auth/register', async (req, res) => {
         // A2-A42: Try the new 21-column INSERT (with signed_up_via_guest_invite).
         // If that fails because the column doesn't exist (pre-migration),
         // fall back to the legacy 20-column INSERT so signups still work.
-            let playerResult;
-            const _basePlayerArgs = [
-                userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield',
-                stats.gk, stats.def, stats.str, stats.fit, stats.pac, stats.dec, stats.ast, stats.sht, stats.overall,
-                validatedSkillLevel, ageRange, validatedRegion, validatedInterests.includes('coaching')
-            ];
-            try {
-                playerResult = await _regClient.query(
+        let playerResult;
+        const _basePlayerArgs = [
+            userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield',
+            stats.gk, stats.def, stats.str, stats.fit, stats.pac, stats.dec, stats.ast, stats.sht, stats.overall,
+            validatedSkillLevel, ageRange, validatedRegion, validatedInterests.includes('coaching')
+        ];
+        try {
+            playerResult = await pool.query(
+                `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
+                    goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
+                    skill_level, age_range, region_code, coachable, signed_up_via_guest_invite)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
+                         $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING id`,
+                [..._basePlayerArgs, _signedUpViaGuestInvite]
+            );
+        } catch (e) {
+            // Pre-migration fallback: column missing → legacy INSERT
+            if (e.code === '42703' /* undefined_column */) {
+                console.warn('[A2 signup] signed_up_via_guest_invite column missing — using legacy INSERT. Run a2-migration.sql to enable RAF suppression.');
+                playerResult = await pool.query(
                     `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
                         goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
                         pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
-                        skill_level, age_range, region_code, coachable, signed_up_via_guest_invite)
+                        skill_level, age_range, region_code, coachable)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
-                             $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING id`,
-                    [..._basePlayerArgs, _signedUpViaGuestInvite]
+                             $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) RETURNING id`,
+                    _basePlayerArgs
                 );
-            } catch (e) {
-                // Pre-migration fallback: column missing → legacy INSERT
-                if (e.code === '42703' /* undefined_column */) {
-                    console.warn('[A2 signup] signed_up_via_guest_invite column missing — using legacy INSERT. Run a2-migration.sql to enable RAF suppression.');
-                    playerResult = await _regClient.query(
-                        `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
-                            goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
-                            pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
-                            skill_level, age_range, region_code, coachable)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
-                                 $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) RETURNING id`,
-                        _basePlayerArgs
-                    );
-                } else {
-                    throw e;
-                }
+            } else {
+                throw e;
             }
-            playerId = playerResult.rows[0].id;
-
-            // Create credits record
-            await _regClient.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
-
-            // FIX-133: commit the user-identity triple atomically
-            await _regClient.query('COMMIT');
-            _regTxOpen = false;
-        } catch (regTxErr) {
-            // FIX-133: rollback if any of the critical triple failed
-            if (_regTxOpen) {
-                try { await _regClient.query('ROLLBACK'); } catch (_) {}
-            }
-            throw regTxErr;
-        } finally {
-            _regClient.release();
         }
+        const playerId = playerResult.rows[0].id;
+
+        // Create credits record
+        await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
 
         // ── A2-A83: Auto-claim the guest invite token at signup time ──────
         // Without this, a friend who signs up via the link but never returns to
@@ -4565,36 +4439,16 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
         if (!description?.trim()) return res.status(400).json({ error: 'Description is required' });
         if (Math.abs(parsedAmount) > 500) return res.status(400).json({ error: 'Amount too large — max ±£500' });
 
-        // FIX-158: wrap balance UPDATE + ledger record in a transaction. Previously
-        // these were separate pool.query calls — process death between them would leave
-        // the balance changed but the ledger missing the entry, with no [CREDIT-LEDGER-FAIL]
-        // log because recordCreditTransaction was never reached. Now atomic.
-        const _credClient = await pool.connect();
-        let oldBalance = 0;
-        try {
-            await _credClient.query('BEGIN');
-            // Capture old balance before update (under lock so concurrent admin ops can't race the read)
-            const prevBalResult = await _credClient.query(
-                'SELECT balance FROM credits WHERE player_id = $1 FOR UPDATE',
-                [req.params.id]
-            );
-            oldBalance = prevBalResult.rows.length > 0 ? parseFloat(prevBalResult.rows[0].balance) : 0;
+        // Capture old balance before update so we can show it in the email
+        const prevBalResult = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [req.params.id]);
+        const oldBalance = prevBalResult.rows.length > 0 ? parseFloat(prevBalResult.rows[0].balance) : 0;
 
-            await _credClient.query(
-                'UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                [parsedAmount, req.params.id]
-            );
+        await pool.query(
+            'UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
+            [parsedAmount, req.params.id]
+        );
 
-            await recordCreditTransaction(_credClient, req.params.id, amount, 'admin_adjustment', description, req.user.userId);
-            await _credClient.query('COMMIT');
-        } catch (txErr) {
-            try { await _credClient.query('ROLLBACK'); } catch (_) {}
-            throw txErr;
-        } finally {
-            _credClient.release();
-        }
-
-        // Audit log can stay on pool (post-COMMIT) — separate observability channel
+        await recordCreditTransaction(pool, req.params.id, amount, 'admin_adjustment', description, req.user.userId);
         await auditLog(pool, req.user.playerId, 'credit_adjustment', req.params.id, `${parsedAmount >= 0 ? '+' : ''}£${parsedAmount.toFixed(2)} — ${description.trim()}`);
 
         res.json({ message: 'Credits adjusted' });
@@ -4626,30 +4480,17 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
         // Option B: free credits are a separate bucket from the real-money balance.
         // Positive grants add to free_credit_balance; admins can also pass a negative
         // value to remove granted credits. Balance (real money) is NOT touched here.
-        // FIX-158: same transaction guarantee as the real-balance endpoint above —
-        // INSERT/UPDATE + ledger record atomic.
-        const _fcClient = await pool.connect();
-        try {
-            await _fcClient.query('BEGIN');
-            await _fcClient.query(
-                `INSERT INTO credits (player_id, balance, free_credit_balance)
-                 VALUES ($1, 0, $2)
-                 ON CONFLICT (player_id) DO UPDATE
-                    SET free_credit_balance = credits.free_credit_balance + $2,
-                        last_updated        = CURRENT_TIMESTAMP`,
-                [req.params.id, parsedAmount]
-            );
+        await pool.query(
+            `INSERT INTO credits (player_id, balance, free_credit_balance)
+             VALUES ($1, 0, $2)
+             ON CONFLICT (player_id) DO UPDATE
+                SET free_credit_balance = credits.free_credit_balance + $2,
+                    last_updated        = CURRENT_TIMESTAMP`,
+            [req.params.id, parsedAmount]
+        );
 
-            await recordCreditTransaction(_fcClient, req.params.id, parsedAmount, 'free_credit',
-                desc, req.user.userId);
-            await _fcClient.query('COMMIT');
-        } catch (txErr) {
-            try { await _fcClient.query('ROLLBACK'); } catch (_) {}
-            throw txErr;
-        } finally {
-            _fcClient.release();
-        }
-
+        await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
+            desc, req.user.userId);
         await auditLog(pool, req.user.playerId, 'free_credit_grant', req.params.id, `${parsedAmount >= 0 ? '+' : ''}£${parsedAmount.toFixed(2)} free credits — ${desc}`);
 
         res.json({ message: 'Free credits recorded' });
@@ -4758,45 +4599,20 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         }
 
         // FIX-053: Update balance with audit trail if changed
-        // FIX-161: same transaction guarantee as FIX-158 on the /credits endpoint —
-        // balance UPDATE + ledger record now atomic. Previously: separate pool.query
-        // calls, process death between them left balance changed without ledger entry.
-        // FOR UPDATE on prev balance read also closes a TOCTOU where concurrent admin
-        // edits could record stale prevBalance in audit log.
-        let _balPrev = 0, _balNew = 0, _balDiff = 0, _balChanged = false;
         if (balance !== undefined) {
-            const _balClient = await pool.connect();
-            try {
-                await _balClient.query('BEGIN');
-                const prevResult = await _balClient.query(
-                    'SELECT balance FROM credits WHERE player_id = $1 FOR UPDATE',
-                    [playerId]
-                );
-                _balPrev = prevResult.rows.length > 0 ? parseFloat(prevResult.rows[0].balance) : 0;
-                _balNew = parseFloat(balance);
-                _balDiff = parseFloat((_balNew - _balPrev).toFixed(2));
-                await _balClient.query(
-                    'UPDATE credits SET balance = $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                    [_balNew, playerId]
-                );
-                if (_balDiff !== 0) {
-                    await recordCreditTransaction(_balClient, playerId, _balDiff, 'admin_adjustment',
-                        `Direct balance set to £${_balNew.toFixed(2)} by admin`, req.user.userId);
-                    _balChanged = true;
-                }
-                await _balClient.query('COMMIT');
-            } catch (txErr) {
-                try { await _balClient.query('ROLLBACK'); } catch (_) {}
-                throw txErr;
-            } finally {
-                _balClient.release();
-            }
-            // Audit + email run post-COMMIT on pool — observability layer, not transaction-critical
-            if (_balChanged) {
+            const prevResult = await pool.query('SELECT balance FROM credits WHERE player_id = $1', [playerId]);
+            const prevBalance = prevResult.rows.length > 0 ? parseFloat(prevResult.rows[0].balance) : 0;
+            const newBalance = parseFloat(balance);
+            const diff = parseFloat((newBalance - prevBalance).toFixed(2));
+            await pool.query('UPDATE credits SET balance = $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [newBalance, playerId]);
+            if (diff !== 0) {
+                await recordCreditTransaction(pool, playerId, diff, 'admin_adjustment', `Direct balance set to £${newBalance.toFixed(2)} by admin`, req.user.userId);
+                // SEC-028: Audit log every balance change — tamper-evident record for disputes
                 await auditLog(pool, req.user.playerId, 'balance_adjustment',
-                    playerId, `prev=£${_balPrev.toFixed(2)} new=£${_balNew.toFixed(2)} diff=£${_balDiff}`);
+                    playerId, `prev=£${prevBalance.toFixed(2)} new=£${newBalance.toFixed(2)} diff=£${diff}`);
+                // Notify player with old/new balance
                 setImmediate(async () => {
-                    await sendBalanceEmail(playerId, _balPrev, _balNew, `Direct balance set to £${_balNew.toFixed(2)} by admin`);
+                    await sendBalanceEmail(playerId, prevBalance, newBalance, `Direct balance set to £${newBalance.toFixed(2)} by admin`);
                 });
             }
         }
@@ -4892,31 +4708,13 @@ app.put('/api/admin/players/:playerId/badges', authenticateToken, requireAdmin, 
         
         await client.query('BEGIN');
 
-        // SEC: Referee badge can only be assigned OR REMOVED by superadmin.
-        // FIX-159: was check-add-only — non-superadmins could DELETE the Referee badge
-        // by passing badgeIds without it (DELETE-then-INSERT pattern below). Removing
-        // a permission badge is as sensitive as adding it. Now: if non-superadmin and
-        // either (a) tries to add Referee, or (b) the player currently has Referee
-        // and the new list doesn't, block.
-        if (req.user.role !== 'superadmin') {
+        // SEC: Referee badge can only be assigned by superadmin
+        if (req.user.role !== 'superadmin' && badgeIds && badgeIds.length > 0) {
             const refBadgeRow = await client.query("SELECT id FROM badges WHERE name = 'Referee'");
             const refBadgeId = refBadgeRow.rows[0]?.id;
-            if (refBadgeId) {
-                // Block adding Referee
-                if (Array.isArray(badgeIds) && badgeIds.includes(refBadgeId)) {
-                    await client.query('ROLLBACK');
-                    return res.status(403).json({ error: 'Only superadmin can assign the Referee badge' });
-                }
-                // Block removing Referee — check if player currently has it AND new list doesn't
-                const hasRefRow = await client.query(
-                    'SELECT 1 FROM player_badges WHERE player_id = $1 AND badge_id = $2',
-                    [playerId, refBadgeId]
-                );
-                const newListHasRef = Array.isArray(badgeIds) && badgeIds.includes(refBadgeId);
-                if (hasRefRow.rows.length > 0 && !newListHasRef) {
-                    await client.query('ROLLBACK');
-                    return res.status(403).json({ error: 'Only superadmin can remove the Referee badge' });
-                }
+            if (refBadgeId && badgeIds.includes(refBadgeId)) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({ error: 'Only superadmin can assign the Referee badge' });
             }
         }
 
@@ -6220,9 +6018,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         } = req.body;
         const parsedEarlyBird      = earlyBirdPrice      != null && earlyBirdPrice      !== '' ? parseFloat(earlyBirdPrice)      : null;
         const parsedSuperEarlyBird = superEarlyBirdPrice != null && superEarlyBirdPrice !== '' ? parseFloat(superEarlyBirdPrice) : null;
-        // P2.1 / FIX-109: pitch_cost is REQUIRED. Tri-state parse first (so we
-        // can produce a clean "missing" error instead of NaN), then enforce below
-        // alongside the other required-field checks.
+        // P2.1: pitch_cost validation. Optional in this server release — frontend
+        // will start sending it in P2b-frontend turn. Once all forms are updated,
+        // change the check below back to REQUIRED (uncomment the rejection line).
         const parsedPitchCost = (pitchCost === null || pitchCost === undefined || pitchCost === '')
             ? null
             : parseFloat(pitchCost);
@@ -6241,9 +6039,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
             if (!orgCheck.rows.length) return res.status(404).json({ error: 'Default organiser not found' });
             if (!orgCheck.rows[0].is_organiser) return res.status(400).json({ error: 'Selected player is not flagged as an organiser' });
         }
-        // FIX-109 (P2b finalise): pitch_cost is now REQUIRED on create. All admin
-        // game-creation forms (Add Game; series-recreate, see below) must send it.
-        if (parsedPitchCost === null) return res.status(400).json({ error: 'Pitch cost is required' });
+        // TODO P2b-finalise: uncomment to enforce required pitch_cost once frontend ships:
+        // if (parsedPitchCost === null) return res.status(400).json({ error: 'Pitch cost is required' });
         // DYNSTAR: normalise star rating so explicit 0★ isn't stripped to null by `|| null`.
         // Admin sends starRating as a number (0, 1, 2, 3, 4, 5) or null/undefined when unset.
         const starRatingForDb = (starRating === null || starRating === undefined || starRating === '')
@@ -6580,9 +6377,7 @@ app.get('/api/admin/game-series/:seriesId/recreate-template', authenticateToken,
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    g.refs_required, g.ref_pay, g.requires_organiser,
                    g.early_bird_price, g.super_early_bird_price,
-                   g.opponent_id,
-                   g.pitch_cost,                                 -- FIX-109: surface for recreate
-                   g.default_organiser_id                        -- FIX-110: surface for recreate
+                   g.opponent_id
               FROM games g
               LEFT JOIN venues v ON v.id = g.venue_id
              WHERE g.series_id = $1
@@ -6673,35 +6468,6 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
             const gameDate = addWeeksLondon(first_game_date, i);
             const gameUrl  = crypto.randomBytes(8).toString('hex');
 
-            // FIX-109 (P2b finalise): pitch_cost must be carried over to recreated
-            // games. Fall back to venue.default_pitch_cost when the template lacks
-            // a value (older series whose source game predates the column).
-            let templatePitchCost = (game_template.pitch_cost === null || game_template.pitch_cost === undefined || game_template.pitch_cost === '')
-                ? null
-                : parseFloat(game_template.pitch_cost);
-            if (templatePitchCost === null && game_template.venue_id) {
-                try {
-                    const venueRow = await client.query(
-                        'SELECT default_pitch_cost FROM venues WHERE id = $1',
-                        [game_template.venue_id]
-                    );
-                    if (venueRow.rows.length && venueRow.rows[0].default_pitch_cost != null) {
-                        templatePitchCost = parseFloat(venueRow.rows[0].default_pitch_cost);
-                    }
-                } catch (_) { /* pre-migration or missing column → leave null */ }
-            }
-            if (templatePitchCost === null || isNaN(templatePitchCost) || templatePitchCost < 0) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({
-                    error: 'Pitch cost is required to recreate this series. Set a default pitch cost on the venue, or update the source series first.'
-                });
-            }
-
-            // FIX-110: default_organiser_id — copy template value if present, else NULL.
-            // No reject path: organiser is legitimately optional. autoAddDefaultOrganiser()
-            // post-commit will defensively skip if the player is no longer is_organiser.
-            const templateOrganiserId = (game_template.default_organiser_id || null);
-
             const inserted = await client.query(`
                 INSERT INTO games (
                     venue_id, game_date, max_players, cost_per_player, format, regularity,
@@ -6711,10 +6477,8 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
                     refs_required, ref_pay, requires_organiser,
                     early_bird_price, super_early_bird_price, opponent_id,
                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                    tournament_team_count, tournament_name, external_opponent,
-                    pitch_cost,                                      -- FIX-109
-                    default_organiser_id                             -- FIX-110
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+                    tournament_team_count, tournament_name, external_opponent
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
                 RETURNING id, game_url
             `, [
                 game_template.venue_id, gameDate.toISOString(),
@@ -6746,58 +6510,7 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
                 game_template.tournament_team_count || null,
                 game_template.tournament_name || null,
                 game_template.external_opponent || null,
-                templatePitchCost,                                   // FIX-109
-                templateOrganiserId,                                 // FIX-110
-            ]).catch(async (err) => {
-                // FIX-110: pre-migration safety. If default_organiser_id column is missing,
-                // retry without it (matches canonical create flow at line ~6177).
-                if (err.code === '42703') {
-                    return await client.query(`
-                        INSERT INTO games (
-                            venue_id, game_date, max_players, cost_per_player, format, regularity,
-                            exclusivity, position_type, game_url, series_id,
-                            team_selection_type, tf_kit_color, opp_kit_color,
-                            star_rating, star_rating_locked,
-                            refs_required, ref_pay, requires_organiser,
-                            early_bird_price, super_early_bird_price, opponent_id,
-                            is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                            tournament_team_count, tournament_name, external_opponent,
-                            pitch_cost
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
-                        RETURNING id, game_url
-                    `, [
-                        game_template.venue_id, gameDate.toISOString(),
-                        parseInt(game_template.max_players),
-                        parseFloat(game_template.cost_per_player),
-                        game_template.format || '5-a-side',
-                        game_template.regularity || 'weekly',
-                        game_template.exclusivity || 'none',
-                        game_template.position_type || 'outfield_gk',
-                        gameUrl, newSeriesId,
-                        game_template.team_selection_type || 'standard',
-                        game_template.tf_kit_color || null,
-                        game_template.opp_kit_color || null,
-                        (game_template.star_rating === null || game_template.star_rating === undefined ? null : game_template.star_rating),
-                        [4, 5].includes(Number(game_template.star_rating)),
-                        parseInt(game_template.refs_required) || 0,
-                        parseFloat(game_template.ref_pay) || 0,
-                        !!game_template.requires_organiser,
-                        game_template.early_bird_price != null && game_template.early_bird_price !== ''
-                            ? parseFloat(game_template.early_bird_price) : null,
-                        game_template.super_early_bird_price != null && game_template.super_early_bird_price !== ''
-                            ? parseFloat(game_template.super_early_bird_price) : null,
-                        game_template.opponent_id || null,
-                        !!game_template.is_venue_clash,
-                        game_template.venue_clash_team1_name || null,
-                        game_template.venue_clash_team2_name || null,
-                        game_template.tournament_team_count || null,
-                        game_template.tournament_name || null,
-                        game_template.external_opponent || null,
-                        templatePitchCost,
-                    ]);
-                }
-                throw err;
-            });
+            ]);
             createdGames.push(inserted.rows[0]);
         }
 
@@ -6816,18 +6529,6 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
         }
 
         await client.query('COMMIT');
-
-        // FIX-110: auto-add the default organiser to every recreated game.
-        // Mirrors the canonical create flow (line ~6230). setImmediate so it
-        // doesn't block the response. autoAddDefaultOrganiser is idempotent
-        // and defensively skips if the player is no longer is_organiser.
-        if (game_template.default_organiser_id) {
-            const orgId = game_template.default_organiser_id;
-            setImmediate(() => createdGames.forEach(g =>
-                autoAddDefaultOrganiser(pool, g.id, orgId, req.user.playerId)
-                    .catch(err => console.error('[autoAddOrganiser recreate]', err.message))
-            ));
-        }
 
         // Audit log (async, non-blocking)
         setImmediate(() => gameAuditLog(pool, null, req.user.playerId, 'series_recreated',
@@ -9143,10 +8844,12 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                         from: '"TotalFooty" <totalfooty19@gmail.com>',
                         to: friendEmail,
                         subject: `⚽ ${(regName || '').replace(/[\r\n]/g, '')} signed you up — TotalFooty`,
-                        html: wrapEmailHtml(`
+                        html: `<div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
+                            <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
                             <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:20px;">YOU'VE BEEN SIGNED UP</h2>
                             ${friendEmailBody}
-                        `)
+                            <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
+                        </div>`
                     }).catch(e => console.error('Friend registration email to friend failed (non-critical):', e.message));
                 }
 
@@ -9366,37 +9069,6 @@ app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, async (req, 
                 return res.status(403).json({ error: 'Not authorised to edit lineup' });
             }
         }
-        // FIX-141: validate that every player_id referenced in positions/subs is actually
-        // confirmed for this game. Without this, a confirmed player with edit rights could
-        // post a lineup containing arbitrary player IDs (or string garbage) and the public
-        // lineup view would render those as phantom players. Guests are allowed (their
-        // IDs prefix 'guest_').
-        const _confirmedRegs = await pool.query(
-            `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
-            [gameId]
-        );
-        const _validIds = new Set(_confirmedRegs.rows.map(r => String(r.player_id)));
-        const _guestRows = await pool.query(
-            'SELECT id FROM game_guests WHERE game_id = $1',
-            [gameId]
-        );
-        for (const g of _guestRows.rows) _validIds.add(`guest_${g.id}`);
-
-        const _checkArr = (arr, label) => {
-            for (const slot of arr) {
-                // Each slot may be { player_id } or { id } depending on UI version. Skip
-                // empty slots (player_id null/undefined/empty string is an unfilled position).
-                const pid = slot && (slot.player_id ?? slot.playerId ?? slot.id);
-                if (pid === null || pid === undefined || pid === '') continue;
-                if (!_validIds.has(String(pid))) {
-                    return `Lineup ${label} contains player ID not confirmed for this game: ${pid}`;
-                }
-            }
-            return null;
-        };
-        const _err = _checkArr(positions, 'positions') || _checkArr(subs, 'subs');
-        if (_err) return res.status(400).json({ error: _err });
-
         await pool.query(
             `INSERT INTO game_lineups (game_id, team_name, positions, subs, updated_by, updated_at)
              VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, NOW())
@@ -9563,29 +9235,10 @@ app.put('/api/admin/series/:seriesId/lineup-editors', authenticateToken, require
         const sc = await client.query('SELECT id FROM game_series WHERE id = $1', [seriesId]);
         if (!sc.rows.length) { return res.status(404).json({ error: 'Series not found' }); }
 
-        // FIX-142: track which IDs were valid vs skipped, surface in response.
-        // Previously, invalid IDs were silently dropped — admin would see "success: 5"
-        // even if only 3 were actually saved. Also tightens UUID format check.
-        const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-        const _validIds = [];
-        const _skippedIds = [];
-        for (const pid of incoming) {
-            if (typeof pid === 'string' && UUID_RE.test(pid)) {
-                _validIds.push(pid);
-            } else {
-                _skippedIds.push(pid);
-            }
-        }
-        if (incoming.length > 0 && _validIds.length === 0) {
-            return res.status(400).json({
-                error: 'No valid player IDs provided',
-                skipped: _skippedIds.length
-            });
-        }
-
         await client.query('BEGIN');
         await client.query('DELETE FROM series_lineup_editors WHERE series_id = $1', [seriesId]);
-        for (const pid of _validIds) {
+        for (const pid of incoming) {
+            if (typeof pid !== 'string' || pid.length > 40) continue;
             await client.query(
                 `INSERT INTO series_lineup_editors (series_id, player_id, added_by)
                  VALUES ($1, $2, $3)
@@ -9595,12 +9248,8 @@ app.put('/api/admin/series/:seriesId/lineup-editors', authenticateToken, require
         }
         await client.query('COMMIT');
         await auditLog(pool, req.user.playerId, 'series_lineup_editors_updated', seriesId,
-            `Editors: ${_validIds.length}${_skippedIds.length > 0 ? ` (${_skippedIds.length} invalid skipped)` : ''}`);
-        res.json({
-            success: true,
-            count: _validIds.length,
-            skipped: _skippedIds.length  // FIX-142: surface count of skipped invalid IDs
-        });
+            `Editors: ${incoming.length}`);
+        res.json({ success: true, count: incoming.length });
     } catch (e) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Update series lineup editors error:', e.message);
@@ -9659,29 +9308,15 @@ app.post('/api/games/:id/captain/handoff', authenticateToken, async (req, res) =
         );
         if (targetCheck.rows.length === 0) return res.status(400).json({ error: 'Target player must be a confirmed player on this game' });
 
-        // FIX-121: wrap DELETE + INSERT in a transaction. Previously, if the INSERT
-        // failed (FK violation, unique constraint, connection drop), the current
-        // captain was already removed leaving the team captainless until manual
-        // admin intervention.
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            // Remove current player from captains (if admin handing off, skip removal)
-            if (!isAdmin) {
-                await client.query('DELETE FROM game_captains WHERE game_id = $1 AND player_id = $2', [gameId, req.user.playerId]);
-            }
-            // Add new captain
-            await client.query(
-                'INSERT INTO game_captains (game_id, player_id, assigned_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-                [gameId, toPlayerId, req.user.playerId]
-            );
-            await client.query('COMMIT');
-        } catch (e) {
-            try { await client.query('ROLLBACK'); } catch (_) {}
-            throw e;
-        } finally {
-            client.release();
+        // Remove current player from captains (if admin handing off, skip removal)
+        if (!isAdmin) {
+            await pool.query('DELETE FROM game_captains WHERE game_id = $1 AND player_id = $2', [gameId, req.user.playerId]);
         }
+        // Add new captain
+        await pool.query(
+            'INSERT INTO game_captains (game_id, player_id, assigned_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+            [gameId, toPlayerId, req.user.playerId]
+        );
         await gameAuditLog(pool, gameId, req.user.playerId, 'captain_handoff',
             `Captaincy handed to player ${toPlayerId} (${targetCheck.rows[0].name})`);
         res.json({ success: true, newCaptain: targetCheck.rows[0].name });
@@ -9923,8 +9558,6 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         
         // If a confirmed player dropped out, try to promote a backup
         let promotedPlayer = null;
-        // FIX-152: capture normal-backup IDs to notify post-COMMIT (was fire-and-forget inside tx)
-        let _spotAvailableBackupIds = [];
         if (wasConfirmed) {
             // Get GK slot info for validation
             const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : gameCheck.rows[0].team_selection_type === 'tournament' ? (gameCheck.rows[0].tournament_team_count || 4) : 2;
@@ -9947,13 +9580,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 
                 // Loop through GK backups - check credits for each
                 for (const candidate of gkBackups.rows) {
-                    // FIX-128 (U5): row-lock the credits row so two simultaneous drop-outs
-                    // (one of which is also evaluating this same GK backup) can't both
-                    // pass the balance check and double-promote. Lock acquired here is
-                    // released at COMMIT/ROLLBACK below.
                     const creditCheck = await client.query(
                         `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
-                           FROM credits WHERE player_id = $1 FOR UPDATE`,
+                           FROM credits WHERE player_id = $1`,
                         [candidate.player_id]
                     );
                     const balance = creditCheck.rows.length > 0 ? parseFloat(creditCheck.rows[0].total_available) : 0;
@@ -9990,18 +9619,23 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             // Normal backups: do NOT auto-promote. 
             // Instead notify ALL normal backups simultaneously — it's a race to claim.
             // (confirmed_backup already paid for guaranteed auto-promotion above)
-            // FIX-152: previously fired sendNotification + client.query INSERT inside the
-            // transaction with .catch(()=>{}) — fire-and-forget queries on a transactional
-            // client can race the COMMIT and silently swallow errors that poison tx state.
-            // Now: capture backup IDs inside tx, fire actual notify+INSERT loop in the
-            // post-COMMIT setImmediate block (uses pool, awaits each, surfaces errors).
             if (!promotedPlayer) {
                 const normalBackups = await client.query(`
                     SELECT r.player_id FROM registrations r
                     WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'normal_backup'
                 `, [gameId]);
+
                 if (normalBackups.rows.length > 0) {
-                    _spotAvailableBackupIds = normalBackups.rows.map(r => r.player_id);
+                    const gameData = await getGameDataForNotification(gameId);
+                    for (const row of normalBackups.rows) {
+                        sendNotification('spot_available', row.player_id, gameData).catch(() => {});
+                        client.query(
+                            `INSERT INTO notifications (player_id, type, message, game_id)
+                             VALUES ($1, 'spot_available', $2, $3)
+                             ON CONFLICT DO NOTHING`,
+                            [row.player_id, `A spot has opened at ${gameData.venue} on ${gameData.day} — first to claim it gets in!`, gameId]
+                        ).catch(() => {});
+                    }
                 }
             }
             
@@ -10122,19 +9756,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         }
 
         await client.query('COMMIT');
-
-        // FIX-123: a non-confirmed_backup that just got promoted is now a confirmed
-        // sign-up. If they're a referred player, the referrer should get the 50p RAF
-        // game credit — same as the standard self-signup path (L7383). Confirmed_backups
-        // already triggered RAF when they originally signed up as a confirmed_backup,
-        // so skip them here. Comped promotions (organiser auto-comp) skip too.
-        if (promotedPlayer
-            && promotedPlayer.backup_type !== 'confirmed_backup') {
-            triggerRafGameCredit(promotedPlayer.player_id).catch(e =>
-                console.error('[dropout backup-promote] RAF game credit failed:', e.message)
-            );
-        }
-
+        
         let message;
         if (wasConfirmed || wasConfirmedBackup) {
             if (wasComped) {
@@ -10155,15 +9777,11 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             message = 'Successfully removed from backup list.';
         }
             
-        // FIX-124: previously the promotedOrganiser branch was nested INSIDE the
-        // promotedPlayer block (misleading indentation), so an organiser-only
-        // promotion (no normal backup promoted alongside) never surfaced the
-        // organiser-promoted message. Now top-level — both run independently.
         if (promotedPlayer) {
             message += ` ${promotedPlayer.alias || promotedPlayer.full_name} has been promoted from the backup list.`;
-        }
         if (promotedOrganiser) {
             message += ` ${promotedOrganiser.alias || promotedOrganiser.full_name} has been promoted as organiser.`;
+        }
         }
         
         // If discipline was applied, prefix the message so the client can show a clear notice.
@@ -10275,23 +9893,6 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 }
                 if (promotedPlayer) {
                     await sendNotification('backup_promoted', promotedPlayer.player_id, gameData);
-                }
-                // FIX-152: fire spot_available pushes + persist notifications rows for
-                // each normal backup. Moved here from inside the transaction (was racing
-                // COMMIT via client.query.catch). Uses pool; per-iteration try/catch
-                // ensures one failure doesn't block remaining notifications.
-                for (const _bpid of _spotAvailableBackupIds) {
-                    try {
-                        await sendNotification('spot_available', _bpid, gameData);
-                        await pool.query(
-                            `INSERT INTO notifications (player_id, type, message, game_id)
-                             VALUES ($1, 'spot_available', $2, $3)
-                             ON CONFLICT DO NOTHING`,
-                            [_bpid, `A spot has opened at ${gameData.venue} on ${gameData.day} — first to claim it gets in!`, gameId]
-                        );
-                    } catch (e) {
-                        console.warn(`[FIX-152] spot_available notify for player ${_bpid} failed:`, e.message);
-                    }
                 }
             } catch (e) {
                 console.error('Dropout notification failed (non-critical):', e.message);
@@ -13364,106 +12965,79 @@ app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameM
 
     const statChanges = [];
 
-    // FIX-161: wrap the player-stats UPDATE loop + game_stat_changes upserts in a
-    // transaction. Previously each UPDATE auto-committed via pool — process death
-    // mid-loop left some players with new stats and others with old, with the admin
-    // seeing 'updated: N' even though only some succeeded. game_stat_changes upserts
-    // also ran on pool with no atomicity guarantee. Now: all-or-nothing per request.
-    // Audit log + statHistory in setImmediate stay on pool (separate observability
-    // channel, post-COMMIT — intentional).
-    const _statsClient = await pool.connect();
-    try {
-        await _statsClient.query('BEGIN');
-
-        for (const row of playerStats) {
-            // Skip guests (player_id starts with 'guest_')
-            if (!row.playerId || String(row.playerId).startsWith('guest_')) continue;
-            // IDOR: only confirmed participants
-            if (!confirmedSet.has(row.playerId)) {
-                errors.push(row.playerId);
-                continue;
-            }
-            const gk  = clamp(parseInt(row.gk)  || 0, 0, 100);
-            const def = clamp(parseInt(row.def) || 0, 0, 20);
-            const str = clamp(parseInt(row.str) || 0, 0, 20);
-            const fit = clamp(parseInt(row.fit) || 0, 0, 20);
-            const pac = clamp(parseInt(row.pac) || 0, 0, 20);
-            const dec = clamp(parseInt(row.dec) || 0, 0, 20);
-            const ass = clamp(parseInt(row.ass) || 0, 0, 20);
-            const sho = clamp(parseInt(row.sho) || 0, 0, 20);
-            const ovr = def + str + fit + pac + dec + ass + sho;
-
-            await _statsClient.query(
-                `UPDATE players
-                 SET goalkeeper_rating = $1,
-                     defending_rating  = $2,
-                     strength_rating   = $3,
-                     fitness_rating    = $4,
-                     pace_rating       = $5,
-                     decisions_rating  = $6,
-                     assisting_rating  = $7,
-                     shooting_rating   = $8,
-                     overall_rating    = $9
-                 WHERE id = $10`,
-                [gk, def, str, fit, pac, dec, ass, sho, ovr, row.playerId]
-            );
-
-            const b = beforeMap[row.playerId] || {};
-            statChanges.push({
-                playerId: row.playerId,
-                oldOverall: b.overall_rating    ?? null, newOverall: ovr,
-                oldGk:      b.goalkeeper_rating ?? null, newGk:      gk,
-                oldDef:     b.defending_rating  ?? null, newDef:     def,
-                oldStr:     b.strength_rating   ?? null, newStr:     str,
-                oldFit:     b.fitness_rating    ?? null, newFit:     fit,
-                oldPac:     b.pace_rating       ?? null, newPac:     pac,
-                oldDec:     b.decisions_rating  ?? null, newDec:     dec,
-                oldAss:     b.assisting_rating  ?? null, newAss:     ass,
-                oldSho:     b.shooting_rating   ?? null, newSho:     sho,
-            });
+    for (const row of playerStats) {
+        // Skip guests (player_id starts with 'guest_')
+        if (!row.playerId || String(row.playerId).startsWith('guest_')) continue;
+        // IDOR: only confirmed participants
+        if (!confirmedSet.has(row.playerId)) {
+            errors.push(row.playerId);
+            continue;
         }
+        const gk  = clamp(parseInt(row.gk)  || 0, 0, 100);
+        const def = clamp(parseInt(row.def) || 0, 0, 20);
+        const str = clamp(parseInt(row.str) || 0, 0, 20);
+        const fit = clamp(parseInt(row.fit) || 0, 0, 20);
+        const pac = clamp(parseInt(row.pac) || 0, 0, 20);
+        const dec = clamp(parseInt(row.dec) || 0, 0, 20);
+        const ass = clamp(parseInt(row.ass) || 0, 0, 20);
+        const sho = clamp(parseInt(row.sho) || 0, 0, 20);
+        const ovr = def + str + fit + pac + dec + ass + sho;
 
-        // STAT-AUDIT: Upsert into game_stat_changes.
-        // ON CONFLICT preserves old_* from first run (original baseline); updates new_* to latest values.
-        if (statChanges.length > 0) {
-            for (const c of statChanges) {
-                try {
-                    await _statsClient.query(
-                        `INSERT INTO game_stat_changes
-                            (game_id, player_id, changed_by,
-                             old_overall, new_overall, old_gk, new_gk,
-                             old_def, new_def, old_str, new_str, old_fit, new_fit,
-                             old_pac, new_pac, old_dec, new_dec, old_ass, new_ass, old_sho, new_sho)
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-                         ON CONFLICT (game_id, player_id) DO UPDATE SET
-                             changed_by  = EXCLUDED.changed_by,
-                             new_overall = EXCLUDED.new_overall, new_gk  = EXCLUDED.new_gk,
-                             new_def     = EXCLUDED.new_def,     new_str = EXCLUDED.new_str,
-                             new_fit     = EXCLUDED.new_fit,     new_pac = EXCLUDED.new_pac,
-                             new_dec     = EXCLUDED.new_dec,     new_ass = EXCLUDED.new_ass,
-                             new_sho     = EXCLUDED.new_sho,     created_at = NOW()`,
-                        [gameId, c.playerId, req.user.playerId,
-                         c.oldOverall, c.newOverall, c.oldGk, c.newGk,
-                         c.oldDef, c.newDef, c.oldStr, c.newStr, c.oldFit, c.newFit,
-                         c.oldPac, c.newPac, c.oldDec, c.newDec, c.oldAss, c.newAss,
-                         c.oldSho, c.newSho]
-                    );
-                } catch (e) {
-                    // game_stat_changes upsert failure is non-critical for stat correctness —
-                    // the players UPDATE above is the source of truth. Log and continue
-                    // rather than rolling back the whole batch over an audit-table issue.
-                    console.warn('game_stat_changes upsert failed (non-critical):', e.message);
-                }
-            }
+        await pool.query(
+            `UPDATE players
+             SET goalkeeper_rating = $1,
+                 defending_rating  = $2,
+                 strength_rating   = $3,
+                 fitness_rating    = $4,
+                 pace_rating       = $5,
+                 decisions_rating  = $6,
+                 assisting_rating  = $7,
+                 shooting_rating   = $8,
+                 overall_rating    = $9
+             WHERE id = $10`,
+            [gk, def, str, fit, pac, dec, ass, sho, ovr, row.playerId]
+        );
+
+        const b = beforeMap[row.playerId] || {};
+        statChanges.push({
+            playerId: row.playerId,
+            oldOverall: b.overall_rating    ?? null, newOverall: ovr,
+            oldGk:      b.goalkeeper_rating ?? null, newGk:      gk,
+            oldDef:     b.defending_rating  ?? null, newDef:     def,
+            oldStr:     b.strength_rating   ?? null, newStr:     str,
+            oldFit:     b.fitness_rating    ?? null, newFit:     fit,
+            oldPac:     b.pace_rating       ?? null, newPac:     pac,
+            oldDec:     b.decisions_rating  ?? null, newDec:     dec,
+            oldAss:     b.assisting_rating  ?? null, newAss:     ass,
+            oldSho:     b.shooting_rating   ?? null, newSho:     sho,
+        });
+    }
+
+    // STAT-AUDIT: Upsert into game_stat_changes.
+    // ON CONFLICT preserves old_* from first run (original baseline); updates new_* to latest values.
+    if (statChanges.length > 0) {
+        for (const c of statChanges) {
+            await pool.query(
+                `INSERT INTO game_stat_changes
+                    (game_id, player_id, changed_by,
+                     old_overall, new_overall, old_gk, new_gk,
+                     old_def, new_def, old_str, new_str, old_fit, new_fit,
+                     old_pac, new_pac, old_dec, new_dec, old_ass, new_ass, old_sho, new_sho)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                 ON CONFLICT (game_id, player_id) DO UPDATE SET
+                     changed_by  = EXCLUDED.changed_by,
+                     new_overall = EXCLUDED.new_overall, new_gk  = EXCLUDED.new_gk,
+                     new_def     = EXCLUDED.new_def,     new_str = EXCLUDED.new_str,
+                     new_fit     = EXCLUDED.new_fit,     new_pac = EXCLUDED.new_pac,
+                     new_dec     = EXCLUDED.new_dec,     new_ass = EXCLUDED.new_ass,
+                     new_sho     = EXCLUDED.new_sho,     created_at = NOW()`,
+                [gameId, c.playerId, req.user.playerId,
+                 c.oldOverall, c.newOverall, c.oldGk, c.newGk,
+                 c.oldDef, c.newDef, c.oldStr, c.newStr, c.oldFit, c.newFit,
+                 c.oldPac, c.newPac, c.oldDec, c.newDec, c.oldAss, c.newAss,
+                 c.oldSho, c.newSho]
+            ).catch(e => console.warn('game_stat_changes upsert failed (non-critical):', e.message));
         }
-
-        await _statsClient.query('COMMIT');
-    } catch (txErr) {
-        try { await _statsClient.query('ROLLBACK'); } catch (_) {}
-        console.error('player-stats tx failed:', txErr.message);
-        return res.status(500).json({ error: 'Failed to update player stats' });
-    } finally {
-        _statsClient.release();
     }
 
     if (errors.length > 0) {
@@ -13579,11 +13153,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         if (!validTeams.includes(winningTeam)) {
             return res.status(400).json({ error: `Invalid winning team. Must be one of: ${validTeams.join(', ')}` });
         }
-        // FIX-132: normalise to lowercase right after whitelist. Downstream code does
-        // strict equality checks like `winningTeam === 'red'` and `!== 'draw'` — without
-        // this, the 'Draw' input would fall through to the WIN branch (the !== 'draw'
-        // check returns true for 'Draw') and assign wins to the wrong team.
-        const normalisedWinningTeam = winningTeam.toLowerCase();
 
         // FIX-097: Combine both type queries into one — also grab series_id for FIX-086
         const gameTypeCheck = await pool.query('SELECT team_selection_type, game_status, series_id, star_rating FROM games WHERE id = $1', [gameId]);
@@ -13615,7 +13184,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             return res.status(400).json({ error: 'Game has already been completed' });
         }
 
-        const shouldHaveMotm = !(isExternal && normalisedWinningTeam === 'blue');
+        const shouldHaveMotm = !(isExternal && winningTeam === 'blue');
         
         // 1. Update game winning team and status
         // awards_open = true opens TF Game Awards voting automatically (replaces old MOTM nominee selection)
@@ -13630,7 +13199,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                  awards_close_at = ${shouldHaveMotm ? "NOW() + INTERVAL '24 hours'" : 'NULL'},
                  ref_review_ends = NOW() + INTERVAL '24 hours'
              WHERE id = $2`,
-            [normalisedWinningTeam, gameId, validatedBalanceScore, validatedUnfair]  // FIX-132: store normalised
+            [winningTeam, gameId, validatedBalanceScore, validatedUnfair]
         );
         // Web47: email confirmed participants once when awards open (helper is throttled
         // via games.awards_emailed_at so repeat triggers don't re-spam). Fire and forget —
@@ -13680,18 +13249,18 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         }
         
         // Update wins for winning team players
-        if (normalisedWinningTeam && normalisedWinningTeam !== 'draw') {
+        if (winningTeam && winningTeam !== 'draw') {
             let winningPlayerIds = [];
             
-            if (isExternal && normalisedWinningTeam === 'red') {
+            if (isExternal && winningTeam === 'red') {
                 // TF wins: all confirmed players who showed up get the win
                 winningPlayerIds = showedUpPlayerIds;
-            } else if (isExternal && normalisedWinningTeam === 'blue') {
+            } else if (isExternal && winningTeam === 'blue') {
                 // Opponent wins: no TF players get wins
                 winningPlayerIds = [];
             } else {
                 // Standard game: get winners from team_players table
-                const winningTeamName = normalisedWinningTeam === 'red' ? 'Red' : 'Blue';
+                const winningTeamName = winningTeam === 'red' ? 'Red' : 'Blue';
                 const winningPlayersResult = await client.query(`
                     SELECT tp.player_id FROM team_players tp
                     JOIN teams t ON t.id = tp.team_id
@@ -13713,54 +13282,26 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
 
             if (winningPlayerIds.length > 0) {
                 const winsClassCol = `total_wins_${starClass.toLowerCase()}`;
-                // FIX-131: pre-migration fallback for per-class wins columns (same rationale as draws below)
-                try {
-                    await client.query(
-                        `UPDATE players 
-                         SET total_wins = total_wins + 1, ${winsClassCol} = ${winsClassCol} + 1
-                         WHERE id = ANY($1)`,
-                        [winningPlayerIds]
-                    );
-                } catch (winsErr) {
-                    if (winsErr.code === '42703') {
-                        console.warn(`[FIX-131] ${winsClassCol} column missing — falling back to total_wins-only UPDATE`);
-                        await client.query(
-                            'UPDATE players SET total_wins = total_wins + 1 WHERE id = ANY($1)',
-                            [winningPlayerIds]
-                        );
-                    } else {
-                        throw winsErr;
-                    }
-                }
+                await client.query(
+                    `UPDATE players 
+                     SET total_wins = total_wins + 1, ${winsClassCol} = ${winsClassCol} + 1
+                     WHERE id = ANY($1)`,
+                    [winningPlayerIds]
+                );
             }
-        } else if (normalisedWinningTeam === 'draw') {
+        } else if (winningTeam === 'draw') {
             // FIX-105: Draws award half a win to ALL players who showed up (both teams).
             // Stored as +1 to total_draws + per-class total_draws_<class>; effective wins
             // computed at read-time as (total_wins + total_draws * 0.5). On Fire streak
             // is unaffected — draws still break the win streak (per-design choice).
             if (showedUpPlayerIds.length > 0) {
                 const drawsClassCol = `total_draws_${starClass.toLowerCase()}`;
-                // FIX-131: pre-migration fallback. If per-class draws columns
-                // don't exist yet, retry without them so the game can still complete.
-                // total_draws is the canonical column; per-class is supplementary.
-                try {
-                    await client.query(
-                        `UPDATE players
-                         SET total_draws = total_draws + 1, ${drawsClassCol} = ${drawsClassCol} + 1
-                         WHERE id = ANY($1)`,
-                        [showedUpPlayerIds]
-                    );
-                } catch (drawsErr) {
-                    if (drawsErr.code === '42703') {
-                        console.warn(`[FIX-131] ${drawsClassCol} column missing — falling back to total_draws-only UPDATE`);
-                        await client.query(
-                            'UPDATE players SET total_draws = total_draws + 1 WHERE id = ANY($1)',
-                            [showedUpPlayerIds]
-                        );
-                    } else {
-                        throw drawsErr;
-                    }
-                }
+                await client.query(
+                    `UPDATE players
+                     SET total_draws = total_draws + 1, ${drawsClassCol} = ${drawsClassCol} + 1
+                     WHERE id = ANY($1)`,
+                    [showedUpPlayerIds]
+                );
             }
         }
         
@@ -13831,9 +13372,9 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         if (seriesUuidFromCheck && (gameType === 'draft_memory' || gameType === 'vs_external')) {
             // Use explicit column per winning team — never interpolate user-supplied values into SQL
             const seriesColMap = { red: 'red_wins', blue: 'blue_wins', draw: 'draws' };
-            const seriesColSql = normalisedWinningTeam === 'red'
+            const seriesColSql = winningTeam === 'red'
                 ? 'UPDATE game_series SET red_wins = red_wins + 1 WHERE id = $1'
-                : normalisedWinningTeam === 'blue'
+                : winningTeam === 'blue'
                     ? 'UPDATE game_series SET blue_wins = blue_wins + 1 WHERE id = $1'
                     : 'UPDATE game_series SET draws = draws + 1 WHERE id = $1';
             await client.query(seriesColSql, [seriesUuidFromCheck]);
@@ -13963,11 +13504,11 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
 
                     // Get winning player IDs for On Fire check
                     let winningPlayerIds = [];
-                    if (normalisedWinningTeam && normalisedWinningTeam !== 'draw') {
-                        if (isExternal && normalisedWinningTeam === 'red') {
+                    if (winningTeam && winningTeam !== 'draw') {
+                        if (isExternal && winningTeam === 'red') {
                             winningPlayerIds = showedUpPlayerIds;
                         } else if (!isExternal) {
-                            const winningTeamName = normalisedWinningTeam === 'red' ? 'Red' : 'Blue';
+                            const winningTeamName = winningTeam === 'red' ? 'Red' : 'Blue';
                             const wpResult = await pool.query(
                                 `SELECT tp.player_id FROM team_players tp
                                  JOIN teams t ON t.id = tp.team_id
@@ -14175,19 +13716,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         const { gameUrl } = req.params;
         
         // Get game by URL - allow confirmed games even if not completed
-        // FIX-122: explicit column list. Previously was SELECT g.* which the master prompt
-        // explicitly flags as a burn pattern — silently exposes any new internal column on
-        // a public unauthenticated endpoint. Audit of the handler below confirms 21 game.X
-        // accesses; listing them here closes the leak.
         const gameResult = await pool.query(`
-            SELECT g.id, g.game_url, g.game_date, g.game_status, g.format,
-                   g.team_selection_type, g.tournament_team_count, g.tournament_name,
-                   g.tournament_results_finalised, g.is_venue_clash,
-                   g.venue_clash_team1_name, g.venue_clash_team2_name,
-                   g.teams_confirmed, g.tf_kit_color, g.opp_kit_color,
-                   g.external_opponent, g.series_id,
-                   g.motm_voting_ends, g.motm_winner_id, g.winning_team,
-                   v.name AS venue_name, v.address AS venue_address
+            SELECT g.*, v.name as venue_name, v.address as venue_address
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.game_url = $1 AND (g.teams_confirmed = TRUE OR g.game_status = 'completed' OR g.is_venue_clash = TRUE OR g.venue_clash_team1_name IS NOT NULL)
@@ -16130,18 +15660,7 @@ async function checkAndGrantAwardBadge(playerId, awardType) {
 }
 
 // Close awards for a game — tally votes, confirm winners, handle ties, send emails
-// FIX-157: in-process lock to prevent two cron loops (awards-close + MOTM auto-finalise)
-// from racing on the same game. Both crons fire every 10min; a game matching
-// both queries simultaneously would call closeAwards twice in parallel,
-// duplicating work (emails, badge checks) even though FIX-154 prevents
-// duplicate DB writes. Lock is per-game so different games still parallelise.
-const _closeAwardsInFlight = new Set();
 async function closeAwards(gameId) {
-    if (_closeAwardsInFlight.has(gameId)) {
-        console.log(`[FIX-157] closeAwards(${gameId}) skipped — concurrent run in flight`);
-        return;
-    }
-    _closeAwardsInFlight.add(gameId);
     try {
         // Get game info
         const gameResult = await pool.query(
@@ -16162,11 +15681,11 @@ async function closeAwards(gameId) {
         const starClass = (game.team_selection_type === 'vs_external' || game.team_selection_type === 'tournament')
             ? 'S' : starClassFromRating(game.star_rating);
 
-        // FIX-148: awards_open=false moved to AFTER the loop. Was here previously,
-        // which meant if the grant loop failed partway, awards_open was already false
-        // and the cron wouldn't retry — partial-grant state stuck forever. Now: grant
-        // first, then close. The idempotency check at the INSERT (line ~16055) prevents
-        // double-granting on retry.
+        // Mark awards closed
+        await pool.query(
+            'UPDATE games SET awards_open = false WHERE id = $1',
+            [gameId]
+        );
 
         // Get all votes for this game
         const votesResult = await pool.query(
@@ -16203,77 +15722,33 @@ async function closeAwards(gameId) {
             for (const winner of winners) {
                 const motmValue = awardType === 'motm' ? (1.0 / winners.length) : 1.00;
 
-                // FIX-154: wrap the per-winner trio (game_awards INSERT + players motm_wins
-                // UPDATE + games motm_winner_id UPDATE) in a transaction. Previously each
-                // ran on pool independently — a crash/deploy between INSERT and the
-                // UPDATEs left game_awards present but motm_wins undercounted; the idempotency
-                // check on retry skipped the row, making the discrepancy permanent.
-                // Now: all-or-nothing per winner. Idempotency check moves INSIDE the tx so
-                // concurrent closeAwards runs (cron + manual finalise + recovery cron)
-                // serialise via FOR UPDATE on the existence row.
-                const _awardClient = await pool.connect();
-                let _awardInserted = false;
-                try {
-                    await _awardClient.query('BEGIN');
+                // Check not already inserted (idempotency)
+                const exists = await pool.query(
+                    'SELECT 1 FROM game_awards WHERE game_id = $1 AND recipient_player_id = $2 AND award_type = $3',
+                    [gameId, winner.playerId, awardType]
+                );
+                if (exists.rows.length > 0) continue;
 
-                    const exists = await _awardClient.query(
-                        'SELECT 1 FROM game_awards WHERE game_id = $1 AND recipient_player_id = $2 AND award_type = $3 FOR UPDATE',
-                        [gameId, winner.playerId, awardType]
+                await pool.query(
+                    `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, motm_value, vote_count, star_class)
+                     VALUES ($1, $2, $3, 'voted', $4, $5, $6)`,
+                    [gameId, winner.playerId, awardType, motmValue, winner.votes, starClass]
+                );
+
+                // Update players.motm_wins for MOTM
+                if (awardType === 'motm') {
+                    const motmClassCol = `motm_wins_${starClass.toLowerCase()}`;
+                    await pool.query(
+                        `UPDATE players SET motm_wins = motm_wins + $1, ${motmClassCol} = ${motmClassCol} + $1 WHERE id = $2`,
+                        [motmValue, winner.playerId]
                     );
-                    if (exists.rows.length > 0) {
-                        await _awardClient.query('ROLLBACK');
-                        continue;
-                    }
-
-                    await _awardClient.query(
-                        `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, motm_value, vote_count, star_class)
-                         VALUES ($1, $2, $3, 'voted', $4, $5, $6)`,
-                        [gameId, winner.playerId, awardType, motmValue, winner.votes, starClass]
+                    // FIX-100: Also write winner back to games.motm_winner_id
+                    // AND motm_winner_id IS NULL guards against overwriting in a tie
+                    await pool.query(
+                        'UPDATE games SET motm_winner_id = $1 WHERE id = $2 AND motm_winner_id IS NULL',
+                        [winner.playerId, gameId]
                     );
-
-                    if (awardType === 'motm') {
-                        const motmClassCol = `motm_wins_${starClass.toLowerCase()}`;
-                        // FIX-147: 42703 fallback for pre-migration safety, scoped to this tx.
-                        try {
-                            await _awardClient.query(
-                                `UPDATE players SET motm_wins = motm_wins + $1, ${motmClassCol} = ${motmClassCol} + $1 WHERE id = $2`,
-                                [motmValue, winner.playerId]
-                            );
-                        } catch (motmErr) {
-                            if (motmErr.code === '42703') {
-                                console.warn(`[FIX-147] ${motmClassCol} column missing — falling back to motm_wins-only UPDATE`);
-                                await _awardClient.query(
-                                    'UPDATE players SET motm_wins = motm_wins + $1 WHERE id = $2',
-                                    [motmValue, winner.playerId]
-                                );
-                            } else {
-                                throw motmErr;
-                            }
-                        }
-                        // FIX-100: write winner back to games.motm_winner_id (NULL guard prevents tie overwrite)
-                        await _awardClient.query(
-                            'UPDATE games SET motm_winner_id = $1 WHERE id = $2 AND motm_winner_id IS NULL',
-                            [winner.playerId, gameId]
-                        );
-                    }
-
-                    await _awardClient.query('COMMIT');
-                    _awardInserted = true;
-                } catch (txErr) {
-                    try { await _awardClient.query('ROLLBACK'); } catch (_) {}
-                    // 23505 (unique_violation) is the expected "concurrent run beat us" case
-                    // if game_awards has UNIQUE(game_id, recipient_player_id, award_type).
-                    // Other errors bubble to the outer try/catch.
-                    if (txErr.code === '23505') {
-                        console.warn(`[FIX-154] race: ${awardType} for player ${winner.playerId} in game ${gameId} — concurrent close already granted`);
-                        continue;
-                    }
-                    throw txErr;
-                } finally {
-                    _awardClient.release();
                 }
-
-                if (!_awardInserted) continue;
 
                 confirmedWinners.push({ awardType, playerId: winner.playerId, votes: winner.votes, motmValue });
 
@@ -16309,13 +15784,6 @@ async function closeAwards(gameId) {
             }
         }
 
-        // FIX-148: only mark awards closed AFTER the grant loop completes.
-        // If we got here, the loop didn't throw — safe to close.
-        await pool.query(
-            'UPDATE games SET awards_open = false WHERE id = $1',
-            [gameId]
-        );
-
         // Admin summary email
         if (confirmedWinners.length > 0) {
             setImmediate(async () => {
@@ -16344,11 +15812,6 @@ async function closeAwards(gameId) {
         return { confirmedWinners };
     } catch (e) {
         console.error(`closeAwards(${gameId}) failed:`, e.message);
-    } finally {
-        // FIX-157: release the in-process lock so this game can be retried by a
-        // later cron tick. Without this, an exception would pin the gameId in
-        // _closeAwardsInFlight permanently.
-        _closeAwardsInFlight.delete(gameId);
     }
 }
 
@@ -16904,10 +16367,6 @@ app.post('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) =
         }
 
         // Check awards are open
-        // FIX-156: previously only checked awards_open. Between awards_close_at
-        // expiry and the cron firing (up to 10 minutes), votes could still be cast.
-        // Now: also verify awards_close_at > NOW() so late votes are rejected at
-        // the source (cron-driven close still updates awards_open=false).
         const gameResult = await pool.query(
             'SELECT awards_open, awards_close_at FROM games WHERE id = $1',
             [gameId]
@@ -16915,9 +16374,6 @@ app.post('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) =
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
         if (!gameResult.rows[0].awards_open) {
             return res.status(400).json({ error: 'Award voting is not currently open for this game' });
-        }
-        if (gameResult.rows[0].awards_close_at && new Date(gameResult.rows[0].awards_close_at) <= new Date()) {
-            return res.status(400).json({ error: 'Award voting closed for this game' });
         }
 
         // Check voter is a confirmed player OR a confirmed referee for this game
@@ -16965,16 +16421,12 @@ app.delete('/api/games/:gameId/awards/vote', authenticateToken, async (req, res)
         const voterId = req.user.playerId;
 
         // Check awards are still open
-        // FIX-156: also verify awards_close_at > NOW() — see vote POST comment.
         const gameResult = await pool.query(
-            'SELECT awards_open, awards_close_at FROM games WHERE id = $1',
+            'SELECT awards_open FROM games WHERE id = $1',
             [gameId]
         );
         if (!gameResult.rows[0]?.awards_open) {
             return res.status(400).json({ error: 'Voting is closed' });
-        }
-        if (gameResult.rows[0].awards_close_at && new Date(gameResult.rows[0].awards_close_at) <= new Date()) {
-            return res.status(400).json({ error: 'Award voting closed for this game' });
         }
 
         await pool.query(
@@ -17825,81 +17277,49 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
             idx++;
         }
         
+        // Update players table flags
+        if (updates.length > 0) {
+            values.push(playerId);
+            await pool.query(
+                'UPDATE players SET ' + updates.join(', ') + ' WHERE id = $' + idx,
+                values
+            );
+        }
+        
+        // Update users.role if provided
+        if (role !== undefined) {
+            const userResult = await pool.query('SELECT user_id FROM players WHERE id = $1', [playerId]);
+            if (userResult.rows.length > 0) {
+                await pool.query('UPDATE users SET role = $1 WHERE id = $2', [role, userResult.rows[0].user_id]);
+            }
+        }
+        
         if (updates.length === 0 && role === undefined) {
             return res.status(400).json({ error: 'No flags to update' });
         }
-
-        // FIX-162: wrap the role-change writes in a single transaction.
-        // Previously up to 4 separate pool.query calls (players UPDATE, users UPDATE,
-        // CLM badge INSERT, Organiser badge INSERT). Process death between them
-        // could leave flags set without role updated → effective access elevated
-        // without the users.role change actually committing. SELECT FOR UPDATE on
-        // the players row serialises concurrent role changes for the same player.
-        const _roleClient = await pool.connect();
-        const _badgesGranted = []; // for post-COMMIT audit logs
-        try {
-            await _roleClient.query('BEGIN');
-            // Lock the players row — concurrent role changes for the same player serialise here
-            await _roleClient.query('SELECT 1 FROM players WHERE id = $1 FOR UPDATE', [playerId]);
-
-            // Update players table flags
-            if (updates.length > 0) {
-                values.push(playerId);
-                await _roleClient.query(
-                    'UPDATE players SET ' + updates.join(', ') + ' WHERE id = $' + idx,
-                    values
+        
+        // Auto-grant CLM badge if setting CLM admin
+        if (is_clm_admin) {
+            const cb = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
+            if (cb.rows.length > 0) {
+                await pool.query(
+                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                    [playerId, cb.rows[0].id]
                 );
+                await auditLog(pool, req.user.playerId, 'badge_auto_awarded', playerId, 'badge: CLM (granted with CLM admin role)');
             }
-
-            // Update users.role if provided
-            if (role !== undefined) {
-                const userResult = await _roleClient.query(
-                    'SELECT user_id FROM players WHERE id = $1', [playerId]
-                );
-                if (userResult.rows.length > 0) {
-                    await _roleClient.query(
-                        'UPDATE users SET role = $1 WHERE id = $2',
-                        [role, userResult.rows[0].user_id]
-                    );
-                }
-            }
-
-            // Auto-grant CLM badge if setting CLM admin
-            if (is_clm_admin) {
-                const cb = await _roleClient.query("SELECT id FROM badges WHERE name = 'CLM'");
-                if (cb.rows.length > 0) {
-                    await _roleClient.query(
-                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                        [playerId, cb.rows[0].id]
-                    );
-                    _badgesGranted.push('CLM');
-                }
-            }
-
-            // Auto-grant Organiser badge if setting organiser
-            if (is_organiser) {
-                const ob = await _roleClient.query("SELECT id FROM badges WHERE name = 'Organiser'");
-                if (ob.rows.length > 0) {
-                    await _roleClient.query(
-                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                        [playerId, ob.rows[0].id]
-                    );
-                    _badgesGranted.push('Organiser');
-                }
-            }
-
-            await _roleClient.query('COMMIT');
-        } catch (txErr) {
-            try { await _roleClient.query('ROLLBACK'); } catch (_) {}
-            throw txErr;
-        } finally {
-            _roleClient.release();
         }
-
-        // Audit logs run post-COMMIT on pool
-        for (const badgeName of _badgesGranted) {
-            await auditLog(pool, req.user.playerId, 'badge_auto_awarded', playerId,
-                `badge: ${badgeName} (granted with ${badgeName === 'CLM' ? 'CLM admin' : 'organiser'} role)`);
+        
+        // Auto-grant Organiser badge if setting organiser
+        if (is_organiser) {
+            const ob = await pool.query("SELECT id FROM badges WHERE name = 'Organiser'");
+            if (ob.rows.length > 0) {
+                await pool.query(
+                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                    [playerId, ob.rows[0].id]
+                );
+                await auditLog(pool, req.user.playerId, 'badge_auto_awarded', playerId, 'badge: Organiser (granted with organiser role)');
+            }
         }
         
         const updated = await pool.query(
@@ -17970,65 +17390,41 @@ function calculateLeagueTable(results, teamNames) {
 
 // Enter a tournament match result
 app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requireGameManager, async (req, res) => {
-    // FIX-135: wrap in transaction with FOR UPDATE on games row. Without this,
-    // two admins simultaneously entering the same fixture both passed dupCheck
-    // (Read Committed snapshot at statement-start) and both INSERTed — league
-    // table double-counted points. Lock on games row serialises tournament
-    // writes per-game without globally blocking other tournaments.
-    const client = await pool.connect();
     try {
         const { gameId } = req.params;
         const { teamA, teamB, teamAScore, teamBScore, force } = req.body;
         
-        await client.query('BEGIN');
-
-        // Validate game is a tournament and not finalised — locked snapshot
-        const gameCheck = await client.query(
-            'SELECT team_selection_type, tournament_results_finalised, tournament_team_count FROM games WHERE id = $1 FOR UPDATE',
+        // Validate game is a tournament and not finalised
+        const gameCheck = await pool.query(
+            'SELECT team_selection_type, tournament_results_finalised, tournament_team_count FROM games WHERE id = $1',
             [gameId]
         );
-        if (gameCheck.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Game not found' });
-        }
-        if (gameCheck.rows[0].team_selection_type !== 'tournament') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Not a tournament game' });
-        }
-        if (gameCheck.rows[0].tournament_results_finalised) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Tournament already finalised' });
-        }
+        if (gameCheck.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        if (gameCheck.rows[0].team_selection_type !== 'tournament') return res.status(400).json({ error: 'Not a tournament game' });
+        if (gameCheck.rows[0].tournament_results_finalised) return res.status(400).json({ error: 'Tournament already finalised' });
         
         // Validate teams exist for this game
-        const teamsCheck = await client.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
+        const teamsCheck = await pool.query('SELECT team_name FROM teams WHERE game_id = $1', [gameId]);
         const validTeams = teamsCheck.rows.map(t => t.team_name);
         if (!validTeams.includes(teamA) || !validTeams.includes(teamB)) {
-            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Invalid team name(s)' });
         }
-        if (teamA === teamB) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'A team cannot play itself' });
-        }
+        if (teamA === teamB) return res.status(400).json({ error: 'A team cannot play itself' });
         
         // Validate scores
         const scoreA = parseInt(teamAScore);
         const scoreB = parseInt(teamBScore);
         if (isNaN(scoreA) || isNaN(scoreB) || scoreA < 0 || scoreB < 0) {
-            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Scores must be non-negative integers' });
         }
         // FIX-059: Sensible upper bound for 5-a-side scores
         const MAX_SCORE = 30;
         if (scoreA > MAX_SCORE || scoreB > MAX_SCORE) {
-            await client.query('ROLLBACK');
             return res.status(400).json({ error: `Score cannot exceed ${MAX_SCORE}` });
         }
         
-        // Check for duplicate matchup — now inside the transaction; the FOR UPDATE
-        // lock on games above means no concurrent tournament writer can race us.
-        const dupCheck = await client.query(
+        // Check for duplicate matchup
+        const dupCheck = await pool.query(
             `SELECT id FROM tournament_results 
              WHERE game_id = $1 AND (
                  (team_a_name = $2 AND team_b_name = $3) OR 
@@ -18037,24 +17433,19 @@ app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requir
             [gameId, teamA, teamB]
         );
         if (dupCheck.rows.length > 0 && !force) {
-            await client.query('ROLLBACK');
             return res.status(409).json({ isDuplicate: true, error: `A result already exists for ${teamA} vs ${teamB}.` });
         }
         
         // Insert result
-        const result = await client.query(
+        const result = await pool.query(
             `INSERT INTO tournament_results (game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by)
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
             [gameId, teamA, teamB, scoreA, scoreB, req.user.playerId]
         );
         
-        // Return updated results + league table — also inside the transaction so what
-        // we return reflects exactly what we committed (no race against a concurrent insert
-        // that committed between INSERT and SELECT).
-        const allResults = await client.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
+        // Return updated results + league table
+        const allResults = await pool.query('SELECT id, game_id, team_a_name, team_b_name, team_a_score, team_b_score, entered_by, entered_at FROM tournament_results WHERE game_id = $1 ORDER BY entered_at', [gameId]);
         const leagueTable = calculateLeagueTable(allResults.rows, validTeams);
-
-        await client.query('COMMIT');
         
         setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'tournament_result_added',
             `Result: ${teamA} ${teamAScore}–${teamBScore} ${teamB}`));
@@ -18065,11 +17456,8 @@ app.post('/api/admin/games/:gameId/tournament-result', authenticateToken, requir
             leagueTable
         });
     } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
         console.error('Enter tournament result error:', error);
         res.status(500).json({ error: 'Failed to enter result' });
-    } finally {
-        client.release();
     }
 });
 
@@ -18091,12 +17479,6 @@ app.put('/api/admin/games/:gameId/tournament-result/:resultId', authenticateToke
         const scoreB = parseInt(teamBScore);
         if (isNaN(scoreA) || isNaN(scoreB) || scoreA < 0 || scoreB < 0) {
             return res.status(400).json({ error: 'Scores must be non-negative integers' });
-        }
-        // FIX-136: enforce same MAX_SCORE upper bound the POST endpoint uses (FIX-059).
-        // Was missing from the edit path — admin could edit a result to score 999.
-        const MAX_SCORE = 30;
-        if (scoreA > MAX_SCORE || scoreB > MAX_SCORE) {
-            return res.status(400).json({ error: `Score cannot exceed ${MAX_SCORE}` });
         }
         
         await pool.query(
@@ -18169,15 +17551,8 @@ app.get('/api/public/game/:gameUrl/tournament', async (req, res) => {
     try {
         const { gameUrl } = req.params;
         
-        // FIX-137: explicit column list. Previously SELECT g.* — same anti-pattern as FIX-122
-        // for the public teams endpoint. Public unauthenticated endpoint must not silently
-        // expose new internal columns. Audited the handler below for every game.X access.
         const gameResult = await pool.query(`
-            SELECT g.id, g.game_url, g.game_date, g.game_status, g.format,
-                   g.team_selection_type, g.tournament_team_count, g.tournament_name,
-                   g.tournament_results_finalised, g.teams_confirmed,
-                   g.winning_team, g.motm_voting_ends, g.motm_winner_id,
-                   v.name AS venue_name, v.address AS venue_address
+            SELECT g.*, v.name as venue_name, v.address as venue_address
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.game_url = $1 AND g.team_selection_type = 'tournament'
@@ -18189,52 +17564,40 @@ app.get('/api/public/game/:gameUrl/tournament', async (req, res) => {
         
         const game = gameResult.rows[0];
         
-        // FIX-138: collapse old N+1 (1 + 2*teamCount queries) into 3 queries total —
-        // one for teams, one JOIN for all players across all teams, one for all guests.
-        // Same approach as FIX-115 for monthly trophies.
+        // Get all teams with players
         const teamsResult = await pool.query('SELECT id, team_name FROM teams WHERE game_id = $1 ORDER BY team_name', [game.id]);
         const teams = {};
         for (const team of teamsResult.rows) {
-            teams[team.team_name] = []; // initialise; populated by single JOIN below
-        }
-
-        // All-teams players in one query
-        const allPlayers = await pool.query(`
-            SELECT t.team_name, p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
-                   r.position_preference as position, p.motm_wins, p.total_appearances
-            FROM team_players tp
-            JOIN teams t ON t.id = tp.team_id
-            JOIN players p ON p.id = tp.player_id
-            JOIN registrations r ON r.player_id = p.id AND r.game_id = $1
-            WHERE t.game_id = $1
-            ORDER BY t.team_name,
-                CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
-                p.squad_number ASC NULLS LAST,
-                p.motm_wins DESC NULLS LAST,
-                p.total_appearances DESC NULLS LAST
-        `, [game.id]);
-
-        for (const p of allPlayers.rows) {
-            if (teams[p.team_name]) {
-                teams[p.team_name].push({
-                    id: p.id, name: p.alias || p.full_name, squadNumber: p.squad_number,
-                    photo_url: p.photo_url, isGK: p.position === 'goalkeeper'
-                });
-            }
-        }
-
-        // All-teams guests in one query
-        const allGuests = await pool.query(
-            `SELECT id, guest_name, overall_rating, team_name FROM game_guests WHERE game_id = $1`,
-            [game.id]
-        );
-        for (const g of allGuests.rows) {
-            if (teams[g.team_name]) {
-                teams[g.team_name].push({
-                    id: `guest_${g.id}`, name: `${g.guest_name} (Guest)`, squadNumber: null,
-                    photo_url: null, isGK: false, isGuest: true
-                });
-            }
+            const playersResult = await pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
+                       p.motm_wins, p.total_appearances
+                FROM team_players tp
+                JOIN players p ON p.id = tp.player_id
+                JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
+                WHERE tp.team_id = $1
+                ORDER BY
+                    CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
+                    p.squad_number ASC NULLS LAST,
+                    p.motm_wins DESC NULLS LAST,
+                    p.total_appearances DESC NULLS LAST
+            `, [team.id, game.id]);
+            
+            // Include guests
+            const teamGuests = await pool.query(
+                `SELECT id, guest_name, overall_rating FROM game_guests WHERE game_id = $1 AND team_name = $2`,
+                [game.id, team.team_name]
+            );
+            
+            const players = playersResult.rows.map(p => ({
+                id: p.id, name: p.alias || p.full_name, squadNumber: p.squad_number,
+                photo_url: p.photo_url, isGK: p.position === 'goalkeeper'
+            }));
+            const guests = teamGuests.rows.map(g => ({
+                id: `guest_${g.id}`, name: `${g.guest_name} (Guest)`, squadNumber: null,
+                photo_url: null, isGK: false, isGuest: true
+            }));
+            
+            teams[team.team_name] = [...players, ...guests];
         }
         
         // Get results and league table
@@ -18320,27 +17683,6 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             return res.status(400).json({ error: 'No results entered. Enter at least one result before finalising.' });
         }
 
-        // FIX-139: validate motmNominees + disciplineRecords against confirmed-player set.
-        // Standard /complete (line ~13426) does this via CRIT-29 — without it, admin (or
-        // a malicious client) can stuff arbitrary player IDs as MOTM nominees or apply
-        // discipline points to non-confirmed players. Tournament finalise was missing this.
-        const _confirmedRows = await client.query(
-            `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
-            [gameId]
-        );
-        const _confirmedSet = new Set(_confirmedRows.rows.map(r => r.player_id));
-        const _invalidNominees = (motmNominees || []).filter(id => !_confirmedSet.has(id));
-        if (_invalidNominees.length > 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'motmNominees contains players not confirmed for this game' });
-        }
-        const _invalidDiscipline = (disciplineRecords || [])
-            .filter(d => d.points > 0 && !_confirmedSet.has(d.playerId));
-        if (_invalidDiscipline.length > 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'disciplineRecords contains players not confirmed for this game' });
-        }
-
         // SEC-025: Require at least (teamCount - 1) results before finalising — prevents declaring a winner with almost no data
         const minResults = parseInt(gameCheck.rows[0].tournament_team_count || 4) - 1;
         if (allResults.rows.length < minResults) {
@@ -18422,27 +17764,13 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             // FIX-105: Tournament-overall draw (top of league table tied on points/GD/GF).
             // Award half a win to ALL participants who showed up. Per-class tracked as 'S'
             // (matches game_awards.star_class behaviour for tournament games).
-            // FIX-140: pre-migration fallback — if total_draws_s column missing, retry
-            // with total_draws-only. Same shape as FIX-131 in standard /complete.
             if (showedUpPlayerIds.length > 0) {
-                try {
-                    await client.query(
-                        `UPDATE players
-                         SET total_draws = total_draws + 1, total_draws_s = total_draws_s + 1
-                         WHERE id = ANY($1)`,
-                        [showedUpPlayerIds]
-                    );
-                } catch (drawsErr) {
-                    if (drawsErr.code === '42703') {
-                        console.warn('[FIX-140] total_draws_s column missing — falling back to total_draws-only UPDATE');
-                        await client.query(
-                            'UPDATE players SET total_draws = total_draws + 1 WHERE id = ANY($1)',
-                            [showedUpPlayerIds]
-                        );
-                    } else {
-                        throw drawsErr;
-                    }
-                }
+                await client.query(
+                    `UPDATE players
+                     SET total_draws = total_draws + 1, total_draws_s = total_draws_s + 1
+                     WHERE id = ANY($1)`,
+                    [showedUpPlayerIds]
+                );
             }
         }
         
@@ -18911,10 +18239,19 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
                     -- Forward periods: one per history row, ending at next change (or 2099)
                     SELECT
                         psh.player_id,
+                        -- FIX-164: cast to int. player_stat_history.overall_rating and
+                        -- goalkeeper_rating are NUMERIC(4,1) — without this cast,
+                        -- json_object_agg() downstream produces keys like "88.0" instead
+                        -- of "88", which the frontend cannot match (it iterates 75-99
+                        -- as integers). Result was a near-empty grid for every player
+                        -- with rating history. The no-history fallback arm (further
+                        -- below) reads from players.overall_rating which is INTEGER,
+                        -- so it was unaffected — that's why some players (Danny etc)
+                        -- showed data while everyone with psh rows showed blank.
                         COALESCE(
                             CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
                             psh.overall_rating
-                        ) AS ovr_in_period,
+                        )::int AS ovr_in_period,
                         psh.created_at AS period_start,
                         COALESCE(
                             LEAD(psh.created_at) OVER (PARTITION BY psh.player_id ORDER BY psh.created_at),
@@ -18938,10 +18275,11 @@ app.get('/api/admin/players/performance', authenticateToken, requireAdmin, async
                     FROM (
                         SELECT
                             psh.player_id,
+                            -- FIX-164: cast to int (see forward arm comment above)
                             COALESCE(
                                 CASE WHEN p.position = 'goalkeeper' THEN psh.goalkeeper_rating END,
                                 psh.overall_rating
-                            ) AS ovr_in_period,
+                            )::int AS ovr_in_period,
                             psh.created_at AS first_at,
                             ROW_NUMBER() OVER (PARTITION BY psh.player_id ORDER BY psh.created_at ASC) AS rn
                         FROM player_stat_history psh
@@ -19811,20 +19149,6 @@ app.post('/api/push/register', authenticateToken, async (req, res) => {
     try {
         const { fcmToken, deviceName } = req.body;
         if (!fcmToken) return res.status(400).json({ error: 'fcmToken is required' });
-        // FIX-144: size + format validation. The mobile app uses Expo's
-        // getExpoPushTokenAsync() which returns ExponentPushToken[XXXX] format
-        // (typical length ~50 chars, max ~80). Reject:
-        //   - non-string inputs
-        //   - >200 char strings (defensive cap — prevents table bloat)
-        //   - anything not matching Expo's bracketed token format
-        // Without this guard, a malicious user could submit large tokens to bloat
-        // fcm_tokens, or register another user's token to share notifications.
-        if (typeof fcmToken !== 'string' || fcmToken.length === 0 || fcmToken.length > 200) {
-            return res.status(400).json({ error: 'fcmToken must be a string between 1 and 200 characters' });
-        }
-        if (!/^ExponentPushToken\[[\w-]+\]$/.test(fcmToken)) {
-            return res.status(400).json({ error: 'fcmToken must be a valid Expo push token' });
-        }
 
         // SEC-043: Purge tokens unused for 90+ days before adding new one — prevents stale token accumulation
         await pool.query(
@@ -20176,12 +19500,8 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, a
                 `Discipline cleared | new tier: gold`);
         });
     } catch (error) {
-        // FIX-151: ROLLBACK without the surrounding catch was silently failing
-        // and the route exited without a response — client would hang until the
-        // socket timed out. Now: catch ROLLBACK errors, always send 500.
-        try { await client.query('ROLLBACK'); } catch (_) {}
+        await client.query('ROLLBACK');
         console.error('Unban error:', error);
-        res.status(500).json({ error: 'Failed to unban player' });
     } finally {
         client.release();
     }
@@ -20436,15 +19756,6 @@ app.post('/api/dm/:playerId/report', authenticateToken, dmReportLimiter, async (
         const reporterId  = req.user.playerId;
         const { playerId } = req.params; // the other person in the conversation
 
-        // FIX-116: capture the reason from the request body. Mobile sends a tagged
-        // category like '[abuse] Abusive / harassment — optional detail'.
-        // Server side: trim, sanitise, cap at 500 chars; falls back to a generic
-        // string if the client didn't send one (older app builds).
-        const rawReason = (req.body?.reason || '').toString().trim();
-        const reportReason = rawReason
-            ? rawReason.replace(/[<>]/g, '').slice(0, 500)
-            : '(No reason provided)';
-
         if (String(playerId) === String(reporterId)) {
             return res.status(400).json({ error: 'Cannot report yourself' });
         }
@@ -20499,8 +19810,6 @@ app.post('/api/dm/:playerId/report', authenticateToken, dmReportLimiter, async (
                                 <td style="font-weight:900;">${htmlEncode(senderName)}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Sent at</td>
                                 <td>${htmlEncode(messageDate)}</td></tr>
-                            <tr><td style="padding:6px 0;color:#888;vertical-align:top;">Reason</td>
-                                <td style="font-weight:600;color:#ffaa00;">${htmlEncode(reportReason)}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;vertical-align:top;">Message</td>
                                 <td style="background:#1a1a1a;padding:10px;border-radius:6px;border-left:3px solid #ff3366;">
                                     ${htmlEncode(messageText)}
@@ -20517,7 +19826,7 @@ app.post('/api/dm/:playerId/report', authenticateToken, dmReportLimiter, async (
         });
 
         setImmediate(() => auditLog(pool, reporterId, 'dm_reported', playerId,
-            `${reporterName} reported a message from ${senderName} — reason: ${reportReason}`));
+            `${reporterName} reported a message from ${senderName}`));
 
         res.json({ message: 'Report submitted successfully' });
     } catch (error) {
@@ -22076,26 +21385,11 @@ app.get('/api/public/game/:gameUrl/messages', async (req, res) => {
 app.delete('/api/admin/messages/:messageId', authenticateToken, requireAdmin, async (req, res) => {
     const { messageId } = req.params;
     try {
-        // FIX-163: capture context before deletion for audit trail. Previously this
-        // endpoint had no audit log — admin could quietly soft-delete chat messages.
-        // Also: only update if not already deleted (was refreshing deleted_at on
-        // already-deleted rows, polluting the timestamp for compliance scenarios).
         const result = await pool.query(
-            `UPDATE game_messages SET deleted_at = NOW()
-             WHERE id = $1 AND deleted_at IS NULL
-             RETURNING id, game_id, player_id`,
+            'UPDATE game_messages SET deleted_at = NOW() WHERE id = $1 RETURNING id',
             [messageId]
         );
-        if (result.rows.length === 0) {
-            // Either not found or already deleted — distinguish with a quick read
-            const exists = await pool.query('SELECT 1 FROM game_messages WHERE id = $1', [messageId]);
-            if (exists.rows.length === 0) return res.status(404).json({ error: 'Message not found' });
-            return res.json({ message: 'Message already deleted', id: messageId });
-        }
-        const row = result.rows[0];
-        // Audit trail — who deleted whose message in which game
-        setImmediate(() => gameAuditLog(pool, row.game_id, req.user.playerId, 'message_deleted',
-            `Message ${messageId} (player ${row.player_id}) deleted by admin`).catch(() => {}));
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Message not found' });
         res.json({ message: 'Message deleted', id: messageId });
     } catch (error) {
         console.error('Delete message error:', error);
@@ -22148,13 +21442,17 @@ app.post('/api/auth/forgot-password', async (req, res) => {
                 from: '"TotalFooty" <totalfooty19@gmail.com>',
                 to: email.trim(),
                 subject: 'TotalFooty — Reset Your Password',
-                html: wrapEmailHtml(`
-                    <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:8px">PASSWORD RESET</h2>
-                    <p style="color:#888;font-size:14px">Hi ${player.full_name},</p>
-                    <p style="color:#888;font-size:14px">You requested a password reset for your TotalFooty account. Click the button below to set a new password.</p>
-                    <a href="${resetLink}" style="display:inline-block;background:#fff;color:#000;padding:14px 28px;border-radius:4px;font-weight:bold;font-size:13px;letter-spacing:2px;text-decoration:none;margin:24px 0">RESET PASSWORD</a>
-                    <p style="color:#555;font-size:12px">This link expires in 1 hour. If you didn't request this, ignore this email.</p>
-                `),
+                html: `
+                    <div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:500px;margin:0 auto">
+                        <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
+                        <h2 style="color:#fff;font-size:20px;letter-spacing:2px;margin-bottom:8px">PASSWORD RESET</h2>
+                        <p style="color:#888;font-size:14px">Hi ${player.full_name},</p>
+                        <p style="color:#888;font-size:14px">You requested a password reset for your TotalFooty account. Click the button below to set a new password.</p>
+                        <a href="${resetLink}" style="display:inline-block;background:#fff;color:#000;padding:14px 28px;border-radius:4px;font-weight:bold;font-size:13px;letter-spacing:2px;text-decoration:none;margin:24px 0">RESET PASSWORD</a>
+                        <p style="color:#555;font-size:12px">This link expires in 1 hour. If you didn't request this, ignore this email.</p>
+                        <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
+                    </div>
+                `,
             }).then(() => {
             }).catch(emailErr => {
                 // Log the real reason — check Render logs if email not arriving
@@ -22308,38 +21606,23 @@ app.post('/api/auth/reset-password', async (req, res) => {
         if (resetToken.used_at) return res.status(400).json({ error: 'This reset link has already been used' });
         if (new Date() > new Date(resetToken.expires_at)) return res.status(400).json({ error: 'This reset link has expired' });
 
-        // FIX-134: wrap the three sequential UPDATEs (password, token_version bump, mark
-        // token used) in a transaction. Previously, if the token_version bump failed
-        // silently between password update and "mark used", SEC-036's guarantee that
-        // existing JWTs are invalidated on password reset would be broken — old
-        // sessions would still authenticate against the new password's account.
+        // Update password on users table
         const passwordHash = await bcrypt.hash(newPassword, 10);
-        const _resetClient = await pool.connect();
-        try {
-            await _resetClient.query('BEGIN');
 
-            await _resetClient.query(
-                `UPDATE users SET password_hash = $1 WHERE id = (SELECT user_id FROM players WHERE id = $2)`,
-                [passwordHash, resetToken.player_id]
-            );
+        await pool.query(
+            `UPDATE users SET password_hash = $1 WHERE id = (SELECT user_id FROM players WHERE id = $2)`,
+            [passwordHash, resetToken.player_id]
+        );
 
-            // SEC-036: Invalidate all existing sessions by bumping token_version — prevents token reuse post-reset
-            await _resetClient.query(
-                `UPDATE users SET token_version = COALESCE(token_version, 0) + 1
-                 WHERE id = (SELECT user_id FROM players WHERE id = $1)`,
-                [resetToken.player_id]
-            );
+        // SEC-036: Invalidate all existing sessions by bumping token_version — prevents token reuse post-reset
+        await pool.query(
+            `UPDATE users SET token_version = COALESCE(token_version, 0) + 1
+             WHERE id = (SELECT user_id FROM players WHERE id = $1)`,
+            [resetToken.player_id]
+        );
 
-            // Mark token as used
-            await _resetClient.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [resetToken.id]);
-
-            await _resetClient.query('COMMIT');
-        } catch (resetTxErr) {
-            try { await _resetClient.query('ROLLBACK'); } catch (_) {}
-            throw resetTxErr;
-        } finally {
-            _resetClient.release();
-        }
+        // Mark token as used
+        await pool.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [resetToken.id]);
 
         // Issue a fresh session cookie so the player is immediately logged in
         const freshPlayer = await pool.query(
@@ -23537,62 +22820,52 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
 
         await client.query('COMMIT');
 
-        // FIX-162: respond BEFORE post-COMMIT email/lookup work. Previously these
-        // ran inline before res.json — if any threw, the catch block fired ROLLBACK
-        // (no-op warning since tx already committed) and returned 500 to the client.
-        // Net effect was: session created in DB, but client saw 500 error.
-        // Now: respond first, fire emails in setImmediate so failures only log.
+        await logCoachingAudit(sessionId, null, req.user.playerId, 'session_created',
+            `Created by ${req.user.role}. Activity: ${activity_type}, group: ${group_type}, ${duration_hours}hr`);
+
+        // Emails
+        const coachName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A coach';
+        const activityLabel = activity_type.replace(/_/g, ' ');
+
+        if (req.user.role === 'superadmin') {
+            // Email all coaches
+            const coaches = await pool.query(
+                `SELECT p.id FROM players p JOIN player_badges pb ON pb.player_id=p.id
+                 JOIN badges b ON b.id=pb.badge_id AND b.name='Coach'`
+            );
+            await sendCoachingEmail(
+                coaches.rows.map(r => r.id),
+                'New Coaching Session Created',
+                `<p style="color:#888">A new coaching session has been created by the TotalFooty admin.</p>
+                 <table><tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${htmlEncode(activityLabel)}</td></tr>
+                 <tr><td style="color:#888">Group Type</td><td style="color:#fff">${htmlEncode(group_type)}</td></tr>
+                 <tr><td style="color:#888">Duration</td><td style="color:#fff">${duration_hours}hr</td></tr></table>
+                 <p style="color:#888;margin-top:16px">Log in to TotalFooty to view details.</p>`
+            );
+        } else {
+            // Email superadmin
+            notifyAdmin(
+                `New Coaching Session — ${htmlEncode(activityLabel)}`,
+                [['Coach', htmlEncode(coachName)], ['Duration', `${duration_hours}hr`], ['Activity', htmlEncode(activityLabel)], ['Group', htmlEncode(group_type)]]
+            );
+        }
+
+        // Email all coachable players
+        const coachablePlayers = await pool.query(
+            `SELECT id FROM players WHERE coachable=TRUE`
+        );
+        await sendCoachingEmail(
+            coachablePlayers.rows.map(r => r.id),
+            'New Coaching Session Available',
+            `<p style="color:#888">A new coaching session is available on TotalFooty.</p>
+             <table><tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${htmlEncode(activityLabel)}</td></tr>
+             <tr><td style="color:#888">Group Type</td><td style="color:#fff">${htmlEncode(group_type)}</td></tr>
+             <tr><td style="color:#888">Duration</td><td style="color:#fff">${duration_hours}hr</td></tr>
+             <tr><td style="color:#888">Price Range</td><td style="color:#fff">£${minPrice?.toFixed(2) || 'TBC'} – £${maxPrice?.toFixed(2) || 'TBC'}</td></tr></table>
+             <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/session.html?url=${sessionUrl}" style="color:#C0392B">View Session →</a></p>`
+        );
+
         res.status(201).json({ id: sessionId, session_url: sessionUrl, min_price: minPrice, max_price: maxPrice });
-
-        setImmediate(async () => {
-            try {
-                await logCoachingAudit(sessionId, null, req.user.playerId, 'session_created',
-                    `Created by ${req.user.role}. Activity: ${activity_type}, group: ${group_type}, ${duration_hours}hr`);
-            } catch (e) { console.warn('coaching audit failed (non-critical):', e.message); }
-
-            try {
-                const coachName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A coach';
-                const activityLabel = activity_type.replace(/_/g, ' ');
-
-                if (req.user.role === 'superadmin') {
-                    // Email all coaches
-                    const coaches = await pool.query(
-                        `SELECT p.id FROM players p JOIN player_badges pb ON pb.player_id=p.id
-                         JOIN badges b ON b.id=pb.badge_id AND b.name='Coach'`
-                    );
-                    await sendCoachingEmail(
-                        coaches.rows.map(r => r.id),
-                        'New Coaching Session Created',
-                        `<p style="color:#888">A new coaching session has been created by the TotalFooty admin.</p>
-                         <table><tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${htmlEncode(activityLabel)}</td></tr>
-                         <tr><td style="color:#888">Group Type</td><td style="color:#fff">${htmlEncode(group_type)}</td></tr>
-                         <tr><td style="color:#888">Duration</td><td style="color:#fff">${duration_hours}hr</td></tr></table>
-                         <p style="color:#888;margin-top:16px">Log in to TotalFooty to view details.</p>`
-                    );
-                } else {
-                    // Email superadmin
-                    notifyAdmin(
-                        `New Coaching Session — ${htmlEncode(activityLabel)}`,
-                        [['Coach', htmlEncode(coachName)], ['Duration', `${duration_hours}hr`], ['Activity', htmlEncode(activityLabel)], ['Group', htmlEncode(group_type)]]
-                    );
-                }
-
-                // Email all coachable players
-                const coachablePlayers = await pool.query(
-                    `SELECT id FROM players WHERE coachable=TRUE`
-                );
-                await sendCoachingEmail(
-                    coachablePlayers.rows.map(r => r.id),
-                    'New Coaching Session Available',
-                    `<p style="color:#888">A new coaching session is available on TotalFooty.</p>
-                     <table><tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${htmlEncode(activityLabel)}</td></tr>
-                     <tr><td style="color:#888">Group Type</td><td style="color:#fff">${htmlEncode(group_type)}</td></tr>
-                     <tr><td style="color:#888">Duration</td><td style="color:#fff">${duration_hours}hr</td></tr>
-                     <tr><td style="color:#888">Price Range</td><td style="color:#fff">£${minPrice?.toFixed(2) || 'TBC'} – £${maxPrice?.toFixed(2) || 'TBC'}</td></tr></table>
-                     <p style="color:#888;margin-top:16px"><a href="https://totalfooty.co.uk/session.html?url=${sessionUrl}" style="color:#C0392B">View Session →</a></p>`
-                );
-            } catch (e) { console.warn('coaching session emails failed (non-critical):', e.message); }
-        });
     } catch (e) {
         await client.query('ROLLBACK');
         console.error('POST /api/coaching/sessions:', e.message);
@@ -23840,84 +23113,42 @@ app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationL
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
-    // FIX-163: wrap the whole flow in a tx with FOR UPDATE on coaching_sessions.
-    // Previously each step ran on pool — capacity race (two concurrent signups both
-    // pass the is_full check), duplicate-register race (double-click from same
-    // player), and is_full update race (count + UPDATE not atomic) all open.
-    const _coachClient = await pool.connect();
-    let session, count;
     try {
-        await _coachClient.query('BEGIN');
-
-        const sessionResult = await _coachClient.query(
+        const sessionResult = await pool.query(
             `SELECT id, max_players, is_full, status, coach_player_id, activity_type
-             FROM coaching_sessions WHERE id=$1 FOR UPDATE`,
+             FROM coaching_sessions WHERE id=$1`,
             [id]
         );
-        if (sessionResult.rows.length === 0) {
-            await _coachClient.query('ROLLBACK');
-            return res.status(404).json({ error: 'Session not found' });
-        }
+        if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
 
-        session = sessionResult.rows[0];
-        if (!['open','coach_confirmed','venue_confirmed','finalised'].includes(session.status)) {
-            await _coachClient.query('ROLLBACK');
+        const session = sessionResult.rows[0];
+        if (!['open','coach_confirmed','venue_confirmed','finalised'].includes(session.status))
             return res.status(400).json({ error: 'Session is not open for registration' });
-        }
-        if (session.is_full) {
-            await _coachClient.query('ROLLBACK');
+        if (session.is_full)
             return res.status(400).json({ error: 'Session is full' });
-        }
 
-        // Check not already registered (now under lock — no double-register race)
-        const existing = await _coachClient.query(
+        // Check not already registered
+        const existing = await pool.query(
             `SELECT id FROM coaching_registrations WHERE session_id=$1 AND player_id=$2`,
             [id, req.user.playerId]
         );
-        if (existing.rows.length > 0) {
-            await _coachClient.query('ROLLBACK');
+        if (existing.rows.length > 0)
             return res.status(400).json({ error: 'Already registered' });
-        }
 
-        // Re-check count under lock — concurrent register would have blocked here
-        const preCount = await _coachClient.query(
-            `SELECT COUNT(*) AS cnt FROM coaching_registrations
-             WHERE session_id=$1 AND status='registered'`,
-            [id]
-        );
-        if (parseInt(preCount.rows[0].cnt) >= session.max_players) {
-            await _coachClient.query('ROLLBACK');
-            return res.status(400).json({ error: 'Session is full' });
-        }
-
-        await _coachClient.query(
+        await pool.query(
             `INSERT INTO coaching_registrations (session_id, player_id) VALUES ($1,$2)`,
             [id, req.user.playerId]
         );
 
-        // Recount post-insert (atomic — same lock)
-        const countResult = await _coachClient.query(
+        // Check if now full
+        const countResult = await pool.query(
             `SELECT COUNT(*) AS cnt FROM coaching_registrations
              WHERE session_id=$1 AND status='registered'`,
             [id]
         );
-        count = parseInt(countResult.rows[0].cnt);
+        const count = parseInt(countResult.rows[0].cnt);
         if (count >= session.max_players) {
-            await _coachClient.query(`UPDATE coaching_sessions SET is_full=TRUE WHERE id=$1`, [id]);
-        }
-
-        await _coachClient.query('COMMIT');
-    } catch (txErr) {
-        try { await _coachClient.query('ROLLBACK'); } catch (_) {}
-        console.error('POST /api/coaching/sessions/:id/register tx:', txErr.message);
-        return res.status(500).json({ error: 'Failed to register' });
-    } finally {
-        _coachClient.release();
-    }
-
-    // Post-COMMIT side effects (using `pool` — no in-tx side effects)
-    try {
-        if (count >= session.max_players) {
+            await pool.query(`UPDATE coaching_sessions SET is_full=TRUE WHERE id=$1`, [id]);
             // Notify superadmin + coach
             const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
             notifyAdmin('Coaching Session Full', [['Details', `Session ${htmlEncode(id)} is now full (${session.max_players} players).`]]);
@@ -23939,13 +23170,12 @@ app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationL
 
         await logCoachingAudit(id, null, req.user.playerId, 'player_registered',
             `Player registered for session. ${count}/${session.max_players} spots filled.`);
-    } catch (e) {
-        // FIX-163: post-COMMIT side effects (emails, audit log) are best-effort.
-        // The registration is already committed; failure here only loses notifications.
-        console.warn('Coaching register post-COMMIT side effects failed (non-critical):', e.message);
-    }
 
-    res.json({ success: true, registered_count: count });
+        res.json({ success: true, registered_count: count });
+    } catch (e) {
+        console.error('POST /api/coaching/sessions/:id/register:', e.message);
+        res.status(500).json({ error: 'Failed to register' });
+    }
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -25932,27 +25162,17 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
         await client.query('BEGIN');
 
         // Check / claim the run slot
-        // FIX-113: also pull error_message — a previous run that completed_at-but-errored
-        // should NOT block the next cron tick from retrying. Only fully-clean runs skip.
         const existing = await client.query(
-            `SELECT id, completed_at, error_message FROM monthly_trophy_runs WHERE year = $1 AND month = $2`,
+            `SELECT id, completed_at FROM monthly_trophy_runs WHERE year = $1 AND month = $2`,
             [year, month]
         );
-        const previousFinishedClean = existing.rows.length > 0
-            && existing.rows[0].completed_at
-            && !existing.rows[0].error_message;
-        if (previousFinishedClean && !force) {
+        if (existing.rows.length > 0 && existing.rows[0].completed_at && !force) {
             await client.query('ROLLBACK');
             return { ok: true, skipped: true, reason: 'already_processed' };
         }
 
-        // Force-rerun OR retry-after-error: wipe previous results for this month before recompute.
-        // FIX-113: failed runs (completed_at NOT NULL but error_message present) are auto-retried
-        // here without needing force=true.
-        const previousFailed = existing.rows.length > 0
-            && existing.rows[0].completed_at
-            && !!existing.rows[0].error_message;
-        if (existing.rows.length > 0 && (force || previousFailed)) {
+        // Force-rerun: wipe previous results for this month before recompute
+        if (existing.rows.length > 0 && force) {
             await client.query(`
                 DELETE FROM monthly_trophy_results WHERE trophy_id IN (
                     SELECT id FROM monthly_trophies WHERE year = $1 AND month = $2
@@ -26036,10 +25256,8 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
 async function tickMonthlyTrophyCron() {
     try {
         const now = new Date();
-        // Only run on day 1 OR day 2 of the month — saves DB queries every other day.
-        // FIX-127: extended from day-1-only to day 1+2 for a 24hr grace window — gives
-        // late game completions on the 1st time to finalise before metrics calculate.
-        if (now.getUTCDate() !== 1 && now.getUTCDate() !== 2) return;
+        // Only run on day 1 of the month — saves DB queries every other day
+        if (now.getUTCDate() !== 1) return;
 
         // Process the PREVIOUS month
         const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
@@ -26069,7 +25287,7 @@ async function tickMonthlyTrophyCron() {
 // GET /api/monthly-trophies/list-months
 // Returns distinct (year, month) pairs that have any trophies recorded.
 // For the admin UI's "select a month" dropdown.
-app.get('/api/monthly-trophies/list-months', publicEndpointLimiter, async (req, res) => {  // FIX-114
+app.get('/api/monthly-trophies/list-months', async (req, res) => {
     try {
         const r = await pool.query(`
             SELECT DISTINCT year, month
@@ -26085,7 +25303,7 @@ app.get('/api/monthly-trophies/list-months', publicEndpointLimiter, async (req, 
 // GET /api/monthly-trophies/:year/:month?region=...
 // Returns all trophies for a given (year, month, region). Public-readable.
 // If region omitted, returns all 6 regions in one payload.
-app.get('/api/monthly-trophies/:year/:month', publicEndpointLimiter, async (req, res) => {  // FIX-114
+app.get('/api/monthly-trophies/:year/:month', async (req, res) => {
     try {
         const year = parseInt(req.params.year);
         const month = parseInt(req.params.month);
@@ -26101,58 +25319,48 @@ app.get('/api/monthly-trophies/:year/:month', publicEndpointLimiter, async (req,
         const filter = region ? 'AND mt.region = $3' : '';
         const params = region ? [year, month, region] : [year, month];
 
-        // FIX-115: collapse old N+1 (1 + up to 36 queries per request) into a single
-        // LEFT JOIN. Group results by trophy_id in JS. Order matches the prior endpoint
-        // exactly (region, metric_id, then rank within each trophy).
-        const flat = await pool.query(`
-            SELECT mt.id AS trophy_id, mt.region, mt.metric_id, mt.calculation_type,
-                   mt.eligibility_min_games, mt.finalized_at,
-                   mtr.rank, mtr.player_id, mtr.primary_stat,
-                   mtr.supporting_stat, mtr.games_played,
-                   COALESCE(p.alias, p.full_name) AS player_name
+        const trophiesRows = await pool.query(`
+            SELECT mt.id, mt.region, mt.metric_id, mt.calculation_type,
+                   mt.eligibility_min_games, mt.finalized_at
             FROM monthly_trophies mt
-            LEFT JOIN monthly_trophy_results mtr ON mtr.trophy_id = mt.id
-            LEFT JOIN players p                 ON p.id           = mtr.player_id
             WHERE mt.year = $1 AND mt.month = $2 ${filter}
-            ORDER BY mt.region, mt.metric_id, mtr.rank`,
+            ORDER BY mt.region, mt.metric_id`,
             params
         );
 
-        const trophyMap = new Map();
-        for (const row of flat.rows) {
-            let trophy = trophyMap.get(row.trophy_id);
-            if (!trophy) {
-                const cfg = METRIC_CONFIG[parseInt(row.metric_id)];
-                trophy = {
-                    trophy_id: row.trophy_id,
-                    region: row.region,
-                    metric_id: row.metric_id,
-                    metric_name: cfg ? cfg.name : 'Unknown',
-                    metric_icon: cfg ? cfg.icon : '',
-                    calculation_type: row.calculation_type,
-                    primary_label: cfg ? cfg.primaryLabel : '',
-                    supporting_label: cfg ? cfg.supportingLabel : '',
-                    eligibility_min_games: row.eligibility_min_games,
-                    finalized_at: row.finalized_at,
-                    results: [],
-                };
-                trophyMap.set(row.trophy_id, trophy);
-            }
-            // Trophy with zero results (LEFT JOIN miss) → skip the result push,
-            // but the trophy header is still in the map (matches prior behaviour
-            // where an empty results query would have produced an empty results array).
-            if (row.rank != null) {
-                trophy.results.push({
-                    rank: row.rank,
-                    player_id: row.player_id,
-                    player_name: row.player_name,
-                    primary_stat: row.primary_stat !== null ? parseFloat(row.primary_stat) : null,
-                    supporting_stat: row.supporting_stat !== null ? parseFloat(row.supporting_stat) : null,
-                    games_played: row.games_played,
-                });
-            }
+        const out = [];
+        for (const t of trophiesRows.rows) {
+            const cfg = METRIC_CONFIG[parseInt(t.metric_id)];
+            const resultsRows = await pool.query(`
+                SELECT mtr.rank, mtr.player_id, mtr.primary_stat, mtr.supporting_stat,
+                       mtr.games_played,
+                       COALESCE(p.alias, p.full_name) AS player_name
+                FROM monthly_trophy_results mtr
+                JOIN players p ON p.id = mtr.player_id
+                WHERE mtr.trophy_id = $1
+                ORDER BY mtr.rank`, [t.id]);
+
+            out.push({
+                trophy_id: t.id,
+                region: t.region,
+                metric_id: t.metric_id,
+                metric_name: cfg ? cfg.name : 'Unknown',
+                metric_icon: cfg ? cfg.icon : '',
+                calculation_type: t.calculation_type,
+                primary_label: cfg ? cfg.primaryLabel : '',
+                supporting_label: cfg ? cfg.supportingLabel : '',
+                eligibility_min_games: t.eligibility_min_games,
+                finalized_at: t.finalized_at,
+                results: resultsRows.rows.map(r => ({
+                    rank: r.rank,
+                    player_id: r.player_id,
+                    player_name: r.player_name,
+                    primary_stat: r.primary_stat !== null ? parseFloat(r.primary_stat) : null,
+                    supporting_stat: r.supporting_stat !== null ? parseFloat(r.supporting_stat) : null,
+                    games_played: r.games_played,
+                })),
+            });
         }
-        const out = Array.from(trophyMap.values());
 
         res.json({ year, month, region: region || 'all', trophies: out });
     } catch (e) {
@@ -26165,7 +25373,7 @@ app.get('/api/monthly-trophies/:year/:month', publicEndpointLimiter, async (req,
 
 // GET /api/players/:playerId/monthly-trophies
 // Player profile history view. Returns every trophy this player has placed in.
-app.get('/api/players/:playerId/monthly-trophies', publicEndpointLimiter, async (req, res) => {  // FIX-114
+app.get('/api/players/:playerId/monthly-trophies', async (req, res) => {
     try {
         const playerId = req.params.playerId;
         if (!playerId) return res.status(400).json({ error: 'Missing playerId' });
@@ -26214,17 +25422,12 @@ app.get('/api/players/:playerId/monthly-trophies', publicEndpointLimiter, async 
 // Body: { year: 2026, month: 4, force: true }
 // Manual trigger — recomputes a specific month's trophies. Used for backfill
 // or testing. force=true wipes existing trophies for that month first.
-// FIX-117: was inline req.user.role check; switched to requireAdmin middleware to match
-// the rest of the admin endpoints in this codebase (server.js:1663).
-app.post('/api/admin/monthly-trophies/run-now', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/monthly-trophies/run-now', authenticateToken, async (req, res) => {
     try {
-        const year = parseInt(req.body?.year);
-        // FIX-126 (M2): clamp year to [2024 .. currentYear+1]. Without this an admin
-        // could pass year=9999 and create empty trophy rows for a non-existent year.
-        const _currentYear = new Date().getUTCFullYear();
-        if (!isFinite(year) || year < 2024 || year > _currentYear + 1) {
-            return res.status(400).json({ error: `Year must be between 2024 and ${_currentYear + 1}` });
+        if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin')) {
+            return res.status(403).json({ error: 'Admin access required' });
         }
+        const year = parseInt(req.body?.year);
         const month = parseInt(req.body?.month);
         const force = !!req.body?.force;
 
@@ -26246,9 +25449,11 @@ app.post('/api/admin/monthly-trophies/run-now', authenticateToken, requireAdmin,
 
 // DELETE /api/admin/monthly-trophies/:year/:month
 // Wipes a month's trophies (admin escape hatch — use sparingly).
-// FIX-117: was inline req.user.role check; switched to requireAdmin middleware.
-app.delete('/api/admin/monthly-trophies/:year/:month', authenticateToken, requireAdmin, async (req, res) => {
+app.delete('/api/admin/monthly-trophies/:year/:month', authenticateToken, async (req, res) => {
     try {
+        if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin')) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
         const year = parseInt(req.params.year);
         const month = parseInt(req.params.month);
         if (!year || !month || month < 1 || month > 12) {
@@ -26430,27 +25635,19 @@ app.post('/api/admin/series/:id/finalize', authenticateToken, requireAdmin, asyn
     try {
         const seriesId = req.params.id;
 
+        const seriesRow = await pool.query(
+            `SELECT series_status FROM game_series WHERE id = $1`, [seriesId]);
+        if (!seriesRow.rows.length) return res.status(404).json({ error: 'Series not found' });
+        if (seriesRow.rows[0].series_status === 'completed') {
+            return res.status(400).json({ error: 'Series already finalised' });
+        }
+
         const trophiesRow = await pool.query(
             `SELECT id, metric_id, calculation_type FROM series_trophies WHERE series_id = $1`, [seriesId]);
 
         const client = await pool.connect();
         try {
             await client.query('BEGIN');
-
-            // FIX-160: re-check series existence + status under FOR UPDATE inside the tx.
-            // Previously the check was on pool before BEGIN — two admins simultaneously
-            // calling finalize both passed and both DELETE+INSERT trophy results. The
-            // FOR UPDATE serialises concurrent finalize calls per series.
-            const seriesRow = await client.query(
-                `SELECT series_status FROM game_series WHERE id = $1 FOR UPDATE`, [seriesId]);
-            if (!seriesRow.rows.length) {
-                await client.query('ROLLBACK');
-                return res.status(404).json({ error: 'Series not found' });
-            }
-            if (seriesRow.rows[0].series_status === 'completed') {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: 'Series already finalised' });
-            }
 
             for (const t of trophiesRow.rows) {
                 console.log(`[finalize] Computing metric_id=${t.metric_id} calc=${t.calculation_type}`);
@@ -26766,7 +25963,7 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
                 payment_description: paymentDescription,
                 amount:      amountPence,
                 redirect_url: `https://totalfooty.co.uk/?wonderful_payment_id=${merchantRef}`,
-                webhook_url: `https://api.totalfooty.co.uk/api/webhooks/wonderful`,  // FIX-143: was hardcoded onrender.com — migrated to api.totalfooty.co.uk (CORS allowlist)
+                webhook_url: `https://totalfooty-api.onrender.com/api/webhooks/wonderful`,
             });
         } catch (wErr) {
             // Mark row as init_failed so the reconciler skips it. If Wonderful
@@ -27004,24 +26201,6 @@ async function _wonderfulAutoRegister(pmt) {
             const client = await pool.connect();
             try {
                 await client.query('BEGIN');
-                // FIX-153: lock games row to serialise concurrent credit-helper runs
-                // (webhook + reconciler can fire near-simultaneously). Without this lock,
-                // two threads both pass the pre-transaction idempotency check at L26660
-                // and both INSERT a registration for the same player.
-                await client.query('SELECT 1 FROM games WHERE id = $1 FOR UPDATE', [pmt.game_id]);
-                // Re-check idempotency inside the locked transaction. If a sibling
-                // webhook/reconciler beat us to it, return its result instead of inserting again.
-                const _idemRe = await client.query(
-                    `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2`,
-                    [pmt.game_id, pmt.player_id]
-                );
-                if (_idemRe.rows.length) {
-                    await client.query('ROLLBACK');
-                    return {
-                        status: _idemRe.rows[0].status === 'confirmed' ? 'confirmed' : 'backup',
-                        reason: 'Already registered (concurrent credit-helper race resolved)'
-                    };
-                }
                 let amountPaid = 0, amountPaidFree = 0;
                 if (finalBackupType === 'confirmed_backup' && !isComped) {
                     const { realCharged, freeCharged } = await applyGameFee(
@@ -27097,87 +26276,6 @@ async function _wonderfulAutoRegister(pmt) {
             const client = await pool.connect();
             try {
                 await client.query('BEGIN');
-                // FIX-146: race-window protection. The unlocked isFull check above
-                // (line ~26627) was made on a stale snapshot. Two concurrent Wonderful
-                // auto-registers for different players paying the last slot of the
-                // same game both saw isFull=false and both INSERTed confirmed,
-                // overflowing capacity. Re-check inside a locked transaction:
-                // - SELECT FOR UPDATE on games row serialises concurrent writers
-                // - If the locked re-check shows full, ROLLBACK and fall through to
-                //   the backup path below (note: control needs to exit this block;
-                //   we mark via _raceFilled and re-enter the backup branch logic).
-                const _lockedCap = await client.query(
-                    `SELECT g.max_players, g.requires_organiser,
-                            ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
-                             + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players,
-                            (SELECT COUNT(*) FROM registrations r
-                               JOIN players p ON p.id = r.player_id
-                              WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) AS org_count
-                     FROM games g WHERE g.id = $1 FOR UPDATE`,
-                    [pmt.game_id]
-                );
-                if (!_lockedCap.rows.length) {
-                    await client.query('ROLLBACK');
-                    return { status: 'failed_game_not_found', reason: 'Game disappeared mid-credit' };
-                }
-                // FIX-153: re-check idempotency inside the locked transaction.
-                // The pre-transaction check at L26660 is a fast-path optimisation only;
-                // a concurrent webhook + reconciler can both pass that check and both
-                // try to INSERT. The games-row FOR UPDATE lock serialises them; the
-                // first to commit wins, the second sees the existing registration here.
-                const _idemRe2 = await client.query(
-                    `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2`,
-                    [pmt.game_id, pmt.player_id]
-                );
-                if (_idemRe2.rows.length) {
-                    await client.query('ROLLBACK');
-                    return {
-                        status: _idemRe2.rows[0].status === 'confirmed' ? 'confirmed' : 'backup',
-                        reason: 'Already registered (concurrent credit-helper race resolved)'
-                    };
-                }
-                const _lc = _lockedCap.rows[0];
-                let _lockedMax = parseInt(_lc.max_players);
-                if (_lc.requires_organiser && !isOrganiser && parseInt(_lc.org_count) === 0) {
-                    _lockedMax = parseInt(_lc.max_players) - 1;
-                }
-                if (parseInt(_lc.current_players) >= _lockedMax) {
-                    // Race lost — game filled between unlocked check and lock acquisition.
-                    // Abort confirmed path; fall through to backup INSERT in this same
-                    // transaction (we still hold the lock — backup INSERT is safe).
-                    let amountPaid = 0, amountPaidFree = 0;
-                    const requestedBackup = ['normal_backup','confirmed_backup','gk_backup']
-                        .includes(requestedBackupType) ? requestedBackupType : 'normal_backup';
-                    const finalBackupType = (requestedBackup === 'gk_backup' && !isGKOnly) ? 'normal_backup' : requestedBackup;
-                    if (finalBackupType === 'confirmed_backup' && !isComped) {
-                        const { realCharged, freeCharged } = await applyGameFee(
-                            client, pmt.player_id, effectivePrice,
-                            `Confirmed backup for game ${pmt.game_id} (via Wonderful — race-fallback)`
-                        );
-                        amountPaid = realCharged;
-                        amountPaidFree = freeCharged || 0;
-                    }
-                    await client.query(
-                        `INSERT INTO registrations
-                            (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, is_comped, registered_at)
-                         VALUES ($1, $2, 'backup', $3, $4, $5, $6, $7, NOW())`,
-                        [pmt.game_id, pmt.player_id, positionValue, finalBackupType, amountPaid, amountPaidFree, isComped]
-                    );
-                    await client.query('COMMIT');
-                    await gameAuditLog(pool, pmt.game_id, pmt.player_id, 'player_signed_up',
-                        `Auto-registered as ${finalBackupType} (FIX-146 race-fallback: game filled mid-credit) via Wonderful ${pmt.merchant_reference}`);
-                    registrationEvent(pool, pmt.game_id, pmt.player_id,
-                        finalBackupType === 'confirmed_backup' ? 'confirmed_backup_joined' : 'backup_joined',
-                        `Position: ${positionValue} | Backup type: ${finalBackupType} | via Wonderful (race-fallback)`).catch(() => {});
-                    getGameDataForNotification(pmt.game_id).then(gd =>
-                        sendNotification('backup_added', pmt.player_id, gd).catch(() => {})
-                    ).catch(() => {});
-                    return {
-                        status: 'backup_game_full',
-                        reason: `Game filled while payment was being processed — added to ${finalBackupType === 'confirmed_backup' ? 'confirmed ' : ''}backup list`
-                    };
-                }
-                // Lock confirms space available — proceed with confirmed INSERT below.
                 let amountPaid = 0, amountPaidFree = 0;
                 if (!isComped) {
                     const { realCharged, freeCharged } = await applyGameFee(
@@ -27278,9 +26376,6 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
     // Atomic claim + credit. Rollback on any failure — payment stays non-credited
     // so the reconciler / next webhook can retry safely.
     const client = await pool.connect();
-    // FIX-145: track release state (same pattern as FIX-120 in RAF triggers) so the
-    // catch and finally don't both call client.release() on the same client.
-    let clientReleased = false;
     let pounds, balBefore, balAfter, freshPmt;
     try {
         await client.query('BEGIN');
@@ -27313,19 +26408,11 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
         balAfter = balBefore + pounds;
         await client.query('COMMIT');
     } catch (txErr) {
-        // FIX-145: rollback if open, release ONLY if not already released.
-        if (!clientReleased) {
-            try { await client.query('ROLLBACK'); } catch (_) {}
-            try { client.release(); } catch (_) {}
-            clientReleased = true;
-        }
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
         throw txErr;
     } finally {
-        // FIX-145: release only on the happy path (catch already handled error paths)
-        if (!clientReleased) {
-            try { client.release(); } catch (_) {}
-            clientReleased = true;
-        }
+        try { client.release(); } catch (_) {}
     }
 
     // Post-commit side-effects. Intentionally outside the tx — if any fail, log but
@@ -28175,30 +27262,6 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
                     gameId: gid,
                 });
             }
-
-            // FIX-119: narrow the race window. The earlier SELECT ... FOR UPDATE
-            // locks the games row but does NOT lock the registrations / game_guests
-            // tables, so two concurrent comms claims for the last seat can both pass
-            // the original capacity check at line 27321 (Read Committed sees the
-            // snapshot at statement start). Re-fetch immediately before INSERT so
-            // any concurrent claim that committed first is now visible. Window is
-            // narrowed from "between 27321 and INSERT" to "between this query and
-            // the next statement" — a few hundred microseconds. Not zero, but a
-            // 99%+ reduction in race surface area without a schema migration.
-            const freshCount = await client.query(`
-                SELECT
-                    ((SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed')
-                   + (SELECT COUNT(*) FROM game_guests   WHERE game_id = $1))::int AS current_players
-            `, [gid]);
-            if (freshCount.rows[0].current_players >= g.max_players) {
-                await client.query(
-                    "UPDATE comms_recipients SET claimed_at = NOW(), claim_outcome = 'game_full' WHERE id = $1",
-                    [r.id]
-                );
-                await client.query('COMMIT');
-                return res.status(409).json({ outcome: 'game_full', message: 'Sorry — this game just filled up.' });
-            }
-
             // Comp the player into the game — confirmed, is_comped=true, amount_paid=0.
             // position_preference 'outfield' lowercase to match existing code conventions
             // (L5244, L6624 default to 'outfield'). The GK detection uses UPPER() so casing
@@ -28243,7 +27306,7 @@ app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web55`); // FIX-111: bumped from web50
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web50`);
 
     // ── Team-email settle recovery sweep ────────────────────────────────────
     // Pending "settle" timers live in memory (setTimeout). If the server restarts
@@ -28432,13 +27495,6 @@ app.listen(PORT, () => {
     }, 10 * 60 * 1000); // 10 minutes
 
     // Auto-finalize expired MOTM voting every 10 minutes
-    // FIX-149: previously called `runMotmFinalize()` which is not defined anywhere
-    // in the codebase — every cron tick threw ReferenceError silently. The
-    // closeAwards() function is the canonical path: it grants MOTM (FIX-100 sets
-    // games.motm_winner_id), per-class motm_wins, badges, sends emails, and fires
-    // push notifications. This cron now serves as a recovery path for games where
-    // the awards-close cron didn't fire (motm_voting_ends < awards_close_at edge
-    // case) or where closeAwards crashed before the MOTM block.
     setInterval(async () => {
         try {
             const expired = await pool.query(`
@@ -28452,18 +27508,15 @@ app.listen(PORT, () => {
 
             if (expired.rows.length === 0) return;
 
-            console.log(`⏰ Auto-finalizing MOTM (closeAwards retry) for ${expired.rows.length} game(s)...`);
+            console.log(`⏰ Auto-finalizing MOTM for ${expired.rows.length} game(s)...`);
             for (const row of expired.rows) {
                 try {
-                    // FIX-149: closeAwards is idempotent — the per-award INSERT check at
-                    // line ~16055 prevents double-granting if awards-close cron has
-                    // partially run already.
-                    const result = await closeAwards(row.id);
-                    const motmCount = (result?.confirmedWinners || []).filter(w => w.awardType === 'motm').length;
-                    if (motmCount > 0) {
-                        console.log(`✅ MOTM auto-finalized game ${row.id} via closeAwards: ${motmCount} MOTM winner(s)`);
+                    const result = await runMotmFinalize(row.id);
+                    if (!result.alreadyFinalized) {
+                        const names = result.winners.map(w => w.name).join(' & ');
+                        console.log(`✅ MOTM auto-finalized game ${row.id}: ${names}`);
                         await gameAuditLog(pool, row.id, null, 'motm_finalized',
-                            `Auto-finalized via closeAwards retry | MOTM winners: ${motmCount}`).catch(() => {});
+                            `Auto-finalized | Winner(s): ${names} | Votes: ${result.winners[0]?.votes ?? '?'}`).catch(() => {});
                     }
                     // Always run ref finalize — MOTM and refs are independent
                     await finaliseRefereeReviews(row.id).catch(e =>
