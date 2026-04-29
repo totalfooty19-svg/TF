@@ -4081,6 +4081,392 @@ app.get('/api/dashboard/my-booked-games', authenticateToken, async (req, res) =>
 });
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD V2 — Phase 1 endpoints (FIX-201, FIX-202, FIX-203)
+//
+// Spec: dashboard-redesign-v2.md (LOCKED 28 Apr 2026)
+// Status: Phase 1 — endpoints only. Frontend dashboardV2 markup is NOT yet
+//         wired; these endpoints are deployable today and exercise-able via
+//         curl/devtools without affecting the live V1 dashboard.
+// V1 endpoints (region-slider, recent-games, my-booked-games) remain alive
+// during the transition and will be removed in a follow-up cleanup deploy
+// after V2 has had ≥1 week of stable production use.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── GET /api/dashboard/timeline (FIX-201) ────────────────────────────────────
+// Replaces V1 region-slider for Dashboard V2. Returns ONE chronologically
+// ordered list of games (past + upcoming) for the player's region, with
+// frontend-friendly metadata for the new horizontal Timeline component.
+//
+// Query params:
+//   ?region=Coventry|Birmingham|Manchester|Nuneaton|Leamington & Warwick|ALL
+//          Override player's profile region for this request only (does not save)
+//   ?search=<keyword>
+//          Optional substring filter: matches venue name, format string, or
+//          series name (case-insensitive). Empty/absent = no search filter.
+//   ?past=20 ?upcoming=20
+//          Window sizes (1..50). Defaults 20 each.
+//
+// Response shape:
+//   {
+//     region: 'Coventry' | 'ALL' | ...,
+//     region_source: 'profile' | 'default' | 'requested',
+//     search: '',                          // echoed back, lowercase, trimmed
+//     tier_visibility_hours: 168 | null,   // null = admin (no limit)
+//     hit_visibility_wall: false,          // true if upcoming was tier-truncated
+//     centre_index: 5,                     // index in `games` of the next-future
+//                                          // game (or last past if none ahead)
+//     games: [ ...sorted ascending by game_date, past first then future... ]
+//   }
+//
+// Frontend derives Timeline state from the response:
+//   games.length === 0 + region_source === 'profile'   → "region launched!" card
+//   games.length === 0 + region_source === 'default'   → "set your region" card
+//   tier_visibility_hours === 0                        → "tier locked" card
+//   hit_visibility_wall === true                       → "improve tier" upsell
+//                                                        appended after last game
+app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
+    try {
+        // ── Player + tier resolution (mirrors V1 region-slider exactly) ──
+        const playerRow = await pool.query(
+            `SELECT region_code, reliability_tier
+             FROM players WHERE id = $1`,
+            [req.user.playerId]
+        );
+        const player  = playerRow.rows[0] || {};
+        const tier    = player.reliability_tier || 'silver';
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+
+        // Region (priority: explicit query > profile > default ALL)
+        const requestedRegion = req.query.region ? String(req.query.region) : null;
+        const { region, source: regionSource } = _resolveSliderRegion(player, requestedRegion);
+
+        // Search keyword — trimmed + lowercased; empty string treated as "no filter"
+        const searchRaw = (req.query.search || '').toString().trim().toLowerCase();
+        // Defensive cap: a 200-char "search" keyword is almost certainly junk/abuse.
+        // Truncate rather than reject so the call still returns games.
+        const search = searchRaw.slice(0, 200);
+
+        // Tier visibility window in hours (mirrors V1)
+        let hoursAhead = 168;                              // silver default = 7d
+        if (tier === 'gold')   hoursAhead = 28 * 24;       // 28d
+        if (tier === 'bronze') hoursAhead = 24;            // 1d
+        if (tier === 'white' || tier === 'black') hoursAhead = 0;
+        const effectiveHoursAhead = isAdmin ? null : hoursAhead;
+
+        // Window sizes (clamped 1..50)
+        const upcomingLimit = Math.min(50, Math.max(1, parseInt(req.query.upcoming) || 20));
+        const pastLimit     = Math.min(50, Math.max(1, parseInt(req.query.past)     || 20));
+
+        // ── Exclusivity badge filter (mirrors V1 region-slider exactly) ──
+        let badgeFilter = '';
+        if (!isAdmin) {
+            const badges = await pool.query(`
+                SELECT b.name FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','CLM','Misfits')`,
+                [req.user.playerId]
+            );
+            const badgeNames = new Set(badges.rows.map(r => r.name));
+            const exclusions = [];
+            if (!badgeNames.has('TF All Star')) exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'allstars')");
+            if (!badgeNames.has('CLM'))         exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'clm')");
+            if (!badgeNames.has('Misfits'))     exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'misfits')");
+            badgeFilter = exclusions.length ? 'AND ' + exclusions.join(' AND ') : '';
+        }
+
+        // ── Region clause: 'ALL' = no filter ──
+        const regionClause = (region === 'ALL') ? '' : 'AND v.region = $2';
+        const baseParams   = (region === 'ALL') ? [req.user.playerId] : [req.user.playerId, region];
+
+        // ── Search clause: substring on venue.name / g.format / gs.series_name ──
+        // Parameterised — never interpolated. NULL-safe via COALESCE so games
+        // missing a series or format don't blow up the LOWER() call.
+        const searchParam = search ? '%' + search + '%' : null;
+        let searchClause = '';
+        if (searchParam) {
+            // Pushed as the LAST param; index depends on whether region is in or out.
+            const idx = baseParams.length + 1;
+            searchClause = `AND (
+                COALESCE(LOWER(v.name), '')         LIKE $${idx} OR
+                COALESCE(LOWER(g.format), '')       LIKE $${idx} OR
+                COALESCE(LOWER(gs.series_name), '') LIKE $${idx}
+            )`;
+            baseParams.push(searchParam);
+        }
+
+        // ── Tier window clause for UPCOMING games ──
+        const tierClause = (effectiveHoursAhead === null)
+            ? ''
+            : (effectiveHoursAhead === 0)
+                ? 'AND 1 = 0'
+                : `AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL '${effectiveHoursAhead} hours'`;
+
+        // ── Common SELECT — lean projection matching what the Timeline card needs ──
+        const baseSelect = `
+            g.id, g.game_url, g.game_date, g.game_status, g.format AS game_format,
+            g.cost_per_player, g.early_bird_price, g.super_early_bird_price,
+            g.max_players, g.star_rating, g.exclusivity,
+            v.name AS venue_name, v.region AS region,
+            gs.series_name,
+            TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
+            ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+              + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))         AS current_players,
+            (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1)
+                                                                                  AS my_status
+        `;
+
+        // ── UPCOMING window (ascending by date, tier-limited for non-admins) ──
+        const upcomingSql = `
+            SELECT ${baseSelect}
+            FROM games g
+            LEFT JOIN venues v       ON v.id = g.venue_id
+            LEFT JOIN game_series gs ON gs.id = g.series_id
+            WHERE g.game_status IN ('available','confirmed')
+              AND g.game_date >= CURRENT_TIMESTAMP
+              ${regionClause}
+              ${searchClause}
+              ${tierClause}
+              ${badgeFilter}
+            ORDER BY g.game_date ASC
+            LIMIT ${upcomingLimit + 1}
+        `;
+
+        // ── PAST window (descending — most recent first; no tier limit) ──
+        const pastSql = `
+            SELECT ${baseSelect}
+            FROM games g
+            LEFT JOIN venues v       ON v.id = g.venue_id
+            LEFT JOIN game_series gs ON gs.id = g.series_id
+            WHERE g.game_status = 'completed'
+              AND g.game_date < CURRENT_TIMESTAMP
+              ${regionClause}
+              ${searchClause}
+              ${badgeFilter}
+            ORDER BY g.game_date DESC
+            LIMIT ${pastLimit}
+        `;
+
+        const [upcomingRes, pastRes] = await Promise.all([
+            pool.query(upcomingSql, baseParams),
+            pool.query(pastSql,     baseParams),
+        ]);
+
+        // hit_visibility_wall: detected by fetching upcomingLimit+1; if we got
+        // exactly that many AND we're not admin AND tier is non-zero, the wall
+        // truncated us. Slice off the spare row before responding.
+        const upcomingFull = upcomingRes.rows;
+        let hitVisibilityWall = false;
+        if (!isAdmin && effectiveHoursAhead !== null && effectiveHoursAhead > 0) {
+            // We didn't get truncated by tier here (we cap with INTERVAL). Wall
+            // detection: query a small probe outside the tier window — only run
+            // if upcoming hit the LIMIT (cheap heuristic).
+            if (upcomingFull.length > upcomingLimit) {
+                hitVisibilityWall = true;
+            } else {
+                // Probe: does ANY game exist in this region BEYOND the tier window?
+                const probeParams = [...baseParams];
+                const probeRegion = (region === 'ALL') ? '' : 'AND v.region = $2';
+                const probe = await pool.query(`
+                    SELECT 1
+                    FROM games g
+                    LEFT JOIN venues v ON v.id = g.venue_id
+                    WHERE g.game_status IN ('available','confirmed')
+                      AND g.game_date >  CURRENT_TIMESTAMP + INTERVAL '${effectiveHoursAhead} hours'
+                      ${probeRegion}
+                      ${badgeFilter}
+                    LIMIT 1
+                `, probeParams.slice(0, region === 'ALL' ? 1 : 2));
+                hitVisibilityWall = probe.rows.length > 0;
+            }
+        }
+        const upcoming = upcomingFull.slice(0, upcomingLimit);
+
+        // Stitch: past (reversed → ascending) THEN upcoming (already ascending)
+        const pastAsc = pastRes.rows.slice().reverse();
+        const games   = pastAsc.concat(upcoming);
+
+        // centre_index = first future game's position; fallback to last past game
+        // (or 0 if list is empty).
+        let centreIndex = 0;
+        if (games.length) {
+            const firstFutureIdx = pastAsc.length;  // upcoming starts at this index
+            centreIndex = (upcoming.length > 0) ? firstFutureIdx : (pastAsc.length - 1);
+            if (centreIndex < 0) centreIndex = 0;
+        }
+
+        res.json({
+            region,
+            region_source: regionSource,
+            search,
+            tier_visibility_hours: effectiveHoursAhead,
+            hit_visibility_wall: hitVisibilityWall,
+            centre_index: centreIndex,
+            games,
+        });
+    } catch (error) {
+        console.error('GET /api/dashboard/timeline error:', error.message);
+        res.status(500).json({ error: 'Failed to load timeline' });
+    }
+});
+
+
+// ── GET /api/dashboard/live-votes (FIX-202) ──────────────────────────────────
+// Returns the player's most recent game with currently-OPEN voting (MOTM
+// or TF Game Awards). Drives Slot A of Dashboard V2's right column.
+//
+// "Live" = game is completed, the voting window has not closed, the player
+// was confirmed in the game, and (for MOTM) a winner has not yet been
+// recorded. The player CAN have already voted — we still surface it so they
+// can check the leaderboard / change their vote where supported.
+//
+// Response shape:
+//   { has_live: false, vote: null }
+//   { has_live: true, vote: {
+//         game_id, game_url, game_date, day_label, venue_name,
+//         vote_type: 'motm' | 'awards',
+//         closes_at,                  // ISO timestamp
+//         minutes_remaining,           // integer, clamped >= 0
+//   }}
+//
+// Selection rule: most-recently-played qualifying game (ORDER BY game_date DESC).
+// MOTM and Awards are returned as a unioned set; the most recent of either wins.
+app.get('/api/dashboard/live-votes', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+
+        // Pull both candidate sets in one query, mark vote_type, take the
+        // most recent. We restrict to games where the player was on a team
+        // (not just a backup who never played) — same "rostered" rule used
+        // throughout the app for MOTM eligibility.
+        const result = await pool.query(`
+            WITH eligible_games AS (
+                SELECT DISTINCT g.id, g.game_url, g.game_date, v.name AS venue_name
+                FROM games g
+                JOIN registrations r  ON r.game_id   = g.id AND r.status = 'confirmed'
+                JOIN team_players tp  ON tp.player_id = r.player_id
+                JOIN teams t          ON t.id = tp.team_id AND t.game_id = g.id
+                LEFT JOIN venues v    ON v.id = g.venue_id
+                WHERE r.player_id  = $1
+                  AND g.game_status = 'completed'
+            ),
+            motm_open AS (
+                SELECT eg.id, eg.game_url, eg.game_date, eg.venue_name,
+                       'motm'::text                         AS vote_type,
+                       g.motm_voting_ends                   AS closes_at
+                FROM eligible_games eg
+                JOIN games g ON g.id = eg.id
+                WHERE g.motm_voting_ends > NOW()
+                  AND g.motm_winner_id IS NULL
+                  AND EXISTS (SELECT 1 FROM motm_nominees mn WHERE mn.game_id = g.id)
+            ),
+            awards_open AS (
+                SELECT eg.id, eg.game_url, eg.game_date, eg.venue_name,
+                       'awards'::text                       AS vote_type,
+                       g.awards_close_at                    AS closes_at
+                FROM eligible_games eg
+                JOIN games g ON g.id = eg.id
+                WHERE g.awards_open = TRUE
+                  AND g.awards_close_at IS NOT NULL
+                  AND g.awards_close_at > NOW()
+            )
+            SELECT * FROM motm_open
+            UNION ALL
+            SELECT * FROM awards_open
+            ORDER BY game_date DESC
+            LIMIT 1
+        `, [playerId]);
+
+        if (result.rows.length === 0) {
+            return res.json({ has_live: false, vote: null });
+        }
+
+        const r        = result.rows[0];
+        const closesAt = r.closes_at;
+        const minutesRemaining = Math.max(0,
+            Math.floor((new Date(closesAt).getTime() - Date.now()) / 60000)
+        );
+        const dayLabel = new Date(r.game_date).toLocaleDateString('en-GB', {
+            weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Europe/London'
+        });
+
+        res.json({
+            has_live: true,
+            vote: {
+                game_id:           r.id,
+                game_url:          r.game_url,
+                game_date:         r.game_date,
+                day_label:         dayLabel,
+                venue_name:        r.venue_name,
+                vote_type:         r.vote_type,
+                closes_at:         closesAt,
+                minutes_remaining: minutesRemaining,
+            },
+        });
+    } catch (error) {
+        console.error('GET /api/dashboard/live-votes error:', error.message);
+        res.status(500).json({ error: 'Failed to load live votes' });
+    }
+});
+
+
+// ── GET /api/dashboard/recent-awards (FIX-203) ───────────────────────────────
+// Returns awards the player has WON in the last 3 days. Drives Slot B of
+// Dashboard V2's right column. Source = game_awards table (server.js:15733
+// confirmed schema: game_id, recipient_player_id, award_type, award_source,
+// motm_value, vote_count, star_class, series_day, created_at).
+//
+// Window: 3 days. Tunable via the AWARDS_WINDOW_DAYS constant below.
+//
+// Response shape:
+//   { has_recent: false, awards: [] }
+//   { has_recent: true, awards: [
+//       { game_id, game_url, game_date, day_label, venue_name,
+//         award_type, vote_count, star_class, awarded_at }
+//   ]}
+//
+// Sort: most recent created_at first.
+const AWARDS_WINDOW_DAYS = 3;  // tunable — Dashboard V2 spec §4.2
+
+app.get('/api/dashboard/recent-awards', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                ga.game_id,
+                g.game_url,
+                g.game_date,
+                v.name        AS venue_name,
+                ga.award_type,
+                ga.vote_count,
+                ga.star_class,
+                ga.created_at AS awarded_at
+            FROM game_awards ga
+            JOIN games g       ON g.id = ga.game_id
+            LEFT JOIN venues v ON v.id = g.venue_id
+            WHERE ga.recipient_player_id = $1
+              AND ga.created_at >= NOW() - INTERVAL '${AWARDS_WINDOW_DAYS} days'
+            ORDER BY ga.created_at DESC
+            LIMIT 20
+        `, [req.user.playerId]);
+
+        const awards = result.rows.map(r => ({
+            ...r,
+            day_label: new Date(r.game_date).toLocaleDateString('en-GB', {
+                weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Europe/London'
+            }),
+        }));
+
+        res.json({
+            has_recent: awards.length > 0,
+            awards,
+        });
+    } catch (error) {
+        console.error('GET /api/dashboard/recent-awards error:', error.message);
+        res.status(500).json({ error: 'Failed to load recent awards' });
+    }
+});
+
+
 // POST /api/player/help-guide-seen — marks the dashboard help guide as viewed
 // (used to prevent auto-launch of the tour on subsequent dashboard loads)
 app.post('/api/player/help-guide-seen', authenticateToken, async (req, res) => {
