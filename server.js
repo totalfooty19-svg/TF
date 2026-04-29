@@ -4208,13 +4208,15 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             g.cost_per_player, g.early_bird_price, g.super_early_bird_price,
             g.max_players, g.star_rating, g.exclusivity,
             v.name AS venue_name, v.region AS region,
+            v.background_image_filename AS venue_background_image,
+            v.photo_url AS venue_photo,
             gs.series_name,
             TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
             ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
               + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))         AS current_players,
             (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1)
                                                                                   AS my_status
-        `;
+        `;  /* FIX-217: include venue_background_image + photo_url for V2 timeline cards */
 
         // ── UPCOMING window (ascending by date, tier-limited for non-admins) ──
         const upcomingSql = `
@@ -4293,6 +4295,34 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             const firstFutureIdx = pastAsc.length;  // upcoming starts at this index
             centreIndex = (upcoming.length > 0) ? firstFutureIdx : (pastAsc.length - 1);
             if (centreIndex < 0) centreIndex = 0;
+        }
+
+        // FIX-217: resolve venue photo same as /api/games — admin-set bg image
+        // → hardcoded venue map → legacy DB photo_url. Frontend uses venue_photo.
+        const _venuePhotoMapV2 = {
+            'Daimler Green - Astro':       'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green - Grass':       'https://totalfooty.co.uk/assets/Daimler_Green_Grass.webp',
+            'Daimler Green':               'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Daimler Green Community Centre': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
+            'Corpus Christi':              'https://totalfooty.co.uk/assets/Corpus_Christi.jpg',
+            'War Memorial Park':           'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Memorial Park':               'https://totalfooty.co.uk/assets/war_memorial_park.jpg',
+            'Powerleague':                 'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Power League':                'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Coventry Powerleague':        'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Powerleague Coventry':        'https://totalfooty.co.uk/assets/Powerleague.jpeg',
+            'Sidney Stringer':             'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+            'Sidney Stringer Academy':     'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
+            'Nuneaton Academy':            'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
+            'Tudor Grange Academy':        'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
+        };
+        for (const game of games) {
+            if (game.venue_background_image) {
+                game.venue_photo = `https://totalfooty.co.uk/assets/venues/${game.venue_background_image}`;
+            } else if (game.venue_name && _venuePhotoMapV2[game.venue_name]) {
+                game.venue_photo = _venuePhotoMapV2[game.venue_name];
+            }
+            // else venue_photo stays as v.photo_url (or null)
         }
 
         res.json({
