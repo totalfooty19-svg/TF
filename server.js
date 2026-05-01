@@ -23141,9 +23141,16 @@ app.get('/api/public/referee-invite/:code', refereeInviteLimiter, async (req, re
 // Anything else (tournament, vs_external, draft_memory, venue_clash) is gated
 // at both the GET and POST layer. team_selection_type 'standard' is the canonical
 // flag; venue_clash is a separate column on games (is_venue_clash boolean).
+//
+// FIX (post-R11-#12): legacy games can have team_selection_type = 'normal' or
+// NULL (rather than canonical 'standard'). The rest of the codebase accepts
+// all three via COALESCE(team_selection_type, 'standard') IN ('normal',
+// 'standard'). Mirror that here so the feedback gate matches reality.
 function _isStandardForFeedback(gameRow) {
     if (!gameRow) return false;
-    if (gameRow.team_selection_type !== 'standard') return false;
+    const t = gameRow.team_selection_type;
+    const isStandardOrLegacy = (t === null || t === 'standard' || t === 'normal');
+    if (!isStandardOrLegacy) return false;
     if (gameRow.is_venue_clash) return false;
     return true;
 }
@@ -24788,7 +24795,8 @@ app.get('/api/admin/games/:gameId/team-setups/:id', authenticateToken, requireGa
         let playersMap = new Map();
         if (playerUuids.length > 0) {
             const pRes = await pool.query(`
-                SELECT id, full_name, alias, overall_rating, position_preference
+                SELECT id, full_name, alias, overall_rating,
+                       COALESCE(position, 'outfield') AS position_preference
                 FROM players
                 WHERE id = ANY($1::uuid[])
             `, [playerUuids]);
@@ -24886,7 +24894,8 @@ app.get('/api/games/:gameId/team-setups/:id', authenticateToken, async (req, res
         let playersMap = new Map();
         if (playerUuids.length > 0) {
             const pRes = await pool.query(`
-                SELECT id, full_name, alias, overall_rating, position_preference
+                SELECT id, full_name, alias, overall_rating,
+                       COALESCE(position, 'outfield') AS position_preference
                 FROM players
                 WHERE id = ANY($1::uuid[])
             `, [playerUuids]);
@@ -25010,10 +25019,19 @@ app.post('/api/admin/games/:gameId/open-multi-voting', authenticateToken, requir
         // algorithm, so opening voting on them would let admins fire pushes
         // for a vote players' endpoint will refuse. Catches the case where
         // admin converted game type while pre-open Multi candidates existed.
-        if (gameStatus.rows[0].team_selection_type !== 'standard') {
+        //
+        // FIX: legacy games can have team_selection_type = 'normal' or NULL
+        // (rather than the canonical 'standard'). The rest of the codebase
+        // accepts all three via COALESCE(team_selection_type, 'standard') IN
+        // ('normal', 'standard'). Mirror that here so /generate-teams (which
+        // succeeds) and /open-multi-voting (which used to 400 on the same
+        // game) agree.
+        const _gameType = gameStatus.rows[0].team_selection_type;
+        const _isStandardOrLegacy = _gameType === null || _gameType === 'standard' || _gameType === 'normal';
+        if (!_isStandardOrLegacy) {
             await client.query('ROLLBACK');
             return res.status(400).json({
-                error: 'Multi-team voting is only supported on standard games. This game is ' + gameStatus.rows[0].team_selection_type + '.'
+                error: 'Multi-team voting is only supported on standard games. This game is ' + _gameType + '.'
             });
         }
 
