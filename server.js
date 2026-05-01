@@ -12314,6 +12314,14 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 );
                 const tplVersion = vRow.rows[0]?.version ?? null;
 
+                // FIX-220 R14-#1: also set _genTemplateId so the re-resolve
+                // inside _runOptimiserOnce (line ~12058) picks up the same
+                // template. Without this, the inner re-resolve runs with
+                // _genTemplateId=null and silently reverts to factory
+                // defaults — every Multi iteration produced identical teams
+                // regardless of which template was chosen for the slot.
+                _genTemplateId = st.template_id;
+
                 // Run the algorithm with these components
                 await _runOptimiserOnce();
 
