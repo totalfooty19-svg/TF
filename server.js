@@ -427,6 +427,8 @@ const AUDIT_TAG_TABLE = {
     team_setup_fine_tuned:                  { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
     team_setup_marked_not_fair_reflection:  { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'low'  },
     team_setup_status_changed_manually:     { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
+    team_setup_composition_edited:          { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
+    multi_candidates_discarded:             { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
     team_vote_cast:                         { cat: 'participation', sub: 'feedback', actor: 'player', sev: 'low' },
     team_vote_retracted:                    { cat: 'participation', sub: 'feedback', actor: 'player', sev: 'low' },
     captain_handoff:          { cat: 'participation', sub: 'roles',       actor: 'player', sev: 'low' },
@@ -4262,6 +4264,8 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             g.id, g.game_url, g.game_date, g.game_status, g.format AS game_format,
             g.cost_per_player, g.early_bird_price, g.super_early_bird_price,
             g.max_players, g.star_rating, g.exclusivity,
+            g.team_selection_type, g.tournament_name, g.external_opponent,
+            opp.logo_url AS opponent_logo_url,
             v.name AS venue_name, v.region AS region,
             v.background_image_filename AS venue_background_image,
             v.photo_url AS venue_photo,
@@ -4271,7 +4275,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
               + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))         AS current_players,
             (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1)
                                                                                   AS my_status
-        `;  /* FIX-217: include venue_background_image + photo_url for V2 timeline cards */
+        `;  /* Bug fix: vs_external/tournament games now show team logo not venue image (matches games modal) */
 
         // ── UPCOMING window (ascending by date, tier-limited for non-admins) ──
         const upcomingSql = `
@@ -4279,6 +4283,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             FROM games g
             LEFT JOIN venues v       ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
+            LEFT JOIN opponents opp ON opp.id = g.opponent_id
             WHERE g.game_status IN ('available','confirmed')
               AND g.game_date >= CURRENT_TIMESTAMP
               ${regionClause}
@@ -4295,6 +4300,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             FROM games g
             LEFT JOIN venues v       ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
+            LEFT JOIN opponents opp ON opp.id = g.opponent_id
             WHERE g.game_status = 'completed'
               AND g.game_date < CURRENT_TIMESTAMP
               ${regionClause}
@@ -4370,9 +4376,19 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             'Sidney Stringer Academy':     'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
             'Nuneaton Academy':            'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
             'Tudor Grange Academy':        'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
+            'Light Hall School'   :        'https://totalfooty.co.uk/assets/venues/light-hall-school.jpg',
         };
         for (const game of games) {
-            if (game.venue_background_image) {
+            // Bug fix: vs_external and tournament games show team/tournament image
+            // on the dashboard, matching the games modal pattern (renderGameCard).
+            // Without this override, V2 timeline cards show the venue photo for
+            // games where the visual identity is the opponent (vs_external) or
+            // the tournament branding.
+            if (game.team_selection_type === 'vs_external' && game.opponent_logo_url) {
+                game.venue_photo = game.opponent_logo_url;
+            } else if (game.team_selection_type === 'tournament') {
+                game.venue_photo = 'https://totalfooty.co.uk/assets/tfclogo%20v2.png';
+            } else if (game.venue_background_image) {
                 game.venue_photo = `https://totalfooty.co.uk/assets/venues/${game.venue_background_image}`;
             } else if (game.venue_name && _venuePhotoMapV2[game.venue_name]) {
                 game.venue_photo = _venuePhotoMapV2[game.venue_name];
@@ -5965,11 +5981,24 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
+                'Light Hall School'   :     'https://totalfooty.co.uk/assets/venues/light-hall-school.jpg',
         };
         
         // Resolve venue hero photo: admin-set background_image_filename -> hardcoded map -> legacy DB photo_url
         const gamesWithPhotos = result.rows.map(game => {
-            if (game.venue_background_image) {
+            // Bug fix: vs_external/tournament games show team logo, matching the
+            // games modal renderGameCard logic. V1 dashboard tiles (TONIGHT,
+            // IM-PLAYING, RECENT) read g.venue_photo directly without their own
+            // override, so the override has to live here for them to render
+            // correctly. The games list itself doesn't break because
+            // renderGameCard already chooses the right backgroundImage based on
+            // team_selection_type — but venue_photo carrying the right value is
+            // also fine for that path.
+            if (game.team_selection_type === 'vs_external' && game.opponent_logo_url) {
+                game.venue_photo = game.opponent_logo_url;
+            } else if (game.team_selection_type === 'tournament') {
+                game.venue_photo = 'https://totalfooty.co.uk/assets/tfclogo%20v2.png';
+            } else if (game.venue_background_image) {
                 game.venue_photo = `https://totalfooty.co.uk/assets/venues/${game.venue_background_image}`;
             } else if (game.venue_name && venuePhotoMap[game.venue_name]) {
                 game.venue_photo = venuePhotoMap[game.venue_name];
@@ -6082,6 +6111,7 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
+                'Light Hall School'   :     'https://totalfooty.co.uk/assets/venues/light-hall-school.jpg',
         };
         
         // Format the response
@@ -6168,6 +6198,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                           WHERE r.game_id = g.id AND r.status = 'confirmed'
                           AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count,
+                   COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2) as registration_status,
                    (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2) as my_backup_type,
                    -- P2.3: amount paid by current user (drives drop-out penalty dialog in game.html)
@@ -6284,6 +6315,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
+                'Light Hall School'   :     'https://totalfooty.co.uk/assets/venues/light-hall-school.jpg',
         };
         
         // Resolve venue hero photo: admin-set background_image_filename -> hardcoded map -> legacy DB photo_url
@@ -11531,7 +11563,72 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         // sequence with different components, then writes N 'proposed' team_setups
         // rows + opens a voting window. See WS2 part 5.
         const _genTemplateIdRaw = req.body?.template_id;
-        const _genMode = (req.body?.mode === 'multi') ? 'multi' : 'standard';
+        let _genMode = 'standard';
+        if (req.body?.mode === 'multi') _genMode = 'multi';
+        else if (req.body?.mode === 'regenerate_one') _genMode = 'regenerate_one';
+
+        // FIX-220 R15: regenerate_one — re-run the algorithm for a single
+        // existing pre-open team_setups row (per-slot RESET button in the
+        // Multi review wizard). We resolve the row's template_id, then run
+        // _runOptimiserOnce once with that template and UPDATE the row in
+        // place. No supersede, no new row, no voting state change.
+        let _regenSetup = null;
+        if (_genMode === 'regenerate_one') {
+            const targetSetupId = parseInt(req.body?.team_setup_id, 10);
+            if (!Number.isInteger(targetSetupId) || targetSetupId <= 0) {
+                return res.status(400).json({ error: 'regenerate_one mode requires a positive integer team_setup_id' });
+            }
+            const sRes = await pool.query(
+                `SELECT id, game_id, template_id, status, slot_number, voting_opened_at
+                   FROM team_setups WHERE id = $1`,
+                [targetSetupId]
+            );
+            if (sRes.rows.length === 0) {
+                return res.status(404).json({ error: 'team_setup_id not found' });
+            }
+            _regenSetup = sRes.rows[0];
+            if (_regenSetup.game_id !== gameId) {
+                return res.status(400).json({ error: 'team_setup does not belong to this game' });
+            }
+            if (_regenSetup.status !== 'proposed' || _regenSetup.voting_opened_at !== null) {
+                return res.status(409).json({ error: 'Cannot regenerate a setup whose voting has opened (or that is no longer proposed).' });
+            }
+
+            // R-AUDIT-5: Refuse if the current confirmed roster differs from
+            // what's in OTHER pre-open slots' compositions. Otherwise we'd
+            // produce a regen with fresh roster while siblings hold stale
+            // compositions — voters would see inconsistent player lists
+            // across candidates. Force a full regen via the wizard's
+            // REGENERATE button if the roster has shifted.
+            const otherSlotsRes = await pool.query(
+                `SELECT team_composition FROM team_setups
+                  WHERE game_id = $1 AND status = 'proposed' AND voting_opened_at IS NULL
+                    AND id <> $2`,
+                [gameId, _regenSetup.id]
+            );
+            if (otherSlotsRes.rows.length > 0) {
+                const currentRosterRes = await pool.query(
+                    `SELECT player_id::text AS pid FROM registrations
+                      WHERE game_id = $1 AND status = 'confirmed'
+                      UNION ALL
+                      SELECT 'guest_' || id::text FROM game_guests
+                      WHERE game_id = $1`,
+                    [gameId]
+                );
+                const currentRoster = new Set(currentRosterRes.rows.map(r => r.pid));
+                for (const row of otherSlotsRes.rows) {
+                    const comp = row.team_composition || { red: [], blue: [] };
+                    const ids = [...(comp.red || []), ...(comp.blue || [])];
+                    const stale = ids.filter(id => !currentRoster.has(String(id)));
+                    if (stale.length > 0) {
+                        return res.status(409).json({
+                            error: 'Player roster has changed since these candidates were generated. Use the wizard\'s REGENERATE button to refresh all slots together.',
+                            stale_in_other_slots: stale,
+                        });
+                    }
+                }
+            }
+        }
 
         // Multi-mode validation up front (mirrors /generate-multi-vote — keep in sync)
         let _multiSlotTemplates = null;
@@ -12030,14 +12127,158 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             // Extra GKs (3rd+) placed as regular units in Phase 6
         }
 
-        // ── Phase 6: Greedy balance ──
+        // ── Phase 6 (FIX-220 R16): Initial allocation — strategy dispatch ──
+        // Each strategy decides the ORDER of placement for unplaced units.
+        // Phase 5 (GK assignment above) has already placed dedicated GKs; this
+        // phase fills the rest. Phase 7 (swap loop, below) refines.
+        //
+        // Strategies:
+        //   'slider_driven'         — legacy: sort high→low, place each on lower-rated team
+        //   'high_first'            — sort high→low, place on lower-rated team (same as legacy initial allocation)
+        //   'low_first'             — sort low→high, place on higher-rated team
+        //   'alternate'             — alternate: high goes to lower team, then low goes to higher team, repeat
+        //   'pair_avoid_priority'   — place pair-paired units together first, then fill rest greedy
         const unplacedIdxs = units.map((_, i) => i).filter(i => !placedUnitIdx.has(i));
-        unplacedIdxs.sort((a, b) => units[b].sumOverall - units[a].sumOverall);
-        for (const i of unplacedIdxs) {
-            const u = units[i];
-            if (ovrSum(redTeam) <= ovrSum(blueTeam)) redTeam.push(...u.members);
-            else                                      blueTeam.push(...u.members);
-            placedUnitIdx.add(i);
+
+        if (_strategy === 'low_first') {
+            // Sort low→high. Place each on the team with FEWER players to keep
+            // counts even; tiebreak to the team with HIGHER ovrSum (so weak
+            // player drags down the strong team). Without the size tiebreak,
+            // empty-state ovrSum equality + always-picking-higher-team would
+            // dump everyone on Red.
+            unplacedIdxs.sort((a, b) => units[a].sumOverall - units[b].sumOverall);
+            for (const i of unplacedIdxs) {
+                const u = units[i];
+                if (redTeam.length < blueTeam.length) {
+                    redTeam.push(...u.members);
+                } else if (blueTeam.length < redTeam.length) {
+                    blueTeam.push(...u.members);
+                } else if (ovrSum(redTeam) >= ovrSum(blueTeam)) {
+                    redTeam.push(...u.members);
+                } else {
+                    blueTeam.push(...u.members);
+                }
+                placedUnitIdx.add(i);
+            }
+        } else if (_strategy === 'alternate') {
+            // Sort high→low, then alternate ends: highest goes to weaker team,
+            // lowest remaining goes to stronger team. Within each placement,
+            // tiebreak by team size (smaller team gets the player) to keep
+            // counts even.
+            unplacedIdxs.sort((a, b) => units[b].sumOverall - units[a].sumOverall);
+            const queue = unplacedIdxs.slice();
+            let pickHigh = true;
+            while (queue.length > 0) {
+                const i = pickHigh ? queue.shift() : queue.pop();
+                const u = units[i];
+                let goRed;
+                if (redTeam.length < blueTeam.length) {
+                    goRed = true;
+                } else if (blueTeam.length < redTeam.length) {
+                    goRed = false;
+                } else if (pickHigh) {
+                    // Highest: lower-rated team gets it
+                    goRed = ovrSum(redTeam) <= ovrSum(blueTeam);
+                } else {
+                    // Lowest: higher-rated team gets it
+                    goRed = ovrSum(redTeam) >= ovrSum(blueTeam);
+                }
+                if (goRed) redTeam.push(...u.members);
+                else        blueTeam.push(...u.members);
+                placedUnitIdx.add(i);
+                pickHigh = !pickHigh;
+            }
+        } else if (_strategy === 'pair_avoid_priority') {
+            // Place units with active pair/avoid prefs first, then fill rest.
+            // For each unit, count how many of its members have active prefs.
+            const prefCount = (u) => {
+                let n = 0;
+                for (const p of u.members) {
+                    if (p.is_guest) continue;
+                    n += (p.pairs || []).length + (p.avoids || []).length;
+                }
+                return n;
+            };
+            // Sort: more-prefs first, then by overall desc as tiebreaker
+            unplacedIdxs.sort((a, b) => {
+                const pa = prefCount(units[a]);
+                const pb = prefCount(units[b]);
+                if (pa !== pb) return pb - pa;
+                return units[b].sumOverall - units[a].sumOverall;
+            });
+            // Place: try to put pair-prefs together. Walk the prefs list and
+            // for each pair, place both players on the same team if neither
+            // is yet placed; for avoids, try opposite. Fall through to greedy
+            // for whatever isn't covered.
+            // Build a map: player_id → its target side (decided by the first
+            // pref we honour for it). This is a heuristic, NOT guaranteed
+            // optimal (the swap loop in Phase 7 will refine).
+            // R16-A22: seed targetSide with players ALREADY placed by Phase 5
+            // (dedicated GKs and beef5 atomic units). Without this seed, a
+            // pair pref pointing to a Phase-5-placed player would silently fail
+            // the lookup and the heuristic would split the pair.
+            const targetSide = new Map();
+            for (const p of redTeam) {
+                if (!p.is_guest) targetSide.set(toStrId(p.player_id), 'red');
+            }
+            for (const p of blueTeam) {
+                if (!p.is_guest) targetSide.set(toStrId(p.player_id), 'blue');
+            }
+            for (const i of unplacedIdxs) {
+                const u = units[i];
+                for (const p of u.members) {
+                    if (p.is_guest) continue;
+                    const pid = toStrId(p.player_id);
+                    if (targetSide.has(pid)) continue;
+                    // For each pair partner, pick the same side they're going to
+                    for (const pairTarget of (p.pairs || [])) {
+                        const tid = toStrId(pairTarget);
+                        if (targetSide.has(tid)) {
+                            targetSide.set(pid, targetSide.get(tid));
+                            break;
+                        }
+                    }
+                    if (targetSide.has(pid)) continue;
+                    // Or for an avoid, pick the opposite of where they're going
+                    for (const avoidTarget of (p.avoids || [])) {
+                        const tid = toStrId(avoidTarget);
+                        if (targetSide.has(tid)) {
+                            targetSide.set(pid, targetSide.get(tid) === 'red' ? 'blue' : 'red');
+                            break;
+                        }
+                    }
+                    if (targetSide.has(pid)) continue;
+                    // No target yet — pick lower-rated team
+                    targetSide.set(pid, ovrSum(redTeam) <= ovrSum(blueTeam) ? 'red' : 'blue');
+                }
+                // Place all members of this unit. Unit's side = first member's targetSide.
+                let unitSide = null;
+                for (const p of u.members) {
+                    if (p.is_guest) continue;
+                    unitSide = targetSide.get(toStrId(p.player_id));
+                    if (unitSide) break;
+                }
+                if (!unitSide) {
+                    // R16-AUDIT-14: balance team sizes first, then ovrSum
+                    if      (redTeam.length < blueTeam.length) unitSide = 'red';
+                    else if (blueTeam.length < redTeam.length) unitSide = 'blue';
+                    else unitSide = ovrSum(redTeam) <= ovrSum(blueTeam) ? 'red' : 'blue';
+                }
+                if (unitSide === 'red') redTeam.push(...u.members);
+                else                     blueTeam.push(...u.members);
+                placedUnitIdx.add(i);
+            }
+        } else {
+            // 'slider_driven', 'high_first', and any unknown strategy fall here.
+            // Original/legacy greedy behaviour: sort high→low, place each on
+            // the team with currently-lower ovrSum.
+            unplacedIdxs.sort((a, b) => units[b].sumOverall - units[a].sumOverall);
+            for (const i of unplacedIdxs) {
+                const u = units[i];
+                if (ovrSum(redTeam) <= ovrSum(blueTeam)) redTeam.push(...u.members);
+                else                                      blueTeam.push(...u.members);
+                placedUnitIdx.add(i);
+            }
         }
 
         // ── Team-of lookup (stateful — refers to current red/blue arrays) ──
@@ -12055,8 +12296,15 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         // FIX-220: changed from const to let — Multi mode reassigns this per
         // iteration so the same closure-bound functions read different values.
         // Standard mode behaviour unchanged.
-        let _components = await _resolveTemplateComponents(pool, _genTemplateId)
-                         || { ...ALGORITHM_COMPONENT_DEFAULTS };
+        // FIX-220 R16: also load strategy + priority_slot_3 alongside components.
+        // For templates pre-dating R16, defaults are 'slider_driven'/'none'
+        // which preserves the existing single-pass optimiser behaviour.
+        let _tplCfg = await _resolveTemplateConfig(pool, _genTemplateId)
+                       || { components: { ...ALGORITHM_COMPONENT_DEFAULTS },
+                            strategy: 'slider_driven', priority_slot_3: 'none' };
+        let _components       = _tplCfg.components;
+        let _strategy         = _tplCfg.strategy;
+        let _priority_slot_3  = _tplCfg.priority_slot_3;
         // Snapshot the template version at generation time — saved on the
         // team_setups row so historical analysis is exact.
         let _genTemplateVersion = null;
@@ -12173,17 +12421,121 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             return false;
         }
 
-        // Single-swap hill-climb, 50 attempts
+        // FIX-220 R16: priority-vector swap helper (lex-order acceptance).
+        // Each swap is evaluated by a "priority vector" of buffer overruns:
+        //   [overall_overrun, defender_overrun, slot3_overrun,
+        //    def_sum_overrun, fit_sum_overrun, score]
+        // A swap is accepted if its vector is lex-smaller than the current.
+        // Used by non-slider strategies; slider_driven uses the legacy
+        // score-only acceptance (trySwapPair above).
+        function _priorityVector(red, blue) {
+            const d = computeDissatisfaction(red, blue);
+            const defBuf = 3;
+            // Overall: target = overallBuffer
+            const overallOverrun = Math.max(0, d.overallGap - overallBuffer);
+            // Defender: target = 1 (or wider if gkTeam exists)
+            let defenderOverrun = Math.max(0, d.defenderGap - 1);
+            if (gkTeam) {
+                // Asymmetric: GK side can have fewer defenders
+                const redDefs = red.filter(p => isDefender(p)).length;
+                const blueDefs = blue.filter(p => isDefender(p)).length;
+                if (gkTeam === 'red'  && redDefs  <= blueDefs) defenderOverrun = Math.max(0, (blueDefs - redDefs) - 2);
+                if (gkTeam === 'blue' && blueDefs <= redDefs)  defenderOverrun = Math.max(0, (redDefs - blueDefs) - 2);
+            }
+            // Slot 3: depends on _priority_slot_3
+            let slot3Overrun = 0;
+            if (_priority_slot_3 === 'pair_avoid') {
+                // Slot 3 = number of broken pair/avoid prefs
+                slot3Overrun = d.brokenOwP + d.brokenOwA + d.brokenMP + d.brokenMA;
+            } else if (_priority_slot_3 === 'def_skill') {
+                // Slot 3 = defending-sum gap (more aggressive than slot 4)
+                slot3Overrun = Math.max(0, d.defSumGap - 1);
+            } else if (_priority_slot_3 === 'fitness') {
+                // Slot 3 = fitness-sum gap (more aggressive than slot 5)
+                slot3Overrun = Math.max(0, d.fitSumGap - 1);
+            } else if (_priority_slot_3 === 'gk_skill_match') {
+                // Slot 3 = absolute difference of GK ratings between teams.
+                // R16-A30: only meaningful when BOTH teams have a GK. If only
+                // one team has a GK (or neither), no swap will fix it — return
+                // 0 overrun to avoid wasting swap-loop iterations.
+                const gkRedArr  = red.filter(p => isDedicatedGK(p));
+                const gkBlueArr = blue.filter(p => isDedicatedGK(p));
+                if (gkRedArr.length > 0 && gkBlueArr.length > 0) {
+                    const gkRedRating  = gkRedArr[0].goalkeeper_rating  || 0;
+                    const gkBlueRating = gkBlueArr[0].goalkeeper_rating || 0;
+                    slot3Overrun = Math.abs(gkRedRating - gkBlueRating);
+                }
+            }
+            // Slot 4 + 5: existing buffers
+            const defSumOverrun = Math.max(0, d.defSumGap - defBuf);
+            const fitSumOverrun = Math.max(0, d.fitSumGap - defBuf);
+            return [overallOverrun, defenderOverrun, slot3Overrun, defSumOverrun, fitSumOverrun, d.score];
+        }
+
+        function _vecLess(a, b) {
+            for (let i = 0; i < a.length; i++) {
+                if (a[i] < b[i]) return true;
+                if (a[i] > b[i]) return false;
+            }
+            return false;
+        }
+
+        function trySwapPairPriority(idxR, idxB) {
+            const candR = redTeam[idxR];
+            const candB = blueTeam[idxB];
+            if (!candR || !candB) return false;
+            if (candR.is_guest || candB.is_guest) return false;
+            if (beef5MemberIds.has(toStrId(candR.player_id))) return false;
+            if (beef5MemberIds.has(toStrId(candB.player_id))) return false;
+            const guestsR = guestGroups.get(candR.player_id) || [];
+            const guestsB = guestGroups.get(candB.player_id) || [];
+            const strip = (team, mvs) => team.filter(p =>
+                !mvs.some(m => toStrId(m.player_id) === toStrId(p.player_id))
+            );
+            const nr = strip(redTeam.slice(),  [candR, ...guestsR]);
+            const nb = strip(blueTeam.slice(), [candB, ...guestsB]);
+            nr.push(candB, ...guestsB);
+            nb.push(candR, ...guestsR);
+            const before = _priorityVector(redTeam, blueTeam);
+            const after  = _priorityVector(nr, nb);
+            if (_vecLess(after, before)) {
+                redTeam.length = 0;  redTeam.push(...nr);
+                blueTeam.length = 0; blueTeam.push(...nb);
+                return true;
+            }
+            return false;
+        }
+
+        // FIX-220 R16: Single-swap hill-climb, 50 attempts. Strategy decides
+        // which acceptance criterion to use.
+        // R16 audit-5: legacy thresholdsMet() only checks overall/defender/
+        // def_sum/fit_sum. For non-slider strategies, also require the slot 3
+        // priority's overrun to be zero, otherwise we'd exit early before
+        // slot 3 was satisfied.
+        // R16-AUDIT-3: only KNOWN non-slider strategies use the priority swap
+        // loop. Unknown strategy falls back to slider_driven (matches the
+        // Phase 6 dispatcher's else-branch behaviour for unknowns).
+        const _NEW_STRATEGIES = ['pair_avoid_priority', 'high_first', 'low_first', 'alternate'];
+        const _useSwapFn = _NEW_STRATEGIES.includes(_strategy) ? trySwapPairPriority : trySwapPair;
+        function _thresholdsMetForStrategy(red, blue) {
+            if (!thresholdsMet(red, blue)) return false;
+            if (!_NEW_STRATEGIES.includes(_strategy)) return true;
+            // Check slot 3 satisfaction by computing the priority vector and
+            // confirming slot 3 overrun is 0
+            const v = _priorityVector(red, blue);
+            // v = [overall, defender, slot3, def_sum, fit_sum, score]
+            return v[2] === 0;
+        }
         for (let attempt = 0; attempt < 50; attempt++) {
             let improved = false;
             outer:
             for (let i = 0; i < redTeam.length; i++) {
                 for (let j = 0; j < blueTeam.length; j++) {
-                    if (trySwapPair(i, j)) { improved = true; break outer; }
+                    if (_useSwapFn(i, j)) { improved = true; break outer; }
                 }
             }
             if (!improved) break;
-            if (thresholdsMet(redTeam, blueTeam)) break;
+            if (_thresholdsMetForStrategy(redTeam, blueTeam)) break;
         }
 
         // ── Phase 8: Relax loop ──
@@ -12222,17 +12574,20 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         outerRelax:
         for (const tier of relaxTiers) {
             while (tier.arr.length > 0) {
-                if (thresholdsMet(redTeam, blueTeam)) break outerRelax;
+                if (_thresholdsMetForStrategy(redTeam, blueTeam)) break outerRelax;
                 const idx = Math.floor(Math.random() * tier.arr.length);
                 const dropped = tier.arr.splice(idx, 1)[0];
                 logRelax(tier.name, dropped);
-                // Try another swap pass after dropping this constraint
+                // Try another swap pass after dropping this constraint.
+                // R16-A33: use the strategy-aware swap fn so non-slider
+                // strategies don't accept score-improving swaps that hurt
+                // their priority vector.
                 for (let attempt = 0; attempt < 25; attempt++) {
                     let improved = false;
                     outerSwap:
                     for (let i = 0; i < redTeam.length; i++) {
                         for (let j = 0; j < blueTeam.length; j++) {
-                            if (trySwapPair(i, j)) { improved = true; break outerSwap; }
+                            if (_useSwapFn(i, j)) { improved = true; break outerSwap; }
                         }
                     }
                     if (!improved) break;
@@ -12254,6 +12609,11 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
 
         const dissatisfaction = {
             score: finalDiss.score,
+            // FIX-220 R16: snapshot of which strategy + slot 3 was used for
+            // this generation. Stored in algorithm_diagnostics JSONB so
+            // analytics can attribute outcomes to specific strategies.
+            strategy: _strategy,
+            priority_slot_3: _priority_slot_3,
             honoured: {
                 mutual_pairs:   mutualPairs.length   - finalDiss.brokenMP,
                 mutual_avoids:  mutualAvoids.length  - finalDiss.brokenMA,
@@ -12305,9 +12665,15 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         if (_genMode === 'multi') {
             const candidates = [];
             for (const st of _multiSlotTemplates) {
-                // Per-iteration: re-resolve components + version for this slot's template
-                _components = await _resolveTemplateComponents(pool, st.template_id)
-                           || { ...ALGORITHM_COMPONENT_DEFAULTS };
+                // Per-iteration: re-resolve config + version for this slot's template
+                // FIX-220 R16: also reassigns _strategy and _priority_slot_3 so
+                // each Multi candidate runs the algorithm with its own strategy.
+                const _iterCfg = await _resolveTemplateConfig(pool, st.template_id)
+                              || { components: { ...ALGORITHM_COMPONENT_DEFAULTS },
+                                   strategy: 'slider_driven', priority_slot_3: 'none' };
+                _components      = _iterCfg.components;
+                _strategy        = _iterCfg.strategy;
+                _priority_slot_3 = _iterCfg.priority_slot_3;
                 const vRow = await pool.query(
                     `SELECT version FROM algorithm_templates WHERE id = $1`,
                     [st.template_id]
@@ -12442,6 +12808,122 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 voting_minutes: _multiVotingMinutes,  // for admin UI to show duration
                 candidates: candidates.length,
                 voting_opened: false,  // explicit signal: admin must open voting
+            });
+        }
+
+        // ── REGENERATE ONE — re-run the algorithm for a single pre-open
+        //    team_setups row. Used by the Multi review wizard's per-tab
+        //    RESET button. We've already validated _regenSetup above.
+        //    Resolve its template, run optimiser once, UPDATE the row in
+        //    place (composition + hash), clear admin_fine_tuned. No new
+        //    row, no supersede, no voting state change. (FIX-220 R15.)
+        if (_genMode === 'regenerate_one') {
+            // Resolve components for the target setup's template
+            _genTemplateId = _regenSetup.template_id;
+
+            // R-AUDIT-51: refuse if the template was archived since orig gen.
+            // Admin should pick a different template (full regen via wizard's
+            // REGENERATE button) rather than silently resurrecting it here.
+            if (_regenSetup.template_id != null) {
+                const archCheck = await pool.query(
+                    `SELECT is_archived FROM algorithm_templates WHERE id = $1`,
+                    [_regenSetup.template_id]
+                );
+                if (archCheck.rows.length === 0) {
+                    return res.status(404).json({
+                        error: 'Template was deleted since this slot was generated. Use REGENERATE to pick a different template.'
+                    });
+                }
+                if (archCheck.rows[0].is_archived) {
+                    return res.status(400).json({
+                        error: 'Template has been archived since this slot was generated. Use REGENERATE to pick a different template.'
+                    });
+                }
+            }
+
+            // FIX-220 R16: reassign full config (components + strategy + slot 3)
+            const _regenCfg = await _resolveTemplateConfig(pool, _regenSetup.template_id)
+                           || { components: { ...ALGORITHM_COMPONENT_DEFAULTS },
+                                strategy: 'slider_driven', priority_slot_3: 'none' };
+            _components      = _regenCfg.components;
+            _strategy        = _regenCfg.strategy;
+            _priority_slot_3 = _regenCfg.priority_slot_3;
+
+            // Capture current template version so the row reflects what was
+            // actually used in THIS regen (template may have been edited
+            // since original gen). NULL is fine if template was deleted.
+            let _regenTemplateVersion = null;
+            if (_regenSetup.template_id != null) {
+                const vRow = await pool.query(
+                    `SELECT version FROM algorithm_templates WHERE id = $1`,
+                    [_regenSetup.template_id]
+                );
+                _regenTemplateVersion = vRow.rows[0]?.version ?? null;
+            }
+
+            await _runOptimiserOnce();
+
+            // Build composition payload from the current redTeam/blueTeam closure vars.
+            const _toCompId = (p) => p.is_guest
+                ? (typeof p.player_id === 'string' && p.player_id.startsWith('guest_')
+                    ? p.player_id
+                    : 'guest_' + String(p.player_id))
+                : p.player_id;
+            const newRedIds  = redTeam.map(_toCompId);
+            const newBlueIds = blueTeam.map(_toCompId);
+            const newComposition = { red: newRedIds, blue: newBlueIds };
+            const newHash = _hashCompositionLikeLiveTables(newRedIds, newBlueIds);
+
+            // Score for this regenerated composition (mirrors Multi's persistence path)
+            const _diss = _dissatisfaction_outer || {};
+            const _scoreVal = (typeof _diss.score === 'number') ? _diss.score : null;
+
+            // R-AUDIT-33: re-check voting_opened_at right before UPDATE.
+            // The algorithm took non-trivial time; another admin may have
+            // opened voting in the meantime. Refuse rather than overwrite
+            // a now-live composition (which would orphan any votes already
+            // cast under the old hash).
+            const recheckRes = await pool.query(
+                `SELECT voting_opened_at, status FROM team_setups WHERE id = $1`,
+                [_regenSetup.id]
+            );
+            if (recheckRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Setup vanished mid-regenerate (concurrent delete?)' });
+            }
+            if (recheckRes.rows[0].voting_opened_at !== null
+                || recheckRes.rows[0].status !== 'proposed') {
+                return res.status(409).json({
+                    error: 'Voting opened or status changed while regenerating. Aborted to avoid corrupting voting state.'
+                });
+            }
+
+            await pool.query(
+                `UPDATE team_setups
+                    SET team_composition       = $1::jsonb,
+                        team_composition_hash  = $2,
+                        algorithm_score        = $3,
+                        algorithm_diagnostics  = $4::jsonb,
+                        admin_fine_tuned       = false,
+                        template_version       = $6
+                  WHERE id = $5`,
+                [JSON.stringify(newComposition), newHash, _scoreVal,
+                 JSON.stringify(_diss), _regenSetup.id, _regenTemplateVersion]
+            );
+
+            try {
+                await auditLog(pool, req.user.playerId, 'team_setup_composition_edited', gameId,
+                    `setup=${_regenSetup.id} slot=${_regenSetup.slot_number ?? 'NULL'} action=regenerated hash=${newHash || 'null'}`);
+            } catch (e) {}
+
+            return res.json({
+                mode: 'regenerate_one',
+                team_setup_id: _regenSetup.id,
+                slot_number: _regenSetup.slot_number,
+                team_composition: newComposition,
+                team_composition_hash: newHash,
+                algorithm_score: _scoreVal,
+                algorithm_diagnostics: _diss,
+                admin_fine_tuned: false,
             });
         }
 
@@ -12665,6 +13147,20 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             };
         };
         
+        // FIX-220 R15: Build per-player relationships data for the Standard
+        // wizard's likes/dislikes popover. Same shape as team-setups detail.
+        // p.player_id is a UUID for real players and "guest_<n>" for guests
+        // (constructed during algorithm output). _buildPlayerRelationships
+        // filters out the guest_* entries server-side.
+        const _relRedIds  = redTeam.map(p => p.player_id);
+        const _relBlueIds = blueTeam.map(p => p.player_id);
+        let _relationships = {};
+        try {
+            _relationships = await _buildPlayerRelationships(pool, gameId, _relRedIds, _relBlueIds);
+        } catch (e) {
+            console.warn('[generate-teams] _buildPlayerRelationships failed (non-fatal):', e.message);
+        }
+
         res.json({
             success: true,
             message: 'Teams generated successfully',
@@ -12676,6 +13172,8 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             thresholds,
             dissatisfaction,
             relaxations_applied: relaxationsApplied,
+            // FIX-220 R15: per-player likes/dislikes data
+            relationships: _relationships,
             // Backward-compat: expose beef relationships for any legacy UI readers.
             // Note: under the flipped semantics, beef now means "kept together", not "kept apart".
             beefs: (() => {
@@ -13408,7 +13906,10 @@ app.get('/api/admin/games/:gameId/revenue-breakdown', authenticateToken, require
         };
         totals.total_real = totals.registration_real + totals.guest_real + totals.dropped_real;
         totals.total_free = totals.registration_free + totals.guest_free + totals.dropped_free;
-        totals.total_revenue = totals.total_real + totals.total_free;
+        // Revenue = real cash only. FC is internal accounting (TF gave it to players
+        // for free via RAF/comp) — using FC doesn't put money in TF's bank, so it's
+        // not revenue. total_free is kept on the response as informational.
+        totals.total_revenue = totals.total_real;
 
         res.json({
             game_id: gameId,  // UUID, not int
@@ -13554,7 +14055,9 @@ app.get('/api/admin/games/:gameId/finance', authenticateToken, requireSuperAdmin
         // ─── Aggregates ─────────────────────────────────────────────────────
         const totalReal = regReal + guestReal + droppedReal;
         const totalFree = regFree + guestFree + droppedFree;
-        const totalRevenue = totalReal + totalFree;
+        // Revenue = real cash only. FC is internal accounting (gifted credit), not
+        // money entering TF's bank. total_free is exposed separately on the response.
+        const totalRevenue = totalReal;
         const totalCost = (pitchCost != null ? pitchCost : 0) + refCost;
         const totalBillable = confirmedCount + guestPaidCount + droppedCount;
 
@@ -13599,7 +14102,10 @@ app.get('/api/admin/games/:gameId/finance', authenticateToken, requireSuperAdmin
             },
             summary: {
                 gross_profit:        totalReal - totalCost,
-                gross_profit_inc_fc: totalRevenue - totalCost,
+                // gross_profit_inc_fc kept as informational — what profit would look
+                // like if we counted FC as if it were cash. Computed explicitly because
+                // totalRevenue now means real cash only.
+                gross_profit_inc_fc: (totalReal + totalFree) - totalCost,
                 per_player_spend:    totalBillable > 0 ? totalCost / totalBillable : 0,
                 per_player_revenue:  totalBillable > 0 ? totalReal / totalBillable : 0
             },
@@ -16183,6 +16689,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
+                'Light Hall School'   :     'https://totalfooty.co.uk/assets/venues/light-hall-school.jpg',
         };
         
         // Resolve venue hero photo: admin-set background_image_filename -> hardcoded map -> legacy DB photo_url
@@ -16531,6 +17038,7 @@ app.get('/api/public/games', async (req, res) => {
             'Sidney Stringer Academy': 'https://totalfooty.co.uk/assets/Sidney_Stringer_Academy.jpg',
                 'Nuneaton Academy':        'https://totalfooty.co.uk/assets/nuneaton_academy.webp',
                 'Tudor Grange Academy':     'https://totalfooty.co.uk/assets/Tudor-Grange-pitch.webp',
+                'Light Hall School'   :     'https://totalfooty.co.uk/assets/venues/light-hall-school.jpg',
         };
         // Resolve venue hero photo: admin-set background_image_filename -> hardcoded map -> legacy DB photo_url
         const rows = result.rows.map(game => {
@@ -19258,7 +19766,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 COALESCE((SELECT SUM(CASE
                   WHEN r.is_comped                THEN 0
                   WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), g.cost_per_player)
-                  ELSE                                  COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)
+                  ELSE                                  COALESCE(r.amount_paid, 0)
                 END)
                  FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 -- P1.1: real-money portion only (the £X in "£X + £Y FC")
@@ -19291,7 +19799,37 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 -- Batch 9: share-template fields (templates.md)
                 EXISTS(SELECT 1 FROM game_lineups gl WHERE gl.game_id = g.id) AS has_lineup,
                 TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time_london,
-                opp_mgr.name AS opponent_name
+                opp_mgr.name AS opponent_name,
+                -- FIX-220 manage-games-redesign: surface multi-vote state on the games list
+                -- so the redesigned card can render the "voting live" / "voting closed,
+                -- pick winner" status without an extra fetch per card.
+                EXISTS(
+                    SELECT 1 FROM team_setups ts
+                    WHERE ts.game_id = g.id
+                      AND ts.status = 'proposed'
+                      AND ts.voting_opened_at IS NOT NULL
+                      AND ts.voting_closed_at IS NULL
+                ) AS multi_vote_active,
+                (SELECT MIN(ts.voting_closes_at) FROM team_setups ts
+                  WHERE ts.game_id = g.id
+                    AND ts.status = 'proposed'
+                    AND ts.voting_opened_at IS NOT NULL
+                    AND ts.voting_closed_at IS NULL) AS multi_vote_closes_at,
+                EXISTS(
+                    SELECT 1 FROM team_setups ts
+                    WHERE ts.game_id = g.id
+                      AND ts.status = 'proposed'
+                      AND ts.voting_closed_at IS NOT NULL
+                      AND NOT EXISTS(
+                          SELECT 1 FROM team_setups ts2
+                          WHERE ts2.game_id = g.id AND ts2.status = 'confirmed'
+                      )
+                ) AS multi_vote_awaiting_pick,
+                -- For trophies icon: show only on the first game of a series
+                -- (per Q1 — trophies can only be edited before series start)
+                CASE WHEN g.series_id IS NULL THEN FALSE
+                     ELSE g.game_date = (SELECT MIN(g2.game_date) FROM games g2 WHERE g2.series_id = g.series_id)
+                END AS is_first_in_series
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 LEFT JOIN opponents opp_mgr ON opp_mgr.id = g.opponent_id
                 ORDER BY g.game_date DESC`;
@@ -19318,7 +19856,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 COALESCE((SELECT SUM(CASE
                   WHEN r.is_comped                THEN 0
                   WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), g.cost_per_player)
-                  ELSE                                  COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)
+                  ELSE                                  COALESCE(r.amount_paid, 0)
                 END)
                  FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) as confirmed_revenue,
                 -- P1.1: real-money portion only
@@ -19351,7 +19889,33 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 -- Batch 9: share-template fields (templates.md)
                 EXISTS(SELECT 1 FROM game_lineups gl WHERE gl.game_id = g.id) AS has_lineup,
                 TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time_london,
-                opp_clm.name AS opponent_name
+                opp_clm.name AS opponent_name,
+                -- FIX-220 manage-games-redesign: same multi-vote/series fields as admin branch
+                EXISTS(
+                    SELECT 1 FROM team_setups ts
+                    WHERE ts.game_id = g.id
+                      AND ts.status = 'proposed'
+                      AND ts.voting_opened_at IS NOT NULL
+                      AND ts.voting_closed_at IS NULL
+                ) AS multi_vote_active,
+                (SELECT MIN(ts.voting_closes_at) FROM team_setups ts
+                  WHERE ts.game_id = g.id
+                    AND ts.status = 'proposed'
+                    AND ts.voting_opened_at IS NOT NULL
+                    AND ts.voting_closed_at IS NULL) AS multi_vote_closes_at,
+                EXISTS(
+                    SELECT 1 FROM team_setups ts
+                    WHERE ts.game_id = g.id
+                      AND ts.status = 'proposed'
+                      AND ts.voting_closed_at IS NOT NULL
+                      AND NOT EXISTS(
+                          SELECT 1 FROM team_setups ts2
+                          WHERE ts2.game_id = g.id AND ts2.status = 'confirmed'
+                      )
+                ) AS multi_vote_awaiting_pick,
+                CASE WHEN g.series_id IS NULL THEN FALSE
+                     ELSE g.game_date = (SELECT MIN(g2.game_date) FROM games g2 WHERE g2.series_id = g.series_id)
+                END AS is_first_in_series
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 LEFT JOIN opponents opp_clm ON opp_clm.id = g.opponent_id
                 WHERE (${conditions.join(' OR ')})
@@ -23350,6 +23914,52 @@ async function _resolveTemplateComponents(pool, templateId) {
     return { ...ALGORITHM_COMPONENT_DEFAULTS, ...overrides };
 }
 
+// FIX-220 R16: full template config — components + strategy + priority_slot_3.
+// Returns { components, strategy, priority_slot_3 } or null if template missing.
+// Defaults: strategy='slider_driven', priority_slot_3='none' (preserves
+// existing optimiser behaviour for templates that pre-date the migration).
+//
+// If the strategy/priority_slot_3 columns don't yet exist (pre-migration deploy
+// gap), we catch the error and fall back to legacy components-only fetch with
+// safe defaults. This lets server.js deploy BEFORE the SQL migration runs.
+async function _resolveTemplateConfig(pool, templateId) {
+    if (templateId == null) {
+        return {
+            components: { ...ALGORITHM_COMPONENT_DEFAULTS },
+            strategy: 'slider_driven',
+            priority_slot_3: 'none',
+        };
+    }
+    try {
+        const r = await pool.query(
+            `SELECT components,
+                    COALESCE(strategy, 'slider_driven') AS strategy,
+                    COALESCE(priority_slot_3, 'none')   AS priority_slot_3
+               FROM algorithm_templates WHERE id = $1`,
+            [templateId]
+        );
+        if (r.rows.length === 0) return null;
+        const overrides = r.rows[0].components || {};
+        return {
+            components: { ...ALGORITHM_COMPONENT_DEFAULTS, ...overrides },
+            strategy: r.rows[0].strategy,
+            priority_slot_3: r.rows[0].priority_slot_3,
+        };
+    } catch (e) {
+        // 42703 = undefined_column. Migration hasn't run yet.
+        if (e && e.code === '42703') {
+            const components = await _resolveTemplateComponents(pool, templateId);
+            if (components === null) return null;
+            return {
+                components,
+                strategy: 'slider_driven',
+                priority_slot_3: 'none',
+            };
+        }
+        throw e;
+    }
+}
+
 // Convenience read: the currently confirmed team_setups row for a game,
 // or null if none. Used by the player voting endpoints (to validate that the
 // game is in voting state) and elsewhere.
@@ -24162,16 +24772,41 @@ app.get('/api/admin/games/:id/team-feedback', authenticateToken, requireGameMana
 // remain requireSuperAdmin.
 app.get('/api/admin/templates', authenticateToken, requireGameManager, async (req, res) => {
     try {
-        const r = await pool.query(`
-            SELECT id, name, description, version, parent_template_id, components,
-                   default_slot, is_archived, is_system_protected,
-                   created_at, updated_at, created_by
-            FROM algorithm_templates
-            WHERE is_archived = false
-            ORDER BY default_slot NULLS LAST, LOWER(name)
-        `);
+        // FIX-220 R16: include strategy + priority_slot_3. Pre-migration, those
+        // columns don't exist yet — fall back to legacy SELECT and synthesise
+        // defaults so the wizard's template picker still loads.
+        let rResult;
+        try {
+            rResult = await pool.query(`
+                SELECT id, name, description, version, parent_template_id, components,
+                       default_slot, is_archived, is_system_protected,
+                       COALESCE(strategy, 'slider_driven')        AS strategy,
+                       COALESCE(priority_slot_3, 'none')          AS priority_slot_3,
+                       created_at, updated_at, created_by
+                FROM algorithm_templates
+                WHERE is_archived = false
+                ORDER BY default_slot NULLS LAST, LOWER(name)
+            `);
+        } catch (e) {
+            if (e && e.code === '42703') {
+                console.warn('[templates GET list] strategy/priority_slot_3 columns missing — run 03-phased-team-build-migration.sql. Synthesising defaults.');
+                rResult = await pool.query(`
+                    SELECT id, name, description, version, parent_template_id, components,
+                           default_slot, is_archived, is_system_protected,
+                           created_at, updated_at, created_by
+                    FROM algorithm_templates
+                    WHERE is_archived = false
+                    ORDER BY default_slot NULLS LAST, LOWER(name)
+                `);
+                rResult.rows = rResult.rows.map(r => ({
+                    ...r, strategy: 'slider_driven', priority_slot_3: 'none',
+                }));
+            } else {
+                throw e;
+            }
+        }
         // Compose response — composite scores stubbed until WS3 lands.
-        const rows = r.rows.map(t => ({
+        const rows = rResult.rows.map(t => ({
             ...t,
             stats: {
                 acceptance_rate:   null,  // populated in WS3 from team_setups + multi-vote outcomes
@@ -24194,13 +24829,34 @@ app.get('/api/admin/templates/:id', authenticateToken, requireSuperAdmin, async 
         return res.status(400).json({ error: 'Invalid template id' });
     }
     try {
-        const r = await pool.query(
-            `SELECT id, name, description, version, parent_template_id, components,
-                    default_slot, is_archived, is_system_protected,
-                    created_at, updated_at, created_by
-             FROM algorithm_templates WHERE id = $1`,
-            [id]
-        );
+        // FIX-220 R16: include strategy + slot 3, defensive fallback if cols missing.
+        let r;
+        try {
+            r = await pool.query(
+                `SELECT id, name, description, version, parent_template_id, components,
+                        default_slot, is_archived, is_system_protected,
+                        COALESCE(strategy, 'slider_driven')        AS strategy,
+                        COALESCE(priority_slot_3, 'none')          AS priority_slot_3,
+                        created_at, updated_at, created_by
+                 FROM algorithm_templates WHERE id = $1`,
+                [id]
+            );
+        } catch (e) {
+            if (e && e.code === '42703') {
+                console.warn('[templates GET :id] strategy/priority_slot_3 columns missing — run 03-phased-team-build-migration.sql. Synthesising defaults.');
+                r = await pool.query(
+                    `SELECT id, name, description, version, parent_template_id, components,
+                            default_slot, is_archived, is_system_protected,
+                            created_at, updated_at, created_by
+                     FROM algorithm_templates WHERE id = $1`,
+                    [id]
+                );
+                if (r.rows[0]) {
+                    r.rows[0].strategy = 'slider_driven';
+                    r.rows[0].priority_slot_3 = 'none';
+                }
+            } else { throw e; }
+        }
         if (r.rows.length === 0) return res.status(404).json({ error: 'Template not found' });
 
         const t = r.rows[0];
@@ -24264,7 +24920,7 @@ app.get('/api/admin/templates/:id/versions', authenticateToken, requireSuperAdmi
 
 // POST /api/admin/templates — create new template
 app.post('/api/admin/templates', authenticateToken, requireSuperAdmin, async (req, res) => {
-    const { name, description, components, default_slot } = req.body || {};
+    const { name, description, components, default_slot, strategy, priority_slot_3 } = req.body || {};
 
     if (typeof name !== 'string' || name.trim().length === 0 || name.length > 100) {
         return res.status(400).json({ error: 'name is required (1-100 chars)' });
@@ -24274,6 +24930,24 @@ app.post('/api/admin/templates', authenticateToken, requireSuperAdmin, async (re
 
     const validation = _validateTemplateComponents(components);
     if (!validation.ok) return res.status(400).json({ error: validation.error });
+
+    // FIX-220 R16: validate strategy + priority_slot_3 enums
+    const VALID_STRATEGIES = ['slider_driven', 'pair_avoid_priority', 'high_first', 'low_first', 'alternate'];
+    const VALID_SLOT3      = ['none', 'pair_avoid', 'gk_skill_match', 'def_skill', 'fitness'];
+    let strategyVal = 'slider_driven';
+    if (strategy !== undefined && strategy !== null) {
+        if (typeof strategy !== 'string' || !VALID_STRATEGIES.includes(strategy)) {
+            return res.status(400).json({ error: 'strategy must be one of: ' + VALID_STRATEGIES.join(', ') });
+        }
+        strategyVal = strategy;
+    }
+    let slot3Val = 'none';
+    if (priority_slot_3 !== undefined && priority_slot_3 !== null) {
+        if (typeof priority_slot_3 !== 'string' || !VALID_SLOT3.includes(priority_slot_3)) {
+            return res.status(400).json({ error: 'priority_slot_3 must be one of: ' + VALID_SLOT3.join(', ') });
+        }
+        slot3Val = priority_slot_3;
+    }
 
     let slotVal = null;
     if (default_slot !== undefined && default_slot !== null) {
@@ -24308,16 +24982,43 @@ app.post('/api/admin/templates', authenticateToken, requireSuperAdmin, async (re
             );
         }
 
-        const r = await client.query(
-            `INSERT INTO algorithm_templates
-                (name, description, version, components, default_slot, is_system_protected, created_by)
-             VALUES ($1, $2, 1, $3::jsonb, $4, false, $5)
-             RETURNING id, name, version, default_slot`,
-            [trimmedName, trimmedDesc, JSON.stringify(validation.cleaned), slotVal, req.user.playerId]
-        );
+        // FIX-220 R16: INSERT with strategy + slot 3. Pre-migration the
+        // columns don't exist — fall back to legacy INSERT silently.
+        let r;
+        try {
+            r = await client.query(
+                `INSERT INTO algorithm_templates
+                    (name, description, version, components, default_slot,
+                     is_system_protected, created_by, strategy, priority_slot_3)
+                 VALUES ($1, $2, 1, $3::jsonb, $4, false, $5, $6, $7)
+                 RETURNING id, name, version, default_slot, strategy, priority_slot_3`,
+                [trimmedName, trimmedDesc, JSON.stringify(validation.cleaned), slotVal,
+                 req.user.playerId, strategyVal, slot3Val]
+            );
+        } catch (e) {
+            if (e && e.code === '42703') {
+                console.warn('[templates POST] strategy/priority_slot_3 columns missing — running migration recommended. Falling back to legacy INSERT (these fields will not persist).');
+                r = await client.query(
+                    `INSERT INTO algorithm_templates
+                        (name, description, version, components, default_slot, is_system_protected, created_by)
+                     VALUES ($1, $2, 1, $3::jsonb, $4, false, $5)
+                     RETURNING id, name, version, default_slot`,
+                    [trimmedName, trimmedDesc, JSON.stringify(validation.cleaned), slotVal, req.user.playerId]
+                );
+                if (r.rows[0]) {
+                    r.rows[0].strategy = strategyVal;
+                    r.rows[0].priority_slot_3 = slot3Val;
+                }
+            } else { throw e; }
+        }
 
         await client.query('COMMIT');
-        try { await auditLog(pool, req.user.playerId, 'template_created', String(r.rows[0].id), `name="${trimmedName}"`); } catch (e) {}
+        try {
+            // R16-A61: capture strategy + slot 3 in creation audit
+            await auditLog(pool, req.user.playerId, 'template_created',
+                String(r.rows[0].id),
+                `name="${trimmedName}" strategy=${strategyVal} slot3=${slot3Val}`);
+        } catch (e) {}
         res.json({ template: r.rows[0] });
     } catch (error) {
         try { await client.query('ROLLBACK'); } catch (e) {}
@@ -24336,10 +25037,34 @@ app.put('/api/admin/templates/:id', authenticateToken, requireSuperAdmin, async 
     if (!Number.isInteger(id) || id <= 0) {
         return res.status(400).json({ error: 'Invalid template id' });
     }
-    const { name, description, components, default_slot } = req.body || {};
+    const { name, description, components, default_slot, strategy, priority_slot_3 } = req.body || {};
 
     const validation = _validateTemplateComponents(components);
     if (!validation.ok) return res.status(400).json({ error: validation.error });
+
+    // FIX-220 R16: validate strategy + slot 3 if provided. undefined = preserve.
+    const VALID_STRATEGIES = ['slider_driven', 'pair_avoid_priority', 'high_first', 'low_first', 'alternate'];
+    const VALID_SLOT3      = ['none', 'pair_avoid', 'gk_skill_match', 'def_skill', 'fitness'];
+    let strategyProvided = false;
+    let strategyVal = null;
+    if (strategy !== undefined) {
+        strategyProvided = true;
+        if (strategy === null || (typeof strategy === 'string' && VALID_STRATEGIES.includes(strategy))) {
+            strategyVal = strategy === null ? 'slider_driven' : strategy;
+        } else {
+            return res.status(400).json({ error: 'strategy must be one of: ' + VALID_STRATEGIES.join(', ') });
+        }
+    }
+    let slot3Provided = false;
+    let slot3Val = null;
+    if (priority_slot_3 !== undefined) {
+        slot3Provided = true;
+        if (priority_slot_3 === null || (typeof priority_slot_3 === 'string' && VALID_SLOT3.includes(priority_slot_3))) {
+            slot3Val = priority_slot_3 === null ? 'none' : priority_slot_3;
+        } else {
+            return res.status(400).json({ error: 'priority_slot_3 must be one of: ' + VALID_SLOT3.join(', ') });
+        }
+    }
 
     let slotVal = null;          // null = no slot
     let slotProvided = false;
@@ -24422,23 +25147,65 @@ app.put('/api/admin/templates/:id', authenticateToken, requireSuperAdmin, async 
         }
 
         // Step 3 — insert the new version
-        const newRow = await client.query(
-            `INSERT INTO algorithm_templates
-                (name, description, version, parent_template_id, components,
-                 default_slot, is_system_protected, created_by)
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
-             RETURNING id, name, version, parent_template_id, default_slot`,
-            [
-                newName,
-                newDesc,
-                old.version + 1,
-                old.id,
-                JSON.stringify(newComponents),
-                resolvedSlot,
-                old.is_system_protected,
-                req.user.playerId,
-            ]
-        );
+        // FIX-220 R16: carry forward strategy + slot 3. If user changed them
+        // in the request, use new values; else preserve from old row.
+        // R16-A38: validate preserved values against current enum. If the
+        // old template was created against a previous enum that no longer
+        // includes its value, fall back to safe defaults rather than failing
+        // the CHECK constraint.
+        let newStrategy = strategyProvided
+            ? strategyVal
+            : (old.strategy || 'slider_driven');
+        if (!VALID_STRATEGIES.includes(newStrategy)) {
+            console.warn('[templates PUT] stale strategy="' + newStrategy + '" on template id=' + id + ', resetting to slider_driven');
+            newStrategy = 'slider_driven';
+        }
+        let newSlot3 = slot3Provided
+            ? slot3Val
+            : (old.priority_slot_3 || 'none');
+        if (!VALID_SLOT3.includes(newSlot3)) {
+            console.warn('[templates PUT] stale priority_slot_3="' + newSlot3 + '" on template id=' + id + ', resetting to none');
+            newSlot3 = 'none';
+        }
+
+        let newRow;
+        try {
+            newRow = await client.query(
+                `INSERT INTO algorithm_templates
+                    (name, description, version, parent_template_id, components,
+                     default_slot, is_system_protected, created_by,
+                     strategy, priority_slot_3)
+                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10)
+                 RETURNING id, name, version, parent_template_id, default_slot, strategy, priority_slot_3`,
+                [
+                    newName, newDesc, old.version + 1, old.id,
+                    JSON.stringify(newComponents), resolvedSlot,
+                    old.is_system_protected, req.user.playerId,
+                    newStrategy, newSlot3,
+                ]
+            );
+        } catch (e) {
+            if (e && e.code === '42703') {
+                // Pre-migration fallback
+                console.warn('[templates PUT] strategy/priority_slot_3 columns missing — run 03-phased-team-build-migration.sql. Falling back to legacy INSERT (these fields will not persist).');
+                newRow = await client.query(
+                    `INSERT INTO algorithm_templates
+                        (name, description, version, parent_template_id, components,
+                         default_slot, is_system_protected, created_by)
+                     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+                     RETURNING id, name, version, parent_template_id, default_slot`,
+                    [
+                        newName, newDesc, old.version + 1, old.id,
+                        JSON.stringify(newComponents), resolvedSlot,
+                        old.is_system_protected, req.user.playerId,
+                    ]
+                );
+                if (newRow.rows[0]) {
+                    newRow.rows[0].strategy = newStrategy;
+                    newRow.rows[0].priority_slot_3 = newSlot3;
+                }
+            } else { throw e; }
+        }
 
         await client.query('COMMIT');
 
@@ -24450,6 +25217,11 @@ app.put('/api/admin/templates/:id', authenticateToken, requireSuperAdmin, async 
             const newComp = JSON.stringify(newComponents);
             if (oldComp !== newComp) diffParts.push(`components changed`);
             if (resolvedSlot !== old.default_slot) diffParts.push(`slot: ${old.default_slot} → ${resolvedSlot}`);
+            // R16-A61: capture strategy + slot 3 changes for audit visibility
+            const oldStrat = old.strategy || 'slider_driven';
+            if (newStrategy !== oldStrat) diffParts.push(`strategy: ${oldStrat} → ${newStrategy}`);
+            const oldSlot3 = old.priority_slot_3 || 'none';
+            if (newSlot3 !== oldSlot3) diffParts.push(`slot3: ${oldSlot3} → ${newSlot3}`);
             await auditLog(pool, req.user.playerId, 'template_edited',
                 String(newRow.rows[0].id),
                 `parent=${id} v${old.version}→v${old.version + 1} | ${diffParts.join(' | ') || 'no-op'}`);
@@ -24759,6 +25531,173 @@ app.get('/api/games/:gameId/team-votes/me', authenticateToken, async (req, res) 
     }
 });
 
+// ─── FIX-220 R15: Per-player relationships for likes/dislikes popover ────────
+// Builds a per-player map of all relationships affecting team placement,
+// each marked with side (red/blue/absent), honoured status, and mutual flag.
+//
+// Composition shape: { red: [id|"guest_N"], blue: [...] }
+// Player UUIDs only — guests are excluded (guests don't have BFFs/Rivals/beef
+// in current schema). Returns { [playerId]: { bffs, rivals, pair_prefs,
+// avoid_prefs, beefs } } where each entry has:
+//   { id, name, side, honoured, mutual, level? }
+//
+// honoured semantics:
+//   - bffs / pair_prefs:    same side = honoured (best, both on same team)
+//                           opposite  = broken
+//                           absent    = null
+//   - rivals / avoid_prefs / beefs: opposite side = honoured
+//                                   same side    = broken
+//                                   absent       = null
+//
+// mutual semantics: the target player has THIS player on their list with
+// the same preference type (BFF↔BFF, pair↔pair, avoid↔avoid, rival↔rival).
+// Beef is checked symmetrically too (player A → player B level X, AND
+// player B → player A any level → mutual).
+async function _buildPlayerRelationships(pool, gameId, redIds, blueIds) {
+    // Player UUIDs only — guests don't carry these prefs in schema today.
+    const redPlayers  = redIds.filter(x  => typeof x === 'string' && !x.startsWith('guest_'));
+    const bluePlayers = blueIds.filter(x => typeof x === 'string' && !x.startsWith('guest_'));
+    const allPlayers  = [...redPlayers, ...bluePlayers];
+    if (allPlayers.length === 0) return {};
+
+    // Side lookup
+    const redSet  = new Set(redPlayers);
+    const blueSet = new Set(bluePlayers);
+    const sideOf = (pid) => redSet.has(pid) ? 'red' : (blueSet.has(pid) ? 'blue' : 'absent');
+
+    // Pull all four relationship types in parallel for the players involved.
+    // BFFs: edges from any player in our set; their bff_player_id may be ANY player.
+    const [bffRes, rivalRes, prefRes, beefRes] = await Promise.all([
+        pool.query(
+            `SELECT pb.player_id, pb.bff_player_id AS target_id,
+                    COALESCE(p.alias, p.full_name) AS target_name
+               FROM player_bffs pb
+               JOIN players p ON p.id = pb.bff_player_id
+              WHERE pb.player_id = ANY($1::uuid[])`,
+            [allPlayers]
+        ),
+        pool.query(
+            `SELECT pr.player_id, pr.rival_player_id AS target_id,
+                    COALESCE(p.alias, p.full_name) AS target_name
+               FROM player_rivals pr
+               JOIN players p ON p.id = pr.rival_player_id
+              WHERE pr.player_id = ANY($1::uuid[])`,
+            [allPlayers]
+        ),
+        pool.query(
+            `SELECT r.player_id, rp.target_player_id AS target_id,
+                    rp.preference_type,
+                    COALESCE(p.alias, p.full_name) AS target_name
+               FROM registration_preferences rp
+               JOIN registrations r ON r.id = rp.registration_id
+               JOIN players p ON p.id = rp.target_player_id
+              WHERE r.game_id = $1
+                AND r.player_id = ANY($2::uuid[])
+                AND r.status = 'confirmed'
+                AND COALESCE(rp.source, 'manual') NOT IN ('auto_bff','auto_rival')`,
+            [gameId, allPlayers]
+        ),
+        pool.query(
+            `SELECT b.player_id, b.target_player_id AS target_id, b.rating,
+                    COALESCE(p.alias, p.full_name) AS target_name
+               FROM beef b
+               JOIN players p ON p.id = b.target_player_id
+              WHERE b.player_id = ANY($1::uuid[]) AND b.rating >= 1`,
+            [allPlayers]
+        ),
+    ]);
+
+    // Mutual-check helper: given an edge (player → target, type),
+    // does target also have player on its list with the same type?
+    // We build reverse-edge sets keyed by "target|player" string.
+    const bffEdgeSet  = new Set(bffRes.rows.map(r => r.player_id + '|' + r.target_id));
+    const rivalEdgeSet = new Set(rivalRes.rows.map(r => r.player_id + '|' + r.target_id));
+    // Pair/avoid: keyed by player → target → type
+    const prefEdgeSet = new Set(prefRes.rows.map(r => r.player_id + '|' + r.target_id + '|' + r.preference_type));
+    // Beef: any rating in either direction counts as mutual
+    const beefEdgeSet = new Set(beefRes.rows.map(r => r.player_id + '|' + r.target_id));
+
+    const result = {};
+    const ensure = (pid) => {
+        if (!result[pid]) {
+            result[pid] = { bffs: [], rivals: [], pair_prefs: [], avoid_prefs: [], beefs: [] };
+        }
+        return result[pid];
+    };
+
+    // Compute honoured for "same-side preferred" types (bff, pair)
+    const honouredSameSide = (playerId, targetId) => {
+        const sP = sideOf(playerId);
+        const sT = sideOf(targetId);
+        if (sT === 'absent') return null;
+        return sP === sT;
+    };
+    // Compute honoured for "opposite-side preferred" types (rival, avoid, beef)
+    const honouredOppositeSide = (playerId, targetId) => {
+        const sP = sideOf(playerId);
+        const sT = sideOf(targetId);
+        if (sT === 'absent') return null;
+        return sP !== sT;
+    };
+
+    for (const r of bffRes.rows) {
+        const isMutual = bffEdgeSet.has(r.target_id + '|' + r.player_id);
+        ensure(r.player_id).bffs.push({
+            id:       r.target_id,
+            name:     r.target_name,
+            side:     sideOf(r.target_id),
+            honoured: honouredSameSide(r.player_id, r.target_id),
+            mutual:   isMutual,
+        });
+    }
+    for (const r of rivalRes.rows) {
+        const isMutual = rivalEdgeSet.has(r.target_id + '|' + r.player_id);
+        ensure(r.player_id).rivals.push({
+            id:       r.target_id,
+            name:     r.target_name,
+            side:     sideOf(r.target_id),
+            honoured: honouredOppositeSide(r.player_id, r.target_id),
+            mutual:   isMutual,
+        });
+    }
+    for (const r of prefRes.rows) {
+        const sameTypeKey = r.target_id + '|' + r.player_id + '|' + r.preference_type;
+        const isMutual = prefEdgeSet.has(sameTypeKey);
+        const entry = {
+            id:       r.target_id,
+            name:     r.target_name,
+            side:     sideOf(r.target_id),
+            honoured: r.preference_type === 'pair'
+                ? honouredSameSide(r.player_id, r.target_id)
+                : honouredOppositeSide(r.player_id, r.target_id),
+            mutual:   isMutual,
+        };
+        if (r.preference_type === 'pair') {
+            ensure(r.player_id).pair_prefs.push(entry);
+        } else if (r.preference_type === 'avoid') {
+            ensure(r.player_id).avoid_prefs.push(entry);
+        }
+    }
+    for (const r of beefRes.rows) {
+        const isMutual = beefEdgeSet.has(r.target_id + '|' + r.player_id);
+        // R-AUDIT-29: beef semantic in this codebase is "kept TOGETHER" (per
+        // physical-safety reasoning: same team players don't tackle each
+        // other, so beef pairs are placed together). Honoured = same side,
+        // not opposite. Algorithm uses union-find to merge beef-5 pairs into
+        // atomic units placed on a single team.
+        ensure(r.player_id).beefs.push({
+            id:       r.target_id,
+            name:     r.target_name,
+            side:     sideOf(r.target_id),
+            honoured: honouredSameSide(r.player_id, r.target_id),
+            mutual:   isMutual,
+            level:    parseInt(r.rating, 10) || 1,
+        });
+    }
+
+    return result;
+}
+
 // ─── GET /api/admin/games/:gameId/team-setups/:id ─────────────────────────────
 // Admin equivalent of the player-facing /api/games/:gameId/team-setups/:id.
 // Bypasses the confirmed-player gate (admin may not be registered for the
@@ -24846,12 +25785,25 @@ app.get('/api/admin/games/:gameId/team-setups/:id', authenticateToken, requireGa
             };
         });
 
+        // FIX-220 R15: per-player likes/dislikes data for the popover.
+        // Wrap in try/catch — if it fails we still return rosters (the
+        // popover button just won't show extra data). Don't 500 the whole
+        // endpoint on a relationship-data hiccup.
+        let _relationships = {};
+        try {
+            _relationships = await _buildPlayerRelationships(pool, gameId,
+                composition.red || [], composition.blue || []);
+        } catch (relErr) {
+            console.warn('[team-setups detail] _buildPlayerRelationships failed (non-fatal):', relErr.message);
+        }
+
         return res.json({
             team_setup_id: setup.id,
             slot: setup.slot_number,
             status: setup.status,
             redTeam:  resolveSide(composition.red),
             blueTeam: resolveSide(composition.blue),
+            relationships: _relationships,
         });
     } catch (e) {
         console.error('Admin team-setup detail error:', e);
@@ -25504,7 +26456,8 @@ app.get('/api/admin/games/:gameId/voting-status', authenticateToken, requireGame
         // the admin voting modal.
         const setupsRes = await pool.query(`
             SELECT ts.id, ts.slot_number, ts.template_id, ts.team_composition,
-                   ts.algorithm_score, ts.is_admin_overridden_winner,
+                   ts.algorithm_score, ts.algorithm_diagnostics, ts.admin_fine_tuned,
+                   ts.is_admin_overridden_winner,
                    ts.voting_opened_at, ts.voting_closes_at, ts.voting_closed_at,
                    ts.status,
                    at.name AS template_name, at.version AS template_version
@@ -25560,6 +26513,8 @@ app.get('/api/admin/games/:gameId/voting-status', authenticateToken, requireGame
                 template_name: s.template_name,
                 template_version: s.template_version,
                 algorithm_score: s.algorithm_score,
+                algorithm_diagnostics: s.algorithm_diagnostics,
+                admin_fine_tuned: !!s.admin_fine_tuned,
                 status: s.status,
                 is_admin_override: !!s.is_admin_overridden_winner,
                 up: t.up,
@@ -26032,6 +26987,220 @@ app.patch('/api/admin/team-setups/:id/status', authenticateToken, requireSuperAd
     } catch (error) {
         console.error('Patch team-setup status error:', error);
         res.status(500).json({ error: 'Failed to change setup status' });
+    }
+});
+
+// =============================================================================
+// FIX-220 R14-#2: PATCH team-setup composition (per-slot fine-tuning)
+// =============================================================================
+// Allows admin to edit a team_setup's red/blue rosters before voting opens.
+// Validates that all player IDs belong to confirmed registrations for the
+// game. Recomputes the team_composition_hash. Marks admin_fine_tuned=true.
+//
+// Body: { red: [playerId|"guest_<id>", ...], blue: [...] }
+//
+// Gates:
+//   - Must be admin/superadmin (requireGameManager)
+//   - Setup must belong to the game in URL
+//   - Setup must be in 'proposed' status (pre-open or post-close-pre-completed)
+//     and voting_closed_at must be NULL (don't edit closed votes)
+app.patch('/api/admin/games/:gameId/team-setups/:id/composition',
+    authenticateToken, requireGameManager, async (req, res) => {
+    const { gameId } = req.params;
+    const id = parseInt(req.params.id, 10);
+    if (!isValidUuid(gameId)) {
+        return res.status(400).json({ error: 'Invalid game id' });
+    }
+    if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid setup id' });
+    }
+    const body = req.body || {};
+    if (!body || typeof body !== 'object' || !Array.isArray(body.red) || !Array.isArray(body.blue)) {
+        return res.status(400).json({ error: 'Body must include { red: [...], blue: [...] }' });
+    }
+    const red  = body.red;
+    const blue = body.blue;
+
+    // R-AUDIT-9: refuse non-string elements. Frontend should send UUIDs as
+    // strings or "guest_<n>" markers; numbers/objects/null indicate a bug or
+    // tampering. Without this, non-string IDs would be silently filtered out
+    // and the resulting composition would corrupt downstream live-table writes.
+    const isValidIdShape = (x) => typeof x === 'string' && x.length > 0;
+    const badRed  = red.filter(x => !isValidIdShape(x));
+    const badBlue = blue.filter(x => !isValidIdShape(x));
+    if (badRed.length > 0 || badBlue.length > 0) {
+        return res.status(400).json({
+            error: 'All composition IDs must be non-empty strings (UUID or "guest_<n>")',
+            invalid: [...badRed, ...badBlue].slice(0, 5),
+        });
+    }
+
+    // R-AUDIT-8: refuse duplicates (same ID twice on same team OR across teams).
+    const allIdsCheck = [...red, ...blue].map(x => String(x));
+    const seenIds = new Set();
+    const dupes = [];
+    for (const id of allIdsCheck) {
+        if (seenIds.has(id)) dupes.push(id);
+        else seenIds.add(id);
+    }
+    if (dupes.length > 0) {
+        return res.status(400).json({
+            error: 'Duplicate IDs in composition (same player or guest cannot appear twice)',
+            duplicates: [...new Set(dupes)],
+        });
+    }
+
+    try {
+        // Validate setup
+        const sRes = await pool.query(
+            `SELECT id, game_id, status, voting_opened_at, voting_closed_at, slot_number
+               FROM team_setups WHERE id = $1`,
+            [id]
+        );
+        if (sRes.rows.length === 0) return res.status(404).json({ error: 'Team setup not found' });
+        const setup = sRes.rows[0];
+        if (setup.game_id !== gameId) {
+            return res.status(400).json({ error: 'team_setup does not belong to this game' });
+        }
+        // R-AUDIT-33: refuse edits once voting has opened (orphans live votes
+        // due to hash change). Pre-open only — wizard's OPEN VOTING closes
+        // the fine-tune UI but the endpoint must enforce this independently.
+        if (setup.status !== 'proposed' || setup.voting_opened_at !== null || setup.voting_closed_at !== null) {
+            return res.status(409).json({ error: 'Cannot edit composition once voting has opened (or is no longer proposed).' });
+        }
+
+        // Validate all non-guest IDs belong to confirmed registrations for this game.
+        // Guests stay as 'guest_<id>' markers — same convention as the algorithm output.
+        const allIds = [...red, ...blue];
+        const playerUuids = allIds.filter(x => typeof x === 'string' && !x.startsWith('guest_'));
+        const guestIdsRaw = allIds
+            .filter(x => typeof x === 'string' && x.startsWith('guest_'))
+            .map(x => x.replace('guest_', ''))
+            .filter(s => /^[0-9]+$/.test(s))
+            .map(s => parseInt(s, 10));
+
+        if (playerUuids.length > 0) {
+            const validRes = await pool.query(
+                `SELECT player_id FROM registrations
+                  WHERE game_id = $1 AND status = 'confirmed'
+                    AND player_id = ANY($2::uuid[])`,
+                [gameId, playerUuids]
+            );
+            const validSet = new Set(validRes.rows.map(r => r.player_id));
+            const missing = playerUuids.filter(pid => !validSet.has(pid));
+            if (missing.length > 0) {
+                return res.status(400).json({
+                    error: 'Some player IDs are not confirmed registrations for this game',
+                    missing
+                });
+            }
+        }
+        if (guestIdsRaw.length > 0) {
+            const validGuestRes = await pool.query(
+                `SELECT id FROM game_guests WHERE game_id = $1 AND id = ANY($2::int[])`,
+                [gameId, guestIdsRaw]
+            );
+            const validGuestSet = new Set(validGuestRes.rows.map(r => r.id));
+            const missingGuests = guestIdsRaw.filter(gid => !validGuestSet.has(gid));
+            if (missingGuests.length > 0) {
+                return res.status(400).json({
+                    error: 'Some guest IDs do not belong to this game',
+                    missing: missingGuests.map(gid => 'guest_' + gid)
+                });
+            }
+        }
+
+        // Compute hash from the new composition. Use the in-memory equivalent
+        // (composition input, not live tables) since the live tables haven't
+        // been written yet for proposed setups.
+        const newComposition = { red, blue };
+        const newHash = _hashCompositionLikeLiveTables(red, blue);
+
+        // R-AUDIT-33b: include voting state in WHERE so the UPDATE is a no-op
+        // if voting was opened in the (small) gap between gate-check and now.
+        // Frontend will see 0 rows affected and surface as 409.
+        const upRes = await pool.query(
+            `UPDATE team_setups
+                SET team_composition = $1::jsonb,
+                    team_composition_hash = $2,
+                    admin_fine_tuned = true
+              WHERE id = $3 AND status = 'proposed'
+                AND voting_opened_at IS NULL AND voting_closed_at IS NULL
+              RETURNING id`,
+            [JSON.stringify(newComposition), newHash, id]
+        );
+        if (upRes.rowCount === 0) {
+            return res.status(409).json({
+                error: 'Voting state changed during edit — refresh wizard and try again.'
+            });
+        }
+
+        try {
+            await auditLog(pool, req.user.playerId, 'team_setup_composition_edited', gameId,
+                `setup=${id} slot=${setup.slot_number ?? 'NULL'} hash=${newHash || 'null'}`);
+        } catch (e) {}
+
+        res.json({
+            id, slot_number: setup.slot_number,
+            team_composition: newComposition,
+            team_composition_hash: newHash,
+            admin_fine_tuned: true,
+        });
+    } catch (error) {
+        console.error('Patch team-setup composition error:', error);
+        res.status(500).json({ error: 'Failed to update team setup composition' });
+    }
+});
+
+// =============================================================================
+// FIX-220 R14-#3: DELETE all pre-open Multi candidates for a game
+// =============================================================================
+// Discards a Multi-mode review wizard's candidates so admin can swap to
+// Standard mode (or restart Multi with different templates). Only acts on
+// pre-open candidates — once voting has opened, this endpoint refuses.
+//
+// Sets status='superseded' on all matching team_setups for the game.
+// Used by the wizard's "← BACK TO MODE PICKER" button.
+app.delete('/api/admin/games/:gameId/multi-candidates',
+    authenticateToken, requireGameManager, async (req, res) => {
+    const { gameId } = req.params;
+    if (!isValidUuid(gameId)) {
+        return res.status(400).json({ error: 'Invalid game id' });
+    }
+
+    try {
+        // R-AUDIT-77: Atomic check + update. If any open candidates exist
+        // for this game, refuse. We can't fully prevent a race between this
+        // check and the UPDATE, but the UPDATE's own WHERE clause filters
+        // to voting_opened_at IS NULL, so any concurrently-opened slots
+        // will be left alone (their voting state is preserved).
+        const openCheck = await pool.query(
+            `SELECT COUNT(*)::int AS n FROM team_setups
+              WHERE game_id = $1 AND status = 'proposed' AND voting_opened_at IS NOT NULL`,
+            [gameId]
+        );
+        if (openCheck.rows[0].n > 0) {
+            return res.status(409).json({
+                error: 'Voting is already open for this game. End voting first before discarding candidates.'
+            });
+        }
+
+        const r = await pool.query(
+            `UPDATE team_setups SET status = 'superseded'
+              WHERE game_id = $1 AND status = 'proposed' AND voting_opened_at IS NULL
+              RETURNING id`,
+            [gameId]
+        );
+
+        try {
+            await auditLog(pool, req.user.playerId, 'multi_candidates_discarded', gameId,
+                `count=${r.rowCount} ids=${r.rows.map(x => x.id).join(',')}`);
+        } catch (e) {}
+
+        res.json({ discarded: r.rowCount });
+    } catch (error) {
+        console.error('Discard multi candidates error:', error);
+        res.status(500).json({ error: 'Failed to discard candidates' });
     }
 });
 
@@ -27372,7 +28541,8 @@ async function _fetchFinanceGames(from, to) {
             dropped_real: droppedReal, dropped_free: droppedFree,
             total_real:     totalReal,
             total_free:     totalFree,
-            total_revenue:  totalReal + totalFree,
+            // Revenue = real cash only. FC is gifted credit, not money in the bank.
+            total_revenue:  totalReal,
             // EB-AUDIT: early bird savings (sum of cost - effective_at_signup)
             early_bird_savings: ebSavings,
             gross_profit:        totalReal - totalCost,
@@ -27442,7 +28612,9 @@ app.get('/api/admin/finance/summary', authenticateToken, requireSuperAdmin, asyn
         const summary = {
             ...agg,
             gross_profit:        agg.total_real - agg.total_cost,
-            gross_profit_inc_fc: agg.total_revenue - agg.total_cost,
+            // gross_profit_inc_fc is informational — counts FC as if cash. Computed
+            // explicitly because total_revenue now means real cash only.
+            gross_profit_inc_fc: (agg.total_real + agg.total_free) - agg.total_cost,
             per_game_avg_profit: agg.game_count > 0 ? (agg.total_real - agg.total_cost) / agg.game_count : 0,
             avg_billable_per_game: agg.game_count > 0 ? agg.billable_total / agg.game_count : 0
         };
@@ -27467,11 +28639,12 @@ app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) 
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'backup'), 0) as backup_count,
                 COALESCE((SELECT COUNT(*) FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) +
                 COALESCE((SELECT COUNT(*) FROM game_guests gg WHERE gg.game_id = g.id), 0) as total_players,
-                -- P1.1: revenue formula respects free credits + discount feature
+                -- Revenue = real cash only. FC is gifted credit, not money in the bank.
+                -- The IS NULL branch keeps legacy compat for old rows that pre-date FC tracking.
                 COALESCE((SELECT SUM(CASE
                   WHEN r.is_comped                THEN 0
                   WHEN r.amount_paid_free IS NULL THEN COALESCE(NULLIF(r.amount_paid, 0), g.cost_per_player)
-                  ELSE                                  COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)
+                  ELSE                                  COALESCE(r.amount_paid, 0)
                 END)
                     FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0) +
                 COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg WHERE gg.game_id = g.id
