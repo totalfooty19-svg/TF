@@ -1035,12 +1035,36 @@ async function reviewDynamicStarRating(pool, gameId) {
         const total = parseInt(countRow.rows[0].total) || 0;
         if (total < 8) return; // Minimum 8 players before dynamic rating kicks in
 
-        // Avg OVR of confirmed registered players (guests have no OVR, so we exclude them)
+        // FIX-235: Use GK rating for goalkeepers (registrations with
+        // position_preference='GK'; guests with position_classification='gk').
+        // Players/guests with goalkeeper_rating = 0 are excluded — they're
+        // not real GKs and would drag the avg down. Guests now also count
+        // (previously the comment said "guests have no OVR" — false; they
+        // have both overall_rating and goalkeeper_rating columns).
         const ovrRow = await pool.query(
-            `SELECT ROUND(AVG(p.overall_rating)::numeric, 2) AS avg_ovr
-             FROM registrations r
-             JOIN players p ON p.id = r.player_id
-             WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.overall_rating IS NOT NULL`,
+            `SELECT ROUND(AVG(rating)::numeric, 2) AS avg_ovr FROM (
+                -- Confirmed registered players
+                SELECT CASE
+                    WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                        THEN NULLIF(p.goalkeeper_rating, 0)
+                    ELSE p.overall_rating
+                END AS rating
+                FROM registrations r
+                JOIN players p ON p.id = r.player_id
+                WHERE r.game_id = $1 AND r.status = 'confirmed'
+
+                UNION ALL
+
+                -- Guests
+                SELECT CASE
+                    WHEN gg.position_classification = 'gk'
+                        THEN NULLIF(gg.goalkeeper_rating, 0)
+                    ELSE gg.overall_rating
+                END AS rating
+                FROM game_guests gg
+                WHERE gg.game_id = $1
+            ) ratings
+            WHERE rating IS NOT NULL`,
             [gameId]
         );
         const avgOvr = parseFloat(ovrRow.rows[0]?.avg_ovr);
@@ -3942,10 +3966,18 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
             v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
             ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
              + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players,
-            ROUND((SELECT AVG(p.overall_rating)
-                   FROM registrations r JOIN players p ON p.id = r.player_id
-                   WHERE r.game_id = g.id AND r.status = 'confirmed'
-                   AND p.overall_rating IS NOT NULL)::numeric, 1) AS live_avg_ovr,
+            ROUND((SELECT AVG(rating) FROM (
+                       SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                   THEN NULLIF(p.goalkeeper_rating, 0)
+                                   ELSE p.overall_rating END AS rating
+                       FROM registrations r JOIN players p ON p.id = r.player_id
+                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       UNION ALL
+                       SELECT CASE WHEN gg.position_classification = 'gk'
+                                   THEN NULLIF(gg.goalkeeper_rating, 0)
+                                   ELSE gg.overall_rating END AS rating
+                       FROM game_guests gg WHERE gg.game_id = g.id
+                   ) ratings WHERE rating IS NOT NULL)::numeric, 1) AS live_avg_ovr,
             EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) AS is_registered`;
 
         // Upcoming games — ascending (next first)
@@ -4114,10 +4146,18 @@ app.get('/api/dashboard/my-booked-games', authenticateToken, async (req, res) =>
                    r.backup_type AS my_backup_type,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players,
-                   ROUND((SELECT AVG(p.overall_rating)
-                          FROM registrations r2 JOIN players p ON p.id = r2.player_id
-                          WHERE r2.game_id = g.id AND r2.status = 'confirmed'
-                          AND p.overall_rating IS NOT NULL)::numeric, 1) AS live_avg_ovr
+                   ROUND((SELECT AVG(rating) FROM (
+                              SELECT CASE WHEN UPPER(TRIM(r2.position_preference)) = 'GK'
+                                          THEN NULLIF(p.goalkeeper_rating, 0)
+                                          ELSE p.overall_rating END AS rating
+                              FROM registrations r2 JOIN players p ON p.id = r2.player_id
+                              WHERE r2.game_id = g.id AND r2.status = 'confirmed'
+                              UNION ALL
+                              SELECT CASE WHEN gg.position_classification = 'gk'
+                                          THEN NULLIF(gg.goalkeeper_rating, 0)
+                                          ELSE gg.overall_rating END AS rating
+                              FROM game_guests gg WHERE gg.game_id = g.id
+                          ) ratings WHERE rating IS NOT NULL)::numeric, 1) AS live_avg_ovr
             FROM registrations r
             JOIN games g ON g.id = r.game_id
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -4861,8 +4901,10 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, as
                 `GK:${b.goalkeeper_rating ?? '?'}→${goalkeeper}`,
             ].join(' ');
             await auditLog(pool, req.user.playerId, 'stats_updated', req.params.id, detail);
-            // DYNSTAR-C: if OVR changed, upcoming games this player is in need recalc
-            if ((b.overall_rating ?? null) !== (overall ?? null)) {
+            // DYNSTAR-C: if OVR or GK rating changed, upcoming games this player
+            // is in need recalc. FIX-235: GK rating now affects the avg too.
+            if ((b.overall_rating ?? null) !== (overall ?? null)
+                || (b.goalkeeper_rating ?? null) !== (goalkeeper ?? null)) {
                 reviewStarsForPlayers(pool, [req.params.id]).catch(() => {});
             }
         });
@@ -5036,9 +5078,11 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
         }
 
         // Update player ratings and stats
-        // DYNSTAR-C: capture old OVR so we only fire recalc when it actually changed.
-        const prevOvrRow = await pool.query('SELECT overall_rating FROM players WHERE id = $1', [playerId]);
+        // DYNSTAR-C: capture old OVR + GK so we only fire recalc when changed.
+        // FIX-235: GK rating now affects star calc, so also watch goalkeeper_rating.
+        const prevOvrRow = await pool.query('SELECT overall_rating, goalkeeper_rating FROM players WHERE id = $1', [playerId]);
         const prevOverall = prevOvrRow.rows[0]?.overall_rating ?? null;
+        const prevGk      = prevOvrRow.rows[0]?.goalkeeper_rating ?? null;
         await pool.query(`
             UPDATE players SET
                 goalkeeper_rating = $1,
@@ -5080,8 +5124,8 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
             );
         }
 
-        // DYNSTAR-C: if OVR changed, fire recalc for player's upcoming games
-        if (prevOverall !== overall_rating) {
+        // DYNSTAR-C: if OVR or GK rating changed, fire recalc for player's upcoming games (FIX-235)
+        if (prevOverall !== overall_rating || prevGk !== goalkeeper_rating) {
             reviewStarsForPlayers(pool, [playerId]).catch(() => {});
         }
 
@@ -5930,10 +5974,18 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
-                   ROUND((SELECT AVG(p.overall_rating)
-                          FROM registrations r JOIN players p ON p.id = r.player_id
-                          WHERE r.game_id = g.id AND r.status = 'confirmed'
-                          AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
+                   ROUND((SELECT AVG(rating) FROM (
+                       SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                   THEN NULLIF(p.goalkeeper_rating, 0)
+                                   ELSE p.overall_rating END AS rating
+                       FROM registrations r JOIN players p ON p.id = r.player_id
+                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       UNION ALL
+                       SELECT CASE WHEN gg.position_classification = 'gk'
+                                   THEN NULLIF(gg.goalkeeper_rating, 0)
+                                   ELSE gg.overall_rating END AS rating
+                       FROM game_guests gg WHERE gg.game_id = g.id
+                   ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
@@ -6193,10 +6245,18 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
-                   ROUND((SELECT AVG(p.overall_rating)
-                          FROM registrations r JOIN players p ON p.id = r.player_id
-                          WHERE r.game_id = g.id AND r.status = 'confirmed'
-                          AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
+                   ROUND((SELECT AVG(rating) FROM (
+                       SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                   THEN NULLIF(p.goalkeeper_rating, 0)
+                                   ELSE p.overall_rating END AS rating
+                       FROM registrations r JOIN players p ON p.id = r.player_id
+                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       UNION ALL
+                       SELECT CASE WHEN gg.position_classification = 'gk'
+                                   THEN NULLIF(gg.goalkeeper_rating, 0)
+                                   ELSE gg.overall_rating END AS rating
+                       FROM game_guests gg WHERE gg.game_id = g.id
+                   ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count,
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2) as registration_status,
@@ -9235,6 +9295,9 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
 
         await client.query('COMMIT');
 
+        // FIX-235: guest left → squad-avg shifts (especially if GK), recalc dynamic star.
+        reviewDynamicStarRating(pool, gameId).catch(() => {});
+
         res.json({
             message: `${guest.guest_name} removed. £${refundAmt.toFixed(2)} refunded to your balance.`
         });
@@ -9311,6 +9374,9 @@ app.patch('/api/games/:gameId/guests/:guestId/stats', authenticateToken, require
              gk, newOverall, guestId, gameId]
         );
 
+        // FIX-235: guest's OVR/GK changed → squad-avg shifts, recalc dynamic star.
+        reviewDynamicStarRating(pool, gameId).catch(() => {});
+
         await gameAuditLog(pool, gameId, req.user.playerId, 'guest_stats_overridden', JSON.stringify({
             guest_id: guestId,
             before: {
@@ -9385,6 +9451,9 @@ app.post('/api/games/:gameId/guests/:guestId/reset-stats', authenticateToken, re
              derived.goalkeeper_rating, derived.overall_rating,
              parentOverall, guestId, gameId]
         );
+
+        // FIX-235: guest's OVR/GK changed → squad-avg shifts, recalc dynamic star.
+        reviewDynamicStarRating(pool, gameId).catch(() => {});
 
         await gameAuditLog(pool, gameId, req.user.playerId, 'guest_stats_reset', JSON.stringify({
             guest_id: guestId, delta, position_classification, new_overall: derived.overall_rating
@@ -11240,6 +11309,12 @@ app.put('/api/admin/games/:gameId/player/:playerId/preferences', authenticateTok
 
         await client.query('COMMIT');
 
+        // FIX-235: position change might toggle GK ↔ outfield, which changes
+        // the squad-avg rating used by reviewDynamicStarRating. Fire-and-forget.
+        if (positions !== undefined) {
+            reviewDynamicStarRating(pool, gameId).catch(() => {});
+        }
+
         setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'preferences_updated',
             `Admin updated prefs for player ${playerId}: pos=${positions ?? 'unchanged'} pairs=${(pairs||[]).length} avoids=${(avoids||[]).length}${fixed_team !== undefined ? ' team=' + fixed_team : ''}`
         ).catch(() => {}));
@@ -11392,6 +11467,10 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
 
         await client.query('COMMIT');
         res.json({ message: 'Preferences updated successfully' });
+
+        // FIX-235: position change might toggle GK ↔ outfield, which changes
+        // the squad-avg rating used by reviewDynamicStarRating. Fire-and-forget.
+        reviewDynamicStarRating(pool, gameId).catch(() => {});
 
         // Non-critical: audit preferences change with resolved names
         setImmediate(async () => {
@@ -12061,6 +12140,28 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         let blueTeam = [];
         let placedUnitIdx = new Set();
 
+        // FIX-236: Hoist template config bindings too. _runOptimiserOnce reads
+        // _strategy at line ~12222 (Phase 5 placement), but the original code
+        // declared these via `let` at ~12385 — INSIDE _runOptimiserOnce yet
+        // AFTER the read site → ReferenceError TDZ crash on every call.
+        // Resolved here, then the inner function picks up the resolved values.
+        let _tplCfg = await _resolveTemplateConfig(pool, _genTemplateId)
+                       || { components: { ...ALGORITHM_COMPONENT_DEFAULTS },
+                            strategy: 'slider_driven', priority_slot_3: 'none' };
+        let _components       = _tplCfg.components;
+        let _strategy         = _tplCfg.strategy;
+        let _priority_slot_3  = _tplCfg.priority_slot_3;
+        // Snapshot the template version at generation time — saved on the
+        // team_setups row so historical analysis is exact.
+        let _genTemplateVersion = null;
+        if (_genTemplateId !== null) {
+            const v = await pool.query(
+                `SELECT version FROM algorithm_templates WHERE id = $1`,
+                [_genTemplateId]
+            );
+            _genTemplateVersion = v.rows[0]?.version ?? null;
+        }
+
         // ── FIX-220: Wrap the algorithm body (Phase 5 → final diss object) in a
         //            callable inner function so Multi mode can iterate over it.
         //            For Standard mode this is called once and behaviour is identical.
@@ -12296,25 +12397,10 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         // FIX-220: changed from const to let — Multi mode reassigns this per
         // iteration so the same closure-bound functions read different values.
         // Standard mode behaviour unchanged.
-        // FIX-220 R16: also load strategy + priority_slot_3 alongside components.
-        // For templates pre-dating R16, defaults are 'slider_driven'/'none'
-        // which preserves the existing single-pass optimiser behaviour.
-        let _tplCfg = await _resolveTemplateConfig(pool, _genTemplateId)
-                       || { components: { ...ALGORITHM_COMPONENT_DEFAULTS },
-                            strategy: 'slider_driven', priority_slot_3: 'none' };
-        let _components       = _tplCfg.components;
-        let _strategy         = _tplCfg.strategy;
-        let _priority_slot_3  = _tplCfg.priority_slot_3;
-        // Snapshot the template version at generation time — saved on the
-        // team_setups row so historical analysis is exact.
-        let _genTemplateVersion = null;
-        if (_genTemplateId !== null) {
-            const v = await pool.query(
-                `SELECT version FROM algorithm_templates WHERE id = $1`,
-                [_genTemplateId]
-            );
-            _genTemplateVersion = v.rows[0]?.version ?? null;
-        }
+        // FIX-236: _tplCfg, _components, _strategy, _priority_slot_3,
+        // _genTemplateVersion are now hoisted to the outer scope (read by
+        // Phase 5 inside _runOptimiserOnce — must exist before the call).
+        // Original declarations here removed.
 
         // ── Dissatisfaction score ──
         function computeDissatisfaction(red, blue, widenBeef5 = false) {
@@ -12680,12 +12766,11 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 );
                 const tplVersion = vRow.rows[0]?.version ?? null;
 
-                // FIX-220 R14-#1: also set _genTemplateId so the re-resolve
-                // inside _runOptimiserOnce (line ~12058) picks up the same
-                // template. Without this, the inner re-resolve runs with
-                // _genTemplateId=null and silently reverts to factory
-                // defaults — every Multi iteration produced identical teams
-                // regardless of which template was chosen for the slot.
+                // FIX-236: Each iteration reassigns _components/_strategy/
+                // _priority_slot_3 directly (above), and these are now hoisted
+                // let bindings, so _runOptimiserOnce reads the freshly assigned
+                // values for this slot. Setting _genTemplateId here keeps it
+                // consistent with the saved team_setups row metadata.
                 _genTemplateId = st.template_id;
 
                 // Run the algorithm with these components
@@ -15394,10 +15479,11 @@ app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameM
     }
 
     // DYNSTAR-C: post-game stat entry is the single biggest driver of OVR drift.
-    // Every player whose OVR actually changed has potentially stale dynamic star
-    // ratings on their upcoming games. Fire-and-forget recalc for all of them.
+    // Every player whose OVR or GK rating actually changed has potentially stale
+    // dynamic star ratings on their upcoming games. Fire-and-forget recalc for
+    // all of them. FIX-235: GK rating now also affects squad-avg star calc.
     const ovrChangedIds = statChanges
-        .filter(c => c.newOverall !== c.oldOverall)
+        .filter(c => c.newOverall !== c.oldOverall || c.newGk !== c.oldGk)
         .map(c => c.playerId);
     if (ovrChangedIds.length > 0) {
         reviewStarsForPlayers(pool, ovrChangedIds).catch(() => {});
@@ -16655,10 +16741,18 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    opp_pub.logo_url AS opponent_logo_url, opp_pub.star_rating AS opponent_star_rating,
                    opp_pub.social_instagram AS opponent_social_instagram, opp_pub.social_twitter AS opponent_social_twitter, opp_pub.social_website AS opponent_social_website,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
-                   ROUND((SELECT AVG(p.overall_rating)
-                          FROM registrations r JOIN players p ON p.id = r.player_id
-                          WHERE r.game_id = g.id AND r.status = 'confirmed'
-                          AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
+                   ROUND((SELECT AVG(rating) FROM (
+                       SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                   THEN NULLIF(p.goalkeeper_rating, 0)
+                                   ELSE p.overall_rating END AS rating
+                       FROM registrations r JOIN players p ON p.id = r.player_id
+                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       UNION ALL
+                       SELECT CASE WHEN gg.position_classification = 'gk'
+                                   THEN NULLIF(gg.goalkeeper_rating, 0)
+                                   ELSE gg.overall_rating END AS rating
+                       FROM game_guests gg WHERE gg.game_id = g.id
+                   ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) as confirmed_organiser_count
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -17007,10 +17101,18 @@ app.get('/api/public/games', async (req, res) => {
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
                      + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id) AS current_players,
-                   ROUND((SELECT AVG(p.overall_rating)
-                          FROM registrations r JOIN players p ON p.id = r.player_id
-                          WHERE r.game_id = g.id AND r.status = 'confirmed'
-                          AND p.overall_rating IS NOT NULL)::numeric, 1) AS live_avg_ovr,
+                   ROUND((SELECT AVG(rating) FROM (
+                       SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                   THEN NULLIF(p.goalkeeper_rating, 0)
+                                   ELSE p.overall_rating END AS rating
+                       FROM registrations r JOIN players p ON p.id = r.player_id
+                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       UNION ALL
+                       SELECT CASE WHEN gg.position_classification = 'gk'
+                                   THEN NULLIF(gg.goalkeeper_rating, 0)
+                                   ELSE gg.overall_rating END AS rating
+                       FROM game_guests gg WHERE gg.game_id = g.id
+                   ) ratings WHERE rating IS NOT NULL)::numeric, 1) AS live_avg_ovr,
                    motm_p.alias AS motm_winner_alias, motm_p.full_name AS motm_winner_name
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -19792,10 +19894,18 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                  AND r.is_comped = FALSE
                  AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) > 0
                  AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) < g.cost_per_player), 0) as discount_gap,
-                ROUND((SELECT AVG(p.overall_rating)
-                 FROM registrations r JOIN players p ON p.id = r.player_id
-                 WHERE r.game_id = g.id AND r.status = 'confirmed'
-                 AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
+                ROUND((SELECT AVG(rating) FROM (
+                       SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                   THEN NULLIF(p.goalkeeper_rating, 0)
+                                   ELSE p.overall_rating END AS rating
+                       FROM registrations r JOIN players p ON p.id = r.player_id
+                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       UNION ALL
+                       SELECT CASE WHEN gg.position_classification = 'gk'
+                                   THEN NULLIF(gg.goalkeeper_rating, 0)
+                                   ELSE gg.overall_rating END AS rating
+                       FROM game_guests gg WHERE gg.game_id = g.id
+                   ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                 -- Batch 9: share-template fields (templates.md)
                 EXISTS(SELECT 1 FROM game_lineups gl WHERE gl.game_id = g.id) AS has_lineup,
                 TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time_london,
@@ -19882,10 +19992,18 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                  AND r.is_comped = FALSE
                  AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) > 0
                  AND (COALESCE(r.amount_paid, 0) + COALESCE(r.amount_paid_free, 0)) < g.cost_per_player), 0) as discount_gap,
-                ROUND((SELECT AVG(p.overall_rating)
-                 FROM registrations r JOIN players p ON p.id = r.player_id
-                 WHERE r.game_id = g.id AND r.status = 'confirmed'
-                 AND p.overall_rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
+                ROUND((SELECT AVG(rating) FROM (
+                       SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                   THEN NULLIF(p.goalkeeper_rating, 0)
+                                   ELSE p.overall_rating END AS rating
+                       FROM registrations r JOIN players p ON p.id = r.player_id
+                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       UNION ALL
+                       SELECT CASE WHEN gg.position_classification = 'gk'
+                                   THEN NULLIF(gg.goalkeeper_rating, 0)
+                                   ELSE gg.overall_rating END AS rating
+                       FROM game_guests gg WHERE gg.game_id = g.id
+                   ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                 -- Batch 9: share-template fields (templates.md)
                 EXISTS(SELECT 1 FROM game_lineups gl WHERE gl.game_id = g.id) AS has_lineup,
                 TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time_london,
@@ -30460,7 +30578,7 @@ app.get('/api/coaching/manage', authenticateToken, async (req, res) => {
 // AUTH: POST /api/coaching/apply
 // Player applies to become a coach
 // ══════════════════════════════════════════════════════════════
-app.post('/api/coaching/apply', authenticateToken, registrationLimiter, async (req, res) => {
+app.post('/api/coaching/apply', authenticateToken, express.json({ limit: '5mb' }), registrationLimiter, async (req, res) => {
     const { certifications, experience, min_hourly_rate, license_doc } = req.body;
     if (!certifications || certifications.length < 5 || certifications.length > 1000)
         return res.status(400).json({ error: 'certifications required (5–1000 chars)' });
@@ -30719,7 +30837,7 @@ app.get('/api/coaching/venues/available', optionalAuth, publicEndpointLimiter, a
 // AUTH: POST /api/ref/apply
 // Player applies to become a TotalFooty referee
 // ══════════════════════════════════════════════════════════════
-app.post('/api/ref/apply', authenticateToken, registrationLimiter, async (req, res) => {
+app.post('/api/ref/apply', authenticateToken, express.json({ limit: '5mb' }), registrationLimiter, async (req, res) => {
     const { certifications, experience, license_doc } = req.body;
     if (!certifications || certifications.length < 5 || certifications.length > 1000)
         return res.status(400).json({ error: 'certifications required (5–1000 chars)' });
@@ -31111,35 +31229,35 @@ app.delete('/api/admin/coaching/sessions/:id', authenticateToken, requireSuperAd
 
 const METRIC_CONFIG = {
     1:  { name: 'Win Percentage',     icon: '📊', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Win %',           supportingLabel: 'Wins' },
-    2:  { name: 'Man of the Match',   icon: '⭐', category: 'core',  awardType: 'motm',             validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'MOTM Count',      supportingLabel: 'MOTM %' },
-    3:  { name: 'Win Count',          icon: '✅', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Wins',            supportingLabel: 'Win %' },
+    2:  { name: 'Man of the Match',   icon: '⭐', category: 'core',  awardType: 'motm',             validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'MOTM Count',      supportingLabel: null },
+    3:  { name: 'Win Count',          icon: '✅', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Wins',            supportingLabel: null },
     4:  { name: 'MOTM Percentage',    icon: '⭐', category: 'core',  awardType: 'motm',             validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'MOTM %',          supportingLabel: 'MOTM Count' },
     5:  { name: 'Appearances',        icon: '📅', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Appearances',     supportingLabel: null },
-    6:  { name: 'Brick Wall',         icon: '🧱', category: 'award', awardType: 'brick_wall',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Brick Wall',      supportingLabel: 'Brick Wall %' },
-    7:  { name: 'Best Engine',        icon: '🔋', category: 'award', awardType: 'best_engine',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Best Engine',     supportingLabel: 'Best Engine %' },
-    8:  { name: 'Reckless Tackler',   icon: '🚑', category: 'award', awardType: 'reckless_tackler', validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Reckless',        supportingLabel: 'Reckless %' },
-    9:  { name: 'Goal Scorer',        icon: '⚽', category: 'award', awardType: 'goalscorer',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Goals',           supportingLabel: 'Goal %' },
-    10: { name: 'Mr Hollywood',       icon: '🎬', category: 'award', awardType: 'mr_hollywood',     deprecated: true,  validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Hollywood',       supportingLabel: 'Hollywood %' },
-    11: { name: 'The Moaner',         icon: '😩', category: 'award', awardType: 'the_moaner',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Moans',           supportingLabel: 'Moan %' },
+    6:  { name: 'Brick Wall',         icon: '🧱', category: 'award', awardType: 'brick_wall',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Brick Wall',      supportingLabel: null },
+    7:  { name: 'Best Engine',        icon: '🔋', category: 'award', awardType: 'best_engine',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Best Engine',     supportingLabel: null },
+    8:  { name: 'Reckless Tackler',   icon: '🚑', category: 'award', awardType: 'reckless_tackler', validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Reckless',        supportingLabel: null },
+    9:  { name: 'Goal Scorer',        icon: '⚽', category: 'award', awardType: 'goalscorer',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Goals',           supportingLabel: null },
+    10: { name: 'Mr Hollywood',       icon: '🎬', category: 'award', awardType: 'mr_hollywood',     deprecated: true,  validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Hollywood',       supportingLabel: null },
+    11: { name: 'The Moaner',         icon: '😩', category: 'award', awardType: 'the_moaner',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Moans',           supportingLabel: null },
     // FIX-164: Howler un-deprecated as part of Awards Expansion (was deprecated in pre-Batch-5; re-enabled with a real award_type).
-    12: { name: 'Howler',             icon: '🤦‍♂️', category: 'award', awardType: 'howler',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Howlers',         supportingLabel: 'Howler %' },
-    13: { name: 'Donkey',             icon: '🫏', category: 'award', awardType: 'donkey',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Donkey',          supportingLabel: 'Donkey %' },
-    14: { name: 'Dropouts',           icon: '🚪', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Dropouts',        supportingLabel: 'Dropout %' },
+    12: { name: 'Howler',             icon: '🤦‍♂️', category: 'award', awardType: 'howler',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Howlers',         supportingLabel: null },
+    13: { name: 'Donkey',             icon: '🫏', category: 'award', awardType: 'donkey',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Donkey',          supportingLabel: null },
+    14: { name: 'Dropouts',           icon: '🚪', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Dropouts',        supportingLabel: null },
     15: { name: 'Guest Signups',      icon: '👥', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Guest Signups',   supportingLabel: 'Per Game' },
     16: { name: 'Discipline Points',  icon: '⚖️', category: 'core',  awardType: null,               validCalcTypes: ['most','most_per_game','most_consecutive'],                           primaryLabel: 'Disc. Points',    supportingLabel: 'Per Game' },
-    17: { name: 'Tournament Wins',    icon: '🏆', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Tournament Wins', supportingLabel: 'Win %' },
-    18: { name: 'External Game Wins', icon: '🆚', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'External Wins',   supportingLabel: 'Win %' },
+    17: { name: 'Tournament Wins',    icon: '🏆', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'Tournament Wins', supportingLabel: null },
+    18: { name: 'External Game Wins', icon: '🆚', category: 'core',  awardType: null,               validCalcTypes: ['most','least','most_consecutive'],                                  primaryLabel: 'External Wins',   supportingLabel: null },
     // NEW (Batch 5 awards revamp)
-    19: { name: 'Cold Moment',        icon: '🥶', category: 'award', awardType: 'cold_moment',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Cold',            supportingLabel: 'Cold %' },
-    20: { name: 'Walker',             icon: '🚶‍♂️', category: 'award', awardType: 'walker',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Walker',          supportingLabel: 'Walker %' },
-    21: { name: 'Pig',                icon: '🐷', category: 'award', awardType: 'pig',              validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Pig',             supportingLabel: 'Pig %' },
+    19: { name: 'Cold Moment',        icon: '🥶', category: 'award', awardType: 'cold_moment',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Cold',            supportingLabel: null },
+    20: { name: 'Walker',             icon: '🚶‍♂️', category: 'award', awardType: 'walker',           validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Walker',          supportingLabel: null },
+    21: { name: 'Pig',                icon: '🐷', category: 'award', awardType: 'pig',              validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Pig',             supportingLabel: null },
     // FIX-164: Awards Expansion — 6 new metrics for series trophies (Howler is at slot 12, un-deprecated above)
-    22: { name: 'Controlled The Game', icon: '🎮', category: 'award', awardType: 'controlled',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Controlled',     supportingLabel: 'Controlled %' },
-    23: { name: 'TF Ledge',            icon: '🦸‍♂️', category: 'award', awardType: 'tf_ledge',         validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'TF Ledge',       supportingLabel: 'TF Ledge %' },
-    24: { name: 'Assist King',         icon: '🅰️', category: 'award', awardType: 'assist_king',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Assists',        supportingLabel: 'Assist %' },
-    25: { name: 'Lucky Bastard',       icon: '🍀', category: 'award', awardType: 'lucky_bastard',    validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Lucky',          supportingLabel: 'Lucky %' },
-    26: { name: 'Invisible Man',       icon: '😶‍🌫️', category: 'award', awardType: 'invisible_man',    validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Invisible',      supportingLabel: 'Invisible %' },
-    27: { name: 'Lost',                icon: '🗺️', category: 'award', awardType: 'lost',             validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Lost',           supportingLabel: 'Lost %' },
+    22: { name: 'Controlled The Game', icon: '🎮', category: 'award', awardType: 'controlled',       validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Controlled',     supportingLabel: null },
+    23: { name: 'TF Ledge',            icon: '🦸‍♂️', category: 'award', awardType: 'tf_ledge',         validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'TF Ledge',       supportingLabel: null },
+    24: { name: 'Assist King',         icon: '🅰️', category: 'award', awardType: 'assist_king',      validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Assists',        supportingLabel: null },
+    25: { name: 'Lucky Bastard',       icon: '🍀', category: 'award', awardType: 'lucky_bastard',    validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Lucky',          supportingLabel: null },
+    26: { name: 'Invisible Man',       icon: '😶‍🌫️', category: 'award', awardType: 'invisible_man',    validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Invisible',      supportingLabel: null },
+    27: { name: 'Lost',                icon: '🗺️', category: 'award', awardType: 'lost',             validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Lost',           supportingLabel: null },
 };
 
 function deriveTier(seriesType, avgStarRating) {
@@ -31320,7 +31438,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
         const r = await pool.query(`
             WITH ${appearancesCte},
             pm AS (
-                SELECT ga.recipient_player_id AS player_id, COUNT(*) AS motm_count
+                SELECT ga.recipient_player_id AS player_id, SUM(ga.motm_value) AS motm_count
                 FROM game_awards ga JOIN games g ON g.id = ga.game_id
                 WHERE g.series_id = $1 AND g.game_status = 'completed' AND ga.award_type = 'motm'
                 GROUP BY ga.recipient_player_id
@@ -31609,13 +31727,29 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
 //   Tick every hour; if it's the 1st of the month and we haven't processed
 //   the previous month yet, run it. Idempotent via monthly_trophy_runs UNIQUE.
 
+// FIX-234: Monthly trophies overhaul — 14 metrics with per-trophy min_games AND
+// min_awards eligibility. Minimums are deliberately LOW (1–4) because monthly
+// has only ~4 games per region, so series-style minimums (8+) would exclude
+// most players. Schema migration 04 adds eligibility_min_awards column.
+//
+// All metrics use calc_type='most' (raw counts) — the move away from %-based
+// metrics is intentional. Trophy displays no longer surface % supporting stats.
 const MONTHLY_METRICS = [
-    { metric_id: 1,  calc_type: 'most',          min_games: 4 },  // Win %
-    { metric_id: 2,  calc_type: 'most',          min_games: 0 },  // MOTM
-    { metric_id: 5,  calc_type: 'most',          min_games: 0 },  // Appearances
-    { metric_id: 9,  calc_type: 'most_per_game', min_games: 4 },  // Goals/Game
-    { metric_id: 13, calc_type: 'most',          min_games: 0 },  // Donkey
-    { metric_id: 16, calc_type: 'most',          min_games: 0 },  // Discipline
+    // (metric_id, calc_type, min_games, min_awards)
+    { metric_id: 1,  calc_type: 'most', min_games: 4, min_awards: 0 },  // Win %         — keeps % primary
+    { metric_id: 2,  calc_type: 'most', min_games: 2, min_awards: 0 },  // MOTM (uses SUM(motm_value) — tied = 0.5)
+    { metric_id: 3,  calc_type: 'most', min_games: 2, min_awards: 0 },  // Win Count
+    { metric_id: 5,  calc_type: 'most', min_games: 2, min_awards: 0 },  // Appearances
+    { metric_id: 6,  calc_type: 'most', min_games: 2, min_awards: 2 },  // Brick Wall
+    { metric_id: 7,  calc_type: 'most', min_games: 2, min_awards: 2 },  // Best Engine
+    { metric_id: 9,  calc_type: 'most', min_games: 2, min_awards: 2 },  // Goal Scorer (count, NOT rate — was 'most_per_game')
+    { metric_id: 11, calc_type: 'most', min_games: 1, min_awards: 1 },  // The Moaner
+    { metric_id: 13, calc_type: 'most', min_games: 1, min_awards: 1 },  // Donkey
+    { metric_id: 16, calc_type: 'most', min_games: 1, min_awards: 0 },  // Discipline Points
+    { metric_id: 19, calc_type: 'most', min_games: 1, min_awards: 1 },  // Cold Moment
+    { metric_id: 20, calc_type: 'most', min_games: 1, min_awards: 1 },  // Walker
+    { metric_id: 21, calc_type: 'most', min_games: 1, min_awards: 1 },  // Pig
+    { metric_id: 24, calc_type: 'most', min_games: 2, min_awards: 2 },  // Assist King
 ];
 
 const MONTHLY_REGIONS = [
@@ -31636,7 +31770,7 @@ const MONTHLY_REGIONS = [
 // from `g.series_id = $1` to a year/month/region triple.
 //
 // Returns array of: { player_id, player_name, appearances, primary_stat, supporting_stat }
-async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, minGames) {
+async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, minGames, minAwards = 0) {
     const id = parseInt(metricId);
     const cfg = METRIC_CONFIG[id];
     if (!cfg) return [];
@@ -31669,8 +31803,18 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
 
     const minGamesFilter = minGames > 0 ? `WHERE ac.appearances >= ${parseInt(minGames)}` : '';
 
-    // ── METRIC 1: Win Percentage ───────────────────────────────────────────
+    // ── min_awards filter: applied to award-based award_count CTEs.
+    // For metrics where primary_stat is the count (calc='most'), this filters
+    // by `award_count >= minAwards`. For Win-count metrics, it applies to wins.
+    const minAwardsThreshold = Math.max(1, parseInt(minAwards) || 0);  // always >= 1 to suppress zeros
+    const awardCountFilter = minAwards > 0
+        ? `WHERE COALESCE(pX.award_count,0) >= ${minAwardsThreshold}`
+        : `WHERE COALESCE(pX.award_count,0) > 0`;
+
+    // ── METRIC 1: Win Percentage (primary=Win %, supporting=wins) ──────────
     if (id === 1) {
+        const winsThreshold = Math.max(1, parseInt(minAwards) || 0);
+        const minAwardsClause = minAwards > 0 ? `AND COALESCE(pw.win_count,0) >= ${winsThreshold}` : '';
         const r = await pool.query(`
             WITH ${appearancesCte},
             pw AS (
@@ -31689,17 +31833,19 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
                    COALESCE(pw.win_count,0)::numeric AS supporting_stat
             FROM app_counts ac LEFT JOIN pw ON pw.player_id = ac.player_id
             ${minGamesFilter}
+            ${minGamesFilter ? minAwardsClause : (minAwards > 0 ? 'WHERE ' + minAwardsClause.slice(4) : '')}
             ORDER BY primary_stat DESC NULLS LAST, ac.appearances DESC
             LIMIT 10`, params);
         return r.rows;
     }
 
-    // ── METRIC 2: MOTM Count ───────────────────────────────────────────────
+    // ── METRIC 2: MOTM Count (uses SUM(motm_value) so tied = 0.5 each) ─────
     if (id === 2) {
+        const motmThreshold = Math.max(1, parseInt(minAwards) || 1);
         const r = await pool.query(`
             WITH ${appearancesCte},
             pm AS (
-                SELECT ga.recipient_player_id AS player_id, COUNT(*) AS motm_count
+                SELECT ga.recipient_player_id AS player_id, SUM(ga.motm_value) AS motm_count
                 FROM game_awards ga
                 JOIN games g ON g.id = ga.game_id
                 ${regionJoin}
@@ -31708,10 +31854,38 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             )
             SELECT ac.player_id, ac.player_name, ac.appearances,
                    COALESCE(pm.motm_count,0)::numeric AS primary_stat,
-                   ROUND(COALESCE(pm.motm_count,0)*100.0/NULLIF(ac.appearances,0),1) AS supporting_stat
+                   NULL::numeric AS supporting_stat
             FROM app_counts ac LEFT JOIN pm ON pm.player_id = ac.player_id
-            WHERE COALESCE(pm.motm_count,0) > 0
+            WHERE COALESCE(pm.motm_count,0) >= ${motmThreshold}
+              ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY primary_stat DESC, ac.appearances ASC
+            LIMIT 10`, params);
+        return r.rows;
+    }
+
+    // ── METRIC 3: Win Count (primary=wins) ─────────────────────────────────
+    if (id === 3) {
+        const winsThreshold = Math.max(1, parseInt(minAwards) || 1);
+        const r = await pool.query(`
+            WITH ${appearancesCte},
+            pw3 AS (
+                SELECT r.player_id, COUNT(*) AS win_count
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                JOIN team_players tp ON tp.player_id = r.player_id
+                JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                ${regionJoin}
+                WHERE r.status = 'confirmed' AND ${scopeFilter}
+                  AND LOWER(t.team_name) = LOWER(g.winning_team)
+                GROUP BY r.player_id
+            )
+            SELECT ac.player_id, ac.player_name, ac.appearances,
+                   COALESCE(pw3.win_count,0)::numeric AS primary_stat,
+                   NULL::numeric AS supporting_stat
+            FROM app_counts ac LEFT JOIN pw3 ON pw3.player_id = ac.player_id
+            WHERE COALESCE(pw3.win_count,0) >= ${winsThreshold}
+              ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
+            ORDER BY primary_stat DESC, ac.appearances DESC
             LIMIT 10`, params);
         return r.rows;
     }
@@ -31724,62 +31898,54 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
                    appearances AS primary_stat,
                    NULL::numeric AS supporting_stat
             FROM app_counts
+            ${minGames > 0 ? `WHERE appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY appearances DESC
             LIMIT 10`, params);
         return r.rows;
     }
 
-    // ── METRIC 9: Goal Scorer (most_per_game) ─────────────────────────────
-    // Mirrors calcSeriesLeaderboard award-metric percentage formula. primary_stat
-    // is the % of games the player won the goalscorer award. supporting_stat is
-    // the raw count. Min-games eligibility filter from A3 decisions.
-    if (id === 9) {
+    // ── METRICS 6, 7, 9, 11, 13, 19, 20, 21, 24: Award-count metrics ──────
+    // Unified branch — primary_stat = count of award_type X, supporting = NULL.
+    // calc_type='most' assumed (we no longer support most_per_game in monthly).
+    const AWARD_TYPE_BY_METRIC = {
+        6:  'brick_wall',
+        7:  'best_engine',
+        9:  'goalscorer',
+        11: 'the_moaner',
+        13: 'donkey',
+        19: 'cold_moment',
+        20: 'walker',
+        21: 'pig',
+        24: 'assist_king',
+    };
+    if (AWARD_TYPE_BY_METRIC[id]) {
+        const awardType = AWARD_TYPE_BY_METRIC[id];
+        const threshold = Math.max(1, parseInt(minAwards) || 1);
         const r = await pool.query(`
             WITH ${appearancesCte},
-            pg9 AS (
+            pa AS (
                 SELECT ga.recipient_player_id AS player_id, COUNT(*) AS award_count
                 FROM game_awards ga
                 JOIN games g ON g.id = ga.game_id
                 ${regionJoin}
-                WHERE ga.award_type = 'goalscorer' AND ${scopeFilter}
+                WHERE ga.award_type = '${awardType}' AND ${scopeFilter}
                 GROUP BY ga.recipient_player_id
             )
             SELECT ac.player_id, ac.player_name, ac.appearances,
-                   ROUND(COALESCE(pg9.award_count,0)*100.0/NULLIF(ac.appearances,0),1) AS primary_stat,
-                   COALESCE(pg9.award_count,0)::numeric AS supporting_stat
-            FROM app_counts ac LEFT JOIN pg9 ON pg9.player_id = ac.player_id
-            ${minGamesFilter}
-            ORDER BY primary_stat DESC NULLS LAST, ac.appearances DESC
-            LIMIT 10`, params);
-        return r.rows;
-    }
-
-    // ── METRIC 13: Donkey Count ────────────────────────────────────────────
-    if (id === 13) {
-        const r = await pool.query(`
-            WITH ${appearancesCte},
-            pd AS (
-                SELECT ga.recipient_player_id AS player_id, COUNT(*) AS award_count
-                FROM game_awards ga
-                JOIN games g ON g.id = ga.game_id
-                ${regionJoin}
-                WHERE ga.award_type = 'donkey' AND ${scopeFilter}
-                GROUP BY ga.recipient_player_id
-            )
-            SELECT ac.player_id, ac.player_name, ac.appearances,
-                   COALESCE(pd.award_count,0)::numeric AS primary_stat,
-                   ROUND(COALESCE(pd.award_count,0)*100.0/NULLIF(ac.appearances,0),1) AS supporting_stat
-            FROM app_counts ac LEFT JOIN pd ON pd.player_id = ac.player_id
-            WHERE COALESCE(pd.award_count,0) > 0
+                   COALESCE(pa.award_count,0)::numeric AS primary_stat,
+                   NULL::numeric AS supporting_stat
+            FROM app_counts ac LEFT JOIN pa ON pa.player_id = ac.player_id
+            WHERE COALESCE(pa.award_count,0) >= ${threshold}
+              ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY primary_stat DESC, ac.appearances ASC
             LIMIT 10`, params);
         return r.rows;
     }
 
     // ── METRIC 16: Discipline Points ───────────────────────────────────────
-    // Uses discipline_records table (separate from registrations) — matches
-    // calcSeriesLeaderboard's discipline branch exactly.
+    // Threshold applies to total points (treats minAwards as min total points).
     if (id === 16) {
+        const ptsThreshold = Math.max(1, parseInt(minAwards) || 1);
         const r = await pool.query(`
             WITH ${appearancesCte},
             pdisc AS (
@@ -31792,9 +31958,10 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             )
             SELECT ac.player_id, ac.player_name, ac.appearances,
                    COALESCE(pdisc.disc_total,0)::numeric AS primary_stat,
-                   ROUND(COALESCE(pdisc.disc_total,0)*1.0/NULLIF(ac.appearances,0),2) AS supporting_stat
+                   NULL::numeric AS supporting_stat
             FROM app_counts ac LEFT JOIN pdisc ON pdisc.player_id = ac.player_id
-            WHERE COALESCE(pdisc.disc_total,0) > 0
+            WHERE COALESCE(pdisc.disc_total,0) >= ${ptsThreshold}
+              ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY primary_stat DESC, ac.appearances ASC
             LIMIT 10`, params);
         return r.rows;
@@ -31847,7 +32014,7 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
             for (const region of MONTHLY_REGIONS) {
                 for (const m of MONTHLY_METRICS) {
                     const leaderboard = await calcMonthlyLeaderboard(
-                        year, month, region, m.metric_id, m.calc_type, m.min_games
+                        year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards
                     );
 
                     // Skip if zero qualifying players
@@ -31856,10 +32023,10 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
                     // Insert trophy definition
                     const trophyRow = await client.query(
                         `INSERT INTO monthly_trophies
-                         (year, month, region, metric_id, calculation_type, eligibility_min_games)
-                         VALUES ($1, $2, $3, $4, $5, $6)
+                         (year, month, region, metric_id, calculation_type, eligibility_min_games, eligibility_min_awards)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)
                          RETURNING id`,
-                        [year, month, region, m.metric_id, m.calc_type, m.min_games]
+                        [year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards || 0]
                     );
                     const trophyId = trophyRow.rows[0].id;
 
@@ -31973,7 +32140,7 @@ app.get('/api/monthly-trophies/:year/:month', async (req, res) => {
 
         const trophiesRows = await pool.query(`
             SELECT mt.id, mt.region, mt.metric_id, mt.calculation_type,
-                   mt.eligibility_min_games, mt.finalized_at
+                   mt.eligibility_min_games, mt.eligibility_min_awards, mt.finalized_at
             FROM monthly_trophies mt
             WHERE mt.year = $1 AND mt.month = $2 ${filter}
             ORDER BY mt.region, mt.metric_id`,
@@ -32002,6 +32169,7 @@ app.get('/api/monthly-trophies/:year/:month', async (req, res) => {
                 primary_label: cfg ? cfg.primaryLabel : '',
                 supporting_label: cfg ? cfg.supportingLabel : '',
                 eligibility_min_games: t.eligibility_min_games,
+                eligibility_min_awards: t.eligibility_min_awards,
                 finalized_at: t.finalized_at,
                 results: resultsRows.rows.map(r => ({
                     rank: r.rank,
