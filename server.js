@@ -1007,12 +1007,15 @@ function starClassFromRating(starRating) {
 //     0★ / 1★ / 2★ / 3★ stay dynamic — admin may have under-estimated at creation,
 //     and a 0★ game should be able to recover to 0.5★+ once the squad fills out.
 //   - Only runs once ≥ 8 confirmed players are signed up
+//   - FIX-242: boundaries shifted DOWN 1 OVR — every game gets +1★ vs the
+//     previous bands. Reflects calibration feedback that real-world games
+//     were over-classified as 1★ when they weren't actually that bad.
 //   - Uniform half-star boundaries (0.5 OVR = 0.5 star):
-//       <84        → 0★
-//       [84,84.5)  → 0.5★      [84.5,85)  → 1★      [85,85.5)  → 1.5★
-//       [85.5,86)  → 2★        [86,86.5)  → 2.5★    [86.5,87)  → 3★
-//       [87,87.5)  → 3.5★      [87.5,88)  → 4★      [88,88.5)  → 4.5★
-//       ≥88.5      → 5★
+//       <83        → 0★
+//       [83,83.5)  → 0.5★      [83.5,84)  → 1★      [84,84.5)  → 1.5★
+//       [84.5,85)  → 2★        [85,85.5)  → 2.5★    [85.5,86)  → 3★
+//       [86,86.5)  → 3.5★      [86.5,87)  → 4★      [87,87.5)  → 4.5★
+//       ≥87.5      → 5★
 //   - DB column games.star_rating is numeric(3,1) — supports half-star values.
 //   - Called non-critically (never throws to caller)
 async function reviewDynamicStarRating(pool, gameId) {
@@ -1071,11 +1074,13 @@ async function reviewDynamicStarRating(pool, gameId) {
         if (isNaN(avgOvr)) return; // No OVR data — leave rating unchanged
 
         // Map avg OVR → star rating (half-step).
-        // Formula: floor((avg - 84) * 2 + 1) / 2, clamped to [0, 5]
-        //   avg=83 → -1  → clamp → 0       avg=84   → 0.5      avg=84.5 → 1
-        //   avg=85 → 1.5                    avg=86   → 2.5      avg=87   → 3.5
-        //   avg=88 → 4.5                    avg=88.5 → 5        avg=90   → clamp → 5
-        let newStars = Math.floor((avgOvr - 84) * 2 + 1) / 2;
+        // Formula: floor((avg - 83) * 2 + 1) / 2, clamped to [0, 5]
+        // FIX-242: shift OVR baseline from 84 to 83 — every avg OVR now produces
+        // +1★ vs previous bands. Examples (post-shift):
+        //   avg=82 → -1   → clamp → 0       avg=83   → 0.5      avg=83.5 → 1
+        //   avg=84 → 1.5                    avg=85   → 2.5      avg=86   → 3.5
+        //   avg=87 → 4.5                    avg=87.5 → 5        avg=90   → clamp → 5
+        let newStars = Math.floor((avgOvr - 83) * 2 + 1) / 2;
         if (newStars < 0) newStars = 0;
         if (newStars > 5) newStars = 5;
 
@@ -3961,7 +3966,7 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
         const selectFields = `
             g.id, g.game_url, g.game_date, g.game_status, g.format, g.cost_per_player,
             g.exclusivity, g.star_rating, g.star_rating_locked, g.team_selection_type,
-            g.max_players,
+            g.max_players, g.teams_generated,
             v.name AS venue_name, v.region AS venue_region,
             v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
             ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
@@ -4018,11 +4023,14 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
         }
 
         // Recently-completed games — descending (most recent first)
+        // FIX-238: also include 'confirmed' games whose date passed but haven't
+        // been marked completed (limbo state). Mirrors V2 timeline behaviour.
         const completedRows = await pool.query(`
             SELECT ${selectFields}
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
-            WHERE g.game_status = 'completed'
+            WHERE g.game_date < CURRENT_TIMESTAMP
+              AND g.game_status IN ('completed','confirmed')
               ${regionClause}
               ${badgeFilter}
             ORDER BY g.game_date DESC
@@ -4305,6 +4313,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             g.cost_per_player, g.early_bird_price, g.super_early_bird_price,
             g.max_players, g.star_rating, g.exclusivity,
             g.team_selection_type, g.tournament_name, g.external_opponent,
+            g.teams_generated,
             opp.logo_url AS opponent_logo_url,
             v.name AS venue_name, v.region AS region,
             v.background_image_filename AS venue_background_image,
@@ -4313,7 +4322,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
             ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
               + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))         AS current_players,
-            (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1)
+            (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1)
                                                                                   AS my_status
         `;  /* Bug fix: vs_external/tournament games now show team logo not venue image (matches games modal) */
 
@@ -4335,14 +4344,19 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
         `;
 
         // ── PAST window (descending — most recent first; no tier limit) ──
+        // FIX-238: include 'confirmed' games whose date has passed but haven't
+        // been marked completed yet (limbo state — teams generated, game played,
+        // results not yet entered). Frontend renders these with a "TEAMS READY"
+        // badge so player can find them. Available games with past dates are
+        // intentionally excluded — those never filled and would clutter.
         const pastSql = `
             SELECT ${baseSelect}
             FROM games g
             LEFT JOIN venues v       ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
             LEFT JOIN opponents opp ON opp.id = g.opponent_id
-            WHERE g.game_status = 'completed'
-              AND g.game_date < CURRENT_TIMESTAMP
+            WHERE g.game_date < CURRENT_TIMESTAMP
+              AND g.game_status IN ('completed','confirmed')
               ${regionClause}
               ${searchClause}
               ${badgeFilter}
@@ -4446,7 +4460,16 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             games,
         });
     } catch (error) {
-        console.error('GET /api/dashboard/timeline error:', error.message);
+        // FIX-237: rich diagnostic log — when a player hits this, we can grep
+        // Render logs by player ID to see exactly what they sent + the SQL
+        // error code. .stack first so the deepest cause is visible.
+        console.error('GET /api/dashboard/timeline error:',
+            'player=' + (req.user?.playerId || 'anon'),
+            'region=' + (req.query?.region || '<auto>'),
+            'search=' + (req.query?.search || ''),
+            'msg=' + error.message,
+            'code=' + (error.code || ''),
+            error.stack ? '\n' + error.stack.split('\n').slice(0, 4).join('\n') : '');
         res.status(500).json({ error: 'Failed to load timeline' });
     }
 });
@@ -5989,11 +6012,11 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
-                   (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1) as registration_status,
-                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $1) as my_backup_type,
+                   (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1) as registration_status,
+                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1) as my_backup_type,
                    -- P2.3: amount paid by current user (drives drop-out "you'll lose £X" dialog)
-                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $1), 0) as my_amount_paid,
-                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $1), 0) as my_amount_paid_free,
+                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1), 0) as my_amount_paid,
+                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1), 0) as my_amount_paid_free,
                    motm_p.alias as motm_winner_alias, motm_p.full_name as motm_winner_name,
                    opp_list.logo_url AS opponent_logo_url, opp_list.star_rating AS opponent_star_rating
             FROM games g
@@ -6259,11 +6282,11 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                    ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count,
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
-                   (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2) as registration_status,
-                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2) as my_backup_type,
+                   (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1) as registration_status,
+                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1) as my_backup_type,
                    -- P2.3: amount paid by current user (drives drop-out penalty dialog in game.html)
-                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $2), 0) as my_amount_paid,
-                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $2), 0) as my_amount_paid_free
+                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1), 0) as my_amount_paid,
+                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1), 0) as my_amount_paid_free
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
@@ -7630,6 +7653,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 -- Batch 8: derive positions + position_preference from position_classification
                 CASE WHEN gg.position_classification = 'gk' THEN 'GK' ELSE 'Outfield' END as positions,
                 CASE WHEN gg.position_classification = 'gk' THEN 'GK' ELSE 'outfield' END as position_preference,
+                NULL::text as position_areas,
                 gg.position_classification,
                 NULL::text as tournament_team_preference,
                 gg.team_name,
@@ -17004,6 +17028,9 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
         const isDraftMemory = team_selection_type === 'draft_memory' && series_id;
         
         // Get registered players — for draft_memory games, also join fixed team memory
+        // FIX-240: also return backups (status='backup'), with backup_type so the
+        // frontend can split into 3 sections (confirmed_backup / gk_backup / normal).
+        // Confirmed registrations are sorted to the top via the ORDER BY status clause.
         const playersResult = await pool.query(`
             SELECT 
                 p.id,
@@ -17016,25 +17043,36 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                 p.total_wins,
                 p.total_draws,
                 p.reliability_tier,
+                p.is_organiser,
                 r.position_preference,
+                r.position_areas,
                 r.registered_at,
+                r.status,
+                r.backup_type,
                 ${isDraftMemory ? 'pft.fixed_team' : 'NULL::text AS fixed_team'},
                 (SELECT json_agg(json_build_object('name', b.name, 'icon', b.icon))
                  FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
             FROM registrations r
             JOIN players p ON p.id = r.player_id
             ${isDraftMemory ? `LEFT JOIN player_fixed_teams pft ON pft.player_id = p.id AND pft.series_id = $2` : ''}
-            WHERE r.game_id = $1 AND r.status = 'confirmed'
+            WHERE r.game_id = $1 AND r.status IN ('confirmed','backup')
             GROUP BY p.id, p.full_name, p.alias, p.squad_number, p.photo_url, 
                      p.total_appearances, p.motm_wins, p.total_wins, p.total_draws, p.reliability_tier,
-                     r.position_preference, r.registered_at
+                     p.is_organiser,
+                     r.position_preference, r.position_areas, r.registered_at, r.status, r.backup_type
                      ${isDraftMemory ? ', pft.fixed_team' : ''}
             ORDER BY
+                CASE r.status WHEN 'confirmed' THEN 0 WHEN 'backup' THEN 1 ELSE 2 END ASC,
+                CASE r.backup_type
+                     WHEN 'confirmed_backup' THEN 0
+                     WHEN 'gk_backup'        THEN 1
+                     WHEN 'normal_backup'    THEN 2
+                     ELSE 3 END ASC,
                 CASE WHEN p.squad_number IS NOT NULL THEN 0 ELSE 1 END ASC,
                 p.squad_number ASC NULLS LAST,
                 p.motm_wins DESC NULLS LAST,
                 p.total_appearances DESC NULLS LAST
-            LIMIT 50
+            LIMIT 100
         `, isDraftMemory ? [gameId, series_id] : [gameId]);
         
         // Append guests so they appear on the public game page
@@ -17052,6 +17090,7 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                 NULL::text as reliability_tier,
                 -- Batch 8: derive from real position_classification
                 CASE WHEN gg.position_classification = 'gk' THEN 'GK' ELSE 'outfield' END as position_preference,
+                NULL::text as position_areas,
                 gg.position_classification,
                 gg.overall_rating,
                 gg.relative_rating,
@@ -17067,6 +17106,11 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
                 gg.derived_from_parent_ovr,
                 NULL::text as fixed_team,
                 NULL::json as badges,
+                -- FIX-240: status/backup_type so the public players consumer can
+                -- filter alongside registrations. Guests are always "confirmed".
+                'confirmed'::text as status,
+                NULL::text as backup_type,
+                FALSE as is_organiser,
                 TRUE as is_guest
             FROM game_guests gg
             WHERE gg.game_id = $1
@@ -31258,6 +31302,11 @@ const METRIC_CONFIG = {
     25: { name: 'Lucky Bastard',       icon: '🍀', category: 'award', awardType: 'lucky_bastard',    validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Lucky',          supportingLabel: null },
     26: { name: 'Invisible Man',       icon: '😶‍🌫️', category: 'award', awardType: 'invisible_man',    validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Invisible',      supportingLabel: null },
     27: { name: 'Lost',                icon: '🗺️', category: 'award', awardType: 'lost',             validCalcTypes: ['most','least','most_per_game','least_per_game','most_consecutive'],  primaryLabel: 'Lost',           supportingLabel: null },
+    // FIX-241: Ref-performance metrics. Computed from referee_reviews/game_referees,
+    // not awards or registrations. Primary stat = avg final_rating across the
+    // month; supporting = number of finalised reviewed games.
+    28: { name: 'Best Ref',            icon: '👮‍♂️📈', category: 'core', awardType: null,                validCalcTypes: ['most'],   primaryLabel: 'Avg Score',      supportingLabel: 'Reviewed Games' },
+    29: { name: 'Worst Ref',           icon: '👮‍♂️📉', category: 'core', awardType: null,                validCalcTypes: ['least'],  primaryLabel: 'Avg Score',      supportingLabel: 'Reviewed Games' },
 };
 
 function deriveTier(seriesType, avgStarRating) {
@@ -31750,6 +31799,11 @@ const MONTHLY_METRICS = [
     { metric_id: 20, calc_type: 'most', min_games: 1, min_awards: 1 },  // Walker
     { metric_id: 21, calc_type: 'most', min_games: 1, min_awards: 1 },  // Pig
     { metric_id: 24, calc_type: 'most', min_games: 2, min_awards: 2 },  // Assist King
+    // FIX-241: Ref metrics. min_games here = min REVIEWED games (not appearances).
+    // The calc branch below also requires each counted game to have >=3 reviews
+    // (per spec: review_count >= 3 to be statistically meaningful).
+    { metric_id: 28, calc_type: 'most',  min_games: 1, min_awards: 0 }, // Best Ref  — highest avg
+    { metric_id: 29, calc_type: 'least', min_games: 1, min_awards: 0 }, // Worst Ref — lowest avg
 ];
 
 const MONTHLY_REGIONS = [
@@ -31963,6 +32017,46 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             WHERE COALESCE(pdisc.disc_total,0) >= ${ptsThreshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY primary_stat DESC, ac.appearances ASC
+            LIMIT 10`, params);
+        return r.rows;
+    }
+
+    // ── METRICS 28 / 29: Best Ref / Worst Ref ──────────────────────────────
+    // Avg of game_referees.final_rating across the month, restricted to games
+    // where the ref's review_count >= 3 (statistical floor — fewer reviews
+    // is too noisy for a trophy-grade ranking).
+    // Primary stat: avg rating (rounded to 2dp).
+    // Supporting stat: count of qualifying reviewed games.
+    // calc_type 'most' (id=28) = highest avg wins; 'least' (id=29) = lowest avg wins.
+    // FIX-241: distinct from all other monthly metrics — no appearances CTE
+    // needed (refs don't appear in registrations.r.status='confirmed' for the
+    // games they ref). Min reviewed games threshold replaces it.
+    if (id === 28 || id === 29) {
+        const minReviewedGames = Math.max(1, parseInt(minGames) || 1);
+        const sortDir = (id === 28) ? 'DESC' : 'ASC';
+        const r = await pool.query(`
+            WITH ref_games AS (
+                SELECT gr.player_id,
+                       gr.final_rating::numeric AS rating
+                FROM game_referees gr
+                JOIN games g ON g.id = gr.game_id
+                ${regionJoin}
+                WHERE ${scopeFilter}
+                  AND gr.status = 'confirmed'
+                  AND gr.player_id IS NOT NULL
+                  AND gr.final_rating IS NOT NULL
+                  AND gr.review_count >= 3
+            )
+            SELECT rg.player_id,
+                   COALESCE(p.alias, p.full_name) AS player_name,
+                   COUNT(*)::int                    AS appearances,
+                   ROUND(AVG(rg.rating)::numeric,2) AS primary_stat,
+                   COUNT(*)::numeric                AS supporting_stat
+            FROM ref_games rg
+            JOIN players p ON p.id = rg.player_id
+            GROUP BY rg.player_id, COALESCE(p.alias, p.full_name)
+            HAVING COUNT(*) >= ${minReviewedGames}
+            ORDER BY primary_stat ${sortDir}, COUNT(*) DESC
             LIMIT 10`, params);
         return r.rows;
     }
