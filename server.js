@@ -1502,6 +1502,13 @@ const NOTIF_TEMPLATES = {
     award_reckless_tackler_badge: _d => ({ title: '🚑 Reckless Tackler Badge Earned!', body: '3 Reckless Tackler awards — the badge is now on your profile. Calm down.' }),
     // FIX-165: award_goalscorer email template (was missing — Goalscorer winners got no email pre-FIX-165)
     award_goalscorer:     d => ({ title: '⚽ Goalscorer!',               body: `You won Goalscorer for ${d.day} at ${d.venue}. Got on the scoresheet.` }),
+    // Awards Expansion v2 — Turtle / Secret Agent / Butterfingers (banter, non-silent)
+    award_turtle:         d => ({ title: '🐢 The Turtle',                body: `You won The Turtle for ${d.day}. Bring your running shoes next time!` }),
+    award_secret_agent:   d => ({ title: '🤵 The Secret Agent',          body: `You won The Secret Agent for ${d.day}. Traitor!` }),
+    award_butterfingers:  d => ({ title: '🧈 Butterfingers',             body: `You won The Butterfingers for ${d.day}. Keep going and Arteta will play you in the League Cup.` }),
+    award_turtle_badge:        _d => ({ title: '🐢 Turtle Badge Earned!',         body: '3 Turtle awards — the Turtle Badge is now on your profile. Pick up the pace.' }),
+    award_secret_agent_badge:  _d => ({ title: '🤵 Secret Agent Badge Earned!',   body: '3 Secret Agent awards — the Secret Agent Badge is now on your profile. Pick a side.' }),
+    award_butterfingers_badge: _d => ({ title: '🧈 Butterfingers Badge Earned!',  body: '3 Butterfingers awards — the Butterfingers Badge is now on your profile. Hands of stone.' }),
     // P2.3 — alert to GAFFA on late drop-out
     late_dropout_alert: d => ({
         title: '🚨 Late drop-out',
@@ -18319,12 +18326,15 @@ const AWARD_TYPES = [
     'walker', 'pig',
     // FIX-164: Awards Expansion — 7 new awards (3 positive, 4 banter)
     'controlled', 'tf_ledge', 'assist_king',
-    'howler', 'lucky_bastard', 'invisible_man', 'lost'
+    'howler', 'lucky_bastard', 'invisible_man', 'lost',
+    // Awards Expansion v2 — Turtle/Secret Agent/Butterfingers (banter, non-silent)
+    'turtle', 'secret_agent', 'butterfingers',
 ];
 const POSITIVE_AWARDS = ['motm','best_engine','brick_wall','goalscorer','cold_moment',
     'controlled','tf_ledge','assist_king']; // FIX-164
 const BANTER_AWARDS   = ['reckless_tackler','the_moaner','donkey','walker','pig',
-    'howler','lucky_bastard','invisible_man','lost']; // FIX-164
+    'howler','lucky_bastard','invisible_man','lost',
+    'turtle','secret_agent','butterfingers']; // Awards Expansion v2
 const MIN_VOTES_REQUIRED = 3; // default for all awards except MOTM
 // FIX-164: assist_king set to 2 (mirrors goalscorer — multiple winners possible per game)
 const AWARD_MIN_VOTES = { goalscorer: 2, assist_king: 2 };
@@ -18387,6 +18397,13 @@ async function sendAwardEmail(playerId, awardType, extraData = {}) {
             howler_badge:      'award_howler_badge',
             lucky_bastard_badge: 'award_lucky_bastard_badge',
             reckless_tackler_badge: 'award_reckless_tackler_badge',
+            // Awards Expansion v2 — Turtle / Secret Agent / Butterfingers (banter, non-silent)
+            turtle:        'award_turtle',
+            secret_agent:  'award_secret_agent',
+            butterfingers: 'award_butterfingers',
+            turtle_badge:        'award_turtle_badge',
+            secret_agent_badge:  'award_secret_agent_badge',
+            butterfingers_badge: 'award_butterfingers_badge',
         };
         const tmplKey = templateMap[awardType];
         if (!tmplKey || !NOTIF_TEMPLATES[tmplKey]) return;
@@ -18427,6 +18444,8 @@ async function checkAndGrantAwardBadge(playerId, awardType) {
             howler: 'Howler', lucky_bastard: 'Lucky Bastard',
             invisible_man: 'Invisible Man', lost: 'Lost',
             reckless_tackler: 'Reckless Tackler',
+            // Awards Expansion v2 — Turtle / Secret Agent / Butterfingers
+            turtle: 'Turtle', secret_agent: 'Secret Agent', butterfingers: 'Butterfingers',
         };
         const thresholdMap = {
             best_engine: 5, brick_wall: 5, donkey: 3,        // FIX-164: Donkey lowered 5→3
@@ -18436,6 +18455,8 @@ async function checkAndGrantAwardBadge(playerId, awardType) {
             howler: 3, lucky_bastard: 3,                      // FIX-164: banter
             invisible_man: 3, lost: 3,                        // FIX-164: silent (badge granted, no email/push)
             reckless_tackler: 3,                              // FIX-164: backfill
+            // Awards Expansion v2 — all at default 3 banter threshold
+            turtle: 3, secret_agent: 3, butterfingers: 3,
         };
         const badgeName = badgeNameMap[awardType];
         const threshold = thresholdMap[awardType];
@@ -18484,6 +18505,10 @@ async function checkAndGrantAwardBadge(playerId, awardType) {
             lucky_bastard: 'lucky_bastard_badge',
             reckless_tackler: 'reckless_tackler_badge',
             // invisible_man + lost: deliberately omitted — silent badges
+            // Awards Expansion v2 — all 3 emailed on badge unlock
+            turtle:        'turtle_badge',
+            secret_agent:  'secret_agent_badge',
+            butterfingers: 'butterfingers_badge',
         };
         const emailType = badgeEmailMap[awardType];
         if (emailType) setImmediate(() => sendAwardEmail(playerId, emailType, {}));
@@ -18661,6 +18686,10 @@ async function closeAwards(gameId) {
                                     controlled: 'award_controlled', tf_ledge: 'award_tf_ledge',
                                     assist_king: 'award_assist_king', howler: 'award_howler',
                                     lucky_bastard: 'award_lucky_bastard',
+                                    // Awards Expansion v2 — push notifications for new banter awards
+                                    turtle: 'award_turtle',
+                                    secret_agent: 'award_secret_agent',
+                                    butterfingers: 'award_butterfingers',
                                 };
                                 const tk = pushTemplateMap[awardType];
                                 if (tk && NOTIF_TEMPLATES[tk]) {
@@ -18689,9 +18718,11 @@ async function closeAwards(gameId) {
                         // FIX-164: Awards Expansion — extended from 6 badged awards to 13.
                         // Includes 8 new badged awards (controlled/tf_ledge/assist_king/howler/
                         // lucky_bastard/invisible_man/lost/reckless_tackler) + 2 backfills (the_moaner/goalscorer).
+                        // Awards Expansion v2: added turtle/secret_agent/butterfingers (banter, badge threshold 3).
                         if (['best_engine','brick_wall','donkey','cold_moment','pig','walker',
                              'the_moaner','goalscorer','controlled','tf_ledge','assist_king',
-                             'howler','lucky_bastard','invisible_man','lost','reckless_tackler'].includes(awardType)) {
+                             'howler','lucky_bastard','invisible_man','lost','reckless_tackler',
+                             'turtle','secret_agent','butterfingers'].includes(awardType)) {
                             await checkAndGrantAwardBadge(winner.playerId, awardType);
                             // Regenerate bio after badge grant
                             setImmediate(() => regeneratePlayerBio(winner.playerId));
@@ -18776,6 +18807,9 @@ function buildAwardsText(player, awardsData) {
         donkey: 'Donkey Award wins',  walker: 'Walker Award wins',  pig: 'Pig Award wins',
         howler: 'Howler Award wins',  lucky_bastard: 'Lucky Bastard wins',
         invisible_man: 'Invisible Man wins',  lost: 'Lost Award wins',
+        // Awards Expansion v2 — Turtle / Secret Agent / Butterfingers
+        turtle: 'Turtle Award wins',  secret_agent: 'Secret Agent Award wins',
+        butterfingers: 'Butterfingers Award wins',
     };
     for (const [k, lbl] of Object.entries(awardLabels)) {
         if (c[k] > 0) parts.push(`${lbl}: ${c[k]}`);
@@ -19616,6 +19650,10 @@ app.get('/api/public/players/leaderboard/awards', async (req, res) => {
                 COALESCE(SUM(CASE WHEN ga.award_type = 'lucky_bastard'    THEN 1 ELSE 0 END), 0) as award_lucky_bastard,
                 COALESCE(SUM(CASE WHEN ga.award_type = 'invisible_man'    THEN 1 ELSE 0 END), 0) as award_invisible_man,
                 COALESCE(SUM(CASE WHEN ga.award_type = 'lost'             THEN 1 ELSE 0 END), 0) as award_lost,
+                -- Awards Expansion v2
+                COALESCE(SUM(CASE WHEN ga.award_type = 'turtle'           THEN 1 ELSE 0 END), 0) as award_turtle,
+                COALESCE(SUM(CASE WHEN ga.award_type = 'secret_agent'     THEN 1 ELSE 0 END), 0) as award_secret_agent,
+                COALESCE(SUM(CASE WHEN ga.award_type = 'butterfingers'    THEN 1 ELSE 0 END), 0) as award_butterfingers,
                 COALESCE(COUNT(ga.id), 0) as total_awards
              FROM players p
              LEFT JOIN game_awards ga ON ga.recipient_player_id = p.id
@@ -29069,12 +29107,17 @@ app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res
                     COUNT(*) FILTER (WHERE award_type = 'lucky_bastard')    AS aw_lucky_bastard,
                     COUNT(*) FILTER (WHERE award_type = 'invisible_man')    AS aw_invisible_man,
                     COUNT(*) FILTER (WHERE award_type = 'lost')             AS aw_lost,
+                    -- Awards Expansion v2 — Turtle / Secret Agent / Butterfingers (banter)
+                    COUNT(*) FILTER (WHERE award_type = 'turtle')           AS aw_turtle,
+                    COUNT(*) FILTER (WHERE award_type = 'secret_agent')     AS aw_secret_agent,
+                    COUNT(*) FILTER (WHERE award_type = 'butterfingers')    AS aw_butterfingers,
                     COUNT(*) AS aw_total,
                     -- FIX-164: positive/banter aggregations updated to mirror POSITIVE_AWARDS / BANTER_AWARDS arrays
                     COUNT(*) FILTER (WHERE award_type IN ('motm','best_engine','brick_wall','goalscorer','cold_moment',
                                                           'controlled','tf_ledge','assist_king')) AS aw_positive,
                     COUNT(*) FILTER (WHERE award_type IN ('reckless_tackler','the_moaner','donkey','walker','pig',
-                                                          'howler','lucky_bastard','invisible_man','lost')) AS aw_banter,
+                                                          'howler','lucky_bastard','invisible_man','lost',
+                                                          'turtle','secret_agent','butterfingers')) AS aw_banter,
                     COUNT(*) FILTER (WHERE star_class = 'A') AS star_a,
                     COUNT(*) FILTER (WHERE star_class = 'B') AS star_b,
                     COUNT(*) FILTER (WHERE star_class = 'C') AS star_c,
@@ -29166,6 +29209,10 @@ app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res
                 COALESCE(ac.aw_lucky_bastard,    0) AS award_lucky_bastard,
                 COALESCE(ac.aw_invisible_man,    0) AS award_invisible_man,
                 COALESCE(ac.aw_lost,             0) AS award_lost,
+                -- Awards Expansion v2
+                COALESCE(ac.aw_turtle,           0) AS award_turtle,
+                COALESCE(ac.aw_secret_agent,     0) AS award_secret_agent,
+                COALESCE(ac.aw_butterfingers,    0) AS award_butterfingers,
                 COALESCE(ac.star_a, 0) AS star_class_a,
                 COALESCE(ac.star_b, 0) AS star_class_b,
                 COALESCE(ac.star_c, 0) AS star_class_c,
@@ -31510,6 +31557,13 @@ const METRIC_CONFIG = {
     // month; supporting = number of finalised reviewed games.
     28: { name: 'Best Ref',            icon: '👮‍♂️📈', category: 'core', awardType: null,                validCalcTypes: ['most'],   primaryLabel: 'Avg Score',      supportingLabel: 'Reviewed Games' },
     29: { name: 'Worst Ref',           icon: '👮‍♂️📉', category: 'core', awardType: null,                validCalcTypes: ['least'],  primaryLabel: 'Avg Score',      supportingLabel: 'Reviewed Games' },
+    // Awards Expansion v2 — 3 new banter series metrics. Limited calcTypes per
+    // GAFFA spec: 'most' (lifetime/series total) and 'most_per_game' only — no
+    // 'least' or 'consecutive' variants. Series min-games filter (>=3) is
+    // already enforced by appearancesCte in calcSeriesLeaderboard.
+    30: { name: 'Turtle',              icon: '🐢', category: 'award', awardType: 'turtle',           validCalcTypes: ['most','most_per_game'],                                              primaryLabel: 'Turtles',         supportingLabel: null },
+    31: { name: 'Secret Agent',        icon: '🤵', category: 'award', awardType: 'secret_agent',     validCalcTypes: ['most','most_per_game'],                                              primaryLabel: 'Secret Agent',    supportingLabel: null },
+    32: { name: 'Butterfingers',       icon: '🧈', category: 'award', awardType: 'butterfingers',    validCalcTypes: ['most','most_per_game'],                                              primaryLabel: 'Butterfingers',   supportingLabel: null },
 };
 
 function deriveTier(seriesType, avgStarRating) {
