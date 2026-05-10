@@ -8359,7 +8359,16 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     : 'Registered successfully';
             }
         } else if (regBackupType === 'confirmed_backup') {
-            message = `You're on the confirmed backup list. £${effectiveCost.toFixed(2)} has been deducted and you'll be first in line if a spot opens. If you don't get on, you'll be refunded after the game.`;
+            // FIX: comped organisers were getting the same "£X has been deducted"
+            // message as paying players, even though the !isComped gate at line
+            // ~8151 correctly skipped the deduction. The actual balance was fine
+            // but the UI made organisers think they'd been charged. Comp-aware
+            // copy mirrors the confirmed-status branch above.
+            if (isComped) {
+                message = "You're on the confirmed backup list — covered by the GAFFA, no charge. You'll be first in line if a spot opens.";
+            } else {
+                message = `You're on the confirmed backup list. £${effectiveCost.toFixed(2)} has been deducted and you'll be first in line if a spot opens. If you don't get on, you'll be refunded after the game.`;
+            }
         } else if (regBackupType === 'gk_backup') {
             message = "You're on the GK backup list. You'll be notified if a GK spot becomes available.";
         } else {
@@ -9622,9 +9631,11 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
             return res.status(403).json({ error: 'Your account has been suspended. Please contact an admin.' });
         }
 
-        // Verify player is a normal_backup for this game
+        // Verify player is a normal_backup for this game.
+        // is_comped retrieved so a comped organiser claim doesn't get charged
+        // (FIX: previously claim-spot called applyGameFee unconditionally).
         const regCheck = await client.query(
-            `SELECT id, position_preference FROM registrations
+            `SELECT id, position_preference, is_comped FROM registrations
              WHERE game_id = $1 AND player_id = $2 AND status = 'backup' AND backup_type = 'normal_backup'
              FOR UPDATE`,
             [gameId, playerId]
@@ -9686,23 +9697,33 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
 
         // Charge credits at effective price; applyGameFee consumes free credits first and
         // returns realCharged + freeCharged (the portions actually debited).
+        // FIX: skip charge entirely if this player is comped (organiser sat on
+        // normal_backup with is_comped=TRUE on their reg row). The amount_paid /
+        // amount_paid_free UPDATE below is also skipped — registration retains
+        // its 0/0/comped state through promotion, which keeps drop-out refund
+        // logic at line ~10673 (gated on !wasComped) consistent.
+        const _claimWasComped = !!regCheck.rows[0].is_comped;
         let realCharged = 0;
         let freeCharged = 0;
-        if (cost > 0) {
+        if (cost > 0 && !_claimWasComped) {
             const chargeResult = await applyGameFee(client, playerId, cost, `Claimed open spot — game ${gameId}`);
             realCharged = chargeResult.realCharged;
             freeCharged = chargeResult.freeCharged || 0;
+            // Record both real-balance and free-credit portions — enables exact drop-out refund.
+            await client.query(
+                'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
+                [realCharged, freeCharged, regCheck.rows[0].id]
+            );
         }
-        // Record both real-balance and free-credit portions — enables exact drop-out refund
-        await client.query(
-            'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
-            [realCharged, freeCharged, regCheck.rows[0].id]
-        );
 
-        // In-app notification confirmation
+        // In-app notification confirmation — comp-aware so organisers don't see
+        // a "deducted" message that contradicts their actual balance.
+        const _claimMsg = _claimWasComped
+            ? 'You claimed the open spot — covered by the GAFFA, no charge. See you on the pitch!'
+            : `You claimed the open spot! £${cost.toFixed(2)} deducted. See you on the pitch!`;
         await client.query(
             `INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, 'backup_promoted', $2, $3)`,
-            [playerId, `You claimed the open spot! £${cost.toFixed(2)} deducted. See you on the pitch!`, gameId]
+            [playerId, _claimMsg, gameId]
         );
 
         await client.query('COMMIT');
@@ -10806,17 +10827,52 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             );
             const currentGKs = parseInt(gkCountResult.rows[0].gk_count) || 0;
             
-            // If a GK dropped out, first check for GK backups
-            if (wasGKOnly) {
+            // ── BACKUP PROMOTION PRIORITY (GAFFA's overhaul) ─────────────────
+            // Tier 1: Confirmed backups (paid up front — they win). Within tier 1,
+            //         position-matching the dropped slot wins, then chronological.
+            // Tier 2: Unpaid GK backup (only when GK drops).
+            // Tier 3: Broadcast to normal_backup (only when outfield drops — handled below).
+            //
+            // SQL ORDER BY: position-match → 0, mismatch → 1; then registered_at ASC.
+            // wasGKOnly toggles which side counts as "match" (GK drop → GK position
+            // is match; outfield drop → non-GK position is match).
+            const confirmedBackups = await client.query(`
+                SELECT r.id, r.player_id, r.backup_type, r.position_preference, r.is_comped, r.registered_at, p.full_name, p.alias
+                FROM registrations r
+                JOIN players p ON p.id = r.player_id
+                WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'confirmed_backup'
+                ORDER BY
+                    CASE
+                        WHEN $2::boolean AND UPPER(TRIM(COALESCE(r.position_preference, ''))) = 'GK' THEN 0
+                        WHEN NOT $2::boolean AND UPPER(TRIM(COALESCE(r.position_preference, ''))) <> 'GK' THEN 0
+                        ELSE 1
+                    END ASC,
+                    r.registered_at ASC
+            `, [gameId, wasGKOnly]);
+
+            for (const candidate of confirmedBackups.rows) {
+                const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
+                // Defensive GK cap — skip GK candidate if game already at max GKs.
+                // Triggers when an outfield drops and we're at GK cap; promoting a
+                // GK-confirmed-backup as outfield would exceed the GK slot count.
+                // The next candidate (next-confirmed or unpaid tier) gets the slot.
+                if (isGK && currentGKs >= maxGKSlots) continue;
+                promotedPlayer = candidate;
+                break;
+            }
+
+            // Tier 2: unpaid GK backup — only when GK dropped and no confirmed claimed it.
+            if (!promotedPlayer && wasGKOnly) {
                 const gkBackups = await client.query(`
-                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
+                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, r.is_comped, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'gk_backup'
                     ORDER BY r.registered_at ASC
                 `, [gameId]);
-                
-                // Loop through GK backups - check credits for each
+
+                // Loop — check credits for each (gk_backup is unpaid so they need
+                // affordability now). EB-aware via effectiveDebited (bug fixed web47).
                 for (const candidate of gkBackups.rows) {
                     const creditCheck = await client.query(
                         `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
@@ -10824,33 +10880,10 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                         [candidate.player_id]
                     );
                     const balance = creditCheck.rows.length > 0 ? parseFloat(creditCheck.rows[0].total_available) : 0;
-                    // Balance check uses effective price — a GK backup whose balance covers
-                    // the EB price should be eligible for promotion (bug fixed web47).
                     if (balance >= effectiveDebited) {
                         promotedPlayer = candidate;
                         break;
                     }
-                }
-            }
-            
-            // If no GK backup was promoted, check confirmed backups (already paid - no credit check needed)
-            if (!promotedPlayer) {
-                const confirmedBackups = await client.query(`
-                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
-                    FROM registrations r
-                    JOIN players p ON p.id = r.player_id
-                    WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'confirmed_backup'
-                    ORDER BY r.registered_at ASC
-                `, [gameId]);
-                
-                // Loop through confirmed backups - check GK slot limits
-                for (const candidate of confirmedBackups.rows) {
-                    const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
-                    if (isGK && currentGKs >= maxGKSlots) {
-                        continue; // Skip — would exceed GK limit
-                    }
-                    promotedPlayer = candidate;
-                    break;
                 }
             }
             
@@ -10887,9 +10920,16 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 // FIX-171: BFFs/Rivals auto-fill — fires for the promoted player.
                 await applyBffRivalAutoFill(client, promotedPlayer.player_id, gameId, promotedPlayer.id);
 
-                // If they weren't a confirmed_backup, charge them now at effective price
-                // (EB tier at promotion time — not full cost_per_player, bug fixed web47).
-                if (promotedPlayer.backup_type !== 'confirmed_backup') {
+                // If they weren't a confirmed_backup AND they aren't a comped
+                // organiser, charge them now at effective price (EB tier at
+                // promotion time — not full cost_per_player, bug fixed web47).
+                // FIX: previously charged comped organisers on gk_backup or
+                // normal_backup promotion because the gate only checked
+                // backup_type, not is_comped. is_comped on the registration
+                // row is the durable signal — set true at signup for organisers
+                // under the 6-comp cap.
+                const _promotedWasComped = !!promotedPlayer.is_comped;
+                if (promotedPlayer.backup_type !== 'confirmed_backup' && !_promotedWasComped) {
                     const { realCharged: promotedCharged, freeCharged: promotedFreeCharged } = await applyGameFee(client, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`);
                     // Record both portions so drop-out refund is exact.
                     await client.query(
@@ -10898,12 +10938,20 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     );
                 }
 
-                // Create notification for promoted player
+                // Comp-aware promotion notification. Three cases:
+                //   1. is_comped TRUE → "covered by the GAFFA"
+                //   2. confirmed_backup (paid at signup) → "payment already taken"
+                //   3. other non-comped (gk_backup / normal_backup) → "£X deducted"
+                const _promotionMsgTail = _promotedWasComped
+                    ? 'Covered by the GAFFA — no charge.'
+                    : (promotedPlayer.backup_type === 'confirmed_backup'
+                        ? 'Your payment has already been taken.'
+                        : `£${effectiveDebited.toFixed(2)} has been deducted from your balance.`);
                 await client.query(
                     `INSERT INTO notifications (player_id, type, message, game_id)
                      VALUES ($1, 'backup_promoted', $2, $3)`,
                     [promotedPlayer.player_id,
-                     `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${effectiveDebited.toFixed(2)} has been deducted from your balance.`}`,
+                     `Great news! A spot opened up and you've been promoted to the game! ${_promotionMsgTail}`,
                      gameId]
                 );
             }
@@ -16296,7 +16344,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
 
             const playersResult = await pool.query(`
                 SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
-                       r.venue_clash_team_preference, r.position_preference
+                       r.venue_clash_team_preference, r.position_preference,
+                       r.position_areas
                 FROM registrations r
                 JOIN players p ON p.id = r.player_id
                 WHERE r.game_id = $1 AND r.status = 'confirmed'
@@ -16305,10 +16354,15 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
 
             const team1 = [], team2 = [], flexible = [], undecided = [];
             for (const p of playersResult.rows) {
+                // FIX: surface position fields so game.html can render specific
+                // positions (LB, CB, LM…) inline + in the player profile pitch.
+                // isGK fixed: register saves 'GK'/'Outfield', never 'goalkeeper'.
                 const obj = {
                     id: p.id, name: p.alias || p.full_name,
                     squadNumber: p.squad_number, photo_url: p.photo_url,
-                    isGK: p.position_preference === 'goalkeeper'
+                    position_areas: p.position_areas || null,
+                    position_preference: p.position_preference || null,
+                    isGK: (p.position_preference || '').toUpperCase() === 'GK'
                 };
                 const pref = p.venue_clash_team_preference;
                 if (pref === t1 || pref === 'team1') team1.push(obj);
@@ -16351,7 +16405,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             const tournamentTeams = {};
             for (const team of teamsResult.rows) {
                 const playersResult = await pool.query(`
-                    SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position
+                    SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                           r.position_preference as position, r.position_areas
                     FROM team_players tp
                     JOIN players p ON p.id = tp.player_id
                     JOIN registrations r ON r.player_id = p.id AND r.game_id = $2
@@ -16368,11 +16423,16 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                 
                 const players = playersResult.rows.map(p => ({
                     id: p.id, name: p.alias || p.full_name, squadNumber: p.squad_number,
-                    photo_url: p.photo_url, isGK: p.position === 'goalkeeper'
+                    photo_url: p.photo_url,
+                    position_areas: p.position_areas || null,
+                    position_preference: p.position || null,
+                    isGK: (p.position || '').toUpperCase() === 'GK'
                 }));
                 const guests = teamGuests.rows.map(g => ({
                     id: `guest_${g.id}`, name: `${g.guest_name} (Guest)`, squadNumber: null,
-                    photo_url: null, isGK: false, isGuest: true
+                    photo_url: null,
+                    position_areas: null, position_preference: null,
+                    isGK: false, isGuest: true
                 }));
                 
                 tournamentTeams[team.team_name] = [...players, ...guests];
@@ -16438,7 +16498,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         const NULL_UUID = '00000000-0000-0000-0000-000000000000';
         const [redTeamResult, blueTeamResult] = await Promise.all([
             pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                       r.position_preference as position, r.position_areas,
                        p.motm_wins, p.total_appearances
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
@@ -16451,7 +16512,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                     p.total_appearances DESC NULLS LAST
             `, [redTeamId || NULL_UUID, game.id]),
             pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                       r.position_preference as position, r.position_areas,
                        p.motm_wins, p.total_appearances
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
@@ -16465,13 +16527,18 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             `, [blueTeamId || NULL_UUID, game.id])
         ]);
         
-        // Map to format expected by frontend
+        // Map to format expected by frontend.
+        // FIX: surface position_areas + position_preference so game.html can
+        // render specific positions inline + in the player profile pitch view.
+        // isGK fixed: register saves 'GK'/'Outfield', never 'goalkeeper'.
         const redTeam = redTeamResult.rows.map(p => ({
             id: p.id,
             name: p.alias || p.full_name,
             squadNumber: p.squad_number,
             photo_url: p.photo_url,
-            isGK: p.position === 'goalkeeper'
+            position_areas: p.position_areas || null,
+            position_preference: p.position || null,
+            isGK: (p.position || '').toUpperCase() === 'GK'
         }));
         
         const blueTeam = blueTeamResult.rows.map(p => ({
@@ -16479,7 +16546,9 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             name: p.alias || p.full_name,
             squadNumber: p.squad_number,
             photo_url: p.photo_url,
-            isGK: p.position === 'goalkeeper'
+            position_areas: p.position_areas || null,
+            position_preference: p.position || null,
+            isGK: (p.position || '').toUpperCase() === 'GK'
         }));
         
         // Also fetch guests assigned to teams
@@ -16493,6 +16562,8 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
                 name: `${guest.guest_name}`,
                 squadNumber: null,
                 photo_url: null,
+                position_areas: null,
+                position_preference: null,
                 isGK: false,
                 isGuest: true
             };
@@ -17130,6 +17201,113 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
 // Get player profile (public)
 // GET /api/public/games — public games list for unauthenticated visitors
 // Returns upcoming + recently completed games. No tier gating, no PII, no registration status.
+// ── PUBLIC LANDING STATS ──────────────────────────────────────────────
+// Powers the games.html landing page: live counts + recent activity for
+// social proof. Public, no auth, cached by Cloudflare via standard headers.
+// All counts derived from current DB state — no hardcoded numbers.
+app.get('/api/public/landing-stats', async (req, res) => {
+    try {
+        const [
+            activePlayersRes,
+            gamesThisWeekRes,
+            venuesRes,
+            regionsRes,
+            recentGamesRes,
+            totalGamesPlayedRes,
+        ] = await Promise.all([
+            // Players with at least one confirmed registration in last 90 days.
+            // Honest "active" count — not lifetime signups.
+            pool.query(`
+                SELECT COUNT(DISTINCT r.player_id) AS cnt
+                  FROM registrations r
+                  JOIN games g ON g.id = r.game_id
+                 WHERE g.game_date > NOW() - INTERVAL '90 days'
+                   AND r.status = 'confirmed'
+            `),
+            // Games scheduled in the next 7 days.
+            pool.query(`
+                SELECT COUNT(*) AS cnt
+                  FROM games
+                 WHERE game_date BETWEEN NOW() AND NOW() + INTERVAL '7 days'
+                   AND game_status IN ('available','confirmed')
+                   AND (exclusivity IS NULL OR exclusivity NOT IN ('clm','allstars','misfits'))
+            `),
+            // Distinct venues with games in the last/next 90 days.
+            pool.query(`
+                SELECT COUNT(DISTINCT venue_id) AS cnt
+                  FROM games
+                 WHERE game_date BETWEEN NOW() - INTERVAL '90 days' AND NOW() + INTERVAL '90 days'
+                   AND venue_id IS NOT NULL
+            `),
+            // Regions with upcoming games — for ad-set targeting + region chips.
+            pool.query(`
+                SELECT DISTINCT v.region
+                  FROM games g
+                  JOIN venues v ON v.id = g.venue_id
+                 WHERE g.game_date > NOW()
+                   AND g.game_status IN ('available','confirmed')
+                   AND v.region IS NOT NULL
+                   AND v.region != ''
+                   AND (g.exclusivity IS NULL OR g.exclusivity NOT IN ('clm','allstars','misfits'))
+                 ORDER BY v.region
+            `),
+            // Recent completed games with MOTM — real social proof. Limit 6.
+            pool.query(`
+                SELECT g.id, g.game_url, g.game_date, g.format,
+                       v.name AS venue_name, v.region AS venue_region,
+                       p.alias AS motm_alias, p.full_name AS motm_full_name,
+                       p.photo_url AS motm_photo
+                  FROM games g
+                  LEFT JOIN venues v ON v.id = g.venue_id
+                  LEFT JOIN players p ON p.id = g.motm_winner_id
+                 WHERE g.game_status = 'completed'
+                   AND g.motm_winner_id IS NOT NULL
+                   AND (g.exclusivity IS NULL OR g.exclusivity NOT IN ('clm','allstars','misfits'))
+                 ORDER BY g.game_date DESC
+                 LIMIT 6
+            `),
+            // Total games ever completed — credibility number.
+            pool.query(`
+                SELECT COUNT(*) AS cnt
+                  FROM games
+                 WHERE game_status = 'completed'
+            `),
+        ]);
+
+        // Build response. Numbers are integers; recentGames is a small array
+        // shaped for direct rendering (frontend doesn't need to do extra work).
+        const recentGames = recentGamesRes.rows.map(r => ({
+            game_url:       r.game_url,
+            game_date:      r.game_date,
+            format:         r.format,
+            venue_name:     r.venue_name,
+            venue_region:   r.venue_region,
+            motm_name:      r.motm_alias || r.motm_full_name || null,
+            motm_photo:     r.motm_photo || null,
+        }));
+
+        // Light cache — landing page traffic can hammer this; 60s freshness
+        // is fine for stats that change every few minutes at most.
+        res.set('Cache-Control', 'public, max-age=60');
+        res.json({
+            active_players:      parseInt(activePlayersRes.rows[0].cnt) || 0,
+            games_this_week:     parseInt(gamesThisWeekRes.rows[0].cnt) || 0,
+            venues_count:        parseInt(venuesRes.rows[0].cnt) || 0,
+            total_games_played:  parseInt(totalGamesPlayedRes.rows[0].cnt) || 0,
+            regions:             regionsRes.rows.map(r => r.region),
+            recent_games:        recentGames,
+        });
+    } catch (error) {
+        console.error('Landing stats error:', error);
+        // Fail soft — landing page should not 500 on missing stats. Return
+        // zeros + empty arrays so the page still renders.
+        res.json({
+            active_players: 0, games_this_week: 0, venues_count: 0,
+            total_games_played: 0, regions: [], recent_games: [],
+        });
+    }
+});
+
 app.get('/api/public/games', async (req, res) => {
     try {
         const result = await pool.query(`
@@ -17892,16 +18070,41 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             );
             const currentGKs = parseInt(gkCountResult.rows[0].gk_count) || 0;
             
-            // If a GK was removed, try GK backups first
-            if (wasGKOnly) {
+            // ── BACKUP PROMOTION PRIORITY (GAFFA's overhaul — admin path) ────
+            // Mirror of the gameDropOut path so both auto-promote routes behave
+            // identically. Tier 1: confirmed (position-match first, chrono within).
+            // Tier 2: unpaid GK (only if GK removal).
+            const confirmedBackups = await pool.query(`
+                SELECT r.id, r.player_id, r.backup_type, r.position_preference, r.is_comped, r.registered_at, p.full_name, p.alias
+                FROM registrations r
+                JOIN players p ON p.id = r.player_id
+                WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'confirmed_backup'
+                ORDER BY
+                    CASE
+                        WHEN $2::boolean AND UPPER(TRIM(COALESCE(r.position_preference, ''))) = 'GK' THEN 0
+                        WHEN NOT $2::boolean AND UPPER(TRIM(COALESCE(r.position_preference, ''))) <> 'GK' THEN 0
+                        ELSE 1
+                    END ASC,
+                    r.registered_at ASC
+            `, [gameId, wasGKOnly]);
+
+            for (const candidate of confirmedBackups.rows) {
+                const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
+                if (isGK && currentGKs >= maxGKSlots) continue;
+                promotedPlayer = candidate;
+                break;
+            }
+
+            // Tier 2: unpaid GK backup — only when GK removed.
+            if (!promotedPlayer && wasGKOnly) {
                 const gkBackups = await pool.query(`
-                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
+                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, r.is_comped, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
                     WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'gk_backup'
                     ORDER BY r.registered_at ASC
                 `, [gameId]);
-                
+
                 for (const candidate of gkBackups.rows) {
                     const creditCheck = await pool.query(
                         `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
@@ -17911,24 +18114,6 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                         promotedPlayer = candidate;
                         break;
                     }
-                }
-            }
-            
-            // Then try confirmed backups (with GK slot check)
-            if (!promotedPlayer) {
-                const confirmedBackups = await pool.query(`
-                    SELECT r.id, r.player_id, r.backup_type, r.position_preference, p.full_name, p.alias
-                    FROM registrations r
-                    JOIN players p ON p.id = r.player_id
-                    WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'confirmed_backup'
-                    ORDER BY r.registered_at ASC
-                `, [gameId]);
-                
-                for (const candidate of confirmedBackups.rows) {
-                    const isGK = candidate.position_preference?.trim().toUpperCase() === 'GK';
-                    if (isGK && currentGKs >= maxGKSlots) continue;
-                    promotedPlayer = candidate;
-                    break;
                 }
             }
             
@@ -17957,7 +18142,11 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                     );
                     // FIX-177: BFFs/Rivals auto-fill — fires for the promoted player.
                     await applyBffRivalAutoFill(promoClient, promotedPlayer.player_id, gameId, promotedPlayer.id);
-                    if (promotedPlayer.backup_type !== 'confirmed_backup') {
+                    // FIX: mirror gameDropOut path — skip charge if the
+                    // promoted player is a comped organiser. is_comped column
+                    // on the registration row is the durable signal.
+                    const _adminPromoWasComped = !!promotedPlayer.is_comped;
+                    if (promotedPlayer.backup_type !== 'confirmed_backup' && !_adminPromoWasComped) {
                         // Charge effective price + record both portions so future dropout
                         // refunds the correct real+free split.
                         const { realCharged: adminPromoCharged, freeCharged: adminPromoFree } = await applyGameFee(promoClient, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`);
@@ -17975,10 +18164,18 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                 }
                 
                 try {
+                    // Comp-aware notification — same three-case logic as
+                    // gameDropOut so messaging is consistent across both
+                    // auto-promote routes (admin remove vs player drop).
+                    const _adminPromoMsgTail = _adminPromoWasComped
+                        ? 'Covered by the GAFFA — no charge.'
+                        : (promotedPlayer.backup_type === 'confirmed_backup'
+                            ? 'Your payment has already been taken.'
+                            : `£${effectiveDebited.toFixed(2)} has been deducted from your balance.`);
                     await pool.query(
                         `INSERT INTO notifications (player_id, type, message, game_id) VALUES ($1, 'backup_promoted', $2, $3)`,
                         [promotedPlayer.player_id,
-                         `Great news! A spot opened up and you've been promoted to the game! ${promotedPlayer.backup_type === 'confirmed_backup' ? 'Your payment has already been taken.' : `£${effectiveDebited.toFixed(2)} has been deducted from your balance.`}`,
+                         `Great news! A spot opened up and you've been promoted to the game! ${_adminPromoMsgTail}`,
                          gameId]
                     );
                     // Send push + WhatsApp notification to promoted player
@@ -20504,7 +20701,8 @@ app.get('/api/public/game/:gameUrl/tournament', async (req, res) => {
         const teams = {};
         for (const team of teamsResult.rows) {
             const playersResult = await pool.query(`
-                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url, r.position_preference as position,
+                SELECT p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                       r.position_preference as position, r.position_areas,
                        p.motm_wins, p.total_appearances
                 FROM team_players tp
                 JOIN players p ON p.id = tp.player_id
@@ -20525,11 +20723,16 @@ app.get('/api/public/game/:gameUrl/tournament', async (req, res) => {
             
             const players = playersResult.rows.map(p => ({
                 id: p.id, name: p.alias || p.full_name, squadNumber: p.squad_number,
-                photo_url: p.photo_url, isGK: p.position === 'goalkeeper'
+                photo_url: p.photo_url,
+                position_areas: p.position_areas || null,
+                position_preference: p.position || null,
+                isGK: (p.position || '').toUpperCase() === 'GK'
             }));
             const guests = teamGuests.rows.map(g => ({
                 id: `guest_${g.id}`, name: `${g.guest_name} (Guest)`, squadNumber: null,
-                photo_url: null, isGK: false, isGuest: true
+                photo_url: null,
+                position_areas: null, position_preference: null,
+                isGK: false, isGuest: true
             }));
             
             teams[team.team_name] = [...players, ...guests];
@@ -31324,7 +31527,11 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
     const cfg = METRIC_CONFIG[id];
     if (!cfg) return [];
 
-    // Reusable appearances CTE (confirmed players in completed games)
+    // Reusable appearances CTE (confirmed players in completed games).
+    // SERIES-TIEBREAK FIX: Universal min_games >= 3 enforced here. Players with
+    // <3 appearances are filtered out at source so they can never appear on any
+    // series leaderboard. Sub-3 entries were the cause of "1-game 100%-er above
+    // 5-of-5 player" rankings.
     const appearancesCte = `
         app_counts AS (
             SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name, COUNT(*) AS appearances
@@ -31333,6 +31540,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
             JOIN games g ON g.id = r.game_id
             WHERE g.series_id = $1 AND g.game_status = 'completed' AND r.status = 'confirmed'
             GROUP BY r.player_id, COALESCE(p.alias, p.full_name)
+            HAVING COUNT(*) >= 3
         )`;
 
     // ── METRIC 5: Appearances ──────────────────────────────────────────────
@@ -31368,17 +31576,17 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, ac.appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
-                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
-                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+                FROM max_str ms INNER JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC, ms.player_id ASC LIMIT 10`, [seriesId]);
             return r.rows;
         }
         const dir = calcType === 'least' ? 'ASC' : 'DESC';
         const r = await pool.query(`
             WITH ${appearancesCte}
             SELECT player_id, player_name, appearances, appearances AS primary_stat, NULL::numeric AS supporting_stat
-            FROM app_counts ORDER BY appearances ${dir} LIMIT 10`, [seriesId]);
+            FROM app_counts ORDER BY appearances ${dir}, player_id ASC LIMIT 10`, [seriesId]);
         return r.rows;
     }
 
@@ -31414,15 +31622,16 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, ac.appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
-                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
-                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+                FROM max_str ms INNER JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC, ms.player_id ASC LIMIT 10`, [seriesId]);
             return r.rows;
         }
 
+        // SERIES-TIEBREAK FIX: tiebreak is always "more appearances", regardless
+        // of calc. Removed legacy tbDir variable (was inverted: ASC for 'most').
         const dir = calcType === 'least' ? 'ASC' : 'DESC';
-        const tbDir = calcType === 'least' ? 'DESC' : 'ASC';
         const r = await pool.query(`
             WITH ${appearancesCte},
             pw AS (
@@ -31444,7 +31653,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                         THEN COALESCE(pw.win_count,0)::numeric
                         ELSE ROUND(COALESCE(pw.win_count,0)*100.0/NULLIF(ac.appearances,0),1) END AS supporting_stat
             FROM app_counts ac LEFT JOIN pw ON pw.player_id = ac.player_id
-            ORDER BY primary_stat ${dir}, ac.appearances ${tbDir} LIMIT 10`, [seriesId]);
+            ORDER BY primary_stat ${dir}, ac.appearances DESC, ac.player_id ASC LIMIT 10`, [seriesId]);
         return r.rows;
     }
 
@@ -31476,14 +31685,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, ac.appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
-                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
-                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+                FROM max_str ms INNER JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC, ms.player_id ASC LIMIT 10`, [seriesId]);
             return r.rows;
         }
+        // SERIES-TIEBREAK FIX: tiebreak is always "more appearances".
         const dir = calcType === 'least' ? 'ASC' : 'DESC';
-        const tbDir = calcType === 'least' ? 'DESC' : 'ASC';
         const r = await pool.query(`
             WITH ${appearancesCte},
             pm AS (
@@ -31500,12 +31709,17 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                         THEN ROUND(COALESCE(pm.motm_count,0)*100.0/NULLIF(ac.appearances,0),1)
                         ELSE COALESCE(pm.motm_count,0)::numeric END AS supporting_stat
             FROM app_counts ac LEFT JOIN pm ON pm.player_id = ac.player_id
-            ORDER BY primary_stat ${dir}, ac.appearances ${tbDir} LIMIT 10`, [seriesId]);
+            ORDER BY primary_stat ${dir}, ac.appearances DESC, ac.player_id ASC LIMIT 10`, [seriesId]);
         return r.rows;
     }
 
-    // ── METRICS 6–13: Game Awards ──────────────────────────────────────────
-    if (id >= 6 && id <= 13) {
+    // ── AWARD METRICS: 6–13 + 19–27 (FIX-164 expansion) ──────────────────
+    // Series-trophy fix: the original gate `id >= 6 && id <= 13` excluded the
+    // FIX-164 metrics (Cold Moment, Walker, Pig, Controlled, TF Ledge, Assist
+    // King, Lucky Bastard, Invisible Man, Lost). They all have a valid
+    // awardType in METRIC_CONFIG so the same SQL works for all.
+    const SERIES_AWARD_METRIC_IDS = [6, 7, 8, 9, 10, 11, 12, 13, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+    if (SERIES_AWARD_METRIC_IDS.includes(id)) {
         const awardType = cfg.awardType;
 
         if (calcType === 'most_consecutive') {
@@ -31534,17 +31748,17 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, ac.appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
-                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
-                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`,
+                FROM max_str ms INNER JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC, ms.player_id ASC LIMIT 10`,
                 [seriesId, awardType]);
             return r.rows;
         }
 
+        // SERIES-TIEBREAK FIX: tiebreak is always "more appearances".
         const usePct = calcType === 'most_per_game' || calcType === 'least_per_game';
         const dir = (calcType === 'least' || calcType === 'least_per_game') ? 'ASC' : 'DESC';
-        const tbDir = (calcType === 'least' || calcType === 'least_per_game') ? 'DESC' : 'ASC';
         const r = await pool.query(`
             WITH ${appearancesCte},
             pa AS (
@@ -31561,7 +31775,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                         THEN COALESCE(pa.award_count,0)::numeric
                         ELSE ROUND(COALESCE(pa.award_count,0)*100.0/NULLIF(ac.appearances,0),1) END AS supporting_stat
             FROM app_counts ac LEFT JOIN pa ON pa.player_id = ac.player_id
-            ORDER BY primary_stat ${dir}, ac.appearances ${tbDir} LIMIT 10`,
+            ORDER BY primary_stat ${dir}, ac.appearances DESC, ac.player_id ASC LIMIT 10`,
             [seriesId, awardType]);
         return r.rows;
     }
@@ -31593,15 +31807,17 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, ac.appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
-                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
-                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+                FROM max_str ms INNER JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC, ms.player_id ASC LIMIT 10`, [seriesId]);
             return r.rows;
         }
         const usePct = calcType === 'most_per_game';
         // Appearances = total signups (confirmed + dropped_out) for this metric.
         // Dropout % = dropout_count / total_signups so the rate is meaningful.
+        // SERIES-TIEBREAK FIX: signup_counts gets HAVING >= 3 (signups, not just confirmed).
+        // ORDER BY tiebreaker is more-signups + player_id.
         const r = await pool.query(`
             WITH signup_counts AS (
                 SELECT r.player_id, COALESCE(p.alias, p.full_name) AS player_name,
@@ -31613,6 +31829,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                 WHERE g.series_id = $1 AND g.game_status = 'completed'
                 AND r.status IN ('confirmed','dropped_out')
                 GROUP BY r.player_id, COALESCE(p.alias, p.full_name)
+                HAVING COUNT(*) >= 3
             )
             SELECT player_id, player_name, appearances,
                    CASE WHEN ${usePct}
@@ -31623,7 +31840,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                         ELSE ROUND(dropout_count*100.0/NULLIF(appearances,0),1) END AS supporting_stat
             FROM signup_counts
             WHERE dropout_count > 0
-            ORDER BY primary_stat DESC, appearances ASC LIMIT 10`, [seriesId]);
+            ORDER BY primary_stat DESC, appearances DESC, player_id ASC LIMIT 10`, [seriesId]);
         return r.rows;
     }
 
@@ -31663,10 +31880,10 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, ac.appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
-                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
-                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+                FROM max_str ms INNER JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC, ms.player_id ASC LIMIT 10`, [seriesId]);
             return r.rows;
         }
         const usePct = calcType === 'most_per_game';
@@ -31687,7 +31904,7 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                         THEN COALESCE(gs.signup_count,0)::numeric
                         ELSE ROUND(COALESCE(gs.signup_count,0)*1.0/NULLIF(ac.appearances,0),2) END AS supporting_stat
             FROM app_counts ac LEFT JOIN gs ON gs.player_id = ac.player_id
-            ORDER BY primary_stat DESC, ac.appearances ASC LIMIT 10`, [seriesId]);
+            ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC LIMIT 10`, [seriesId]);
         return r.rows;
     }
 
@@ -31719,10 +31936,10 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                     GROUP BY player_id, player_name
                 ),
                 ${appearancesCte}
-                SELECT ms.player_id, ms.player_name, COALESCE(ac.appearances,0) AS appearances,
+                SELECT ms.player_id, ms.player_name, ac.appearances,
                        ms.primary_stat, NULL::numeric AS supporting_stat
-                FROM max_str ms LEFT JOIN app_counts ac ON ac.player_id = ms.player_id
-                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC LIMIT 10`, [seriesId]);
+                FROM max_str ms INNER JOIN app_counts ac ON ac.player_id = ms.player_id
+                WHERE ms.primary_stat > 0 ORDER BY ms.primary_stat DESC, ac.appearances DESC, ms.player_id ASC LIMIT 10`, [seriesId]);
             return r.rows;
         }
         const usePct = calcType === 'most_per_game';
@@ -31742,7 +31959,45 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
                         THEN COALESCE(pdisc.disc_total,0)::numeric
                         ELSE ROUND(COALESCE(pdisc.disc_total,0)*1.0/NULLIF(ac.appearances,0),2) END AS supporting_stat
             FROM app_counts ac LEFT JOIN pdisc ON pdisc.player_id = ac.player_id
-            ORDER BY primary_stat DESC, ac.appearances ASC LIMIT 10`, [seriesId]);
+            ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC LIMIT 10`, [seriesId]);
+        return r.rows;
+    }
+
+    // ── METRICS 28 / 29: Best Ref / Worst Ref ──────────────────────────────
+    // SERIES-TIEBREAK FIX: Mirrors monthly Best/Worst Ref (server.js calcMonthly).
+    // Avg of game_referees.final_rating across the series, restricted to games
+    // where the ref's review_count >= 3 (statistical floor — fewer reviews
+    // is too noisy for a trophy-grade ranking).
+    // Primary stat: avg rating (rounded to 2dp).
+    // Supporting stat: count of qualifying reviewed games.
+    // Min reviewed games: 3 (universal series threshold).
+    // Tiebreaker: more reviewed games, then player_id ASC.
+    if (id === 28 || id === 29) {
+        const sortDir = (id === 28) ? 'DESC' : 'ASC';
+        const r = await pool.query(`
+            WITH ref_games AS (
+                SELECT gr.player_id,
+                       gr.final_rating::numeric AS rating
+                FROM game_referees gr
+                JOIN games g ON g.id = gr.game_id
+                WHERE g.series_id = $1
+                  AND g.game_status = 'completed'
+                  AND gr.status = 'confirmed'
+                  AND gr.player_id IS NOT NULL
+                  AND gr.final_rating IS NOT NULL
+                  AND gr.review_count >= 3
+            )
+            SELECT rg.player_id,
+                   COALESCE(p.alias, p.full_name) AS player_name,
+                   COUNT(*)::int                    AS appearances,
+                   ROUND(AVG(rg.rating)::numeric,2) AS primary_stat,
+                   COUNT(*)::numeric                AS supporting_stat
+            FROM ref_games rg
+            JOIN players p ON p.id = rg.player_id
+            GROUP BY rg.player_id, COALESCE(p.alias, p.full_name)
+            HAVING COUNT(*) >= 3
+            ORDER BY primary_stat ${sortDir}, COUNT(*) DESC, rg.player_id ASC
+            LIMIT 10`, [seriesId]);
         return r.rows;
     }
 
@@ -31888,7 +32143,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             FROM app_counts ac LEFT JOIN pw ON pw.player_id = ac.player_id
             ${minGamesFilter}
             ${minGamesFilter ? minAwardsClause : (minAwards > 0 ? 'WHERE ' + minAwardsClause.slice(4) : '')}
-            ORDER BY primary_stat DESC NULLS LAST, ac.appearances DESC
+            ORDER BY primary_stat DESC NULLS LAST, ac.appearances DESC, ac.player_id ASC
             LIMIT 10`, params);
         return r.rows;
     }
@@ -31912,7 +32167,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             FROM app_counts ac LEFT JOIN pm ON pm.player_id = ac.player_id
             WHERE COALESCE(pm.motm_count,0) >= ${motmThreshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
-            ORDER BY primary_stat DESC, ac.appearances ASC
+            ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC
             LIMIT 10`, params);
         return r.rows;
     }
@@ -31939,7 +32194,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             FROM app_counts ac LEFT JOIN pw3 ON pw3.player_id = ac.player_id
             WHERE COALESCE(pw3.win_count,0) >= ${winsThreshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
-            ORDER BY primary_stat DESC, ac.appearances DESC
+            ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC
             LIMIT 10`, params);
         return r.rows;
     }
@@ -31953,7 +32208,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
                    NULL::numeric AS supporting_stat
             FROM app_counts
             ${minGames > 0 ? `WHERE appearances >= ${parseInt(minGames)}` : ''}
-            ORDER BY appearances DESC
+            ORDER BY appearances DESC, player_id ASC
             LIMIT 10`, params);
         return r.rows;
     }
@@ -31991,7 +32246,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             FROM app_counts ac LEFT JOIN pa ON pa.player_id = ac.player_id
             WHERE COALESCE(pa.award_count,0) >= ${threshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
-            ORDER BY primary_stat DESC, ac.appearances ASC
+            ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC
             LIMIT 10`, params);
         return r.rows;
     }
@@ -32016,7 +32271,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             FROM app_counts ac LEFT JOIN pdisc ON pdisc.player_id = ac.player_id
             WHERE COALESCE(pdisc.disc_total,0) >= ${ptsThreshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
-            ORDER BY primary_stat DESC, ac.appearances ASC
+            ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC
             LIMIT 10`, params);
         return r.rows;
     }
@@ -32056,7 +32311,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             JOIN players p ON p.id = rg.player_id
             GROUP BY rg.player_id, COALESCE(p.alias, p.full_name)
             HAVING COUNT(*) >= ${minReviewedGames}
-            ORDER BY primary_stat ${sortDir}, COUNT(*) DESC
+            ORDER BY primary_stat ${sortDir}, COUNT(*) DESC, rg.player_id ASC
             LIMIT 10`, params);
         return r.rows;
     }
