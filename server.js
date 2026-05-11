@@ -1887,6 +1887,11 @@ app.post('/api/auth/register', async (req, res) => {
         // web sends 'ref' and 'referee_invite' (snake_case). Accept both.
         const ref = req.body.ref || req.body.referralCode || null;
         const referee_invite_code = req.body.referee_invite || req.body.refereeInvite || null;
+        // Landing attribution: web games.html stashes landing_hit_id in sessionStorage
+        // when the user lands with UTM/region params. Signup endpoint receives it
+        // here and writes a row in landing_attributions linking the new player to
+        // the originating ad campaign. Snake_case for web payload consistency.
+        const landingHitId = req.body.landing_hit_id || req.body.landingHitId || null;
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -2057,6 +2062,36 @@ app.post('/api/auth/register', async (req, res) => {
 
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
+
+        // ── LANDING ATTRIBUTION ─────────────────────────────────────────────
+        // Link this new player to the landing_hit that brought them here, if
+        // their sessionStorage carried a hit_id through to signup. Non-blocking
+        // — fail-soft if the table doesn't exist yet (pre-migration) or the
+        // hit_id is bogus. The PRIMARY KEY on player_id means we only ever
+        // record one attribution per player (first-touch attribution).
+        //
+        // SAFETY: validate UUID format before passing to PG to avoid noise in
+        // logs from "22P02 invalid_text_representation" errors when someone
+        // POSTs a non-UUID string (curl users, attackers, broken sessions).
+        const _UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (landingHitId && typeof landingHitId === 'string' && _UUID_RE.test(landingHitId)) {
+            try {
+                await pool.query(
+                    `INSERT INTO landing_attributions (player_id, hit_id)
+                     VALUES ($1, $2)
+                     ON CONFLICT (player_id) DO NOTHING`,
+                    [playerId, landingHitId]
+                );
+            } catch (e) {
+                // 23503 = foreign key violation (hit_id not in landing_hits)
+                // 42P01 = table doesn't exist (migration not run yet)
+                // 22P02 = invalid uuid (shouldn't hit this thanks to regex above, but defensive)
+                // Either way: not critical, signup still succeeds.
+                if (e.code !== '23503' && e.code !== '42P01' && e.code !== '22P02') {
+                    console.warn('[landing-attribution] write failed (non-critical):', e.message);
+                }
+            }
+        }
 
         // ── A2-A83: Auto-claim the guest invite token at signup time ──────
         // Without this, a friend who signs up via the link but never returns to
@@ -17312,6 +17347,176 @@ app.get('/api/public/landing-stats', async (req, res) => {
             active_players: 0, games_this_week: 0, venues_count: 0,
             total_games_played: 0, regions: [], recent_games: [],
         });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// LANDING ATTRIBUTION — track ad campaign hits + signup attribution
+// ═══════════════════════════════════════════════════════════════════════
+// games.html POSTs here on page load if it has UTM params or a landing region.
+// Anonymous — no auth required. Deduplicated by (anon_session_id, utm_campaign)
+// via a unique index, so refresh/return-in-same-session won't inflate counts.
+//
+// PRIVACY: IP and UA stored as 16-hex truncated SHA-256 hashes, not raw values.
+// No cookies — anon_session_id is client-generated and lives in sessionStorage
+// only (lost on tab close). This means ~70% of conversions WON'T be attributed
+// because the user closed the tab before signing up. Accepted tradeoff for
+// avoiding GDPR consent requirements.
+app.post('/api/public/landing-hit', async (req, res) => {
+    try {
+        const {
+            anon_session_id,
+            landing_region,
+            utm_source, utm_medium, utm_campaign, utm_content, utm_term,
+            referrer,
+        } = req.body || {};
+
+        // Minimal validation — anon_session_id is the only hard requirement.
+        // Empty body = ignore (someone curl'd the endpoint).
+        if (!anon_session_id || typeof anon_session_id !== 'string' || anon_session_id.length > 64) {
+            return res.status(400).json({ error: 'invalid session id' });
+        }
+
+        // Clamp string lengths defensively (someone could POST a megabyte URL)
+        const clamp = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
+        const region   = clamp(landing_region, 64);
+        const source   = clamp(utm_source, 64);
+        const medium   = clamp(utm_medium, 64);
+        const campaign = clamp(utm_campaign, 128);
+        const content  = clamp(utm_content, 128);
+        const term     = clamp(utm_term, 128);
+        const ref      = clamp(referrer, 500);
+
+        // Hash IP + UA — 16 hex chars is enough to deduplicate without storing
+        // anything reversible. Pattern mirrors line 16714.
+        const rawIp = (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim();
+        const rawUa = (req.headers['user-agent'] || '').toString().slice(0, 500);
+        const ipHash = rawIp ? crypto.createHash('sha256').update(rawIp).digest('hex').slice(0, 16) : null;
+        const uaHash = rawUa ? crypto.createHash('sha256').update(rawUa).digest('hex').slice(0, 16) : null;
+
+        // Upsert: ON CONFLICT (anon_session_id, COALESCE(utm_campaign,'__none__'))
+        // is enforced by the unique index from the migration. We DO NOTHING on
+        // conflict and RETURNING id only returns a row on first insert. To
+        // always return the hit_id (so the client can stash it), we do INSERT
+        // ON CONFLICT DO UPDATE SET ... = EXCLUDED.x (no-op) RETURNING id.
+        // Simpler: do the INSERT, on conflict ignore, then SELECT.
+        let hitId = null;
+        try {
+            const ins = await pool.query(
+                `INSERT INTO landing_hits
+                    (anon_session_id, landing_region, utm_source, utm_medium,
+                     utm_campaign, utm_content, utm_term, referrer, ip_hash, ua_hash)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                 RETURNING id`,
+                [anon_session_id, region, source, medium, campaign, content, term, ref, ipHash, uaHash]
+            );
+            hitId = ins.rows[0].id;
+        } catch (e) {
+            // 23505 = duplicate key (same session_id + same campaign already exists)
+            if (e.code === '23505') {
+                const lookup = await pool.query(
+                    `SELECT id FROM landing_hits
+                      WHERE anon_session_id = $1
+                        AND COALESCE(utm_campaign, '__none__') = COALESCE($2, '__none__')
+                      LIMIT 1`,
+                    [anon_session_id, campaign]
+                );
+                hitId = lookup.rows[0]?.id || null;
+            } else {
+                throw e;
+            }
+        }
+
+        // Return hit_id so the client can stash it and reference on signup.
+        res.json({ ok: true, hit_id: hitId });
+    } catch (error) {
+        // Non-critical analytics endpoint — never break the user flow.
+        console.warn('landing-hit error:', error.message);
+        res.status(200).json({ ok: false });
+    }
+});
+
+// GET /api/admin/landing-attribution-report — campaign performance dashboard
+// Returns rolled-up rows grouped by utm_campaign with hits, signups,
+// conversion rate, games played, and LIFETIME revenue per campaign.
+// Lifetime revenue = sum of amount_paid across all completed-game registrations
+// for every player attributed to that campaign. Includes paid + free credits.
+app.get('/api/admin/landing-attribution-report', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        // Optional window filter: ?days=30 limits hits to last 30 days.
+        // Signups + revenue are always lifetime per the spec ("lifetime per
+        // attributed signup"). Default window for hits = 90 days, plenty to
+        // include the most recent ad campaigns.
+        const days = Math.max(1, Math.min(365, parseInt(req.query.days, 10) || 90));
+
+        // Group by utm_campaign. NULL campaigns roll up under '(none)' so
+        // organic / direct traffic still appears.
+        // Revenue: attribution → player_id → registrations.amount_paid
+        // (only completed games count; pre-completion regs may still be
+        // refunded). Free credits NOT counted as revenue — they're comped.
+        const sql = `
+            WITH hits AS (
+                SELECT COALESCE(lh.utm_campaign, '(none)') AS campaign,
+                       lh.utm_source,
+                       lh.utm_medium,
+                       lh.landing_region,
+                       COUNT(*) AS hits
+                  FROM landing_hits lh
+                 WHERE lh.landed_at > NOW() - ($1::int || ' days')::interval
+                 GROUP BY 1, 2, 3, 4
+            ),
+            attributed AS (
+                SELECT COALESCE(lh.utm_campaign, '(none)') AS campaign,
+                       lh.utm_source,
+                       lh.utm_medium,
+                       lh.landing_region,
+                       COUNT(DISTINCT la.player_id) AS signups,
+                       COUNT(DISTINCT r.id)         FILTER (WHERE g.game_status = 'completed') AS games_played,
+                       COALESCE(SUM(r.amount_paid) FILTER (WHERE g.game_status = 'completed'), 0) AS revenue
+                  FROM landing_hits lh
+                  JOIN landing_attributions la ON la.hit_id = lh.id
+                  LEFT JOIN registrations r ON r.player_id = la.player_id
+                  LEFT JOIN games        g ON g.id = r.game_id
+                 WHERE lh.landed_at > NOW() - ($1::int || ' days')::interval
+                 GROUP BY 1, 2, 3, 4
+            )
+            SELECT h.campaign,
+                   h.utm_source,
+                   h.utm_medium,
+                   h.landing_region,
+                   h.hits,
+                   COALESCE(a.signups, 0)      AS signups,
+                   COALESCE(a.games_played, 0) AS games_played,
+                   COALESCE(a.revenue, 0)::numeric(10,2) AS revenue,
+                   CASE WHEN h.hits > 0
+                        THEN ROUND(100.0 * COALESCE(a.signups, 0) / h.hits, 1)
+                        ELSE 0 END AS conv_rate_pct
+              FROM hits h
+              LEFT JOIN attributed a ON a.campaign = h.campaign
+                                    AND COALESCE(a.utm_source,'') = COALESCE(h.utm_source,'')
+                                    AND COALESCE(a.utm_medium,'') = COALESCE(h.utm_medium,'')
+                                    AND COALESCE(a.landing_region,'') = COALESCE(h.landing_region,'')
+             ORDER BY h.hits DESC, h.campaign ASC
+             LIMIT 200
+        `;
+        const result = await pool.query(sql, [days]);
+
+        // Totals row for the summary card.
+        const totals = result.rows.reduce((acc, r) => ({
+            hits:         acc.hits         + parseInt(r.hits),
+            signups:      acc.signups      + parseInt(r.signups),
+            games_played: acc.games_played + parseInt(r.games_played),
+            revenue:      acc.revenue      + parseFloat(r.revenue),
+        }), { hits: 0, signups: 0, games_played: 0, revenue: 0 });
+        totals.revenue = +totals.revenue.toFixed(2);
+        totals.conv_rate_pct = totals.hits > 0
+            ? +(100 * totals.signups / totals.hits).toFixed(1)
+            : 0;
+
+        res.json({ window_days: days, totals, rows: result.rows });
+    } catch (error) {
+        console.error('landing-attribution-report error:', error.message);
+        res.status(500).json({ error: 'Failed to load attribution report' });
     }
 });
 
