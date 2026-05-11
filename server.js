@@ -1312,6 +1312,20 @@ async function sendTeamsConfirmedEmails(gameId, options = {}) {
 const TEAM_EMAIL_DEBOUNCE_MS = 10 * 60 * 1000; // 10 minutes
 const _teamEmailTimers = new Map(); // gameId -> setTimeout handle
 
+// Wonderful webhook reverse-lookup fail cache — short-circuits repeat lookups
+// when a webhook arrives multiple times for an unresolvable wpId. Wonderful
+// sends ~7 webhooks per payment (created → pending → paid); without this,
+// each unresolved webhook would re-fire up to 20 sequential Wonderful API
+// calls. Keyed by wpId, value = timestamp of last failed attempt. Entries
+// expire after 5 minutes via the cleanup interval below.
+const _reverseLookupFailCache = new Map(); // wpId -> Date.now() of last failure
+setInterval(() => {
+    const cutoff = Date.now() - (5 * 60 * 1000);
+    for (const [wpId, ts] of _reverseLookupFailCache) {
+        if (ts < cutoff) _reverseLookupFailCache.delete(wpId);
+    }
+}, 60 * 1000).unref?.(); // unref so it doesn't block process exit
+
 // Read the currently-assigned team for every player on a game as a plain object
 async function getTeamSnapshot(gameId) {
     const r = await pool.query(`
@@ -33457,26 +33471,64 @@ async function _wonderfulVerifyStatus(pmt) {
     let verified = null;
     let resolvedWpId = pmt.wonderful_payment_id || null;
 
-    // ── LIST-SEARCH FIRST (most reliable source of truth) ─────────────────
+    // ── DIRECT FILTERED LOOKUP (most reliable when ref is known) ──────────
+    // /v2/payments?merchant_payment_reference=X returns ONLY the payment(s)
+    // matching that reference — no list-50 limit, no need to scan. Tried
+    // first because it's deterministic. If Wonderful doesn't support the
+    // query param it'll fall through to the unfiltered list-search below.
+    if (pmt.merchant_reference) {
+        try {
+            const filterRes = await wonderfulRequest('GET',
+                `/v2/payments?merchant_payment_reference=${encodeURIComponent(pmt.merchant_reference)}&limit=10`
+            );
+            const payments = filterRes.data?.payments || filterRes.data?.data || filterRes.data || [];
+            const arr = Array.isArray(payments) ? payments : [];
+            // Filter (defensively — the server might be ignoring our query param)
+            const match = arr.find(p =>
+                p.merchant_payment_reference === pmt.merchant_reference ||
+                p.merchant_reference === pmt.merchant_reference ||
+                p.reference === pmt.merchant_reference
+            );
+            if (match) {
+                verified = match.status || null;
+                const foundWpId = match.id || match.order_id || match.payment_id || null;
+                if (foundWpId && foundWpId !== resolvedWpId) {
+                    resolvedWpId = foundWpId;
+                    await pool.query(
+                        `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
+                        [resolvedWpId, pmt.id]
+                    ).catch(() => {});
+                    console.log('[WF verify] filtered lookup resolved', pmt.merchant_reference, '→ wpId', resolvedWpId, '· status', verified);
+                }
+            }
+        } catch (e) {
+            console.warn('[WF verify] filtered lookup failed:', e.message);
+        }
+    }
+
+    // ── LIST-SEARCH FALLBACK (unfiltered, scans last 50) ──────────────────
     // Wonderful's /v2/payments/{id} GET on a quick-pay ID can return the LINK's
     // status rather than the underlying payment's status — so a paid payment
     // can appear 'pending' forever via that path. The list endpoint returns the
     // actual payment records, matched by our merchant_reference (which we own).
     // This is why webhooks would fail and the reconciler would never credit:
     // direct-GET returned a non-terminal status → list-search was skipped.
-    if (pmt.merchant_reference) {
+    if (!verified && pmt.merchant_reference) {
         try {
             const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
-            const payments = listRes.data?.payments || listRes.data || [];
-            const found = (Array.isArray(payments) ? payments : []).find(p =>
+            const payments = listRes.data?.payments || listRes.data?.data || listRes.data || [];
+            const arr = Array.isArray(payments) ? payments : [];
+            // Log shape ONCE per call so we can finally see why webhook lookups fail
+            const sample = arr[0] ? Object.keys(arr[0]).join(',') : '(empty)';
+            console.log('[WF verify] list-search shape: array len=' + arr.length + ' | sample keys:', sample);
+            const found = arr.find(p =>
                 p.merchant_payment_reference === pmt.merchant_reference ||
-                p.merchant_reference === pmt.merchant_reference
+                p.merchant_reference === pmt.merchant_reference ||
+                p.reference === pmt.merchant_reference
             );
             if (found) {
                 verified = found.status || null;
-                // Persist the resolved id (could be `id` or `order_id` depending on shape).
-                // Store whichever matches the webhook so future webhook lookups hit directly.
-                const foundWpId = found.id || found.order_id || null;
+                const foundWpId = found.id || found.order_id || found.payment_id || null;
                 if (foundWpId && foundWpId !== resolvedWpId) {
                     resolvedWpId = foundWpId;
                     await pool.query(
@@ -33940,14 +33992,24 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         // to find the payment with this order_id, pull its merchant_reference,
         // and match to our DB. Also persists the webhook's id so future webhooks
         // hit directly.
+        //
+        // HARDENING: also tries scanning recent pending DB rows and checking each
+        // one's merchant_ref against Wonderful (reverse lookup) so we can catch
+        // the case where the list endpoint returns LINK records but not PAYMENT
+        // records with order_id.
         if (!pmt && wpId) {
             try {
                 const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
-                const payments = listRes.data?.payments || listRes.data || [];
+                const payments = listRes.data?.payments || listRes.data?.data || listRes.data || [];
+                // Log the response shape ONCE per webhook so we can diagnose if the
+                // structure changes. Compact but reveals enough.
+                const sample = Array.isArray(payments) && payments[0] ? Object.keys(payments[0]).join(',') : '(empty)';
+                console.log('[WF webhook] list-search shape:', Array.isArray(payments) ? `array len=${payments.length}` : typeof payments, '| sample keys:', sample);
+
                 const found = (Array.isArray(payments) ? payments : []).find(p =>
-                    p.id === wpId || p.order_id === wpId
+                    p.id === wpId || p.order_id === wpId || p.payment_id === wpId
                 );
-                const ref = found?.merchant_payment_reference || found?.merchant_reference || null;
+                const ref = found?.merchant_payment_reference || found?.merchant_reference || found?.reference || null;
                 if (ref) {
                     const byRef = await pool.query(
                         `SELECT * FROM wonderful_payments WHERE merchant_reference = $1`, [ref]
@@ -33959,6 +34021,63 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                             [wpId, pmt.id]
                         ).catch(() => {});
                         console.log('[WF webhook] resolved order_id → merchant_reference via list-search:', wpId, '→', ref);
+                    }
+                } else {
+                    // ── REVERSE LOOKUP ───────────────────────────────────────
+                    // List-search didn't find it (maybe Wonderful's /v2/payments
+                    // returns LINK records whose 'id' is our stored wpId but no
+                    // order_id field at all). Scan our own recent pending rows
+                    // and ask Wonderful "is THIS one's status changed?" for each.
+                    // Limited to last 20 pending rows so this stays bounded.
+                    //
+                    // RATE-LIMIT GUARD: Wonderful sends multiple webhooks per
+                    // payment (created → pending → paid, ~7 total observed).
+                    // Without caching, each unresolved webhook would re-fire 20
+                    // sequential API calls (= up to 140 calls per stuck payment).
+                    // Cache "tried-and-failed" wpIds for 5 minutes so repeated
+                    // webhooks short-circuit. Cache lives in process memory;
+                    // restarts clear it (acceptable — reconciler covers any gap).
+                    if (_reverseLookupFailCache.has(wpId)) {
+                        console.log('[WF webhook] reverse-lookup skipped (recently failed for wpId)', wpId);
+                    } else {
+                        console.log('[WF webhook] list-search did not match wpId', wpId, '— trying reverse lookup against pending rows');
+                        const pendingRows = await pool.query(
+                            `SELECT * FROM wonderful_payments
+                              WHERE status IN ('init_pending','pending')
+                                AND created_at > NOW() - INTERVAL '24 hours'
+                              ORDER BY created_at DESC
+                              LIMIT 20`
+                        );
+                        let matched = false;
+                        for (const candidate of pendingRows.rows) {
+                            if (!candidate.merchant_reference) continue;
+                            try {
+                                const filterRes = await wonderfulRequest('GET',
+                                    `/v2/payments?merchant_payment_reference=${encodeURIComponent(candidate.merchant_reference)}&limit=5`
+                                );
+                                const candPayments = filterRes.data?.payments || filterRes.data?.data || filterRes.data || [];
+                                const arr = Array.isArray(candPayments) ? candPayments : [];
+                                const match = arr.find(p =>
+                                    p.id === wpId || p.order_id === wpId || p.payment_id === wpId
+                                );
+                                if (match) {
+                                    pmt = candidate;
+                                    matched = true;
+                                    await pool.query(
+                                        `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
+                                        [wpId, pmt.id]
+                                    ).catch(() => {});
+                                    console.log('[WF webhook] reverse-lookup matched wpId', wpId, '→ ref', candidate.merchant_reference);
+                                    break;
+                                }
+                            } catch (innerE) {
+                                console.warn('[WF webhook] reverse-lookup candidate failed:', candidate.merchant_reference, innerE.message);
+                            }
+                        }
+                        if (!matched) {
+                            // Add to fail cache so subsequent webhooks short-circuit
+                            _reverseLookupFailCache.set(wpId, Date.now());
+                        }
                     }
                 }
             } catch (e) {
