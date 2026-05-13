@@ -1577,23 +1577,34 @@ async function sendNotification(type, playerId, data = {}) {
 // notifyAdmin: fire-and-forget email to SUPERADMIN_EMAIL. Never throws.
 // rows: array of [label, value] pairs to render as a table.
 async function notifyAdmin(subject, rows) {
-    if (!SUPERADMIN_EMAIL) return;
+    // FIX (admin-email-broken): match signup-email fallback so emails still send
+    // when SUPERADMIN_EMAIL env var is missing or wrong. Previously this function
+    // would silent-return when the var was unset, killing every Wonderful payment
+    // notification and any other admin alert routed through here.
+    const to = SUPERADMIN_EMAIL || 'totalfooty19@gmail.com';
     try {
         const tableRows = rows.map(([label, value]) =>
             `<tr><td style="padding:6px 0;color:#888;width:140px;vertical-align:top;">${htmlEncode(String(label))}</td>` +
             `<td style="font-weight:700;color:#fff;">${htmlEncode(String(value))}</td></tr>`
         ).join('');
-        await emailTransporter.sendMail({
+        const info = await emailTransporter.sendMail({
             from: '"TotalFooty" <totalfooty19@gmail.com>',
-            to:   SUPERADMIN_EMAIL,
+            to,
             subject,
             html: wrapEmailHtml(
                 `<p style="color:#888;font-size:14px;margin:0 0 16px">${htmlEncode(subject)}</p>` +
                 `<table style="width:100%;border-collapse:collapse;font-size:14px;">${tableRows}</table>`
             ),
         });
+        // Log success so you can verify in Render logs that the email actually went
+        // out — accepted addresses + message id confirm Gmail accepted the send.
+        console.log('[notifyAdmin sent] to:', to, '| subject:', subject, '| messageId:', info?.messageId || '(none)');
     } catch (e) {
-        console.warn('notifyAdmin email failed (non-critical):', e.message);
+        // Log the FULL error including code/response so we can diagnose Gmail
+        // failures (535 = bad password, 550 = address rejected, ETIMEDOUT = SMTP block).
+        console.error('[notifyAdmin FAILED] to:', to, '| subject:', subject,
+            '| error:', e?.message || e, '| code:', e?.code || '(none)',
+            '| response:', e?.response || '(none)');
     }
 }
 
@@ -1906,6 +1917,21 @@ app.post('/api/auth/register', async (req, res) => {
         // here and writes a row in landing_attributions linking the new player to
         // the originating ad campaign. Snake_case for web payload consistency.
         const landingHitId = req.body.landing_hit_id || req.body.landingHitId || null;
+        // FIX-243: When a cold visitor clicked a specific game tile on
+        // games.html, that tile's game_url was stashed in sessionStorage and
+        // is passed here. Surface it in the admin signup email so GAFFA sees
+        // exactly which game pulled the signup — useful context for the
+        // manual £7-credit / WhatsApp-invite step. NOT used for auto-register
+        // (manual review remains the anti-abuse gate per Fix 6 policy).
+        // Validated lightly (max length, basic shape) before being echoed
+        // back in HTML, then htmlEncoded on render.
+        let landingIntentGameUrl = null;
+        const _ligRaw = req.body.landing_intent_game_url || req.body.landingIntentGameUrl || null;
+        if (typeof _ligRaw === 'string' && _ligRaw.length > 0 && _ligRaw.length <= 200 && /^[A-Za-z0-9_\-]+$/.test(_ligRaw)) {
+            // game_url slugs across the platform are alphanumeric + `_-` only;
+            // anything else is junk / probe traffic and we ignore it.
+            landingIntentGameUrl = _ligRaw;
+        }
 
         // Validate required fields
         if (!fullName || !email || !password || !phone) {
@@ -2402,9 +2428,10 @@ app.post('/api/auth/register', async (req, res) => {
             }
 
             try {
-                await emailTransporter.sendMail({
+                const signupAdminTo = SUPERADMIN_EMAIL || 'totalfooty19@gmail.com';
+                const info = await emailTransporter.sendMail({
                     from: '"TotalFooty" <totalfooty19@gmail.com>',
-                    to: SUPERADMIN_EMAIL || 'totalfooty19@gmail.com',
+                    to: signupAdminTo,
                     subject: '🆕 New Player Signup — TotalFooty',
                     html: wrapEmailHtml(`
                         <p style="color:#888;font-size:14px;margin:0 0 16px">New account created</p>
@@ -2415,6 +2442,7 @@ app.post('/api/auth/register', async (req, res) => {
                             <tr><td style="padding:6px 0;color:#888;">Mobile</td><td>${htmlEncode(phone.trim())}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Age Range</td><td>${ageRange === '16_18' ? '16–18' : '18+'}</td></tr>
                             ${validatedRegion ? `<tr><td style="padding:6px 0;color:#888;">Region</td><td style="font-weight:900;">${htmlEncode(validatedRegion)}</td></tr>` : ''}
+                            ${landingIntentGameUrl ? `<tr><td style="padding:6px 0;color:#888;">From game</td><td style="font-weight:900;"><a href="https://totalfooty.co.uk/game.html?url=${encodeURIComponent(landingIntentGameUrl)}" style="color:#00cc66;text-decoration:none;">${htmlEncode(landingIntentGameUrl)}</a></td></tr>` : ''}
                             ${validatedInterests.length > 0 ? `<tr><td style="padding:6px 0;color:#888;">Interests</td><td>${validatedInterests.map(i => i.charAt(0).toUpperCase()+i.slice(1)).join(', ')}</td></tr>` : ''}
                             ${referredByRow}
                             ${validatedSkillLevel ? `<tr><td style="padding:6px 0;color:#888;">Skill Level</td><td style="font-weight:900;">${htmlEncode(validatedSkillLevel)}</td></tr>
@@ -2422,8 +2450,11 @@ app.post('/api/auth/register', async (req, res) => {
                         </table>
                     `)
                 });
+                // Verbose log so silent failures become visible in Render logs.
+                console.log('[signup admin email sent] to:', signupAdminTo, '| player:', email, '| messageId:', info?.messageId || '(none)');
             } catch (e) {
-                console.error('Admin signup notification failed (non-critical):', e.message);
+                console.error('[signup admin email FAILED]', '| error:', e?.message || e,
+                    '| code:', e?.code || '(none)', '| response:', e?.response || '(none)');
             }
         });
     } catch (error) {
@@ -5058,6 +5089,41 @@ app.post('/api/admin/players/:id/credits', authenticateToken, requireSuperAdmin,
 
         await recordCreditTransaction(pool, req.params.id, amount, 'admin_adjustment', description, req.user.userId);
         await auditLog(pool, req.user.playerId, 'credit_adjustment', req.params.id, `${parsedAmount >= 0 ? '+' : ''}£${parsedAmount.toFixed(2)} — ${description.trim()}`);
+
+        // FIX (manual-credit-double-credit-guard): if this looks like a manual
+        // recovery of a stuck Wonderful payment (positive amount, matching pence
+        // value, status pending/init_pending, player matches), mark those rows
+        // as 'credited_manually' so the reconciler doesn't credit them again
+        // when Wonderful's API eventually reports them as paid.
+        //
+        // Conservative match: amount + player + non-terminal status. If multiple
+        // pending payments match the amount exactly, mark them all — admin would
+        // not credit the same player the same amount twice in normal operation
+        // unless reconciling several stuck payments at once.
+        if (parsedAmount > 0) {
+            try {
+                const pence = Math.round(parsedAmount * 100);
+                const matchedRows = await pool.query(
+                    `UPDATE wonderful_payments
+                        SET status = 'credited_manually',
+                            confirmed_at = COALESCE(confirmed_at, NOW()),
+                            credited_at  = COALESCE(credited_at, NOW())
+                      WHERE player_id = $1
+                        AND amount_pence = $2
+                        AND status NOT IN ('credited', 'credited_manually', 'failed', 'cancelled', 'expired', 'init_failed')
+                        AND created_at > NOW() - INTERVAL '14 days'
+                  RETURNING id, merchant_reference, status`,
+                    [req.params.id, pence]
+                );
+                if (matchedRows.rows.length > 0) {
+                    console.log(`[manual-credit guard] marked ${matchedRows.rows.length} pending Wonderful payment(s) as credited_manually:`,
+                        matchedRows.rows.map(r => r.merchant_reference).join(', '));
+                }
+            } catch (guardErr) {
+                // Non-fatal — credit already applied. Just log so we can see if guard fires errors.
+                console.warn('[manual-credit guard] failed to mark pending Wonderful rows:', guardErr.message);
+            }
+        }
 
         res.json({ message: 'Credits adjusted' });
 
@@ -33465,6 +33531,46 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
 // Returns { verified, resolvedWpId }
 //   verified     — 'paid' | 'accepted' | 'failed' | 'cancelled' | 'processing' | 'submitted' | null
 //   resolvedWpId — Wonderful's payment id (possibly newly resolved)
+// Pick the "best" payment from a list of Wonderful API records that match
+// a given merchant_reference. When a player abandons + retries, multiple
+// records exist for the same reference; earlier attempts may be 'cancelled'
+// while a later retry succeeded as 'paid'. This helper ensures we always
+// resolve to the most successful state, never accidentally writing a stale
+// 'cancelled' status when a successful retry exists.
+//
+// Priority:
+//   1. paid / accepted        (terminal success — credit these)
+//   2. pending / created      (in-flight, may still succeed)
+//   3. anything not cancelled (failed/expired/etc)
+//   4. cancelled              (lowest — only if all attempts cancelled)
+// Within each tier, prefer the most recent updated_at.
+function _pickBestWonderfulPayment(matches) {
+    if (!matches || matches.length === 0) return null;
+    if (matches.length === 1) return matches[0];
+
+    const tierOf = (p) => {
+        const s = (p.status || '').toLowerCase();
+        if (s === 'paid' || s === 'accepted')   return 0;
+        if (s === 'pending' || s === 'created') return 1;
+        if (s === 'cancelled')                  return 3;
+        return 2;
+    };
+    const sorted = [...matches].sort((a, b) => {
+        const ta = tierOf(a), tb = tierOf(b);
+        if (ta !== tb) return ta - tb;
+        // Tiebreak: most recent updated_at wins
+        const ua = new Date(a.updated_at || a.created_at || 0).getTime();
+        const ub = new Date(b.updated_at || b.created_at || 0).getTime();
+        return ub - ua;
+    });
+    if (sorted.length > 1) {
+        console.log('[WF pickBest] chose status=' + sorted[0].status,
+            '| of ' + matches.length + ' attempts:',
+            matches.map(m => `${m.status}@${m.updated_at || m.created_at}`).join(' / '));
+    }
+    return sorted[0];
+}
+
 async function _wonderfulVerifyStatus(pmt) {
     if (!WONDERFUL_API_KEY) return { verified: null, resolvedWpId: pmt.wonderful_payment_id || null };
 
@@ -33483,12 +33589,19 @@ async function _wonderfulVerifyStatus(pmt) {
             );
             const payments = filterRes.data?.payments || filterRes.data?.data || filterRes.data || [];
             const arr = Array.isArray(payments) ? payments : [];
-            // Filter (defensively — the server might be ignoring our query param)
-            const match = arr.find(p =>
+            // FIX (wonderful-multi-attempt): when a player abandons + retries, Wonderful
+            // creates MULTIPLE payment records for the same merchant_reference. Earlier
+            // attempts often end 'cancelled'; only the successful retry is 'paid'. Picking
+            // the wrong one (e.g. the first 'cancelled' attempt) prevented Jac's credit
+            // and wrote 'cancelled' status to our DB, blocking the reconciler permanently.
+            // New rule: among ALL matching records, prefer paid/accepted > pending/created
+            //          > everything else > cancelled. Tiebreak by most recent updated_at.
+            const matches = arr.filter(p =>
                 p.merchant_payment_reference === pmt.merchant_reference ||
                 p.merchant_reference === pmt.merchant_reference ||
                 p.reference === pmt.merchant_reference
             );
+            const match = _pickBestWonderfulPayment(matches);
             if (match) {
                 verified = match.status || null;
                 const foundWpId = match.id || match.order_id || match.payment_id || null;
@@ -33498,7 +33611,9 @@ async function _wonderfulVerifyStatus(pmt) {
                         `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
                         [resolvedWpId, pmt.id]
                     ).catch(() => {});
-                    console.log('[WF verify] filtered lookup resolved', pmt.merchant_reference, '→ wpId', resolvedWpId, '· status', verified);
+                    console.log('[WF verify] filtered lookup resolved', pmt.merchant_reference,
+                        '→ wpId', resolvedWpId, '· status', verified,
+                        matches.length > 1 ? `(chose best of ${matches.length} attempts)` : '');
                 }
             }
         } catch (e) {
@@ -33521,11 +33636,13 @@ async function _wonderfulVerifyStatus(pmt) {
             // Log shape ONCE per call so we can finally see why webhook lookups fail
             const sample = arr[0] ? Object.keys(arr[0]).join(',') : '(empty)';
             console.log('[WF verify] list-search shape: array len=' + arr.length + ' | sample keys:', sample);
-            const found = arr.find(p =>
+            // Pick best of all matching attempts (see filtered-lookup comment above).
+            const matches = arr.filter(p =>
                 p.merchant_payment_reference === pmt.merchant_reference ||
                 p.merchant_reference === pmt.merchant_reference ||
                 p.reference === pmt.merchant_reference
             );
+            const found = _pickBestWonderfulPayment(matches);
             if (found) {
                 verified = found.status || null;
                 const foundWpId = found.id || found.order_id || found.payment_id || null;
@@ -33866,7 +33983,7 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
             `UPDATE wonderful_payments
              SET status = 'credited', confirmed_at = NOW(), credited_at = NOW(),
                  wonderful_payment_id = COALESCE(wonderful_payment_id, $1)
-             WHERE id = $2 AND status != 'credited'
+             WHERE id = $2 AND status NOT IN ('credited', 'credited_manually')
              RETURNING *`,
             [verifyWpId || pmt.wonderful_payment_id || null, pmt.id]
         );
@@ -34006,9 +34123,30 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                 const sample = Array.isArray(payments) && payments[0] ? Object.keys(payments[0]).join(',') : '(empty)';
                 console.log('[WF webhook] list-search shape:', Array.isArray(payments) ? `array len=${payments.length}` : typeof payments, '| sample keys:', sample);
 
-                const found = (Array.isArray(payments) ? payments : []).find(p =>
+                let found = (Array.isArray(payments) ? payments : []).find(p =>
                     p.id === wpId || p.order_id === wpId || p.payment_id === wpId
                 );
+
+                // FIX (wonderful-pagination): when list-search misses (Wonderful's
+                // /v2/payments returns ~25 records regardless of limit param, and a
+                // payment can fall off the back if other merchants are active),
+                // fetch the specific payment record by wpId directly. This is the
+                // deterministic path and should always succeed if the webhook's
+                // wpId is real. Without this, paid webhooks for older payments
+                // never resolved → never credited.
+                if (!found) {
+                    try {
+                        const directRes = await wonderfulRequest('GET', `/v2/payments/${wpId}`);
+                        const directPmt = directRes.data?.payment || directRes.data || null;
+                        if (directPmt && (directPmt.id === wpId || directPmt.order_id === wpId)) {
+                            found = directPmt;
+                            console.log('[WF webhook] direct GET resolved wpId:', wpId, '· status:', directPmt.status, '· ref:', directPmt.reference || directPmt.merchant_payment_reference || directPmt.merchant_reference || '(none)');
+                        }
+                    } catch (e) {
+                        console.warn('[WF webhook] direct GET failed for wpId', wpId, ':', e.message);
+                    }
+                }
+
                 const ref = found?.merchant_payment_reference || found?.merchant_reference || found?.reference || null;
                 if (ref) {
                     const byRef = await pool.query(
@@ -34087,8 +34225,8 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         if (!pmt) {
             return console.warn('[WF webhook] no matching payment record (reconciler will retry) — wpId:', wpId, 'ref:', webhookRef);
         }
-        if (pmt.status === 'credited') {
-            return console.log('[WF webhook] already credited, skipping:', pmt.merchant_reference);
+        if (pmt.status === 'credited' || pmt.status === 'credited_manually') {
+            return console.log('[WF webhook] already credited (' + pmt.status + '), skipping:', pmt.merchant_reference);
         }
 
         // Verify with Wonderful API — never trust webhook payload alone
@@ -34101,9 +34239,10 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         }
 
         if (verified !== 'paid' && verified !== 'accepted') {
-            // Record Wonderful's state without crediting
+            // Record Wonderful's state without crediting. Guard against overwriting
+            // a 'credited_manually' status with a transient Wonderful state.
             await pool.query(
-                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status != 'credited'`,
+                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
                 [verified, resolvedWpId, pmt.id]
             ).catch(() => {});
             return;
@@ -34144,7 +34283,7 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
         console.log('[WF status-poll] ref:', ref, 'db_status:', p.status, 'wp_id:', p.wonderful_payment_id || 'NULL');
 
         // Cold-start recovery
-        if (p.status !== 'credited' && WONDERFUL_API_KEY) {
+        if (p.status !== 'credited' && p.status !== 'credited_manually' && WONDERFUL_API_KEY) {
             const { verified, resolvedWpId } = await _wonderfulVerifyStatus(p);
             if (verified === 'paid' || verified === 'accepted') {
                 try {
@@ -34159,9 +34298,9 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
                     console.error('[WF status-poll] recovery failed:', e.message);
                 }
             } else if (verified && verified !== 'paid' && verified !== 'accepted') {
-                // Mirror Wonderful's state in our DB without crediting
+                // Mirror Wonderful's state in our DB without crediting. Guard manual credit.
                 await pool.query(
-                    `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status != 'credited'`,
+                    `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
                     [verified, resolvedWpId, p.id]
                 ).catch(() => {});
             }
@@ -34197,6 +34336,7 @@ app.post('/api/admin/payments/wonderful/reconcile/:ref', authenticateToken, requ
         if (!row.rows.length) return res.status(404).json({ error: 'Payment not found' });
         const pmt = row.rows[0];
         if (pmt.status === 'credited') return res.json({ message: 'Already credited', status: 'credited' });
+        if (pmt.status === 'credited_manually') return res.json({ message: 'Already credited manually', status: 'credited_manually' });
         if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'Wonderful API not configured' });
 
         const { verified, resolvedWpId } = await _wonderfulVerifyStatus(pmt);
@@ -34263,6 +34403,7 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
         if (!pmtRow.rows.length) return res.status(404).json({ error: 'Payment not found' });
         const pmt = pmtRow.rows[0];
         if (pmt.status === 'credited') return res.status(409).json({ error: 'Already credited', payment: pmt });
+        if (pmt.status === 'credited_manually') return res.status(409).json({ error: 'Already credited manually', payment: pmt });
         if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'WONDERFUL_API_KEY not set' });
 
         // Verify — list-search fallback handles NULL wonderful_payment_id
@@ -34856,7 +34997,26 @@ app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web64`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web57`);
+
+    // ── Email transport self-check ──────────────────────────────────────────
+    // Verifies SMTP credentials on boot so silent email failures become loud.
+    // Without this, an expired Gmail App Password would just cause every email
+    // to fail without you knowing — exactly the bug we hit.
+    const adminTarget = SUPERADMIN_EMAIL || 'totalfooty19@gmail.com';
+    const hasPwd = !!process.env.GMAIL_APP_PASSWORD;
+    console.log(`📧 Email config: GMAIL_APP_PASSWORD ${hasPwd ? 'SET' : '** MISSING **'} | SUPERADMIN_EMAIL → ${adminTarget}`);
+    emailTransporter.verify((err) => {
+        if (err) {
+            console.error('❌ EMAIL TRANSPORT BROKEN — Gmail SMTP verify failed:',
+                err.message || err, '| code:', err.code || '(none)',
+                '| response:', err.response || '(none)');
+            console.error('   → Likely fix: regenerate Gmail App Password at https://myaccount.google.com/apppasswords');
+            console.error('   → Then update GMAIL_APP_PASSWORD env var in Render and restart.');
+        } else {
+            console.log('✅ Email transport verified — Gmail SMTP ready');
+        }
+    });
 
     // ── Team-email settle recovery sweep ────────────────────────────────────
     // Pending "settle" timers live in memory (setTimeout). If the server restarts
@@ -34917,7 +35077,7 @@ app.listen(PORT, () => {
             // to return cleanly — _wonderfulVerifyStatus will list-search and resolve.
             const pending = await pool.query(
                 `SELECT * FROM wonderful_payments
-                 WHERE status NOT IN ('credited', 'failed', 'cancelled', 'expired', 'init_failed')
+                 WHERE status NOT IN ('credited', 'credited_manually', 'failed', 'cancelled', 'expired', 'init_failed')
                    AND created_at BETWEEN NOW() - INTERVAL '72 hours' AND NOW() - INTERVAL '30 seconds'
                  ORDER BY created_at ASC
                  LIMIT 30`
@@ -34940,10 +35100,10 @@ app.listen(PORT, () => {
                             console.log(`  ✓ credited £${result.pounds.toFixed(2)} — ref ${pmt.merchant_reference}${pmt.game_id ? ` · auto-register: ${result.autoRegister.status || 'topup-only'}` : ''}`);
                         }
                     } else {
-                        // Not paid — mirror Wonderful's state in our DB without crediting
+                        // Not paid — mirror Wonderful's state in our DB without crediting. Guard manual credit.
                         if (pmt.status !== verified) {
                             await pool.query(
-                                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status != 'credited'`,
+                                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
                                 [verified, resolvedWpId, pmt.id]
                             ).catch(() => {});
                         }
