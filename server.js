@@ -1905,6 +1905,645 @@ const requireGameManager = async (req, res, next) => {
 // AUTHENTICATION
 // ==========================================
 
+// ════════════════════════════════════════════════════════════════════════
+// FIX-244 — Signup OVR derivation (position grids + level + recency decay)
+// ════════════════════════════════════════════════════════════════════════
+// Replaces the flat 4-button skill-level model. New signups send:
+//   signupPositions:  CSV of "gk", "def", "mid", "att" (one or more)
+//   signupPrimary:    "goalkeeper" or "outfield" (only required if positions
+//                     includes both gk AND outfield; auto-derived otherwise)
+//   signupLevel:      one of 9 keys in LEVEL_OVR_MAP
+//   signupYearsOff:   integer 0..4 — years since last played at chosen level
+//
+// Output: { gk, def, str, fit, pac, dec, ast, sht, overall, primary,
+//           stat_grid_used } — same shape as legacy SKILL_STAT_MAP rows so
+// the INSERT block downstream doesn't need restructuring.
+//
+// Legacy SKILL_STAT_MAP kept for clients (older mobile builds) that still
+// only send `skillLevel` — see register handler below.
+
+const FIX244_LEVEL_OVR_MAP = {
+    beginner:    78,    // "Complete beginner"
+    casual:      82,    // "Only played casually"
+    school:      84,    // "School team"
+    five_seven:  86,    // "5/7-a-side league"
+    sunday:      87,    // "Sunday league"
+    saturday:    88,    // "Saturday league"
+    step_6_10:   89,    // "Step 6–10"
+    semi_pro:    92,    // "Semi-pro"
+    pro:         95,    // "Pro"
+};
+
+// Per-tier decay (years off → OVR loss). All applied via floor() so a
+// fractional year never moves OVR — "1 year off at 5/7-a-side = 0.4 decay
+// = floor → 0 loss". Beginner tier still asks the question (signal for
+// future tuning) but applies the gentlest decay.
+const FIX244_DECAY_PER_YEAR = (levelKey) => {
+    if (['beginner', 'casual', 'school'].includes(levelKey)) return 0.25;
+    if (levelKey === 'five_seven')                            return 0.40;
+    return 0.50; // sunday + above
+};
+
+// Grid rows — keys are the OVR target. Selected by computing
+// (level_OVR - floor(yearsOff * decayPerYear)), clamped to [78,95], then
+// rounded DOWN to the nearest grid row that exists. Each row has 7
+// outfield stat values + a GK column. For GK signups: outfield stats are
+// flat 12s, GK rating = the row's GK value (replacing what the grid says
+// for outfield primaries).
+//
+// Per spec Q4 — Defender 82 row second stat is 12, not 1 (typo in source
+// spreadsheet). Verified via row sum = 82.
+const FIX244_GRIDS = {
+    def: {
+        78: { def: 12, str: 11, fit: 11, pac: 11, dec: 11, ast: 11, sht: 11, gk: 80 },
+        82: { def: 12, str: 12, fit: 12, pac: 12, dec: 12, ast: 11, sht: 11, gk: 84 },
+        84: { def: 13, str: 12, fit: 12, pac: 12, dec: 12, ast: 12, sht: 11, gk: 84 },
+        86: { def: 13, str: 13, fit: 12, pac: 12, dec: 12, ast: 12, sht: 12, gk: 85 },
+        87: { def: 13, str: 13, fit: 12, pac: 12, dec: 13, ast: 12, sht: 12, gk: 86 },
+        88: { def: 13, str: 13, fit: 13, pac: 12, dec: 13, ast: 12, sht: 12, gk: 87 },
+        89: { def: 14, str: 13, fit: 13, pac: 12, dec: 13, ast: 12, sht: 12, gk: 87 },
+        92: { def: 14, str: 13, fit: 13, pac: 13, dec: 13, ast: 13, sht: 13, gk: 87 },
+        95: { def: 15, str: 13, fit: 14, pac: 13, dec: 14, ast: 13, sht: 13, gk: 87 },
+    },
+    mid: {
+        78: { def: 11, str: 11, fit: 12, pac: 11, dec: 11, ast: 11, sht: 11, gk: 79 },
+        82: { def: 11, str: 12, fit: 12, pac: 12, dec: 12, ast: 12, sht: 11, gk: 83 },
+        84: { def: 12, str: 12, fit: 12, pac: 12, dec: 12, ast: 12, sht: 12, gk: 83 },
+        86: { def: 12, str: 12, fit: 13, pac: 12, dec: 13, ast: 12, sht: 12, gk: 84 },
+        87: { def: 13, str: 12, fit: 13, pac: 12, dec: 13, ast: 12, sht: 12, gk: 85 },
+        88: { def: 13, str: 12, fit: 13, pac: 13, dec: 13, ast: 12, sht: 12, gk: 86 },
+        89: { def: 13, str: 13, fit: 13, pac: 13, dec: 13, ast: 12, sht: 12, gk: 86 },
+        92: { def: 13, str: 13, fit: 14, pac: 13, dec: 13, ast: 13, sht: 13, gk: 86 },
+        95: { def: 13, str: 14, fit: 14, pac: 13, dec: 14, ast: 14, sht: 13, gk: 86 },
+    },
+    att: {
+        78: { def: 11, str: 11, fit: 11, pac: 12, dec: 11, ast: 11, sht: 11, gk: 79 },
+        82: { def: 11, str: 11, fit: 12, pac: 12, dec: 12, ast: 12, sht: 12, gk: 83 },
+        84: { def: 11, str: 12, fit: 12, pac: 12, dec: 12, ast: 12, sht: 13, gk: 83 },
+        86: { def: 11, str: 12, fit: 12, pac: 12, dec: 13, ast: 13, sht: 13, gk: 84 },
+        87: { def: 12, str: 12, fit: 12, pac: 12, dec: 13, ast: 13, sht: 13, gk: 85 },
+        88: { def: 12, str: 12, fit: 12, pac: 13, dec: 13, ast: 13, sht: 13, gk: 86 },
+        89: { def: 12, str: 13, fit: 12, pac: 13, dec: 13, ast: 13, sht: 13, gk: 86 },
+        92: { def: 12, str: 13, fit: 13, pac: 13, dec: 13, ast: 14, sht: 14, gk: 86 },
+        95: { def: 13, str: 13, fit: 13, pac: 14, dec: 14, ast: 14, sht: 14, gk: 86 },
+    },
+};
+
+// GK signup: outfield stats are flat 12s across the board (per spec). GK
+// rating = the row OVR itself (78–95). The "Anywhere" choice (every
+// outfield position) defaults to the mid grid as the balanced fallback.
+const FIX244_GRID_ROWS_ASC = [78, 82, 84, 86, 87, 88, 89, 92, 95];
+
+function _fix244RoundDownToGridRow(ovr) {
+    let best = 78;
+    for (const r of FIX244_GRID_ROWS_ASC) {
+        if (r <= ovr) best = r; else break;
+    }
+    return best;
+}
+
+function _fix244ChooseGrid(positionsArr, primary) {
+    // Pure-GK signup → use GK profile (flat-12 outfield, row OVR as GK rating).
+    if (primary === 'goalkeeper') return 'gk';
+    // Outfield primary. Pick the most-specific grid based on positions.
+    // If the user chose multiple outfield (e.g. DEF+MID, ATT+MID, or all
+    // three), default to the balanced mid grid. Single-pick is honoured.
+    const outfield = positionsArr.filter(p => p !== 'gk');
+    if (outfield.length === 1) return outfield[0]; // def | mid | att
+    return 'mid';
+}
+
+// Returns the same stat-object shape as legacy SKILL_STAT_MAP rows.
+// Returns null if the inputs are invalid (caller should fall back to
+// legacy SKILL_STAT_MAP).
+function _deriveSignupStats(signupPositions, signupPrimary, signupLevel, signupYearsOff) {
+    try {
+        // Validate positions
+        if (!Array.isArray(signupPositions) || signupPositions.length === 0) return null;
+        const VALID_POS = ['gk', 'def', 'mid', 'att'];
+        const positions = signupPositions
+            .map(p => String(p || '').toLowerCase().trim())
+            .filter(p => VALID_POS.includes(p));
+        if (positions.length === 0) return null;
+
+        // Derive primary
+        const hasGk = positions.includes('gk');
+        const hasOutfield = positions.some(p => p !== 'gk');
+        let primary;
+        if (hasGk && !hasOutfield)       primary = 'goalkeeper';
+        else if (!hasGk && hasOutfield)  primary = 'outfield';
+        else if (hasGk && hasOutfield) {
+            // User must have picked one explicitly via signupPrimary.
+            // FIX-244 audit: if signupPrimary is missing or not one of the
+            // two valid values, return null so the server falls back to
+            // the legacy SKILL_STAT_MAP. This protects against malformed
+            // mobile/3rd-party payloads that pick "gk + def" but forget
+            // to send signupPrimary (web wizard validates this client-side,
+            // but the server must not trust frontend validation).
+            if (signupPrimary !== 'goalkeeper' && signupPrimary !== 'outfield') {
+                return null;
+            }
+            primary = signupPrimary;
+        } else {
+            return null; // unreachable
+        }
+
+        // Validate level
+        const levelOvr = FIX244_LEVEL_OVR_MAP[signupLevel];
+        if (levelOvr === undefined) return null;
+
+        // Validate years off (allow 0)
+        let yearsOff = parseInt(signupYearsOff);
+        if (isNaN(yearsOff) || yearsOff < 0) yearsOff = 0;
+        if (yearsOff > 4) yearsOff = 4; // cap at 4+
+
+        // Apply decay
+        const decay = Math.floor(yearsOff * FIX244_DECAY_PER_YEAR(signupLevel));
+        let finalOvr = levelOvr - decay;
+        if (finalOvr < 78) finalOvr = 78;
+        if (finalOvr > 95) finalOvr = 95;
+
+        // Pick grid + row
+        const gridKey = _fix244ChooseGrid(positions, primary);
+        const rowKey  = _fix244RoundDownToGridRow(finalOvr);
+
+        let stats;
+        if (gridKey === 'gk') {
+            // GK primary: outfield stats flat 12, GK rating = row OVR
+            stats = {
+                gk:      rowKey,
+                def:     12, str: 12, fit: 12, pac: 12,
+                dec:     12, ast: 12, sht: 12,
+                overall: rowKey,
+            };
+        } else {
+            const row = FIX244_GRIDS[gridKey][rowKey];
+            stats = {
+                gk:      row.gk,
+                def:     row.def, str: row.str, fit: row.fit, pac: row.pac,
+                dec:     row.dec, ast: row.ast, sht: row.sht,
+                overall: rowKey,
+            };
+        }
+
+        // Carry derivation context for storage + audit
+        stats._signupPositions = positions.join(',');
+        stats._signupPrimary   = primary;
+        stats._signupLevel     = signupLevel;
+        stats._signupYearsOff  = yearsOff;
+        stats._gridUsed        = gridKey;
+        return stats;
+    } catch (e) {
+        console.warn('[FIX-244] _deriveSignupStats failed:', e.message);
+        return null;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-245 — OVR suspicion classifier + carrier inference + aggregation
+// ════════════════════════════════════════════════════════════════════════
+// Three layers:
+//
+//   1) _recomputeOvrSuspicion(playerId) — classifier called after every
+//      game completion and after every applied recalibration. Sets
+//      players.ovr_suspicion to one of:
+//        null                            — normal
+//        'low_winrate'                   — < 20% w/ ≥3 games OR < 33% w/ ≥10
+//        'high_winrate'                  — > 80% w/ ≥3 games OR > 67% w/ ≥10
+//        'low_winrate_carrier_inferred'  — flagged by carrier inference
+//        'high_winrate_carrier_inferred' — symmetric for over-performing
+//
+//      Honours a 3-game cooldown: if `suspicion_cooldown_until_game_count`
+//      is in the future (relative to current total_appearances), classifier
+//      will refuse to re-flag in the same direction. Win-rate normalising
+//      clears the flag immediately regardless of cooldown.
+//
+//   2) _aggregateRatingFeedback(subjectPlayerId) — checks unconsumed votes
+//      for the subject. If trigger threshold met (per-position):
+//        - GK:       ≥2 votes, ≥1 voter, direction matches suspicion
+//        - outfield: ≥3 votes, ≥2 voters, direction matches suspicion
+//      Applies (total_magnitude / 4) OVR points in the suspicion direction.
+//      Consumes oldest votes first up to N*4 magnitude. Audit-logs the
+//      change via statHistory + game_audit_log style entry.
+//
+//   3) _runCarrierInference(subjectPlayerId, signedDirection) — when
+//      votes vindicate a flagged subject (low_winrate → mostly positive
+//      votes, high_winrate → mostly negative), clear the original flag
+//      and try to find the "real culprit" teammate. See spec Q15.
+//
+// Schema additions (run separately — these are deployment notes):
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS ovr_suspicion text;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS suspicion_cooldown_until_appearances integer;
+//   (player_rating_feedback table + indexes — already created via SQL run on 13 May)
+//   (signup_positions, signup_primary, signup_level, signup_years_off — already added)
+
+const FIX245_SUSPICION_DIRECTION = {
+    'low_winrate':                   -1,  // suspected overrated → expect negative votes
+    'high_winrate':                  +1,  // suspected underrated → expect positive votes
+    'low_winrate_carrier_inferred':  -1,
+    'high_winrate_carrier_inferred': +1,
+};
+
+async function _recomputeOvrSuspicion(playerId) {
+    try {
+        // Fetch current state
+        const r = await pool.query(
+            `SELECT id, total_appearances, total_wins, total_draws, position,
+                    ovr_suspicion, suspicion_cooldown_until_appearances
+             FROM players WHERE id = $1`,
+            [playerId]
+        );
+        if (r.rows.length === 0) return;
+        const p = r.rows[0];
+
+        const appearances = parseInt(p.total_appearances) || 0;
+        const wins        = parseInt(p.total_wins)        || 0;
+        const draws       = parseInt(p.total_draws)       || 0;
+        if (appearances < 3) return; // not enough data either way
+
+        // effective_wins includes draws at 0.5 — same convention used in
+        // /api/players/:id (server.js:3272 effective_wins / effective_win_percent)
+        const effWins      = wins + draws * 0.5;
+        const effWinPct    = (effWins / appearances) * 100;
+
+        let newFlag = null;
+        if (appearances >= 10) {
+            if (effWinPct < 33) newFlag = 'low_winrate';
+            else if (effWinPct > 67) newFlag = 'high_winrate';
+        } else {
+            // 3..9 appearances — tighter band
+            if (effWinPct < 20) newFlag = 'low_winrate';
+            else if (effWinPct > 80) newFlag = 'high_winrate';
+        }
+
+        // Honour cooldown — won't re-flag in same direction until cooldown clears.
+        // Cooldown is encoded as the appearance count at which the cooldown
+        // expires. If appearances is BELOW that count, we're still cooling
+        // down for the previously-cleared flag direction.
+        if (newFlag && p.suspicion_cooldown_until_appearances) {
+            const cooldownUntil = parseInt(p.suspicion_cooldown_until_appearances);
+            if (appearances < cooldownUntil) {
+                // Still in cooldown — don't re-flag in any direction.
+                // But DO clear an existing flag (in case classifier already
+                // moved them to normal band).
+                newFlag = null;
+            }
+        }
+
+        // Apply if changed
+        if (newFlag !== p.ovr_suspicion) {
+            await pool.query(
+                `UPDATE players SET ovr_suspicion = $1 WHERE id = $2`,
+                [newFlag, playerId]
+            );
+            console.log(`[FIX-245 classifier] player ${playerId}: ${p.ovr_suspicion || 'null'} → ${newFlag || 'null'} (winPct=${effWinPct.toFixed(1)}, app=${appearances})`);
+        }
+    } catch (e) {
+        console.warn('[FIX-245 classifier] failed for player', playerId, e.message);
+    }
+}
+
+// Re-classify every player who played in a given game. Called from the
+// game-completion handler.
+async function _recomputeOvrSuspicionForGame(gameId) {
+    try {
+        const r = await pool.query(
+            `SELECT DISTINCT player_id FROM registrations
+              WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        for (const row of r.rows) {
+            await _recomputeOvrSuspicion(row.player_id);
+        }
+    } catch (e) {
+        console.warn('[FIX-245 classifier-for-game] failed for game', gameId, e.message);
+    }
+}
+
+// Aggregate unconsumed votes and apply OVR adjustment if trigger threshold met.
+// Returns { applied: bool, deltaOvr: int, votesConsumed: int, reason?: string }.
+async function _aggregateRatingFeedback(subjectPlayerId) {
+    // FIX-245 audit: serialise on the subject row to prevent
+    // double-applied recalibration when eager (POST) and cron run for the
+    // same subject at the same time. We take ONE client, BEGIN early,
+    // SELECT FOR UPDATE on the subject's row. Concurrent callers block on
+    // the row lock until first commits; second then sees the updated
+    // applied_amount on the votes and either finds nothing to do or
+    // applies the correct *remaining* increment.
+    const client = await pool.connect();
+    let inTxn = false;
+    try {
+        await client.query('BEGIN');
+        inTxn = true;
+
+        // Lock the subject's row for the duration of this txn.
+        const subjR = await client.query(
+            `SELECT id, alias, position, overall_rating, ovr_suspicion,
+                    total_appearances
+             FROM players WHERE id = $1
+             FOR UPDATE`,
+            [subjectPlayerId]
+        );
+        if (subjR.rows.length === 0) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return { applied: false, reason: 'subject_not_found' };
+        }
+        const subj = subjR.rows[0];
+        if (!subj.ovr_suspicion) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return { applied: false, reason: 'not_flagged' };
+        }
+
+        const isGk         = subj.position === 'goalkeeper';
+        const suspicionDir = FIX245_SUSPICION_DIRECTION[subj.ovr_suspicion] || 0;
+        if (suspicionDir === 0) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return { applied: false, reason: 'unknown_flag' };
+        }
+
+        // Fetch unconsumed votes — oldest first.
+        // Read via the same client so we see anything committed before our lock.
+        const votesR = await client.query(
+            `SELECT id, voter_player_id, reference_player_id, delta_vote,
+                    COALESCE(applied_amount, 0) AS applied_amount, created_at
+             FROM player_rating_feedback
+             WHERE subject_player_id = $1 AND fully_consumed = false
+                   AND delta_vote IS NOT NULL
+             ORDER BY created_at ASC`,
+            [subjectPlayerId]
+        );
+        const votes = votesR.rows;
+        if (votes.length === 0) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return { applied: false, reason: 'no_votes' };
+        }
+
+        // Split into direction-matching vs counter-direction.
+        const matchingVotes = votes.filter(v => Math.sign(v.delta_vote) === suspicionDir);
+        const counterVotes  = votes.filter(v => Math.sign(v.delta_vote) === -suspicionDir);
+
+        const matchingCount  = matchingVotes.length;
+        const matchingVoters = new Set(matchingVotes.map(v => v.voter_player_id)).size;
+        const counterCount   = counterVotes.length;
+        const counterVoters  = new Set(counterVotes.map(v => v.voter_player_id)).size;
+
+        const matchThresholdHit = isGk
+            ? (matchingCount >= 2 && matchingVoters >= 1)
+            : (matchingCount >= 3 && matchingVoters >= 2);
+
+        const counterThresholdHit = isGk
+            ? (counterCount >= 2 && counterVoters >= 1)
+            : (counterCount >= 3 && counterVoters >= 2);
+
+        // ── COUNTER-direction majority: vindication. Spec Q15 / B-iss-2.
+        if (counterThresholdHit && counterCount > matchingCount) {
+            await client.query(
+                `UPDATE players SET ovr_suspicion = NULL,
+                        suspicion_cooldown_until_appearances = COALESCE(total_appearances, 0) + 3
+                 WHERE id = $1`,
+                [subjectPlayerId]
+            );
+            const counterIds = counterVotes.map(v => v.id);
+            if (counterIds.length > 0) {
+                await client.query(
+                    `UPDATE player_rating_feedback
+                        SET applied_amount = ABS(delta_vote),
+                            fully_consumed = true
+                      WHERE id = ANY($1::bigint[])`,
+                    [counterIds]
+                );
+            }
+
+            // Carrier inference runs OUTSIDE this txn — it does its own writes
+            // on a different player. We commit our changes first so the
+            // vindication isn't held up if inference is slow.
+            await client.query('COMMIT'); inTxn = false;
+
+            const carrier = await _runCarrierInference(subjectPlayerId, suspicionDir);
+            try {
+                await pool.query(
+                    `INSERT INTO audit_logs (action, target_id, detail, created_at)
+                     VALUES ($1, $2, $3, NOW())`,
+                    [
+                        'rating_suspicion_redirected',
+                        subjectPlayerId,
+                        JSON.stringify({
+                            cleared_flag: subj.ovr_suspicion,
+                            counter_votes: counterCount,
+                            counter_voters: counterVoters,
+                            inferred_carrier_id: carrier ? carrier.playerId : null,
+                            inferred_carrier_alias: carrier ? carrier.alias : null,
+                        }),
+                    ]
+                );
+            } catch (e) { console.warn('[FIX-245 redirect audit] failed:', e.message); }
+
+            console.log(`[FIX-245 vindication] player ${subjectPlayerId} flag cleared (${counterCount} counter votes); carrier=${carrier?.alias || 'none'}`);
+            return { applied: true, deltaOvr: 0, votesConsumed: counterCount, reason: 'vindicated', carrier };
+        }
+
+        // ── MATCHING-direction threshold: standard recalibration.
+        if (!matchThresholdHit) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return { applied: false, reason: 'threshold_not_met' };
+        }
+
+        // Sum magnitudes (absolute values of remaining delta_vote minus applied_amount).
+        const remaining = matchingVotes.map(v => ({
+            ...v,
+            remainMag: Math.abs(v.delta_vote) - v.applied_amount,
+        }));
+        const totalMag = remaining.reduce((s, v) => s + v.remainMag, 0);
+
+        // 4 magnitude → 1 OVR. No per-cycle cap (spec Q16).
+        const ovrShift = Math.floor(totalMag / 4);
+        if (ovrShift <= 0) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return { applied: false, reason: 'insufficient_magnitude' };
+        }
+
+        const signedShift = ovrShift * suspicionDir;
+        let magToConsume  = ovrShift * 4;
+
+        const oldOvr = parseInt(subj.overall_rating) || 0;
+        const newOvr = Math.max(40, Math.min(99, oldOvr + signedShift));
+
+        const consumeOps = [];
+        for (const v of remaining) {
+            if (magToConsume <= 0) break;
+            const take = Math.min(v.remainMag, magToConsume);
+            const newApplied = v.applied_amount + take;
+            const fullyConsumed = newApplied >= Math.abs(v.delta_vote);
+            consumeOps.push({ id: v.id, applied: newApplied, fully: fullyConsumed });
+            magToConsume -= take;
+        }
+
+        // All writes inside the existing txn (lock still held).
+        await client.query(
+            `UPDATE players SET overall_rating = $1 WHERE id = $2`,
+            [newOvr, subjectPlayerId]
+        );
+
+        for (const op of consumeOps) {
+            await client.query(
+                `UPDATE player_rating_feedback
+                    SET applied_amount = $1, fully_consumed = $2
+                  WHERE id = $3`,
+                [op.applied, op.fully, op.id]
+            );
+        }
+
+        const curStatsR = await client.query(
+            `SELECT defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating,
+                    shooting_rating, goalkeeper_rating, reliability_tier
+             FROM players WHERE id = $1`,
+            [subjectPlayerId]
+        );
+        const cs = curStatsR.rows[0] || {};
+        await client.query(
+            `INSERT INTO player_stat_history
+              (player_id, changed_by, overall_rating, defending_rating, strength_rating,
+               fitness_rating, pace_rating, decisions_rating, assisting_rating,
+               shooting_rating, goalkeeper_rating, reliability_tier, created_at)
+             VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
+            [subjectPlayerId, newOvr,
+             cs.defending_rating, cs.strength_rating, cs.fitness_rating,
+             cs.pace_rating, cs.decisions_rating, cs.assisting_rating,
+             cs.shooting_rating, cs.goalkeeper_rating, cs.reliability_tier]
+        );
+
+        await client.query(
+            `INSERT INTO audit_logs (action, target_id, detail, created_at)
+             VALUES ($1, $2, $3, NOW())`,
+            [
+                'rating_recalibrated_via_feedback',
+                subjectPlayerId,
+                JSON.stringify({
+                    old_ovr: oldOvr, new_ovr: newOvr, delta: signedShift,
+                    votes_used: consumeOps.length,
+                    magnitude_consumed: ovrShift * 4,
+                    leftover_magnitude: totalMag - (ovrShift * 4),
+                    suspicion_flag: subj.ovr_suspicion,
+                }),
+            ]
+        );
+
+        await client.query('COMMIT'); inTxn = false;
+
+        // Re-classify suspicion with new OVR (separate connection)
+        await _recomputeOvrSuspicion(subjectPlayerId);
+
+        console.log(`[FIX-245 recalibration] player ${subjectPlayerId}: OVR ${oldOvr} → ${newOvr} (${consumeOps.length} votes used)`);
+        return { applied: true, deltaOvr: signedShift, votesConsumed: consumeOps.length, oldOvr, newOvr };
+    } catch (e) {
+        if (inTxn) { try { await client.query('ROLLBACK'); } catch (_) {} }
+        console.error('[FIX-245 aggregate] failed for subject', subjectPlayerId, e);
+        return { applied: false, reason: 'error', error: e.message };
+    } finally {
+        client.release();
+    }
+}
+
+// Carrier inference — when a flagged player gets vindicated by votes, look
+// at the games they actually LOST (if low_winrate) or WON (if high_winrate)
+// and find the highest-OVR teammate who appeared most often as "highest
+// OVR on the losing/winning team". Threshold: ≥50% of losses, min 2 absolute.
+async function _runCarrierInference(subjectPlayerId, suspicionDir) {
+    try {
+        // Pull subject's last 10 games of the relevant outcome.
+        // For low_winrate vindication (suspicionDir=-1) → look at LOSSES.
+        // For high_winrate vindication (suspicionDir=+1) → look at WINS.
+        const wantWin = (suspicionDir === +1);
+
+        const lossR = await pool.query(
+            `SELECT g.id AS game_id, t.team_name, g.winning_team
+               FROM registrations r
+               JOIN games g    ON g.id = r.game_id
+               JOIN team_players tp ON tp.player_id = r.player_id
+               JOIN teams t    ON t.id = tp.team_id AND t.game_id = g.id
+              WHERE r.player_id = $1
+                AND r.status = 'confirmed'
+                AND g.game_status = 'completed'
+                AND g.team_selection_type != 'vs_external'
+                AND g.winning_team IS NOT NULL
+                AND g.winning_team != ''
+                AND ($2::boolean = (LOWER(g.winning_team) = LOWER(t.team_name)))
+              ORDER BY g.game_date DESC
+              LIMIT 10`,
+            [subjectPlayerId, wantWin]
+        );
+        const games = lossR.rows;
+        if (games.length < 2) return null; // can't infer from <2 games
+
+        // For each game, find highest-OVR teammate on subject's team (excluding subject).
+        const teammateAppearances = new Map(); // playerId → count
+        const teammateMeta = new Map();        // playerId → { alias, ovr }
+        for (const g of games) {
+            // Find the highest-OVR teammate excluding subject
+            const tmR = await pool.query(
+                `SELECT p.id, p.alias, p.overall_rating
+                   FROM team_players tp
+                   JOIN teams t  ON t.id = tp.team_id
+                   JOIN players p ON p.id = tp.player_id
+                  WHERE t.game_id = $1 AND t.team_name = $2
+                    AND p.id != $3
+                  ORDER BY p.overall_rating DESC NULLS LAST
+                  LIMIT 1`,
+                [g.game_id, g.team_name, subjectPlayerId]
+            );
+            if (tmR.rows.length === 0) continue;
+            const tm = tmR.rows[0];
+            teammateAppearances.set(tm.id, (teammateAppearances.get(tm.id) || 0) + 1);
+            teammateMeta.set(tm.id, { alias: tm.alias, ovr: tm.overall_rating });
+        }
+
+        if (teammateAppearances.size === 0) return null;
+
+        // Pick the teammate with the most appearances as "highest-OVR on losing/winning team"
+        let topTeammate = null, topCount = 0;
+        for (const [pid, c] of teammateAppearances.entries()) {
+            if (c > topCount) { topCount = c; topTeammate = pid; }
+        }
+
+        // Threshold: ≥50% of games AND ≥2 absolute appearances
+        if (topCount < 2 || topCount / games.length < 0.5) return null;
+
+        // Check the inferred carrier isn't already flagged in this direction —
+        // and hasn't been very recently flagged via inference (avoid ping-pong)
+        const cR = await pool.query(
+            `SELECT id, alias, ovr_suspicion, total_appearances
+             FROM players WHERE id = $1`,
+            [topTeammate]
+        );
+        if (cR.rows.length === 0) return null;
+        const carrier = cR.rows[0];
+        const inferredFlag = wantWin
+            ? 'high_winrate_carrier_inferred'
+            : 'low_winrate_carrier_inferred';
+
+        if (carrier.ovr_suspicion === inferredFlag) {
+            // Already flagged — don't re-flag, just return the existing record
+            return { playerId: carrier.id, alias: carrier.alias, alreadyFlagged: true };
+        }
+        // If they're flagged in the OPPOSITE direction, leave them alone.
+        if (carrier.ovr_suspicion &&
+            FIX245_SUSPICION_DIRECTION[carrier.ovr_suspicion] !== suspicionDir) {
+            return null;
+        }
+
+        await pool.query(
+            `UPDATE players SET ovr_suspicion = $1 WHERE id = $2`,
+            [inferredFlag, topTeammate]
+        );
+        return { playerId: carrier.id, alias: carrier.alias, appearances: topCount, totalGames: games.length };
+    } catch (e) {
+        console.warn('[FIX-245 carrier inference] failed:', e.message);
+        return null;
+    }
+}
+
+
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { fullName, alias, email, password, phone, skillLevel, roleParam, ageRange, region, interests } = req.body;
@@ -1952,7 +2591,11 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(400).json({ error: 'Invalid email address' });
         }
 
-        // SEC: skill_level must be one of four exact values or absent entirely
+        // SEC: skill_level must be one of four exact values or absent entirely.
+        // Kept for backwards compatibility — older mobile clients may still
+        // send `skillLevel` as their only signal. New clients send the FIX-244
+        // signupPositions/signupPrimary/signupLevel/signupYearsOff payload
+        // (which takes precedence below).
         const VALID_SKILL_LEVELS = ['beginner', 'casual', 'average', 'decent'];
         const validatedSkillLevel = (skillLevel && VALID_SKILL_LEVELS.includes(skillLevel))
             ? skillLevel
@@ -1964,8 +2607,21 @@ app.post('/api/auth/register', async (req, res) => {
             average:  { gk: 87, def: 13, str: 12, fit: 13, pac: 12, dec: 12, ast: 12, sht: 12, overall: 86 },
             decent:   { gk: 88, def: 12, str: 12, fit: 13, pac: 12, dec: 13, ast: 13, sht: 13, overall: 88 },
         };
-        // Skipped = casual. Same overall (84), same GK (86). skill_level stored as null.
-        let stats = SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
+
+        // FIX-244: Try new derivation first. Falls back to legacy SKILL_STAT_MAP
+        // if any input is missing or invalid. This is the dual-shape acceptance
+        // that lets server, web, and mobile deploy independently without a
+        // flag-day cutover.
+        const signupPositions = req.body.signupPositions || req.body.signup_positions || null;
+        const signupPrimary   = req.body.signupPrimary   || req.body.signup_primary   || null;
+        const signupLevel     = req.body.signupLevel     || req.body.signup_level     || null;
+        const signupYearsOff  = req.body.signupYearsOff !== undefined
+            ? req.body.signupYearsOff
+            : req.body.signup_years_off;
+
+        const _fix244Stats = _deriveSignupStats(signupPositions, signupPrimary, signupLevel, signupYearsOff);
+        // Legacy fallback: skipped or invalid → casual (overall 84, GK 86).
+        let stats = _fix244Stats || SKILL_STAT_MAP[validatedSkillLevel] || SKILL_STAT_MAP.casual;
 
         // ── A2: guest invite stat inheritance ──────────────────────────────
         // If signup came via ?guest_invite=TOKEN, fetch the guest record's
@@ -1998,6 +2654,20 @@ app.post('/api/auth/register', async (req, res) => {
                         const n = parseInt(v);
                         return isNaN(n) ? null : n;
                     };
+                    // FIX-244 audit: preserve metadata fields when guest-invite
+                    // stats override the derived numeric values. The new signup
+                    // still told us their positions/level/years — guest-invite
+                    // overrides only the *numeric* stats (inherits host's
+                    // current stats + slider), it shouldn't blank out the
+                    // user's own self-reported context which we want to store
+                    // for analytics and future re-derivation.
+                    const _preserveMeta = {
+                        _signupPositions: stats._signupPositions,
+                        _signupPrimary:   stats._signupPrimary,
+                        _signupLevel:     stats._signupLevel,
+                        _signupYearsOff:  stats._signupYearsOff,
+                        _gridUsed:        stats._gridUsed,
+                    };
                     stats = {
                         gk:  _toInt(gs.goalkeeper_rating) ?? stats.gk,
                         def: _toInt(gs.defending_rating)  ?? stats.def,
@@ -2007,7 +2677,8 @@ app.post('/api/auth/register', async (req, res) => {
                         dec: _toInt(gs.decisions_rating)  ?? stats.dec,
                         ast: _toInt(gs.assisting_rating)  ?? stats.ast,
                         sht: _toInt(gs.shooting_rating)   ?? stats.sht,
-                        overall: _toInt(gs.overall_rating) ?? stats.overall
+                        overall: _toInt(gs.overall_rating) ?? stats.overall,
+                        ..._preserveMeta,
                     };
                     _signedUpViaGuestInvite = true;
                 }
@@ -2067,18 +2738,34 @@ app.post('/api/auth/register', async (req, res) => {
         // fall back to the legacy 20-column INSERT so signups still work.
         let playerResult;
         const _basePlayerArgs = [
-            userId, fullName.trim(), firstName, lastName, playerAlias, phone.trim(), 'outfield',
+            userId, fullName.trim(), firstName, lastName, playerAlias,
+            phone.trim(),
+            // FIX-244: store position as the derived primary ('goalkeeper' or
+            // 'outfield') — this is the same column used by lineup/team-gen.
+            // The fine-grained signup positions are stored separately below.
+            (stats._signupPrimary || 'outfield'),
             stats.gk, stats.def, stats.str, stats.fit, stats.pac, stats.dec, stats.ast, stats.sht, stats.overall,
-            validatedSkillLevel, ageRange, validatedRegion, validatedInterests.includes('coaching')
+            validatedSkillLevel, ageRange, validatedRegion, validatedInterests.includes('coaching'),
+            // FIX-244: granular signup choices (CSV "gk,def,mid,att", primary
+            // string, level key, years_off integer). Null when client sent the
+            // legacy `skillLevel` shape and _deriveSignupStats returned null.
+            stats._signupPositions || null,
+            stats._signupPrimary   || null,
+            stats._signupLevel     || null,
+            (stats._signupYearsOff === undefined ? null : stats._signupYearsOff)
         ];
         try {
             playerResult = await pool.query(
                 `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
                     goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
                     pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
-                    skill_level, age_range, region_code, coachable, signed_up_via_guest_invite)
+                    skill_level, age_range, region_code, coachable,
+                    signup_positions, signup_primary, signup_level, signup_years_off,
+                    signed_up_via_guest_invite)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
-                         $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING id`,
+                         $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                         $21, $22, $23, $24,
+                         $25) RETURNING id`,
                 [..._basePlayerArgs, _signedUpViaGuestInvite]
             );
         } catch (e) {
@@ -2089,9 +2776,15 @@ app.post('/api/auth/register', async (req, res) => {
                     `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
                         goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
                         pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
-                        skill_level, age_range, region_code, coachable)
+                        skill_level, age_range, region_code, coachable,
+                        signup_positions, signup_primary, signup_level, signup_years_off)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
-                             $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) RETURNING id`,
+                             $8,  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                             $21, $22, $23, $24) RETURNING id`,
+                    // Slice off the trailing _signedUpViaGuestInvite element
+                    // that the modern call appends — the legacy schema has no
+                    // such column. _basePlayerArgs IS the 24-element array;
+                    // the modern call appends a 25th via [..., _signedUpViaGuestInvite].
                     _basePlayerArgs
                 );
             } else {
@@ -2445,7 +3138,12 @@ app.post('/api/auth/register', async (req, res) => {
                             ${landingIntentGameUrl ? `<tr><td style="padding:6px 0;color:#888;">From game</td><td style="font-weight:900;"><a href="https://totalfooty.co.uk/game.html?url=${encodeURIComponent(landingIntentGameUrl)}" style="color:#00cc66;text-decoration:none;">${htmlEncode(landingIntentGameUrl)}</a></td></tr>` : ''}
                             ${validatedInterests.length > 0 ? `<tr><td style="padding:6px 0;color:#888;">Interests</td><td>${validatedInterests.map(i => i.charAt(0).toUpperCase()+i.slice(1)).join(', ')}</td></tr>` : ''}
                             ${referredByRow}
-                            ${validatedSkillLevel ? `<tr><td style="padding:6px 0;color:#888;">Skill Level</td><td style="font-weight:900;">${htmlEncode(validatedSkillLevel)}</td></tr>
+                            ${stats._signupPositions ? `<tr><td style="padding:6px 0;color:#888;">Positions</td><td style="font-weight:900;">${htmlEncode(stats._signupPositions.toUpperCase())}</td></tr>` : ''}
+                            ${stats._signupPrimary ? `<tr><td style="padding:6px 0;color:#888;">Primary</td><td style="font-weight:900;">${stats._signupPrimary === 'goalkeeper' ? '🧤 Goalkeeper' : '⚽ Outfield'}</td></tr>` : ''}
+                            ${stats._signupLevel ? `<tr><td style="padding:6px 0;color:#888;">Level</td><td style="font-weight:900;">${htmlEncode(stats._signupLevel)}</td></tr>` : ''}
+                            ${(stats._signupYearsOff !== undefined && stats._signupYearsOff !== null) ? `<tr><td style="padding:6px 0;color:#888;">Years Off</td><td>${stats._signupYearsOff === 0 ? 'still playing / this year' : (stats._signupYearsOff >= 4 ? '4+ years' : stats._signupYearsOff + ' year' + (stats._signupYearsOff === 1 ? '' : 's'))}</td></tr>` : ''}
+                            ${stats._signupLevel ? `<tr><td style="padding:6px 0;color:#888;">Starting OVR</td><td style="font-weight:900;">${stats.overall}</td></tr>` : ''}
+                            ${validatedSkillLevel ? `<tr><td style="padding:6px 0;color:#888;">Skill Level (legacy)</td><td style="font-weight:900;">${htmlEncode(validatedSkillLevel)}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Starting OVR</td><td>${stats.overall}</td></tr>` : ''}
                         </table>
                     `)
@@ -2906,6 +3604,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
                 p.goalkeeper_rating,
                 p.is_clm_admin, p.is_organiser,
+                p.ovr_suspicion, -- FIX-245: rating-suspicion flag for the 🚩/🔥 indicator
                 u.role as user_role, u.email,
                 c.balance as credits,
 
@@ -4971,7 +5670,11 @@ async (req, res) => {
     }
 });
 
-app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, async (req, res) => {
+app.put('/api/admin/players/:id/stats', authenticateToken, requireAdmin, async (req, res) => {
+    // FIX-248: was requireSuperAdmin. Loosened to requireAdmin so regular
+    // admins can edit stats from the team-review screen (previously their
+    // inline edits silently 403'd while the UI showed them working).
+    // Organisers still blocked — they shouldn't change player ratings.
     try {
         const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper } = req.body;
 
@@ -5020,6 +5723,88 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireSuperAdmin, as
         });
     } catch (error) {
         console.error('Update stats error:', error);
+        res.status(500).json({ error: 'Update failed' });
+    }
+});
+
+// FIX-249 — Game-scoped real-player stats edit. Used by the team-review
+// screen so an organiser-of-this-game can edit ratings of players in
+// THEIR game (not arbitrary players). Same effect on players table as
+// the global endpoint above; same audit/history/dynamic-star side effects.
+//
+// Why a second endpoint rather than gameId-in-body on the global one:
+//   - URL carries the scope so requireGameManager middleware works
+//     without modification (it reads gameId from req.params).
+//   - Keeps the global endpoint admin-only (used by the CLM player editor
+//     for cross-game stat edits, which organisers shouldn't be able to do).
+app.put('/api/games/:gameId/players/:playerId/stats', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId, playerId } = req.params;
+        const { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper } = req.body;
+
+        // Verify the player is actually registered for this game. Without
+        // this, an organiser of game A could edit a player who's only
+        // playing in game B by hitting /api/games/<A>/players/<B-player>/stats.
+        // Server-side guard against URL-tampering.
+        const regCheck = await pool.query(
+            `SELECT id FROM registrations
+              WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [gameId, playerId]
+        );
+        if (regCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Player is not confirmed for this game' });
+        }
+
+        // Capture before state for audit diff (same shape as the global endpoint)
+        const beforeRow = await pool.query(
+            `SELECT overall_rating, defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating, goalkeeper_rating
+             FROM players WHERE id = $1`, [playerId]
+        );
+        if (beforeRow.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        const b = beforeRow.rows[0];
+
+        await pool.query(
+            `UPDATE players SET
+                overall_rating = $1, defending_rating = $2, strength_rating = $3,
+                fitness_rating = $4, pace_rating = $5, decisions_rating = $6,
+                assisting_rating = $7, shooting_rating = $8, goalkeeper_rating = $9,
+                updated_at = CURRENT_TIMESTAMP
+              WHERE id = $10`,
+            [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, playerId]
+        );
+
+        res.json({ message: 'Stats updated' });
+
+        setImmediate(async () => {
+            await statHistory(pool, playerId, req.user.playerId,
+                { overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper });
+            const detail = [
+                `OVR:${b.overall_rating ?? '?'}→${overall}`,
+                `DEF:${b.defending_rating ?? '?'}→${defending}`,
+                `STR:${b.strength_rating ?? '?'}→${strength}`,
+                `FIT:${b.fitness_rating ?? '?'}→${fitness}`,
+                `PAC:${b.pace_rating ?? '?'}→${pace}`,
+                `DEC:${b.decisions_rating ?? '?'}→${decisions}`,
+                `AST:${b.assisting_rating ?? '?'}→${assisting}`,
+                `SHT:${b.shooting_rating ?? '?'}→${shooting}`,
+                `GK:${b.goalkeeper_rating ?? '?'}→${goalkeeper}`,
+                `(via game ${gameId} by ${req.managerRole || 'manager'})`,
+            ].join(' ');
+            // Use auditLog (not gameAuditLog) — this is a stats change on
+            // the player record, audit-targeted to the player not the game.
+            // managerRole appended to detail so we can analytics-distinguish
+            // organiser edits from admin edits later.
+            await auditLog(pool, req.user.playerId, 'stats_updated', playerId, detail);
+            if ((b.overall_rating ?? null) !== (overall ?? null)
+                || (b.goalkeeper_rating ?? null) !== (goalkeeper ?? null)) {
+                reviewStarsForPlayers(pool, [playerId]).catch(() => {});
+            }
+        });
+    } catch (error) {
+        console.error('Game-scoped player stats update error:', error);
         res.status(500).json({ error: 'Update failed' });
     }
 });
@@ -9472,6 +10257,10 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
 // Admin-only manual edit of a guest's derived stats. Server recomputes
 // overall_rating from the 7 outfield stats (or goalkeeper_rating for GK
 // guests) and flags is_admin_override = TRUE so the reset button un-greys.
+// FIX-249: reverted to requireGameManager (admin/superadmin/CLM admin/
+// organiser-of-this-game). User clarified organisers SHOULD be able to
+// edit stats. Per-game scope still enforced via requireGameManager's
+// organiser-must-be-confirmed-for-this-game check.
 app.patch('/api/games/:gameId/guests/:guestId/stats', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId, guestId } = req.params;
@@ -9557,6 +10346,8 @@ app.patch('/api/games/:gameId/guests/:guestId/stats', authenticateToken, require
 // Re-runs derivation from current parent stats + stored relative_rating +
 // position_classification. Clears is_admin_override and refreshes
 // derived_from_parent_ovr to the parent's current overall.
+// FIX-249: reverted to requireGameManager for parity with the PATCH stats
+// endpoint. Organisers of this game can reset overrides on their guests.
 app.post('/api/games/:gameId/guests/:guestId/reset-stats', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId, guestId } = req.params;
@@ -15186,9 +15977,17 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
             return res.status(404).json({ error: 'Teams not found' });
         }
         
-        // Also fetch guests assigned to teams
+        // Also fetch guests assigned to teams.
+        // FIX-246: SELECT the real per-stat columns + position_classification +
+        // is_admin_override. Previously this only fetched overall_rating, so
+        // the team-review screen's stat cells for guests were hardcoded to
+        // zero in the .map() below. Real stats are now populated, enabling
+        // the inline-edit flow on the team-gen review screen.
         const guestsResult = await pool.query(
-            `SELECT id, guest_name, overall_rating, team_name, invited_by
+            `SELECT id, guest_name, overall_rating, team_name, invited_by,
+                    defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating,
+                    goalkeeper_rating, position_classification, is_admin_override
              FROM game_guests WHERE game_id = $1 AND team_name IS NOT NULL`,
             [gameId]
         );
@@ -15210,9 +16009,34 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
                     ORDER BY p.full_name
                 `, [team.id, gameId]);
                 
+                // FIX-246: surface the real per-stat values + position + override flag.
+                // isGK derived from position_classification so the OVR cell saves to
+                // gk via the existing savePlayerStatInline GK branch.
                 const teamGuests = guestsResult.rows
                     .filter(g => g.team_name === team.team_name)
-                    .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall: g.overall_rating || 0, defense: 0, strength: 0, fitness: 0, pace: 0, decisions: 0, assisting: 0, shooting: 0, gk: 0, isGK: false, is_guest: true }));
+                    .map(g => {
+                        const isGk = (g.position_classification || '').toLowerCase() === 'gk' ||
+                                     (g.position_classification || '').toLowerCase() === 'goalkeeper';
+                        return {
+                            id: `guest_${g.id}`,
+                            full_name: g.guest_name,
+                            alias: `${g.guest_name} (Guest)`,
+                            squad_number: null,
+                            overall:   isGk ? (g.goalkeeper_rating || 0) : (g.overall_rating || 0),
+                            defense:   g.defending_rating  || 0,
+                            strength:  g.strength_rating   || 0,
+                            fitness:   g.fitness_rating    || 0,
+                            pace:      g.pace_rating       || 0,
+                            decisions: g.decisions_rating  || 0,
+                            assisting: g.assisting_rating  || 0,
+                            shooting:  g.shooting_rating   || 0,
+                            gk:        g.goalkeeper_rating || 0,
+                            isGK:      isGk,
+                            is_guest:  true,
+                            is_admin_override: !!g.is_admin_override,
+                            position_classification: g.position_classification || null,
+                        };
+                    });
                 
                 teams[team.team_name] = [...playersResult.rows.map(p => {
                     const isGKOnly = p.position_preference?.trim().toLowerCase() === 'gk';
@@ -15322,12 +16146,33 @@ app.get('/api/admin/games/:gameId/teams', authenticateToken, requireGameManager,
                 };
             };
 
-            const redGuests = guestsResult.rows
-                .filter(g => g.team_name === 'Red')
-                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall: g.overall_rating || 0, defense: 0, strength: 0, fitness: 0, pace: 0, decisions: 0, assisting: 0, shooting: 0, gk: 0, isGK: false, is_guest: true }));
-            const blueGuests = guestsResult.rows
-                .filter(g => g.team_name === 'Blue')
-                .map(g => ({ id: `guest_${g.id}`, full_name: g.guest_name, alias: `${g.guest_name} (Guest)`, squad_number: null, overall: g.overall_rating || 0, defense: 0, strength: 0, fitness: 0, pace: 0, decisions: 0, assisting: 0, shooting: 0, gk: 0, isGK: false, is_guest: true }));
+            // FIX-246: surface real per-stat values for both red and blue guests.
+            // Shared mapper so the two team-color paths stay identical.
+            const mapGuestRow = (g) => {
+                const isGk = (g.position_classification || '').toLowerCase() === 'gk' ||
+                             (g.position_classification || '').toLowerCase() === 'goalkeeper';
+                return {
+                    id: `guest_${g.id}`,
+                    full_name: g.guest_name,
+                    alias: `${g.guest_name} (Guest)`,
+                    squad_number: null,
+                    overall:   isGk ? (g.goalkeeper_rating || 0) : (g.overall_rating || 0),
+                    defense:   g.defending_rating  || 0,
+                    strength:  g.strength_rating   || 0,
+                    fitness:   g.fitness_rating    || 0,
+                    pace:      g.pace_rating       || 0,
+                    decisions: g.decisions_rating  || 0,
+                    assisting: g.assisting_rating  || 0,
+                    shooting:  g.shooting_rating   || 0,
+                    gk:        g.goalkeeper_rating || 0,
+                    isGK:      isGk,
+                    is_guest:  true,
+                    is_admin_override: !!g.is_admin_override,
+                    position_classification: g.position_classification || null,
+                };
+            };
+            const redGuests  = guestsResult.rows.filter(g => g.team_name === 'Red').map(mapGuestRow);
+            const blueGuests = guestsResult.rows.filter(g => g.team_name === 'Blue').map(mapGuestRow);
 
             const redMapped  = [...redTeamResult.rows.map(mapTeamPlayer),  ...redGuests];
             const blueMapped = [...blueTeamResult.rows.map(mapTeamPlayer), ...blueGuests];
@@ -15895,6 +16740,18 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         if (shouldHaveMotm) {
             sendAwardsOpenEmails(gameId).catch(() => {});
         }
+
+        // FIX-245: re-run the OVR suspicion classifier for every player in
+        // this game. Their total_wins/draws/appearances will be updated by
+        // the rest of this handler (further down); we want the classifier
+        // to see the POST-update state, so this is queued as a deferred
+        // task that runs once the transaction commits. setImmediate works
+        // because _recomputeOvrSuspicionForGame reads via pool (separate
+        // connection) so by the time it runs the COMMIT below has landed.
+        setImmediate(() => {
+            _recomputeOvrSuspicionForGame(gameId).catch(e =>
+                console.warn('[FIX-245 classifier-after-game] failed:', e.message));
+        });
         
         // 2. Get all players in the game
         const playersResult = await client.query(
@@ -18021,7 +18878,18 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
         
         // Also fetch guests for this game
         const guestsResult = await pool.query(
-            `SELECT id, guest_name, overall_rating, invited_by FROM game_guests WHERE game_id = $1 ORDER BY guest_number ASC`,
+            // FIX-246: include the 7 outfield stats + GK rating + position
+            // classification + admin-override flag so the team-gen edit modal
+            // has everything it needs without a second round-trip. Existing
+            // consumers (currentPlayersList render at index.html L18955+,
+            // multi-vote refresh at L16452) only read fields they care about
+            // (overall_rating, guest_name, is_guest) so extra columns are safe.
+            `SELECT id, guest_name, overall_rating, invited_by,
+                    defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating, shooting_rating,
+                    goalkeeper_rating, position_classification, is_admin_override,
+                    relative_rating
+               FROM game_guests WHERE game_id = $1 ORDER BY guest_number ASC`,
             [gameId]
         );
         
@@ -18038,7 +18906,22 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
             position_preference: 'outfield',
             tournament_team_preference: null,
             is_guest: true,
-            invited_by: g.invited_by
+            invited_by: g.invited_by,
+            // FIX-246: stat fields surfaced for the team-gen edit modal.
+            // guest_id is the raw UUID (player_id above is "guest_<uuid>" for
+            // draft compat); modal needs the raw id for the PATCH endpoint.
+            guest_id:                 g.id,
+            defending_rating:         g.defending_rating,
+            strength_rating:          g.strength_rating,
+            fitness_rating:           g.fitness_rating,
+            pace_rating:              g.pace_rating,
+            decisions_rating:         g.decisions_rating,
+            assisting_rating:         g.assisting_rating,
+            shooting_rating:          g.shooting_rating,
+            goalkeeper_rating:        g.goalkeeper_rating,
+            position_classification:  g.position_classification,
+            is_admin_override:        g.is_admin_override,
+            relative_rating:          g.relative_rating,
         }));
         
         res.json([...result.rows, ...guests]);
@@ -22862,6 +23745,11 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
 // DELETE /api/admin/discipline/:recordId — remove a discipline record and recalculate tier
 app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, async (req, res) => {
     const { recordId } = req.params;
+    // FIX-250: surface actual SQL/runtime errors so superadmin can self-diagnose
+    // when this flow fails. Previously the endpoint returned only "Failed to
+    // remove discipline record" and the real error was swallowed in console.error
+    // server-side, leaving the admin blind. The endpoint is requireAdmin-gated
+    // so leaking error.message client-side is acceptable here.
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -22881,18 +23769,26 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
         // Delete the record
         await client.query('DELETE FROM discipline_records WHERE id = $1', [recordId]);
 
-        // Recalculate revolving points (last 10 completed games + manual entries)
+        // FIX-250: Restructured recalc — the previous version used ORDER BY +
+        // LIMIT inside an IN() subquery which is valid PostgreSQL but unusual.
+        // Restructure as a derived-table LEFT JOIN for clarity and to make the
+        // 10-most-recent-completed-games intent explicit. Same result, lower
+        // surprise factor for future maintainers.
         const revolvingResult = await client.query(`
+            WITH recent_games AS (
+                SELECT r.game_id
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id
+                WHERE r.player_id = $1
+                  AND r.status = 'confirmed'
+                  AND g.game_status = 'completed'
+                ORDER BY g.game_date DESC
+                LIMIT 10
+            )
             SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
             FROM discipline_records dr
             WHERE dr.player_id = $1
-            AND (dr.game_id IS NULL OR dr.game_id IN (
-                SELECT r.game_id FROM registrations r
-                JOIN games g ON g.id = r.game_id
-                WHERE r.player_id = $1 AND r.status = 'confirmed'
-                AND g.game_status = 'completed'
-                ORDER BY g.game_date DESC LIMIT 10
-            ))
+              AND (dr.game_id IS NULL OR dr.game_id IN (SELECT game_id FROM recent_games))
         `, [playerId]);
         const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
         const newTier = tierFromRevolvingPoints(revolvingPts);
@@ -22908,8 +23804,21 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
         });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
-        console.error('Remove discipline record error:', error);
-        res.status(500).json({ error: 'Failed to remove discipline record' });
+        // FIX-250: log full error context AND return error.message to client.
+        // This endpoint is admin-only so the message is not user-leak surface.
+        console.error('Remove discipline record error:', {
+            recordId,
+            adminId: req.user?.playerId,
+            errorMessage: error.message,
+            errorCode: error.code,
+            errorDetail: error.detail,
+            errorStack: error.stack
+        });
+        res.status(500).json({
+            error: 'Failed to remove discipline record',
+            detail: error.message,
+            code: error.code || null
+        });
     } finally {
         client.release();
     }
@@ -32756,6 +33665,368 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
 }
 
 
+// ════════════════════════════════════════════════════════════════════════
+// FIX-245 — Rating-feedback endpoints
+// ════════════════════════════════════════════════════════════════════════
+
+// GET /api/games/:gameUrl/rating-feedback-pair
+//
+// Returns a {subject, reference} pair the caller can vote on. Caller must
+// have played in the game (confirmed registration). Subject must:
+//   - have played in this game
+//   - have ovr_suspicion set
+//   - not be the voter or someone the voter already rated in this game
+// Reference must:
+//   - have played in the same game
+//   - same position bucket (goalkeeper ↔ goalkeeper; outfield ↔ outfield)
+//   - ovr_suspicion IS NULL (trusted rating)
+//   - total_appearances >= 5
+//   - current OVR within ±2 of subject's OVR
+//   - not the voter or the subject
+// Response never includes OVR, win rate, or stats (spec Q12 — anti-priming).
+app.get('/api/games/:gameUrl/rating-feedback-pair', authenticateToken, async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        const voterId     = req.user.playerId;
+
+        // Resolve game
+        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
+        if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
+        const gameId = gR.rows[0].id;
+
+        // Voter eligibility: must be confirmed in this game
+        const vR = await pool.query(
+            `SELECT 1 FROM registrations
+              WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [gameId, voterId]
+        );
+        if (vR.rows.length === 0) return res.status(403).json({ error: 'voter_not_in_game' });
+
+        // Subjects: flagged players in this game, that voter hasn't already
+        // voted on (whether the prior vote was a real vote OR a "skip" —
+        // unique index treats skip and vote identically per spec).
+        // RANDOM() for the order so voters see different pairs each request.
+        const subjR = await pool.query(
+            `SELECT p.id, p.alias, p.first_name, p.position, p.overall_rating,
+                    p.signup_positions
+               FROM registrations r
+               JOIN players p ON p.id = r.player_id
+              WHERE r.game_id = $1
+                AND r.status = 'confirmed'
+                AND p.ovr_suspicion IS NOT NULL
+                AND p.id != $2
+                AND NOT EXISTS (
+                    SELECT 1 FROM player_rating_feedback prf
+                     WHERE prf.subject_player_id = p.id
+                       AND prf.voter_player_id   = $2
+                       AND prf.game_id           = $1
+                )
+              ORDER BY RANDOM()`,
+            [gameId, voterId]
+        );
+        if (subjR.rows.length === 0) return res.json({ none: true, reason: 'no_subjects' });
+
+        // For each candidate subject, try to find a reference. Take the
+        // first subject that has at least one valid reference.
+        for (const subj of subjR.rows) {
+            const refR = await pool.query(
+                `SELECT p.id, p.alias, p.first_name, p.position, p.signup_positions
+                   FROM registrations r
+                   JOIN players p ON p.id = r.player_id
+                  WHERE r.game_id = $1
+                    AND r.status = 'confirmed'
+                    AND p.ovr_suspicion IS NULL
+                    AND p.position = $2
+                    AND p.id != $3
+                    AND p.id != $4
+                    AND p.total_appearances >= 5
+                    AND ABS(COALESCE(p.overall_rating, 0) - COALESCE($5::int, 0)) <= 2
+                  ORDER BY RANDOM()
+                  LIMIT 1`,
+                [gameId, subj.position, voterId, subj.id, subj.overall_rating]
+            );
+            if (refR.rows.length === 0) continue;
+            const ref = refR.rows[0];
+
+            // Both records sanitised — NO OVR, win rate, stats.
+            return res.json({
+                gameId,
+                subject:   { id: subj.id, alias: subj.alias, first_name: subj.first_name,
+                             position: subj.position, signup_positions: subj.signup_positions },
+                reference: { id: ref.id,  alias: ref.alias,  first_name: ref.first_name,
+                             position: ref.position, signup_positions: ref.signup_positions },
+            });
+        }
+
+        return res.json({ none: true, reason: 'no_eligible_reference' });
+    } catch (e) {
+        console.error('GET /api/games/:gameUrl/rating-feedback-pair error:', e);
+        return res.status(500).json({ error: 'server_error' });
+    }
+});
+
+// POST /api/games/:gameUrl/rating-feedback
+// Body: { subjectPlayerId, referencePlayerId, deltaVote } where
+//   deltaVote ∈ {-4,-3,-2,-1,0,+1,+2,+3,+4}  → real vote (0 = "same as ref")
+//   deltaVote === null                       → skip (recorded with fully_consumed=true)
+app.post('/api/games/:gameUrl/rating-feedback', authenticateToken, async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        const voterId     = req.user.playerId;
+        const { subjectPlayerId, referencePlayerId, deltaVote } = req.body;
+
+        // Resolve game
+        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
+        if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
+        const gameId = gR.rows[0].id;
+
+        // UUID-shape validation. players.id and games.id are UUIDs.
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!UUID_RE.test(subjectPlayerId))   return res.status(400).json({ error: 'invalid_subject_id' });
+        if (!UUID_RE.test(referencePlayerId)) return res.status(400).json({ error: 'invalid_reference_id' });
+
+        // Vote value validation
+        let validatedDelta = null;
+        const isSkip = (deltaVote === null || deltaVote === undefined);
+        if (!isSkip) {
+            const n = parseInt(deltaVote);
+            if (isNaN(n) || n < -4 || n > 4) return res.status(400).json({ error: 'invalid_delta' });
+            validatedDelta = n;
+        }
+
+        // Voter can't vote on themselves or rate themselves as reference
+        if (voterId === subjectPlayerId || voterId === referencePlayerId) {
+            return res.status(400).json({ error: 'voter_cant_be_in_pair' });
+        }
+        // FIX-245 audit: subject and reference must be different players.
+        // GET pair excludes via SQL, but POST is a separate endpoint a
+        // malicious caller could hit directly with the same UUID for both.
+        if (subjectPlayerId === referencePlayerId) {
+            return res.status(400).json({ error: 'subject_and_reference_must_differ' });
+        }
+
+        // All three players must have been confirmed in this game
+        const partR = await pool.query(
+            `SELECT player_id FROM registrations
+              WHERE game_id = $1 AND status = 'confirmed'
+                AND player_id IN ($2, $3, $4)`,
+            [gameId, voterId, subjectPlayerId, referencePlayerId]
+        );
+        const partSet = new Set(partR.rows.map(r => r.player_id));
+        if (!partSet.has(voterId))           return res.status(403).json({ error: 'voter_not_in_game' });
+        if (!partSet.has(subjectPlayerId))   return res.status(400).json({ error: 'subject_not_in_game' });
+        if (!partSet.has(referencePlayerId)) return res.status(400).json({ error: 'reference_not_in_game' });
+
+        // Subject must currently be flagged for the vote to count
+        // (skips are still recorded so we don't show the pair again).
+        const subjFlagR = await pool.query(
+            `SELECT ovr_suspicion FROM players WHERE id = $1`,
+            [subjectPlayerId]
+        );
+        if (subjFlagR.rows.length === 0) return res.status(404).json({ error: 'subject_not_found' });
+
+        // Insert vote. Unique index (subject, voter, game) prevents dupes.
+        // Skip rows are marked fully_consumed=true so they never feed aggregation.
+        const insertR = await pool.query(
+            `INSERT INTO player_rating_feedback
+               (subject_player_id, reference_player_id, voter_player_id, game_id,
+                delta_vote, applied_amount, fully_consumed, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+             ON CONFLICT (subject_player_id, voter_player_id, game_id) DO NOTHING
+             RETURNING id`,
+            [subjectPlayerId, referencePlayerId, voterId, gameId,
+             validatedDelta,
+             isSkip ? 0 : 0,        // start with 0 magnitude consumed (real votes get consumed by aggregation)
+             isSkip ? true : false] // skips are immediately fully_consumed
+        );
+        if (insertR.rows.length === 0) {
+            // Conflict — already voted on this pair-in-game
+            return res.status(409).json({ error: 'already_voted' });
+        }
+
+        // Trigger eager aggregation if this wasn't a skip
+        let recalibration = null;
+        if (!isSkip) {
+            recalibration = await _aggregateRatingFeedback(subjectPlayerId);
+        }
+
+        return res.json({
+            recorded:     true,
+            skipped:      isSkip,
+            recalibration: recalibration && recalibration.applied
+                ? {
+                    delta_ovr: recalibration.deltaOvr,
+                    votes_consumed: recalibration.votesConsumed,
+                    reason: recalibration.reason || 'recalibrated',
+                  }
+                : null,
+        });
+    } catch (e) {
+        console.error('POST /api/games/:gameUrl/rating-feedback error:', e);
+        return res.status(500).json({ error: 'server_error' });
+    }
+});
+
+// GET /api/games/:gameUrl/rating-feedback-summary
+// Aggregate stats for the game-level "Player feedback from this game" section.
+// Anonymous — never returns voter identities (spec B-iss-11).
+app.get('/api/games/:gameUrl/rating-feedback-summary', authenticateToken, async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
+        if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
+        const gameId = gR.rows[0].id;
+
+        const totalR = await pool.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE delta_vote IS NOT NULL)::int AS votes_cast,
+                COUNT(*) FILTER (WHERE delta_vote IS NULL)::int     AS skips,
+                COUNT(DISTINCT voter_player_id)::int                AS distinct_voters,
+                COUNT(DISTINCT subject_player_id)::int              AS subjects_rated
+             FROM player_rating_feedback
+             WHERE game_id = $1`,
+            [gameId]
+        );
+
+        // Recalibrations triggered from THIS game's votes (best-effort: rows
+        // whose votes_used overlap this game). We approximate by counting
+        // audit_log entries with action='rating_recalibrated_via_feedback'
+        // for subjects who have votes from this game.
+        // FIX-245 audit: target_id::uuid cast crashes the whole query if any
+        // historical audit row has a non-UUID target_id (e.g. an integer ID
+        // string from pre-UUID days). Filter by regex first; cast only the
+        // matching rows. ~ is faster than regexp_match() and Postgres-stable.
+        const recalR = await pool.query(
+            `SELECT COUNT(DISTINCT al.target_id)::int AS subjects_recalibrated
+             FROM audit_logs al
+             WHERE al.action = 'rating_recalibrated_via_feedback'
+               AND al.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               AND al.target_id::uuid IN (
+                  SELECT DISTINCT subject_player_id FROM player_rating_feedback
+                  WHERE game_id = $1
+               )`,
+            [gameId]
+        );
+
+        return res.json({
+            votes_cast:            totalR.rows[0]?.votes_cast || 0,
+            skips:                 totalR.rows[0]?.skips || 0,
+            distinct_voters:       totalR.rows[0]?.distinct_voters || 0,
+            subjects_rated:        totalR.rows[0]?.subjects_rated || 0,
+            subjects_recalibrated: recalR.rows[0]?.subjects_recalibrated || 0,
+        });
+    } catch (e) {
+        console.error('GET /api/games/:gameUrl/rating-feedback-summary error:', e);
+        return res.status(500).json({ error: 'server_error' });
+    }
+});
+
+// GET /api/players/:playerId/rating-feedback-summary
+// Per-player feedback summary for profile pages. Voter identities NEVER
+// returned. Returns: vote count received, suspicion status, last 3
+// recalibrations with delta + date + reference player aliases.
+//
+// FIX-245 audit: Admin OR self only. Without this gate any authed user
+// could probe arbitrary playerIds and learn another player's suspicion
+// status + adjustment history — a privacy leak.
+app.get('/api/players/:playerId/rating-feedback-summary', authenticateToken, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!UUID_RE.test(playerId)) return res.status(400).json({ error: 'invalid_player_id' });
+
+        // Authorisation: admin/superadmin can view anyone; everyone else
+        // can only view their own.
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        const isSelf  = req.user.playerId === playerId;
+        if (!isAdmin && !isSelf) {
+            return res.status(403).json({ error: 'forbidden' });
+        }
+
+        const sumR = await pool.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE delta_vote IS NOT NULL)::int AS votes_received,
+                COUNT(*) FILTER (WHERE delta_vote IS NULL)::int     AS skips_received,
+                COUNT(DISTINCT game_id)::int                        AS games_with_feedback
+             FROM player_rating_feedback
+             WHERE subject_player_id = $1`,
+            [playerId]
+        );
+
+        const pR = await pool.query(
+            `SELECT ovr_suspicion FROM players WHERE id = $1`,
+            [playerId]
+        );
+        if (pR.rows.length === 0) return res.status(404).json({ error: 'player_not_found' });
+
+        // Last 3 recalibrations from audit_log
+        // FIX-245 audit: filter by UUID-shape regex before ::uuid cast to
+        // prevent crash on legacy non-UUID target_id values.
+        const recR = await pool.query(
+            `SELECT detail, created_at
+             FROM audit_logs
+             WHERE action = 'rating_recalibrated_via_feedback'
+               AND target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               AND target_id::uuid = $1::uuid
+             ORDER BY created_at DESC
+             LIMIT 3`,
+            [playerId]
+        );
+        const recalibrations = recR.rows.map(r => {
+            let d = {};
+            try { d = typeof r.detail === 'string' ? JSON.parse(r.detail) : r.detail || {}; } catch (_) {}
+            return {
+                date:      r.created_at,
+                old_ovr:   d.old_ovr,
+                new_ovr:   d.new_ovr,
+                delta:     d.delta,
+                votes_used: d.votes_used,
+            };
+        });
+
+        return res.json({
+            votes_received:      sumR.rows[0]?.votes_received || 0,
+            skips_received:      sumR.rows[0]?.skips_received || 0,
+            games_with_feedback: sumR.rows[0]?.games_with_feedback || 0,
+            current_suspicion:   pR.rows[0].ovr_suspicion,
+            recalibrations,
+        });
+    } catch (e) {
+        console.error('GET /api/players/:playerId/rating-feedback-summary error:', e);
+        return res.status(500).json({ error: 'server_error' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-245 — Nightly aggregation cron
+// ════════════════════════════════════════════════════════════════════════
+// Catches any subjects whose suspicion flag was set by win-rate change
+// without a vote-triggering event. Walks every currently-flagged player
+// and runs _aggregateRatingFeedback for each.
+async function _runNightlyFeedbackAggregation() {
+    try {
+        const r = await pool.query(
+            `SELECT id FROM players
+              WHERE ovr_suspicion IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM player_rating_feedback prf
+                     WHERE prf.subject_player_id = players.id
+                       AND prf.fully_consumed = false
+                       AND prf.delta_vote IS NOT NULL
+                )`
+        );
+        let applied = 0;
+        for (const row of r.rows) {
+            const result = await _aggregateRatingFeedback(row.id);
+            if (result.applied) applied++;
+        }
+        console.log(`[FIX-245 nightly] checked ${r.rows.length} flagged players, applied ${applied} recalibrations`);
+    } catch (e) {
+        console.error('[FIX-245 nightly] failed:', e.message);
+    }
+}
+
+
 // ── Monthly cron scheduler ─────────────────────────────────────────────────
 // Runs every hour. On the 1st of any month, processes the PREVIOUS month if
 // it hasn't been processed yet. Idempotent: monthly_trophy_runs UNIQUE
@@ -35172,6 +36443,13 @@ app.listen(PORT, () => {
     // First tick 30s after boot (lets DB pool warm up), then every 60s.
     setTimeout(autoCloseExpiredMultiVotes, 30_000);
     setInterval(autoCloseExpiredMultiVotes, 60 * 1000);
+
+    // FIX-245: nightly feedback aggregation. Runs every 4 hours so a
+    // late-night vote doesn't sit until the next "calendar" night. Same
+    // setInterval pattern as the rest of the cron family.
+    setInterval(_runNightlyFeedbackAggregation, 4 * 60 * 60 * 1000);
+    // Initial run 5 minutes after boot — catches anything missed during downtime.
+    setTimeout(_runNightlyFeedbackAggregation, 5 * 60 * 1000);
 
     // Keep database AND backend warm (ping every 5 minutes)
     setInterval(async () => {
