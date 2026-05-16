@@ -2220,6 +2220,196 @@ async function _recomputeOvrSuspicionForGame(gameId) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-268a — New calibration model + stat picker + reference pushback
+// ═══════════════════════════════════════════════════════════════════════
+// Constants and helpers used by _aggregateRatingFeedback (rewritten below).
+
+// Sub-stat priority order per position. Index 0 = take-from-first (least
+// positional importance). Defenders lose shooting first, midfielders lose
+// defending first, etc. GK uses a separate code path (only goalkeeper_rating
+// moves, capped 0-140).
+const FIX268_STAT_PRIORITY = {
+    defender:    ['shooting_rating', 'assisting_rating', 'pace_rating', 'decisions_rating', 'fitness_rating', 'strength_rating', 'defending_rating'],
+    midfielder:  ['defending_rating', 'shooting_rating', 'strength_rating', 'fitness_rating', 'pace_rating', 'assisting_rating', 'decisions_rating'],
+    forward:     ['defending_rating', 'strength_rating', 'fitness_rating', 'decisions_rating', 'assisting_rating', 'pace_rating', 'shooting_rating'],
+    // No position set → balanced rotation. Avoids favouring one stat.
+    _default:    ['shooting_rating', 'assisting_rating', 'defending_rating', 'fitness_rating', 'pace_rating', 'strength_rating', 'decisions_rating'],
+};
+
+// Outfield stat caps: floor=1, ceiling=20. GK: 0..140.
+const FIX268_OUTFIELD_FLOOR = 1;
+const FIX268_OUTFIELD_CEILING = 20;
+const FIX268_GK_FLOOR = 0;
+const FIX268_GK_CEILING = 140;
+
+// Established-player threshold. <6 apps = "new", >=6 = "established".
+const FIX268_NEW_PLAYER_CUTOFF = 6;
+
+// Decide how big the OVR step should be, given matching votes/voters and
+// whether this is a new player. Returns the magnitude (always positive).
+// Returns 0 if thresholds not met.
+function _fix268MovementMagnitude(matchingVotes, matchingVoters, isNewPlayer) {
+    if (isNewPlayer) {
+        // New player tiers (more lenient).
+        if (matchingVoters < 2) return 0;
+        if (matchingVotes < 3) return 0;
+        if (matchingVotes === 3) return 1;
+        if (matchingVotes === 4) return 2;
+        if (matchingVotes >= 5 && matchingVoters >= 3) return Math.min(3 + Math.floor((matchingVotes - 5)), 10);
+        // 5 votes but <3 voters → fall back to ±2
+        return 2;
+    } else {
+        // Established player tiers (strict).
+        if (matchingVoters < 3) return 0;
+        if (matchingVotes < 5) return 0;
+        if (matchingVotes < 8) return 1;                                         // 5-7
+        if (matchingVotes < 10) return 2;                                        // 8-9
+        if (matchingVotes >= 10 && matchingVoters >= 5) {
+            // 10 = 3, then +1 per 3 additional votes.
+            return Math.min(3 + Math.floor((matchingVotes - 10) / 3), 10);
+        }
+        return 2; // 10+ votes but <5 voters → cap at 2
+    }
+}
+
+// Counter-direction vindication thresholds — use the lenient new-player table
+// regardless of subject's status. Vindication clearing a wrong flag is a high
+// priority and shouldn't be gated as strictly as calibration.
+function _fix268VindicationThresholdHit(counterVotes, counterVoters) {
+    return counterVotes >= 3 && counterVoters >= 2;
+}
+
+// Pick which sub-stat(s) to change to achieve `signed_delta` OVR change.
+// Returns array of {column, oldVal, newVal} for stats that need updating.
+// If the change can't be fully absorbed by sub-stats (floor/ceiling hit on
+// every available stat), returns the partial result and a `shortfall` field.
+function _fix268PickStatChange(playerRow, signedDelta) {
+    const position = (playerRow.position || '').toLowerCase();
+    if (position === 'goalkeeper') {
+        const cur = parseInt(playerRow.goalkeeper_rating, 10) || 0;
+        const target = Math.max(FIX268_GK_FLOOR, Math.min(FIX268_GK_CEILING, cur + signedDelta));
+        const actualDelta = target - cur;
+        return {
+            changes: actualDelta !== 0
+                ? [{ column: 'goalkeeper_rating', oldVal: cur, newVal: target }]
+                : [],
+            shortfall: signedDelta - actualDelta,
+        };
+    }
+
+    // FIX-268a: ROUND-ROBIN — take 1 unit at a time from each priority stat,
+    // cycling through until the delta is absorbed. This spreads changes across
+    // multiple sub-stats (preserves positional balance) rather than draining the
+    // lowest-priority stat first. Matches GAFFA's spec example.
+    const priority = FIX268_STAT_PRIORITY[position] || FIX268_STAT_PRIORITY._default;
+    let remaining = signedDelta;
+    const workingStats = {};
+    const originalStats = {};
+    for (const col of priority) {
+        const v = parseInt(playerRow[col], 10) || 0;
+        workingStats[col]  = v;
+        originalStats[col] = v;
+    }
+
+    let safety = 200; // hard cap to prevent infinite loop
+    while (remaining !== 0 && safety > 0) {
+        safety--;
+        let moved = false;
+        for (const col of priority) {
+            if (remaining === 0) break;
+            if (remaining < 0 && workingStats[col] > FIX268_OUTFIELD_FLOOR) {
+                workingStats[col] -= 1;
+                remaining += 1;
+                moved = true;
+            } else if (remaining > 0 && workingStats[col] < FIX268_OUTFIELD_CEILING) {
+                workingStats[col] += 1;
+                remaining -= 1;
+                moved = true;
+            }
+        }
+        if (!moved) break; // all stats at floor or ceiling — shortfall remains
+    }
+
+    // Build the changes list from anything that actually moved.
+    const changes = [];
+    for (const col of priority) {
+        if (workingStats[col] !== originalStats[col]) {
+            changes.push({ column: col, oldVal: originalStats[col], newVal: workingStats[col] });
+        }
+    }
+    return { changes, shortfall: remaining };
+}
+
+// When subject can't absorb the desired change (all stats at floor/ceiling),
+// try to push the most-cited reference player in the OPPOSITE direction.
+// Returns { pushed: bool, refPlayerId, alias, changes } or { pushed: false }.
+async function _fix268TryReferencePushback(client, matchingVotes, oppositeDelta) {
+    // matchingVotes = the votes in the dominant direction that we wanted to
+    // apply to subject. oppositeDelta = signed amount to push the reference
+    // player by (negated from what subject couldn't take).
+    if (!matchingVotes || matchingVotes.length === 0 || oppositeDelta === 0) {
+        return { pushed: false, reason: 'no_matching_votes' };
+    }
+    // Tally reference appearances.
+    const tally = new Map();
+    matchingVotes.forEach(v => {
+        if (!v.reference_player_id) return;
+        tally.set(v.reference_player_id, (tally.get(v.reference_player_id) || 0) + 1);
+    });
+    if (tally.size === 0) {
+        return { pushed: false, reason: 'no_references' };
+    }
+    // Sort references by citation count descending.
+    const sorted = Array.from(tally.entries()).sort((a, b) => b[1] - a[1]);
+
+    for (const [refId, count] of sorted) {
+        // Lock the reference row.
+        const refR = await client.query(
+            `SELECT id, alias, position, overall_rating,
+                    defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating,
+                    shooting_rating, goalkeeper_rating
+               FROM players WHERE id = $1 FOR UPDATE`,
+            [refId]
+        );
+        if (refR.rows.length === 0) continue;
+        const ref = refR.rows[0];
+        const pick = _fix268PickStatChange(ref, oppositeDelta);
+        if (pick.changes.length === 0) continue;       // ref also at floor/ceiling
+        if (pick.shortfall === oppositeDelta) continue;// nothing absorbed
+
+        // Apply changes to the reference player.
+        const newOvr = (parseInt(ref.overall_rating, 10) || 0) + (oppositeDelta - pick.shortfall);
+        const setParts = ['overall_rating = $1', 'last_ovr_change_at = NOW()'];
+        const params   = [newOvr];
+        let pi = 2;
+        for (const ch of pick.changes) {
+            setParts.push(`${ch.column} = $${pi++}`);
+            params.push(ch.newVal);
+        }
+        params.push(refId);
+        await client.query(
+            `UPDATE players SET ${setParts.join(', ')} WHERE id = $${pi}`,
+            params
+        );
+        return {
+            pushed: true,
+            refPlayerId: refId,
+            alias: ref.alias,
+            citationCount: count,
+            changes: pick.changes,
+            newOvr,
+            appliedDelta: oppositeDelta - pick.shortfall,
+        };
+    }
+    return { pushed: false, reason: 'all_references_blocked' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-268a helpers
+// ═══════════════════════════════════════════════════════════════════════
+
 // Aggregate unconsumed votes and apply OVR adjustment if trigger threshold met.
 // Returns { applied: bool, deltaOvr: int, votesConsumed: int, reason?: string }.
 async function _aggregateRatingFeedback(subjectPlayerId) {
@@ -2287,13 +2477,16 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
         const counterCount   = counterVotes.length;
         const counterVoters  = new Set(counterVotes.map(v => v.voter_player_id)).size;
 
-        const matchThresholdHit = isGk
-            ? (matchingCount >= 2 && matchingVoters >= 1)
-            : (matchingCount >= 3 && matchingVoters >= 2);
-
-        const counterThresholdHit = isGk
-            ? (counterCount >= 2 && counterVoters >= 1)
-            : (counterCount >= 3 && counterVoters >= 2);
+        // FIX-268a: NEW threshold model.
+        // - Established players (>=6 apps): stricter tiers (5/3 = ±1, 8/4 = ±2, 10/5 = ±3)
+        // - New players (<6 apps): lenient (3/2 = ±1, 4/2 = ±2, 5/3 = ±3)
+        // The vindication threshold uses the lenient table regardless (clearing a
+        // wrong flag is high priority).
+        const apps         = parseInt(subj.total_appearances || 0, 10);
+        const isNewPlayer  = apps < FIX268_NEW_PLAYER_CUTOFF;
+        const movementMag  = _fix268MovementMagnitude(matchingCount, matchingVoters, isNewPlayer);
+        const matchThresholdHit   = movementMag > 0;
+        const counterThresholdHit = _fix268VindicationThresholdHit(counterCount, counterVoters);
 
         // ── COUNTER-direction majority: vindication. Spec Q15 / B-iss-2.
         if (counterThresholdHit && counterCount > matchingCount) {
@@ -2348,26 +2541,90 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
             return { applied: false, reason: 'threshold_not_met' };
         }
 
-        // Sum magnitudes (absolute values of remaining delta_vote minus applied_amount).
+        // FIX-268a: pick stat changes for the signed delta. Reference pushback
+        // kicks in if subject can't absorb the change fully.
+        const signedShift = movementMag * suspicionDir;
+        const oldOvr      = parseInt(subj.overall_rating, 10) || 0;
+
+        // Pull current stats so the picker can decide.
+        const curStatsR = await client.query(
+            `SELECT position, overall_rating,
+                    defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating,
+                    shooting_rating, goalkeeper_rating, reliability_tier
+             FROM players WHERE id = $1`,
+            [subjectPlayerId]
+        );
+        const subjFull = curStatsR.rows[0] || {};
+        const pick     = _fix268PickStatChange(subjFull, signedShift);
+        const absorbed = signedShift - pick.shortfall;
+
+        // If absorbed is 0 entirely and we have a non-zero shift requested,
+        // try to push a reference player in the opposite direction instead.
+        let refPush = null;
+        if (absorbed === 0 && signedShift !== 0) {
+            // Opposite delta = if subject would have gone DOWN by 2, push ref UP by 2.
+            refPush = await _fix268TryReferencePushback(client, matchingVotes, -signedShift);
+            if (!refPush.pushed) {
+                // Both blocked. Don't consume votes. Skip movement entirely.
+                await client.query(
+                    `INSERT INTO audit_logs (action, target_id, detail, created_at)
+                     VALUES ($1, $2, $3, NOW())`,
+                    [
+                        'rating_recalibration_stalled',
+                        subjectPlayerId,
+                        JSON.stringify({
+                            wanted_delta: signedShift,
+                            reason: refPush.reason || 'all_blocked',
+                            matching_votes: matchingCount,
+                            matching_voters: matchingVoters,
+                        }),
+                    ]
+                );
+                await client.query('COMMIT'); inTxn = false;
+                console.log(`[FIX-268 stalled] player ${subjectPlayerId}: subject AND references at limit`);
+                return { applied: false, reason: 'stalled_at_limits' };
+            }
+            // Reference pushback succeeded — audit-log it.
+            await client.query(
+                `INSERT INTO audit_logs (action, target_id, detail, created_at)
+                 VALUES ($1, $2, $3, NOW())`,
+                [
+                    'rating_reference_pushed',
+                    subjectPlayerId,
+                    JSON.stringify({
+                        wanted_subject_delta: signedShift,
+                        ref_player_id:        refPush.refPlayerId,
+                        ref_alias:            refPush.alias,
+                        ref_applied_delta:    refPush.appliedDelta,
+                        ref_new_ovr:          refPush.newOvr,
+                        ref_changes:          refPush.changes,
+                        citation_count:       refPush.citationCount,
+                    }),
+                ]
+            );
+            // Re-classify suspicion on the pushed reference too (outside txn — defer).
+        }
+
+        // Sum magnitudes for vote consumption math.
         const remaining = matchingVotes.map(v => ({
             ...v,
             remainMag: Math.abs(v.delta_vote) - v.applied_amount,
         }));
         const totalMag = remaining.reduce((s, v) => s + v.remainMag, 0);
 
-        // 4 magnitude → 1 OVR. No per-cycle cap (spec Q16).
-        const ovrShift = Math.floor(totalMag / 4);
-        if (ovrShift <= 0) {
-            await client.query('ROLLBACK'); inTxn = false;
-            return { applied: false, reason: 'insufficient_magnitude' };
-        }
-
-        const signedShift = ovrShift * suspicionDir;
-        let magToConsume  = ovrShift * 4;
-
-        const oldOvr = parseInt(subj.overall_rating) || 0;
-        const newOvr = Math.max(40, Math.min(99, oldOvr + signedShift));
-
+        // Vote consumption: consume enough magnitude to cover the absorbed shift.
+        // 1 OVR unit consumes 4 magnitude (same convention as FIX-245).
+        // For reference-pushback cases, we still consume on the subject's votes
+        // because that's the pool the votes belong to.
+        // FIX-268a bugfix: absorbed can be negative (when lowering OVR). The
+        // previous formula Math.max(absorbed, ...) returned 0 for any negative
+        // absorbed → ZERO votes were consumed when OVR went DOWN, causing the
+        // aggregator to re-fire on the same vote pool indefinitely. Use the
+        // ABSOLUTE magnitude of movement to compute consumption.
+        const absorbedMag = Math.abs(absorbed);
+        const pushbackMag = (refPush && refPush.pushed) ? movementMag : 0;
+        let magToConsume = Math.max(absorbedMag, pushbackMag) * 4;
         const consumeOps = [];
         for (const v of remaining) {
             if (magToConsume <= 0) break;
@@ -2377,13 +2634,6 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
             consumeOps.push({ id: v.id, applied: newApplied, fully: fullyConsumed });
             magToConsume -= take;
         }
-
-        // All writes inside the existing txn (lock still held).
-        await client.query(
-            `UPDATE players SET overall_rating = $1 WHERE id = $2`,
-            [newOvr, subjectPlayerId]
-        );
-
         for (const op of consumeOps) {
             await client.query(
                 `UPDATE player_rating_feedback
@@ -2393,38 +2643,62 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
             );
         }
 
-        const curStatsR = await client.query(
-            `SELECT defending_rating, strength_rating, fitness_rating,
-                    pace_rating, decisions_rating, assisting_rating,
-                    shooting_rating, goalkeeper_rating, reliability_tier
-             FROM players WHERE id = $1`,
-            [subjectPlayerId]
-        );
-        const cs = curStatsR.rows[0] || {};
-        await client.query(
-            `INSERT INTO player_stat_history
-              (player_id, changed_by, overall_rating, defending_rating, strength_rating,
-               fitness_rating, pace_rating, decisions_rating, assisting_rating,
-               shooting_rating, goalkeeper_rating, reliability_tier, created_at)
-             VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
-            [subjectPlayerId, newOvr,
-             cs.defending_rating, cs.strength_rating, cs.fitness_rating,
-             cs.pace_rating, cs.decisions_rating, cs.assisting_rating,
-             cs.shooting_rating, cs.goalkeeper_rating, cs.reliability_tier]
-        );
+        let newOvr = oldOvr;
+        if (absorbed !== 0) {
+            // Apply stat changes + OVR + last_ovr_change_at in one UPDATE.
+            newOvr = oldOvr + absorbed;
+            const setParts = ['overall_rating = $1', 'last_ovr_change_at = NOW()'];
+            const params   = [newOvr];
+            let pi = 2;
+            for (const ch of pick.changes) {
+                setParts.push(`${ch.column} = $${pi++}`);
+                params.push(ch.newVal);
+            }
+            params.push(subjectPlayerId);
+            await client.query(
+                `UPDATE players SET ${setParts.join(', ')} WHERE id = $${pi}`,
+                params
+            );
+
+            // Snapshot into history (post-change values).
+            const cs = subjFull;
+            const newStats = { ...cs };
+            for (const ch of pick.changes) newStats[ch.column] = ch.newVal;
+            await client.query(
+                `INSERT INTO player_stat_history
+                  (player_id, changed_by, overall_rating, defending_rating, strength_rating,
+                   fitness_rating, pace_rating, decisions_rating, assisting_rating,
+                   shooting_rating, goalkeeper_rating, reliability_tier, created_at)
+                 VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
+                [subjectPlayerId, newOvr,
+                 newStats.defending_rating, newStats.strength_rating, newStats.fitness_rating,
+                 newStats.pace_rating, newStats.decisions_rating, newStats.assisting_rating,
+                 newStats.shooting_rating, newStats.goalkeeper_rating, cs.reliability_tier]
+            );
+        }
 
         await client.query(
             `INSERT INTO audit_logs (action, target_id, detail, created_at)
              VALUES ($1, $2, $3, NOW())`,
             [
-                'rating_recalibrated_via_feedback',
+                absorbed !== 0 ? 'rating_recalibrated_via_feedback' : 'rating_reference_pushed',
                 subjectPlayerId,
                 JSON.stringify({
-                    old_ovr: oldOvr, new_ovr: newOvr, delta: signedShift,
+                    old_ovr: oldOvr,
+                    new_ovr: newOvr,
+                    delta: absorbed,
+                    movement_magnitude: movementMag,
+                    is_new_player: isNewPlayer,
+                    apps: apps,
                     votes_used: consumeOps.length,
-                    magnitude_consumed: ovrShift * 4,
-                    leftover_magnitude: totalMag - (ovrShift * 4),
                     suspicion_flag: subj.ovr_suspicion,
+                    stat_changes: pick.changes,
+                    shortfall: pick.shortfall,
+                    ref_pushback: refPush && refPush.pushed ? {
+                        ref_id: refPush.refPlayerId,
+                        ref_alias: refPush.alias,
+                        ref_delta: refPush.appliedDelta,
+                    } : null,
                 }),
             ]
         );
@@ -2433,9 +2707,23 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
 
         // Re-classify suspicion with new OVR (separate connection)
         await _recomputeOvrSuspicion(subjectPlayerId);
+        if (refPush && refPush.pushed) {
+            // Also re-classify the pushed reference player.
+            await _recomputeOvrSuspicion(refPush.refPlayerId);
+        }
 
-        console.log(`[FIX-245 recalibration] player ${subjectPlayerId}: OVR ${oldOvr} → ${newOvr} (${consumeOps.length} votes used)`);
-        return { applied: true, deltaOvr: signedShift, votesConsumed: consumeOps.length, oldOvr, newOvr };
+        console.log(`[FIX-268 recalibration] player ${subjectPlayerId}: OVR ${oldOvr} → ${newOvr} (movement=${movementMag}, absorbed=${absorbed}, isNew=${isNewPlayer}, refPush=${refPush?.pushed||false})`);
+        return {
+            applied: true,
+            deltaOvr: absorbed,
+            votesConsumed: consumeOps.length,
+            oldOvr,
+            newOvr,
+            movementMagnitude: movementMag,
+            isNewPlayer,
+            statChanges: pick.changes,
+            refPushback: refPush && refPush.pushed ? refPush : null,
+        };
     } catch (e) {
         if (inTxn) { try { await client.query('ROLLBACK'); } catch (_) {} }
         console.error('[FIX-245 aggregate] failed for subject', subjectPlayerId, e);
@@ -5686,12 +5974,14 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireAdmin, async (
         );
         const b = beforeRow.rows[0] || {};
 
+        // FIX-268a: stamp last_ovr_change_at when OVR actually changes (D7).
         await pool.query(
             `UPDATE players SET 
              overall_rating = $1, defending_rating = $2, strength_rating = $3,
              fitness_rating = $4, pace_rating = $5, decisions_rating = $6,
              assisting_rating = $7, shooting_rating = $8, goalkeeper_rating = $9,
-             updated_at = CURRENT_TIMESTAMP
+             updated_at = CURRENT_TIMESTAMP,
+             last_ovr_change_at = CASE WHEN overall_rating IS DISTINCT FROM $1 THEN NOW() ELSE last_ovr_change_at END
              WHERE id = $10`,
             [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, req.params.id]
         );
@@ -5771,8 +6061,9 @@ app.put('/api/games/:gameId/players/:playerId/stats', authenticateToken, require
                 overall_rating = $1, defending_rating = $2, strength_rating = $3,
                 fitness_rating = $4, pace_rating = $5, decisions_rating = $6,
                 assisting_rating = $7, shooting_rating = $8, goalkeeper_rating = $9,
-                updated_at = CURRENT_TIMESTAMP
-              WHERE id = $10`,
+                updated_at = CURRENT_TIMESTAMP,
+                 last_ovr_change_at = CASE WHEN overall_rating IS DISTINCT FROM $1 THEN NOW() ELSE last_ovr_change_at END
+             WHERE id = $10`,
             [overall, defending, strength, fitness, pace, decisions, assisting, shooting, goalkeeper, playerId]
         );
 
@@ -6034,8 +6325,9 @@ app.put('/api/admin/players/:playerId', authenticateToken, requireAdmin, async (
                 social_instagram = $16,
                 social_youtube = $17,
                 social_facebook = $18,
-                position = $19
-            WHERE id = $20
+                position = $19,
+                 last_ovr_change_at = CASE WHEN overall_rating IS DISTINCT FROM $9 THEN NOW() ELSE last_ovr_change_at END
+             WHERE id = $20
         `, [goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
             pace_rating, decisions_rating, assisting_rating, shooting_rating,
             overall_rating, total_wins, squad_number, phone, alias || null,
@@ -24910,6 +25202,10 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
     }
 
     // Group → action filter map
+    // FIX-265: GROUP_ACTIONS allowlist extended for shop + feedback events.
+    // Each action string emitted from a server `auditLog(...)` call must appear
+    // in this allowlist for at least one group, otherwise the feed query
+    // (which JOINs audit_logs filtered by action IN (...)) won't return it.
     const GROUP_ACTIONS = {
         players:    ['player_created','player_updated','player_deleted','account_updated','stats_updated','tier_recalculated','badges_updated','badge_auto_awarded','badge_auto_removed'],
         games:      ['game_created','game_confirmed','game_completed','game_locked','game_unlocked','teams_generated','teams_confirmed','teams_deleted','type_converted','team_gen_constraint_relaxed','team_gen_beef5_widened','series_recreated'],
@@ -24921,6 +25217,9 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
         motm:       ['motm_voting_started','motm_vote','motm_finalized'],
         awards:     ['award_vote'],
         comms:      ['comms_campaign_sent','comms_email_sent','comms_email_failed','comms_claimed'], // FIX-104
+        // FIX-265: shop + feedback groups (extended with FIX-268a audit actions + FIX-268b/d additions)
+        shop:       ['shop_order_placed','shop_order_cancelled','shop_order_admin_cancelled','shop_status_changed','shop_squad_claimed'],
+        feedback:   ['rating_vote_cast','rating_vote_skipped','rating_vote_deleted','suspicion_cleared','rating_recalc_forced','rating_recalibrated_via_feedback','rating_recalibration_stalled','rating_reference_pushed','rating_suspicion_redirected','rating_feedback_pairs_requested'],
     };
 
     const allGroups = Object.keys(GROUP_ACTIONS);
@@ -33844,6 +34143,13 @@ app.post('/api/games/:gameUrl/rating-feedback', authenticateToken, async (req, r
             return res.status(409).json({ error: 'already_voted' });
         }
 
+        // FIX-262: audit-log the vote so it appears in audit.html under the
+        // FEEDBACK category. Non-blocking — failure doesn't break vote insert.
+        setImmediate(() => auditLog(pool, voterId,
+            isSkip ? 'rating_vote_skipped' : 'rating_vote_cast',
+            subjectPlayerId,
+            `delta=${validatedDelta} reference=${referencePlayerId} game=${gameId}`));
+
         // Trigger eager aggregation if this wasn't a skip
         let recalibration = null;
         if (!isSkip) {
@@ -33866,6 +34172,144 @@ app.post('/api/games/:gameUrl/rating-feedback', authenticateToken, async (req, r
         return res.status(500).json({ error: 'server_error' });
     }
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-268d — Additional pair-request endpoint + voter-context (stat peek)
+// ═══════════════════════════════════════════════════════════════════════
+
+// POST /api/games/:gameUrl/rating-feedback/more
+// Allows a voter to request additional comparison pairs after exhausting the
+// initial batch. Capped at 3 click-through grants per (player, game) and
+// 30 pairs total per (player, game). Audit-logged each call.
+app.post('/api/games/:gameUrl/rating-feedback/more', authenticateToken, async (req, res) => {
+    try {
+        const { gameUrl } = req.params;
+        const voterId     = req.user.playerId;
+
+        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
+        if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
+        const gameId = gR.rows[0].id;
+
+        // Eligibility: voter must be confirmed in the game
+        const vR = await pool.query(
+            `SELECT 1 FROM registrations
+              WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [gameId, voterId]
+        );
+        if (vR.rows.length === 0) return res.status(403).json({ error: 'voter_not_in_game' });
+
+        // How many extra grants has this player already received for this game?
+        const logR = await pool.query(
+            `SELECT pairs_requested FROM player_feedback_request_log
+              WHERE player_id = $1 AND game_id = $2`,
+            [voterId, gameId]
+        );
+        const prior = logR.rows.length > 0 ? logR.rows[0].pairs_requested : 0;
+        const FIX268_MAX_REQUESTS = 3;   // 3 click-through grants per game
+        const FIX268_MAX_PAIRS    = 30;  // 30 pairs total ceiling per game
+
+        if (prior >= FIX268_MAX_REQUESTS) {
+            return res.json({ granted: false, reason: 'cap_reached', priorRequests: prior });
+        }
+
+        // Check how many distinct pairs the voter has already engaged with.
+        // (Includes both real votes and skips — same uniqueness rule as the pair endpoint.)
+        const pairsR = await pool.query(
+            `SELECT COUNT(*)::int AS n
+               FROM player_rating_feedback
+              WHERE game_id = $1 AND voter_player_id = $2`,
+            [gameId, voterId]
+        );
+        const pairsSoFar = pairsR.rows[0].n;
+        if (pairsSoFar >= FIX268_MAX_PAIRS) {
+            return res.json({ granted: false, reason: 'pair_ceiling', pairsSoFar });
+        }
+
+        // Upsert the request log: increment by 1.
+        await pool.query(
+            `INSERT INTO player_feedback_request_log (player_id, game_id, pairs_requested, last_requested_at)
+             VALUES ($1, $2, 1, NOW())
+             ON CONFLICT (player_id, game_id) DO UPDATE
+                SET pairs_requested   = player_feedback_request_log.pairs_requested + 1,
+                    last_requested_at = NOW()`,
+            [voterId, gameId]
+        );
+
+        // Audit-log
+        setImmediate(() => auditLog(pool, voterId, 'rating_feedback_pairs_requested', voterId,
+            `Player requested more comparison pairs (grant ${prior + 1}/${FIX268_MAX_REQUESTS}, game=${gameId})`));
+
+        return res.json({
+            granted: true,
+            grantsUsed: prior + 1,
+            grantsMax:  FIX268_MAX_REQUESTS,
+            pairsSoFar,
+            pairsMax: FIX268_MAX_PAIRS,
+        });
+    } catch (e) {
+        console.error('POST /api/games/:gameUrl/rating-feedback/more error:', e);
+        return res.status(500).json({ error: 'server_error', detail: e.message });
+    }
+});
+
+// GET /api/games/:gameUrl/rating-feedback/voter-context/:playerId
+// Returns the stat-peek payload for one player on the slider screen.
+// NEVER includes overall_rating, sub-stats, or anything rating-derived (D1).
+// Voter must be confirmed in this game to access (prevents arbitrary scraping).
+app.get('/api/games/:gameUrl/rating-feedback/voter-context/:playerId', authenticateToken, async (req, res) => {
+    try {
+        const { gameUrl, playerId } = req.params;
+        const voterId = req.user.playerId;
+
+        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
+        if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
+        const gameId = gR.rows[0].id;
+
+        const vR = await pool.query(
+            `SELECT 1 FROM registrations
+              WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+            [gameId, voterId]
+        );
+        if (vR.rows.length === 0) return res.status(403).json({ error: 'voter_not_in_game' });
+
+        // Pull NON-RATING stats only. Explicit columns — never SELECT *.
+        const pR = await pool.query(
+            `SELECT alias, first_name, position,
+                    total_appearances, total_wins, total_draws,
+                    motm_wins
+               FROM players WHERE id = $1`,
+            [playerId]
+        );
+        if (pR.rows.length === 0) return res.status(404).json({ error: 'player_not_found' });
+        const p = pR.rows[0];
+
+        // Awards count
+        const awR = await pool.query(
+            `SELECT COUNT(*)::int AS n FROM game_award_votes
+              WHERE recipient_player_id = $1`,
+            [playerId]
+        );
+        const awards = awR.rows[0].n;
+
+        return res.json({
+            alias: p.alias,
+            first_name: p.first_name,
+            position: p.position || null,
+            apps:   p.total_appearances || 0,
+            wins:   p.total_wins        || 0,
+            draws:  p.total_draws       || 0,
+            motm:   p.motm_wins         || 0,
+            awards: awards,
+        });
+    } catch (e) {
+        console.error('GET /api/games/:gameUrl/rating-feedback/voter-context error:', e);
+        return res.status(500).json({ error: 'server_error', detail: e.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-268d
+// ═══════════════════════════════════════════════════════════════════════
 
 // GET /api/games/:gameUrl/rating-feedback-summary
 // Aggregate stats for the game-level "Player feedback from this game" section.
@@ -33908,12 +34352,74 @@ app.get('/api/games/:gameUrl/rating-feedback-summary', authenticateToken, async 
             [gameId]
         );
 
+        // FIX-268e: voter-specific eligibility — count pairs the current voter
+        // hasn't yet engaged with. Mobile uses this to hide the CTA when there's
+        // nothing left to vote on (avoids the "tap → 'no comparisons available'"
+        // round trip). Web uses the same logic but is more forgiving (always
+        // shows the section).
+        const voterId = req.user.playerId;
+        let voterPairsRemaining = 0;
+        let voterPairsRequested = 0;
+        let voterMoreGrantsUsed = 0;
+        try {
+            // Quick eligibility check: voter must be confirmed in this game.
+            const eR = await pool.query(
+                `SELECT 1 FROM registrations
+                  WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+                [gameId, voterId]
+            );
+            if (eR.rows.length > 0) {
+                // Count flagged subjects in this game that voter has NOT yet voted on
+                // or skipped. Mirrors the pair-endpoint's eligibility logic.
+                const remR = await pool.query(
+                    `SELECT COUNT(*)::int AS n
+                       FROM registrations r
+                       JOIN players p ON p.id = r.player_id
+                      WHERE r.game_id = $1
+                        AND r.status = 'confirmed'
+                        AND p.ovr_suspicion IS NOT NULL
+                        AND p.id != $2
+                        AND NOT EXISTS (
+                            SELECT 1 FROM player_rating_feedback prf
+                             WHERE prf.subject_player_id = p.id
+                               AND prf.voter_player_id   = $2
+                               AND prf.game_id           = $1
+                        )`,
+                    [gameId, voterId]
+                );
+                voterPairsRemaining = remR.rows[0]?.n || 0;
+
+                // Voter's pair requests so far + their grant usage.
+                const prR = await pool.query(
+                    `SELECT pairs_requested FROM player_feedback_request_log
+                      WHERE player_id = $1 AND game_id = $2`,
+                    [voterId, gameId]
+                );
+                voterMoreGrantsUsed = prR.rows[0]?.pairs_requested || 0;
+
+                const castR = await pool.query(
+                    `SELECT COUNT(*)::int AS n FROM player_rating_feedback
+                      WHERE voter_player_id = $1 AND game_id = $2`,
+                    [voterId, gameId]
+                );
+                voterPairsRequested = castR.rows[0]?.n || 0;
+            }
+        } catch (e) {
+            // Eligibility lookup is best-effort. If it fails, leave fields at 0
+            // (UI degrades to "always show CTA" which is fine).
+            console.warn('rating-feedback-summary eligibility lookup failed:', e.message);
+        }
+
         return res.json({
             votes_cast:            totalR.rows[0]?.votes_cast || 0,
             skips:                 totalR.rows[0]?.skips || 0,
             distinct_voters:       totalR.rows[0]?.distinct_voters || 0,
             subjects_rated:        totalR.rows[0]?.subjects_rated || 0,
             subjects_recalibrated: recalR.rows[0]?.subjects_recalibrated || 0,
+            // FIX-268e: voter-specific signals for CTA visibility
+            voter_pairs_remaining: voterPairsRemaining,
+            voter_pairs_cast:      voterPairsRequested,
+            voter_more_grants_used: voterMoreGrantsUsed,
         });
     } catch (e) {
         console.error('GET /api/games/:gameUrl/rating-feedback-summary error:', e);
@@ -36258,6 +36764,1591 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
         client.release();
     }
 });
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-257 — TotalFooty Shop feature endpoints
+// ═══════════════════════════════════════════════════════════════════════
+// Public shop (logged-in players) + admin (superadmin) endpoints for
+// the kit-and-merch shop. Uses 4 tables created in FIX-256 migration:
+//   shop_products, shop_product_variants, shop_orders, shop_order_lines
+//
+// Conventions followed:
+//   - requireSuperAdmin for /api/admin/shop/* (CRIT-14 pattern)
+//   - authenticateToken for /api/shop/* (player-facing)
+//   - BEGIN/COMMIT with FOR UPDATE row locks for transactional order/refund
+//   - Free-credit-first deduction matching applyGameFee semantics
+//   - Snapshot product_name + variant_label + price_credits on each line
+//   - Snapshot total_credits on order header (drives refund amount)
+//   - All SELECTs use explicit columns; no SELECT *
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── Constants ──────────────────────────────────────────────────────────
+const FIX257_MAX_LINES_PER_ORDER  = 10;
+const FIX257_MAX_QUANTITY_PER_LINE = 5;
+const FIX257_VALID_STATUSES = ['ordered', 'dispatched', 'delivered', 'cancelled'];
+// Products that need a squad_number stamped on them.
+const FIX257_PRODUCTS_NEEDING_SQUAD = new Set([
+    'reversible_shirt', 'non_reversible_shirt', 'hoodie', 'shorts'
+]);
+// Products that need a custom name on the back.
+const FIX257_PRODUCTS_NEEDING_NAME = new Set([
+    'reversible_shirt', 'non_reversible_shirt', 'hoodie'
+]);
+// Products that have initials (hoodie only per design doc).
+const FIX257_PRODUCTS_NEEDING_INITIALS = new Set(['hoodie']);
+// Reversible shirts need two designs picked at order time.
+const FIX257_PRODUCTS_NEEDING_TWO_DESIGNS = new Set(['reversible_shirt']);
+
+// Acceptable design names — locks the enum so a malicious client can't
+// inject arbitrary strings into the printed kit.
+const FIX257_VALID_DESIGNS = new Set([
+    'Ajax Red/White',
+    'Inter Blue/Black',
+    'City Sky Blue Retro',
+    'Pink GK',
+    'Nigeria Green',
+    'Boca Blue/Yellow'
+]);
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+// Build a human-readable variant label from the variant row + product_type.
+// Used to snapshot variant_label_snapshot on order lines for historical
+// rendering even after variants are deactivated.
+function _shopBuildVariantLabel(productType, variant) {
+    if (!variant) return '';
+    const parts = [];
+    if (variant.size)   parts.push(`Size ${variant.size}`);
+    if (variant.colour) parts.push(variant.colour);
+    if (variant.style)  parts.push(`${variant.style} style`);
+    if (variant.design) parts.push(variant.design);
+    return parts.join(', ');
+}
+
+// JOIN players → users for an email address. Returns null if no email
+// (player exists but never set one, or user row missing).
+async function _shopGetPlayerContact(client, playerId) {
+    const r = await client.query(
+        `SELECT p.alias, p.full_name, p.squad_number, u.email
+           FROM players p
+           JOIN users u ON u.id = p.user_id
+          WHERE p.id = $1`,
+        [playerId]
+    );
+    return r.rows[0] || null;
+}
+
+// Fire a status-change email to the player. Non-blocking — errors logged
+// but don't fail the parent request (the status update is the primary action).
+// Triggered from POST /api/shop/orders/:id/cancel AND PUT /api/admin/shop/orders/:id/status.
+async function _shopSendStatusEmail(orderId, newStatus, reason) {
+    try {
+        // Fresh pool query — runs outside any caller transaction so it
+        // sees the committed status update.
+        const orderR = await pool.query(
+            `SELECT o.id, o.player_id, o.status, o.total_credits,
+                    o.collection_game_id, o.cancelled_reason, o.created_at
+               FROM shop_orders o
+              WHERE o.id = $1`,
+            [orderId]
+        );
+        if (orderR.rows.length === 0) return;
+        const order = orderR.rows[0];
+
+        const contact = await _shopGetPlayerContact(pool, order.player_id);
+        if (!contact || !contact.email) {
+            console.warn(`[FIX-257] No email for player ${order.player_id} — order ${orderId} status email skipped`);
+            return;
+        }
+
+        const linesR = await pool.query(
+            `SELECT product_name_snapshot, variant_label_snapshot, quantity,
+                    price_credits, custom_name, custom_initials, squad_number,
+                    design_1, design_2
+               FROM shop_order_lines
+              WHERE order_id = $1
+              ORDER BY id ASC`,
+            [orderId]
+        );
+
+        const linesHtml = linesR.rows.map(l => {
+            const customBits = [];
+            if (l.custom_name)     customBits.push(`Name: ${l.custom_name}`);
+            if (l.custom_initials) customBits.push(`Initials: ${l.custom_initials}`);
+            if (l.squad_number)    customBits.push(`#${l.squad_number}`);
+            if (l.design_1)        customBits.push(`Side A: ${l.design_1}`);
+            if (l.design_2)        customBits.push(`Side B: ${l.design_2}`);
+            const variantBit = l.variant_label_snapshot ? ` — ${l.variant_label_snapshot}` : '';
+            const customStr  = customBits.length ? `<br><span style="color:#888;font-size:12px;">${customBits.join(' · ')}</span>` : '';
+            return `<li style="padding:6px 0;border-bottom:1px solid #2a2a2a;">
+                        <strong>${l.product_name_snapshot}</strong>${variantBit} × ${l.quantity}
+                        <span style="float:right;color:#00cc66;">${l.price_credits} cr</span>
+                        ${customStr}
+                    </li>`;
+        }).join('');
+
+        const playerName = contact.alias || contact.full_name || 'there';
+        let headline, body;
+        switch (newStatus) {
+            case 'ordered':
+                headline = '✓ Order received';
+                body = `Hi ${playerName},<br><br>Thanks for your order — we've got it. All items are custom-made so please allow approximately <strong>6 weeks</strong> before collection. You'll get another email when it ships from our supplier.`;
+                break;
+            case 'dispatched':
+                headline = '📦 Your order is on its way';
+                body = `Hi ${playerName},<br><br>Your shop order has been dispatched from our supplier. We'll bring it along to your next session for collection.`;
+                break;
+            case 'delivered':
+                headline = '🎉 Order delivered';
+                body = `Hi ${playerName},<br><br>Your shop order has been handed over. Hope you love it. Tag us if you wear it on a match day.`;
+                break;
+            case 'cancelled':
+                headline = '↩ Order cancelled — credits refunded';
+                body = `Hi ${playerName},<br><br>Your shop order has been cancelled${reason ? ` (${reason})` : ''}. We've refunded <strong>${order.total_credits} credits</strong> to your TotalFooty balance.`;
+                break;
+            default:
+                return; // unknown status — don't email
+        }
+
+        const orderRef = `#${order.id}`;
+        const inner = `
+            <h2 style="color:#fff;margin:0 0 12px 0;">${headline}</h2>
+            <p style="color:#ccc;font-size:14px;line-height:1.6;">${body}</p>
+            <p style="color:#888;font-size:12px;margin:20px 0 6px 0;">Order ${orderRef}</p>
+            <ul style="list-style:none;padding:0;margin:0;color:#ddd;font-size:14px;">${linesHtml}</ul>
+            <p style="color:#ccc;font-size:14px;margin-top:14px;text-align:right;"><strong>Total: ${order.total_credits} credits</strong></p>`;
+
+        await emailTransporter.sendMail({
+            // FIX-261: align with existing email convention (hardcoded sender).
+            from: '"TotalFooty Shop" <totalfooty19@gmail.com>',
+            to: contact.email,
+            subject: `📦 Order ${orderRef} — ${newStatus.charAt(0).toUpperCase() + newStatus.slice(1)}`,
+            html: wrapEmailHtml(inner)
+        });
+        console.log(`[FIX-257] Status email sent: order ${orderId} → ${newStatus} → ${contact.email}`);
+    } catch (e) {
+        console.error(`[FIX-257] Status email failed for order ${orderId}:`, e.message);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PUBLIC ENDPOINTS — logged-in players
+// ═══════════════════════════════════════════════════════════════════════
+
+// FIX-257: GET /api/shop/products
+// Returns active products + their active variants, sorted by sort_order.
+app.get('/api/shop/products', authenticateToken, async (req, res) => {
+    try {
+        const prodR = await pool.query(
+            `SELECT id, name, description, price_credits, image_url, product_type, sort_order
+               FROM shop_products
+              WHERE active = TRUE
+              ORDER BY sort_order ASC, id ASC`
+        );
+        if (prodR.rows.length === 0) return res.json({ products: [] });
+
+        const productIds = prodR.rows.map(r => r.id);
+        const varR = await pool.query(
+            `SELECT id, product_id, size, colour, style, design
+               FROM shop_product_variants
+              WHERE product_id = ANY($1::integer[]) AND active = TRUE
+              ORDER BY id ASC`,
+            [productIds]
+        );
+
+        const byProduct = new Map(productIds.map(id => [id, []]));
+        varR.rows.forEach(v => {
+            const arr = byProduct.get(v.product_id);
+            if (arr) arr.push({
+                id:     v.id,
+                size:   v.size,
+                colour: v.colour,
+                style:  v.style,
+                design: v.design,
+            });
+        });
+
+        const products = prodR.rows.map(p => ({
+            id:            p.id,
+            name:          p.name,
+            description:   p.description,
+            price_credits: p.price_credits,
+            image_url:     p.image_url,
+            product_type:  p.product_type,
+            requires: {
+                name:        FIX257_PRODUCTS_NEEDING_NAME.has(p.product_type),
+                initials:    FIX257_PRODUCTS_NEEDING_INITIALS.has(p.product_type),
+                squad_number:FIX257_PRODUCTS_NEEDING_SQUAD.has(p.product_type),
+                two_designs: FIX257_PRODUCTS_NEEDING_TWO_DESIGNS.has(p.product_type),
+            },
+            variants:      byProduct.get(p.id) || [],
+        }));
+        res.json({ products });
+    } catch (e) {
+        console.error('GET /api/shop/products error:', e);
+        res.status(500).json({ error: 'Failed to load products' });
+    }
+});
+
+// FIX-257: GET /api/shop/orders/mine
+// Player's own order history (newest first) with all lines.
+app.get('/api/shop/orders/mine', authenticateToken, async (req, res) => {
+    try {
+        const playerId = req.user.playerId;
+        const ordersR = await pool.query(
+            `SELECT id, status, total_credits, collection_game_id,
+                    cancelled_at, cancelled_reason, created_at, updated_at
+               FROM shop_orders
+              WHERE player_id = $1
+              ORDER BY created_at DESC
+              LIMIT 100`,
+            [playerId]
+        );
+        if (ordersR.rows.length === 0) return res.json({ orders: [] });
+
+        const orderIds = ordersR.rows.map(r => r.id);
+        const linesR = await pool.query(
+            `SELECT id, order_id, product_name_snapshot, variant_label_snapshot,
+                    quantity, price_credits, custom_name, custom_initials,
+                    squad_number, design_1, design_2
+               FROM shop_order_lines
+              WHERE order_id = ANY($1::integer[])
+              ORDER BY id ASC`,
+            [orderIds]
+        );
+        const linesByOrder = new Map(orderIds.map(id => [id, []]));
+        linesR.rows.forEach(l => {
+            const arr = linesByOrder.get(l.order_id);
+            if (arr) arr.push({
+                id:              l.id,
+                product_name:    l.product_name_snapshot,
+                variant_label:   l.variant_label_snapshot,
+                quantity:        l.quantity,
+                price_credits:   l.price_credits,
+                custom_name:     l.custom_name,
+                custom_initials: l.custom_initials,
+                squad_number:    l.squad_number,
+                design_1:        l.design_1,
+                design_2:        l.design_2,
+            });
+        });
+        res.json({
+            orders: ordersR.rows.map(o => ({
+                id:                  o.id,
+                status:              o.status,
+                total_credits:       o.total_credits,
+                collection_game_id:  o.collection_game_id,
+                cancelled_at:        o.cancelled_at,
+                cancelled_reason:    o.cancelled_reason,
+                created_at:          o.created_at,
+                updated_at:          o.updated_at,
+                lines:               linesByOrder.get(o.id) || [],
+            }))
+        });
+    } catch (e) {
+        console.error('GET /api/shop/orders/mine error:', e);
+        res.status(500).json({ error: 'Failed to load orders' });
+    }
+});
+
+// FIX-257: GET /api/shop/squad-numbers/check/:num
+// Returns availability for a squad number. 1-999 only.
+app.get('/api/shop/squad-numbers/check/:num', authenticateToken, async (req, res) => {
+    try {
+        const num = parseInt(req.params.num, 10);
+        if (!Number.isInteger(num) || num < 1 || num > 999) {
+            return res.status(400).json({ available: false, error: 'Squad number must be between 1 and 999' });
+        }
+        const r = await pool.query(
+            `SELECT id, alias FROM players WHERE squad_number = $1 LIMIT 1`,
+            [num]
+        );
+        if (r.rows.length === 0) {
+            return res.json({ available: true });
+        }
+        // Don't leak who has it — just say taken.
+        return res.json({ available: false });
+    } catch (e) {
+        console.error('GET /api/shop/squad-numbers/check error:', e);
+        res.status(500).json({ error: 'Check failed' });
+    }
+});
+
+// FIX-257: POST /api/shop/squad-number  body: { number }
+// Claim or change own squad number. 1-999 only. Frees previous if held.
+// Uses FOR UPDATE row lock to prevent two players claiming the same
+// number simultaneously.
+app.post('/api/shop/squad-number', authenticateToken, async (req, res) => {
+    const playerId = req.user.playerId;
+    const num      = parseInt(req.body && req.body.number, 10);
+    if (!Number.isInteger(num) || num < 1 || num > 999) {
+        return res.status(400).json({ error: 'Squad number must be between 1 and 999' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        // Lock any current holder of this number (could be self — that's OK)
+        const taken = await client.query(
+            `SELECT id, alias FROM players WHERE squad_number = $1 FOR UPDATE`,
+            [num]
+        );
+        if (taken.rows.length > 0 && taken.rows[0].id !== playerId) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'That number is already taken' });
+        }
+        // Set new number on requester (this also covers the no-op case
+        // where they already had this number — idempotent).
+        await client.query(
+            `UPDATE players SET squad_number = $1 WHERE id = $2`,
+            [num, playerId]
+        );
+        await client.query('COMMIT');
+        // FIX-262: audit-log squad number claim
+        setImmediate(() => auditLog(pool, playerId, 'shop_squad_claimed', playerId,
+            `Player claimed squad number #${num}`));
+        res.json({ ok: true, squad_number: num });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('POST /api/shop/squad-number error:', e);
+        res.status(500).json({ error: 'Failed to claim squad number' });
+    } finally {
+        client.release();
+    }
+});
+
+// FIX-257: POST /api/shop/order
+// Place a multi-line shop order. Transactional: deduct credits, insert
+// order, insert lines, OR rollback all if anything fails.
+// Body: { lines: [{product_id, variant_id?, quantity, custom_name?,
+//                  custom_initials?, design_1?, design_2?}],
+//         collection_game_id? }
+app.post('/api/shop/order', authenticateToken, async (req, res) => {
+    const playerId = req.user.playerId;
+    const lines    = Array.isArray(req.body && req.body.lines) ? req.body.lines : null;
+    const collectionGameId = req.body && req.body.collection_game_id ? req.body.collection_game_id : null;
+
+    if (!lines || lines.length === 0) {
+        return res.status(400).json({ error: 'Order must have at least one item' });
+    }
+    if (lines.length > FIX257_MAX_LINES_PER_ORDER) {
+        return res.status(400).json({ error: `Max ${FIX257_MAX_LINES_PER_ORDER} items per order` });
+    }
+    // Validate each line shape before opening a txn
+    for (const l of lines) {
+        if (!Number.isInteger(l.product_id) || l.product_id <= 0) {
+            return res.status(400).json({ error: 'Invalid product_id on a line' });
+        }
+        const q = parseInt(l.quantity, 10);
+        if (!Number.isInteger(q) || q < 1 || q > FIX257_MAX_QUANTITY_PER_LINE) {
+            return res.status(400).json({ error: `Quantity must be 1-${FIX257_MAX_QUANTITY_PER_LINE}` });
+        }
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Lock player's credit row + read squad_number
+        const playerR = await client.query(
+            `SELECT p.id, p.squad_number, c.balance, c.free_credit_balance
+               FROM players p
+               LEFT JOIN credits c ON c.player_id = p.id
+              WHERE p.id = $1
+              FOR UPDATE OF c`,
+            [playerId]
+        );
+        if (playerR.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        const player = playerR.rows[0];
+        const squadNum = (player.squad_number != null && player.squad_number >= 1 && player.squad_number <= 999)
+            ? player.squad_number : null;
+
+        // Optional collection_game_id must exist + be in the future + scheduled
+        if (collectionGameId) {
+            const gR = await client.query(
+                `SELECT id, game_date, game_status FROM games WHERE id = $1`,
+                [collectionGameId]
+            );
+            if (gR.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'Collection game not found' });
+            }
+            const g = gR.rows[0];
+            if (new Date(g.game_date) <= new Date()) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'Collection game must be in the future' });
+            }
+        }
+
+        // Fetch all referenced products + variants in one shot
+        const productIds = [...new Set(lines.map(l => l.product_id))];
+        const variantIds = lines.filter(l => l.variant_id).map(l => l.variant_id);
+
+        const prodR = await client.query(
+            `SELECT id, name, price_credits, product_type, active
+               FROM shop_products
+              WHERE id = ANY($1::integer[])`,
+            [productIds]
+        );
+        const productsById = new Map(prodR.rows.map(p => [p.id, p]));
+
+        const varR = variantIds.length > 0 ? await client.query(
+            `SELECT id, product_id, size, colour, style, design, active
+               FROM shop_product_variants
+              WHERE id = ANY($1::integer[])`,
+            [variantIds]
+        ) : { rows: [] };
+        const variantsById = new Map(varR.rows.map(v => [v.id, v]));
+
+        // Validate each line semantically + compute total
+        let totalCredits = 0;
+        const enrichedLines = [];
+        for (const l of lines) {
+            const product = productsById.get(l.product_id);
+            if (!product || !product.active) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: `Product ${l.product_id} not available` });
+            }
+            // Resolve variant. FIX-261: previously special-cased arm_pump_oil
+            // as the only product allowed to have no variant. But the right
+            // rule is: variant is required if the product HAS any active
+            // variants. This way arm_pump_oil with size variants behaves
+            // correctly, and any other product configured with no variants
+            // (e.g. a single-SKU item) also works.
+            let variant = null;
+            if (l.variant_id) {
+                variant = variantsById.get(l.variant_id);
+                if (!variant || variant.product_id !== product.id || !variant.active) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: `Invalid variant for ${product.name}` });
+                }
+            } else {
+                // Count active variants for this product. If any exist, the
+                // client MUST send a variant_id; otherwise the line is
+                // under-specified.
+                const productHasActiveVariants = await client.query(
+                    `SELECT 1 FROM shop_product_variants
+                      WHERE product_id = $1 AND active = TRUE
+                      LIMIT 1`,
+                    [product.id]
+                );
+                if (productHasActiveVariants.rows.length > 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: `${product.name} requires a variant` });
+                }
+            }
+            // Validate per-product custom fields
+            const pt = product.product_type;
+            const needsName    = FIX257_PRODUCTS_NEEDING_NAME.has(pt);
+            const needsInit    = FIX257_PRODUCTS_NEEDING_INITIALS.has(pt);
+            const needsSquad   = FIX257_PRODUCTS_NEEDING_SQUAD.has(pt);
+            const needsDesigns = FIX257_PRODUCTS_NEEDING_TWO_DESIGNS.has(pt);
+
+            const customName = (l.custom_name || '').toString().trim().slice(0, 30) || null;
+            const customInit = (l.custom_initials || '').toString().trim().slice(0, 5) || null;
+            const design1    = needsDesigns ? (l.design_1 || '').toString().trim() : null;
+            const design2    = needsDesigns ? (l.design_2 || '').toString().trim() : null;
+
+            if (needsName && !customName) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: `${product.name} requires a name` });
+            }
+            if (needsInit && !customInit) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: `${product.name} requires initials` });
+            }
+            if (needsSquad && squadNum == null) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    error: 'You need a squad number (1-999) to order this item. Claim one from your profile first.'
+                });
+            }
+            if (needsDesigns) {
+                if (!FIX257_VALID_DESIGNS.has(design1) || !FIX257_VALID_DESIGNS.has(design2)) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: `Reversible shirt requires two valid designs` });
+                }
+            }
+
+            const q = parseInt(l.quantity, 10);
+            const lineTotal = product.price_credits * q;
+            totalCredits += lineTotal;
+            enrichedLines.push({
+                product, variant, quantity: q,
+                customName, customInit,
+                squadNumber: needsSquad ? squadNum : null,
+                design1, design2,
+                price_credits: lineTotal,
+            });
+        }
+
+        // Affordability check — free-first
+        const freeBal = parseFloat(player.free_credit_balance || 0);
+        const realBal = parseFloat(player.balance || 0);
+        const totalBal = freeBal + realBal;
+        if (totalBal < totalCredits) {
+            await client.query('ROLLBACK');
+            return res.status(402).json({
+                error: 'Insufficient credits',
+                required: totalCredits,
+                available: totalBal,
+            });
+        }
+
+        // Deduct credits — free bucket first, then real
+        const freeUsed = Math.min(freeBal, totalCredits);
+        const realUsed = totalCredits - freeUsed;
+        await client.query(
+            `UPDATE credits
+                SET free_credit_balance = free_credit_balance - $1,
+                    balance             = balance - $2,
+                    last_updated        = CURRENT_TIMESTAMP
+              WHERE player_id = $3`,
+            [freeUsed, realUsed, playerId]
+        );
+        if (freeUsed > 0) {
+            await recordCreditTransaction(client, playerId, -freeUsed, 'free_credit',
+                `Shop order placed (free credit)`);
+        }
+        if (realUsed > 0) {
+            await recordCreditTransaction(client, playerId, -realUsed, 'shop_order',
+                `Shop order placed`);
+        }
+
+        // Insert the order header
+        const ordR = await client.query(
+            `INSERT INTO shop_orders
+                 (player_id, status, collection_game_id, total_credits)
+             VALUES ($1, 'ordered', $2, $3)
+             RETURNING id`,
+            [playerId, collectionGameId, totalCredits]
+        );
+        const orderId = ordR.rows[0].id;
+
+        // Insert each line with snapshots
+        for (const el of enrichedLines) {
+            await client.query(
+                `INSERT INTO shop_order_lines
+                     (order_id, product_id, variant_id,
+                      product_name_snapshot, variant_label_snapshot,
+                      quantity, price_credits,
+                      custom_name, custom_initials, squad_number,
+                      design_1, design_2)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+                [
+                    orderId,
+                    el.product.id,
+                    el.variant ? el.variant.id : null,
+                    el.product.name,
+                    _shopBuildVariantLabel(el.product.product_type, el.variant),
+                    el.quantity,
+                    el.price_credits,
+                    el.customName,
+                    el.customInit,
+                    el.squadNumber,
+                    el.design1,
+                    el.design2,
+                ]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        // Fire confirmation email outside the txn (non-blocking)
+        setImmediate(() => _shopSendStatusEmail(orderId, 'ordered'));
+        // FIX-262: audit-log so it appears in audit.html SHOP category
+        setImmediate(() => auditLog(pool, playerId, 'shop_order_placed', playerId,
+            `Order #${orderId} placed. ${enrichedLines.length} line(s), ${totalCredits} credits.`));
+
+        res.json({
+            ok: true,
+            order_id: orderId,
+            total_credits: totalCredits,
+            credits_used: { free: freeUsed, real: realUsed },
+        });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('POST /api/shop/order error:', e);
+        res.status(500).json({ error: 'Failed to place order', detail: e.message, code: e.code });
+    } finally {
+        client.release();
+    }
+});
+
+// FIX-257: POST /api/shop/orders/:id/cancel  body: { reason? }
+// Player self-cancel. Only while status='ordered'. Refunds credits to the
+// same buckets they were taken from (proportional).
+app.post('/api/shop/orders/:id/cancel', authenticateToken, async (req, res) => {
+    const orderId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(orderId)) {
+        return res.status(400).json({ error: 'Invalid order id' });
+    }
+    const playerId = req.user.playerId;
+    const reason   = (req.body && req.body.reason || '').toString().trim().slice(0, 200) || null;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const oR = await client.query(
+            `SELECT id, player_id, status, total_credits
+               FROM shop_orders
+              WHERE id = $1
+              FOR UPDATE`,
+            [orderId]
+        );
+        if (oR.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        const order = oR.rows[0];
+        if (order.player_id !== playerId) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'Not your order' });
+        }
+        if (order.status !== 'ordered') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                error: `Cannot cancel — order is already ${order.status}`,
+            });
+        }
+
+        // Refund credits — go back to the real-credit bucket (simpler; can
+        // split proportionally later if needed). The cancel email tells
+        // the player the exact figure.
+        // FIX-261: use INSERT ON CONFLICT to defend against the edge case
+        // where the credits row was deleted between order and cancel. UPDATE
+        // alone would silently affect 0 rows and lose the refund.
+        await client.query(
+            `INSERT INTO credits (player_id, balance, last_updated)
+             VALUES ($2, $1, CURRENT_TIMESTAMP)
+             ON CONFLICT (player_id) DO UPDATE
+                SET balance      = credits.balance + $1,
+                    last_updated = CURRENT_TIMESTAMP`,
+            [order.total_credits, playerId]
+        );
+        await recordCreditTransaction(client, playerId, order.total_credits, 'shop_refund',
+            `Refund for cancelled shop order #${orderId}`);
+
+        await client.query(
+            `UPDATE shop_orders
+                SET status = 'cancelled',
+                    cancelled_at = NOW(),
+                    cancelled_reason = $1,
+                    updated_at = NOW()
+              WHERE id = $2`,
+            [reason, orderId]
+        );
+        await client.query('COMMIT');
+
+        setImmediate(() => _shopSendStatusEmail(orderId, 'cancelled', reason));
+        // FIX-262: audit-log player-self-cancel.
+        setImmediate(() => auditLog(pool, playerId, 'shop_order_cancelled', playerId,
+            `Player cancelled order #${orderId}. Refunded ${order.total_credits} credits. Reason: ${reason || '(none)'}`));
+
+        res.json({ ok: true, refunded: order.total_credits });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('POST /api/shop/orders/:id/cancel error:', e);
+        res.status(500).json({ error: 'Failed to cancel order', detail: e.message, code: e.code });
+    } finally {
+        client.release();
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ADMIN ENDPOINTS — superadmin only
+// ═══════════════════════════════════════════════════════════════════════
+
+// FIX-257: GET /api/admin/shop/products
+// Lists ALL products (active + inactive) with variant counts AND full variant
+// data inline. FIX-260: variants[] added so the admin client can pre-populate
+// the edit modal and show inactive variants (otherwise unreachable for
+// reactivation). Two-query approach keeps it simple and avoids GROUP BY
+// gymnastics; for >1000 products we'd switch to a join with array_agg.
+app.get('/api/admin/shop/products', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const prodR = await pool.query(
+            `SELECT p.id, p.name, p.description, p.price_credits, p.image_url,
+                    p.product_type, p.sort_order, p.active, p.created_at, p.updated_at,
+                    COUNT(v.id) FILTER (WHERE v.active = TRUE)  AS active_variants,
+                    COUNT(v.id) FILTER (WHERE v.active = FALSE) AS inactive_variants
+               FROM shop_products p
+               LEFT JOIN shop_product_variants v ON v.product_id = p.id
+              GROUP BY p.id
+              ORDER BY p.sort_order ASC, p.id ASC`
+        );
+        if (prodR.rows.length === 0) return res.json({ products: [] });
+
+        // FIX-260: pull all variants in one shot, group client-side by product_id.
+        const varR = await pool.query(
+            `SELECT id, product_id, size, colour, style, design, active, created_at
+               FROM shop_product_variants
+              WHERE product_id = ANY($1::integer[])
+              ORDER BY product_id ASC, active DESC, id ASC`,
+            [prodR.rows.map(p => p.id)]
+        );
+        const byProduct = new Map(prodR.rows.map(p => [p.id, []]));
+        varR.rows.forEach(v => {
+            const arr = byProduct.get(v.product_id);
+            if (arr) arr.push(v);
+        });
+
+        res.json({
+            products: prodR.rows.map(p => ({
+                ...p,
+                variants: byProduct.get(p.id) || [],
+            }))
+        });
+    } catch (e) {
+        console.error('GET /api/admin/shop/products error:', e);
+        res.status(500).json({ error: 'Failed to load products' });
+    }
+});
+
+// FIX-257: POST /api/admin/shop/products
+// Create a new product. Variants added via separate endpoint.
+app.post('/api/admin/shop/products', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { name, description, price_credits, image_url, product_type, sort_order } = req.body || {};
+        if (!name || typeof name !== 'string') {
+            return res.status(400).json({ error: 'name required' });
+        }
+        const price = parseInt(price_credits, 10);
+        if (!Number.isInteger(price) || price < 0) {
+            return res.status(400).json({ error: 'price_credits must be a non-negative integer' });
+        }
+        const validTypes = ['reversible_shirt','non_reversible_shirt','hoodie','shorts','grip_socks','arm_pump_oil'];
+        if (!validTypes.includes(product_type)) {
+            return res.status(400).json({ error: 'invalid product_type' });
+        }
+        const sortVal = Number.isInteger(parseInt(sort_order, 10)) ? parseInt(sort_order, 10) : 0;
+        const r = await pool.query(
+            `INSERT INTO shop_products
+                 (name, description, price_credits, image_url, product_type, sort_order)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             RETURNING id, name, price_credits, product_type, sort_order, active`,
+            [name.trim().slice(0, 100), description || null, price, image_url || null, product_type, sortVal]
+        );
+        res.json({ ok: true, product: r.rows[0] });
+    } catch (e) {
+        console.error('POST /api/admin/shop/products error:', e);
+        res.status(500).json({ error: 'Failed to create product', detail: e.message });
+    }
+});
+
+// FIX-257: PUT /api/admin/shop/products/:id
+// Edit name, description, price, image_url, sort_order, active.
+// product_type is NOT editable post-creation (would invalidate variants/orders).
+app.put('/api/admin/shop/products/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+
+        const fields = [];
+        const vals = [];
+        let pi = 1;
+        for (const [key, max] of [['name', 100], ['description', null], ['image_url', null]]) {
+            if (req.body[key] !== undefined) {
+                fields.push(`${key} = $${pi++}`);
+                const v = req.body[key];
+                vals.push(typeof v === 'string' && max ? v.trim().slice(0, max) : v);
+            }
+        }
+        if (req.body.price_credits !== undefined) {
+            const p = parseInt(req.body.price_credits, 10);
+            if (!Number.isInteger(p) || p < 0) {
+                return res.status(400).json({ error: 'price_credits must be a non-negative integer' });
+            }
+            fields.push(`price_credits = $${pi++}`); vals.push(p);
+        }
+        if (req.body.sort_order !== undefined) {
+            const s = parseInt(req.body.sort_order, 10);
+            if (!Number.isInteger(s)) return res.status(400).json({ error: 'sort_order must be integer' });
+            fields.push(`sort_order = $${pi++}`); vals.push(s);
+        }
+        if (req.body.active !== undefined) {
+            fields.push(`active = $${pi++}`); vals.push(!!req.body.active);
+        }
+        if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        fields.push(`updated_at = NOW()`);
+        vals.push(id);
+
+        const r = await pool.query(
+            `UPDATE shop_products SET ${fields.join(', ')} WHERE id = $${pi} RETURNING id, name, price_credits, active`,
+            vals
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+        res.json({ ok: true, product: r.rows[0] });
+    } catch (e) {
+        console.error('PUT /api/admin/shop/products error:', e);
+        res.status(500).json({ error: 'Failed to update product', detail: e.message });
+    }
+});
+
+// FIX-257: POST /api/admin/shop/products/:id/variants
+// Add one variant to a product.
+app.post('/api/admin/shop/products/:id/variants', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const productId = parseInt(req.params.id, 10);
+        if (!Number.isInteger(productId)) return res.status(400).json({ error: 'Invalid product id' });
+
+        const exists = await pool.query(`SELECT id FROM shop_products WHERE id = $1`, [productId]);
+        if (exists.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+
+        const { size, colour, style, design } = req.body || {};
+        const trim = v => (typeof v === 'string' ? v.trim().slice(0, 50) : null) || null;
+        const r = await pool.query(
+            `INSERT INTO shop_product_variants (product_id, size, colour, style, design)
+             VALUES ($1,$2,$3,$4,$5)
+             RETURNING id, size, colour, style, design, active`,
+            [productId, trim(size), trim(colour), trim(style), trim(design)]
+        );
+        res.json({ ok: true, variant: r.rows[0] });
+    } catch (e) {
+        console.error('POST /api/admin/shop/products/:id/variants error:', e);
+        res.status(500).json({ error: 'Failed to create variant', detail: e.message });
+    }
+});
+
+// FIX-257: PUT /api/admin/shop/variants/:id
+// Edit or deactivate a variant.
+app.put('/api/admin/shop/variants/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+
+        const fields = []; const vals = []; let pi = 1;
+        for (const key of ['size', 'colour', 'style', 'design']) {
+            if (req.body[key] !== undefined) {
+                fields.push(`${key} = $${pi++}`);
+                const v = req.body[key];
+                vals.push(typeof v === 'string' ? v.trim().slice(0, 50) : v);
+            }
+        }
+        if (req.body.active !== undefined) {
+            fields.push(`active = $${pi++}`); vals.push(!!req.body.active);
+        }
+        if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        vals.push(id);
+
+        const r = await pool.query(
+            `UPDATE shop_product_variants SET ${fields.join(', ')}
+              WHERE id = $${pi}
+              RETURNING id, product_id, size, colour, style, design, active`,
+            vals
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Variant not found' });
+        res.json({ ok: true, variant: r.rows[0] });
+    } catch (e) {
+        console.error('PUT /api/admin/shop/variants error:', e);
+        res.status(500).json({ error: 'Failed to update variant', detail: e.message });
+    }
+});
+
+// FIX-257: GET /api/admin/shop/orders
+// All orders with player + lines + status. Supports ?status filter and
+// ?limit / ?offset pagination.
+app.get('/api/admin/shop/orders', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const status = req.query.status && FIX257_VALID_STATUSES.includes(req.query.status)
+            ? req.query.status : null;
+        const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+        const offset = parseInt(req.query.offset, 10) || 0;
+
+        const params = [];
+        let where = '';
+        if (status) {
+            params.push(status);
+            where = `WHERE o.status = $${params.length}`;
+        }
+        params.push(limit); params.push(offset);
+
+        const ordersR = await pool.query(
+            `SELECT o.id, o.player_id, o.status, o.total_credits,
+                    o.collection_game_id, o.cancelled_at, o.cancelled_reason,
+                    o.created_at, o.updated_at, o.notes,
+                    p.alias, p.full_name, p.squad_number,
+                    g.game_date AS collection_game_date,
+                    g.game_url  AS collection_game_url
+               FROM shop_orders o
+               JOIN players p ON p.id = o.player_id
+               LEFT JOIN games g ON g.id = o.collection_game_id
+               ${where}
+              ORDER BY o.created_at DESC
+              LIMIT $${params.length - 1} OFFSET $${params.length}`,
+            params
+        );
+        if (ordersR.rows.length === 0) return res.json({ orders: [] });
+
+        const orderIds = ordersR.rows.map(r => r.id);
+        const linesR = await pool.query(
+            `SELECT id, order_id, product_id, variant_id,
+                    product_name_snapshot, variant_label_snapshot,
+                    quantity, price_credits, custom_name, custom_initials,
+                    squad_number, design_1, design_2
+               FROM shop_order_lines
+              WHERE order_id = ANY($1::integer[])
+              ORDER BY id ASC`,
+            [orderIds]
+        );
+        const byOrder = new Map(orderIds.map(id => [id, []]));
+        linesR.rows.forEach(l => {
+            const arr = byOrder.get(l.order_id);
+            if (arr) arr.push(l);
+        });
+
+        res.json({
+            orders: ordersR.rows.map(o => ({
+                id:                  o.id,
+                status:              o.status,
+                total_credits:       o.total_credits,
+                created_at:          o.created_at,
+                updated_at:          o.updated_at,
+                cancelled_at:        o.cancelled_at,
+                cancelled_reason:    o.cancelled_reason,
+                notes:               o.notes,
+                player: {
+                    id:           o.player_id,
+                    alias:        o.alias,
+                    full_name:    o.full_name,
+                    squad_number: o.squad_number,
+                },
+                collection: o.collection_game_id ? {
+                    game_id:   o.collection_game_id,
+                    game_date: o.collection_game_date,
+                    game_url:  o.collection_game_url,
+                } : null,
+                lines: byOrder.get(o.id) || [],
+            }))
+        });
+    } catch (e) {
+        console.error('GET /api/admin/shop/orders error:', e);
+        res.status(500).json({ error: 'Failed to load orders' });
+    }
+});
+
+// FIX-261: GET /api/admin/shop/stats
+// Returns accurate per-status order counts via SQL COUNT, independent of
+// any pagination/limit on the orders endpoint. Solves the prior issue
+// where stat cards on shop-admin.html only counted the first 500 orders.
+app.get('/api/admin/shop/stats', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE status = 'ordered')    AS ordered,
+                COUNT(*) FILTER (WHERE status = 'dispatched') AS dispatched,
+                COUNT(*) FILTER (WHERE status = 'delivered')  AS delivered,
+                COUNT(*) FILTER (WHERE status = 'cancelled')  AS cancelled,
+                COALESCE(SUM(total_credits) FILTER (WHERE status IN ('ordered','dispatched','delivered')), 0) AS revenue_credits
+               FROM shop_orders`
+        );
+        const row = r.rows[0] || {};
+        res.json({
+            ordered:    parseInt(row.ordered    || 0, 10),
+            dispatched: parseInt(row.dispatched || 0, 10),
+            delivered:  parseInt(row.delivered  || 0, 10),
+            cancelled:  parseInt(row.cancelled  || 0, 10),
+            revenue_credits: parseInt(row.revenue_credits || 0, 10),
+        });
+    } catch (e) {
+        console.error('GET /api/admin/shop/stats error:', e);
+        res.status(500).json({ error: 'Failed to load stats' });
+    }
+});
+
+// FIX-257: PUT /api/admin/shop/orders/:id/status  body: { status, notes? }
+// Update order status. Triggers status email to player on success.
+// Status transitions enforced:
+//   ordered → dispatched | cancelled
+//   dispatched → delivered | cancelled (admin override)
+//   delivered → (terminal)
+//   cancelled → (terminal — re-cancel is no-op)
+app.put('/api/admin/shop/orders/:id/status', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const orderId = parseInt(req.params.id, 10);
+    const newStatus = (req.body && req.body.status || '').toString();
+    const notes = (req.body && req.body.notes || '').toString().trim().slice(0, 500) || null;
+    const cancelReason = (req.body && req.body.cancelled_reason || '').toString().trim().slice(0, 200) || null;
+
+    if (!Number.isInteger(orderId)) return res.status(400).json({ error: 'Invalid id' });
+    if (!FIX257_VALID_STATUSES.includes(newStatus)) {
+        return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const oR = await client.query(
+            `SELECT id, player_id, status, total_credits
+               FROM shop_orders
+              WHERE id = $1
+              FOR UPDATE`,
+            [orderId]
+        );
+        if (oR.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        const order = oR.rows[0];
+
+        // Transition validity
+        const allowed = {
+            ordered:    ['dispatched', 'cancelled'],
+            dispatched: ['delivered',  'cancelled'],
+            delivered:  [],
+            cancelled:  [],
+        }[order.status] || [];
+        if (newStatus !== order.status && !allowed.includes(newStatus)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                error: `Cannot transition from ${order.status} to ${newStatus}`,
+            });
+        }
+
+        // If admin is cancelling, refund credits (same as player cancel)
+        // FIX-261: INSERT ON CONFLICT defends against missing credits row.
+        if (newStatus === 'cancelled' && order.status !== 'cancelled') {
+            await client.query(
+                `INSERT INTO credits (player_id, balance, last_updated)
+                 VALUES ($2, $1, CURRENT_TIMESTAMP)
+                 ON CONFLICT (player_id) DO UPDATE
+                    SET balance      = credits.balance + $1,
+                        last_updated = CURRENT_TIMESTAMP`,
+                [order.total_credits, order.player_id]
+            );
+            await recordCreditTransaction(client, order.player_id, order.total_credits, 'shop_refund',
+                `Admin-cancelled shop order #${orderId}`);
+        }
+
+        // Apply status update
+        await client.query(
+            `UPDATE shop_orders
+                SET status = $1,
+                    notes = COALESCE($2, notes),
+                    cancelled_at = CASE WHEN $1 = 'cancelled' AND cancelled_at IS NULL THEN NOW() ELSE cancelled_at END,
+                    cancelled_reason = CASE WHEN $1 = 'cancelled' THEN COALESCE($3, cancelled_reason) ELSE cancelled_reason END,
+                    updated_at = NOW()
+              WHERE id = $4`,
+            [newStatus, notes, cancelReason, orderId]
+        );
+        await client.query('COMMIT');
+
+        // Email the player about the change (non-blocking)
+        if (newStatus !== order.status) {
+            setImmediate(() => _shopSendStatusEmail(orderId, newStatus, cancelReason));
+            // FIX-262: audit-log admin status transitions.
+            const auditAction = newStatus === 'cancelled' ? 'shop_order_admin_cancelled' : 'shop_status_changed';
+            setImmediate(() => auditLog(pool, req.user.playerId, auditAction, order.player_id,
+                `Order #${orderId}: ${order.status} → ${newStatus}${cancelReason ? '. Reason: ' + cancelReason : ''}`));
+        }
+
+        res.json({ ok: true, status: newStatus });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('PUT /api/admin/shop/orders/:id/status error:', e);
+        res.status(500).json({ error: 'Failed to update status', detail: e.message, code: e.code });
+    } finally {
+        client.release();
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-257 — Shop feature endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-262 — Rating feedback admin endpoints
+// ═══════════════════════════════════════════════════════════════════════
+// All gated requireSuperAdmin. Reads from player_rating_feedback (the raw
+// vote table) and players.ovr_suspicion (the aggregated flag state).
+// Every admin action audit-logs so the changes appear in the audit feed.
+// ═══════════════════════════════════════════════════════════════════════
+
+// FIX-262: GET /api/admin/rating-feedback/summary
+// Paginated per-subject summary: who's received feedback, vote totals,
+// flag state, last activity. Ordered by most-recent-vote desc.
+// Supports ?limit=N&offset=N&flag=(low_winrate|high_winrate|none|any)
+app.get('/api/admin/rating-feedback/summary', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const limit  = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+        const offset = parseInt(req.query.offset, 10) || 0;
+        const flag   = (req.query.flag || 'any').toString();
+
+        const params = [];
+        let flagFilter = '';
+        if (flag === 'low_winrate' || flag === 'high_winrate') {
+            params.push(flag);
+            flagFilter = ` AND p.ovr_suspicion = $${params.length}`;
+        } else if (flag === 'none') {
+            flagFilter = ` AND p.ovr_suspicion IS NULL`;
+        }
+        // Otherwise (flag='any') no filter.
+
+        params.push(limit, offset);
+        const r = await pool.query(
+            `WITH subj_stats AS (
+                SELECT
+                    subject_player_id,
+                    COUNT(*) FILTER (WHERE delta_vote IS NOT NULL) AS total_votes,
+                    COUNT(*) FILTER (WHERE delta_vote IS NULL) AS skip_count,
+                    COUNT(DISTINCT voter_player_id) FILTER (WHERE delta_vote IS NOT NULL) AS distinct_voters,
+                    SUM(applied_amount) FILTER (WHERE fully_consumed = TRUE) AS applied_magnitude,
+                    MAX(created_at) AS last_vote_at,
+                    SUM(CASE WHEN delta_vote > 0 THEN 1 ELSE 0 END) AS positive_votes,
+                    SUM(CASE WHEN delta_vote < 0 THEN 1 ELSE 0 END) AS negative_votes,
+                    SUM(CASE WHEN delta_vote = 0 THEN 1 ELSE 0 END) AS neutral_votes
+                FROM player_rating_feedback
+                GROUP BY subject_player_id
+            )
+            SELECT
+                p.id, p.alias, p.full_name, p.squad_number, p.position,
+                p.overall_rating, p.total_appearances, p.total_wins,
+                p.total_draws, p.total_losses, p.ovr_suspicion,
+                p.suspicion_cooldown_until_appearances,
+                s.total_votes, s.skip_count, s.distinct_voters,
+                s.applied_magnitude, s.last_vote_at,
+                s.positive_votes, s.negative_votes, s.neutral_votes
+            FROM subj_stats s
+            JOIN players p ON p.id = s.subject_player_id
+            WHERE 1=1${flagFilter}
+            ORDER BY s.last_vote_at DESC NULLS LAST
+            LIMIT $${params.length - 1} OFFSET $${params.length}`,
+            params
+        );
+        res.json({ players: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/rating-feedback/summary error:', e);
+        res.status(500).json({ error: 'Failed to load summary', detail: e.message });
+    }
+});
+
+// FIX-262: GET /api/admin/rating-feedback/votes
+// Raw vote grid. Supports filters: subject_id, voter_id, game_id,
+// consumed (true/false), since (ISO datetime).
+app.get('/api/admin/rating-feedback/votes', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+        const offset = parseInt(req.query.offset, 10) || 0;
+
+        const params = [];
+        const where  = ['1=1'];
+        if (req.query.subject_id) {
+            params.push(req.query.subject_id);
+            where.push(`prf.subject_player_id = $${params.length}`);
+        }
+        if (req.query.voter_id) {
+            params.push(req.query.voter_id);
+            where.push(`prf.voter_player_id = $${params.length}`);
+        }
+        if (req.query.game_id) {
+            params.push(req.query.game_id);
+            where.push(`prf.game_id = $${params.length}`);
+        }
+        if (req.query.consumed === 'true' || req.query.consumed === 'false') {
+            params.push(req.query.consumed === 'true');
+            where.push(`prf.fully_consumed = $${params.length}`);
+        }
+        if (req.query.since) {
+            const since = new Date(req.query.since);
+            if (!isNaN(since)) {
+                params.push(since);
+                where.push(`prf.created_at >= $${params.length}`);
+            }
+        }
+        params.push(limit, offset);
+
+        const r = await pool.query(
+            `SELECT
+                prf.id, prf.subject_player_id, prf.reference_player_id,
+                prf.voter_player_id, prf.game_id, prf.delta_vote,
+                prf.applied_amount, prf.fully_consumed, prf.created_at,
+                ps.alias AS subject_alias, ps.full_name AS subject_full_name,
+                ps.squad_number AS subject_squad_number,
+                ps.overall_rating AS subject_ovr, ps.ovr_suspicion AS subject_flag,
+                pr.alias AS reference_alias, pr.full_name AS reference_full_name,
+                pr.overall_rating AS reference_ovr,
+                pv.alias AS voter_alias, pv.full_name AS voter_full_name,
+                g.game_url, g.game_date
+            FROM player_rating_feedback prf
+            JOIN players ps ON ps.id = prf.subject_player_id
+            JOIN players pr ON pr.id = prf.reference_player_id
+            JOIN players pv ON pv.id = prf.voter_player_id
+            LEFT JOIN games g ON g.id = prf.game_id
+            WHERE ${where.join(' AND ')}
+            ORDER BY prf.created_at DESC
+            LIMIT $${params.length - 1} OFFSET $${params.length}`,
+            params
+        );
+        res.json({ votes: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/rating-feedback/votes error:', e);
+        res.status(500).json({ error: 'Failed to load votes', detail: e.message });
+    }
+});
+
+// FIX-262: GET /api/admin/players/:id/rating-feedback
+// Per-player feedback bundle for the manage-players panel.
+// Returns: current flag/cooldown, summary stats, last 25 votes received,
+// and last 25 votes cast BY this player (useful for spotting bad-faith voters).
+app.get('/api/admin/players/:id/rating-feedback', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const playerId = req.params.id;
+        // Player meta
+        const pR = await pool.query(
+            `SELECT id, alias, full_name, squad_number, position,
+                    overall_rating, total_appearances, total_wins,
+                    total_draws, total_losses, ovr_suspicion,
+                    suspicion_cooldown_until_appearances
+               FROM players WHERE id = $1`,
+            [playerId]
+        );
+        if (pR.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        // Votes received as subject
+        const receivedR = await pool.query(
+            `SELECT prf.id, prf.delta_vote, prf.applied_amount, prf.fully_consumed,
+                    prf.created_at, prf.reference_player_id, prf.voter_player_id, prf.game_id,
+                    pr.alias AS reference_alias, pr.overall_rating AS reference_ovr,
+                    pv.alias AS voter_alias,
+                    g.game_url, g.game_date
+               FROM player_rating_feedback prf
+               JOIN players pr ON pr.id = prf.reference_player_id
+               JOIN players pv ON pv.id = prf.voter_player_id
+               LEFT JOIN games g ON g.id = prf.game_id
+              WHERE prf.subject_player_id = $1
+              ORDER BY prf.created_at DESC
+              LIMIT 25`,
+            [playerId]
+        );
+        // Votes cast as voter
+        const castR = await pool.query(
+            `SELECT prf.id, prf.delta_vote, prf.created_at,
+                    prf.subject_player_id, prf.reference_player_id, prf.game_id,
+                    ps.alias AS subject_alias,
+                    pr.alias AS reference_alias,
+                    g.game_url, g.game_date
+               FROM player_rating_feedback prf
+               JOIN players ps ON ps.id = prf.subject_player_id
+               JOIN players pr ON pr.id = prf.reference_player_id
+               LEFT JOIN games g ON g.id = prf.game_id
+              WHERE prf.voter_player_id = $1
+              ORDER BY prf.created_at DESC
+              LIMIT 25`,
+            [playerId]
+        );
+        // Totals
+        const totalsR = await pool.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE delta_vote IS NOT NULL) AS total_received,
+                COUNT(DISTINCT voter_player_id) FILTER (WHERE delta_vote IS NOT NULL) AS distinct_voters,
+                SUM(CASE WHEN delta_vote > 0 THEN 1 ELSE 0 END) AS positive_received,
+                SUM(CASE WHEN delta_vote < 0 THEN 1 ELSE 0 END) AS negative_received
+              FROM player_rating_feedback
+              WHERE subject_player_id = $1`,
+            [playerId]
+        );
+        res.json({
+            player:    pR.rows[0],
+            totals:    totalsR.rows[0],
+            received:  receivedR.rows,
+            cast:      castR.rows,
+        });
+    } catch (e) {
+        console.error('GET /api/admin/players/:id/rating-feedback error:', e);
+        res.status(500).json({ error: 'Failed to load player feedback', detail: e.message });
+    }
+});
+
+// FIX-262: POST /api/admin/players/:id/clear-suspicion
+// Manually clear the ovr_suspicion flag + set cooldown to suppress re-prompting.
+// Audit-logged.
+app.post('/api/admin/players/:id/clear-suspicion', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const playerId = req.params.id;
+        const reason   = (req.body && req.body.reason || '').toString().trim().slice(0, 200) || null;
+
+        const r = await pool.query(
+            `UPDATE players
+                SET ovr_suspicion = NULL,
+                    suspicion_cooldown_until_appearances = COALESCE(total_appearances, 0) + 5
+              WHERE id = $1
+              RETURNING id, alias, ovr_suspicion, suspicion_cooldown_until_appearances`,
+            [playerId]
+        );
+        if (r.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        setImmediate(() => auditLog(pool, req.user.playerId, 'suspicion_cleared', playerId,
+            `Manually cleared rating-suspicion flag. Reason: ${reason || '(none given)'}`));
+        res.json({ ok: true, player: r.rows[0] });
+    } catch (e) {
+        console.error('POST /api/admin/players/:id/clear-suspicion error:', e);
+        res.status(500).json({ error: 'Failed to clear suspicion', detail: e.message });
+    }
+});
+
+// FIX-262: DELETE /api/admin/rating-feedback/votes/:id
+// Remove a spurious vote (e.g. bad-faith voter). Hard-deletes the row.
+// Audit-logged with full context so the delete is reconstructable.
+app.delete('/api/admin/rating-feedback/votes/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const voteId = parseInt(req.params.id, 10);
+        if (!Number.isInteger(voteId)) {
+            return res.status(400).json({ error: 'Invalid vote id' });
+        }
+        const reason = (req.body && req.body.reason || '').toString().trim().slice(0, 200) || null;
+
+        // Capture for audit before deleting
+        const beforeR = await pool.query(
+            `SELECT id, subject_player_id, reference_player_id, voter_player_id,
+                    game_id, delta_vote, applied_amount, fully_consumed, created_at
+               FROM player_rating_feedback WHERE id = $1`,
+            [voteId]
+        );
+        if (beforeR.rows.length === 0) {
+            return res.status(404).json({ error: 'Vote not found' });
+        }
+        const v = beforeR.rows[0];
+
+        await pool.query(`DELETE FROM player_rating_feedback WHERE id = $1`, [voteId]);
+
+        const detail =
+            `Deleted vote id=${v.id} subject=${v.subject_player_id} voter=${v.voter_player_id} ` +
+            `game=${v.game_id} delta=${v.delta_vote} consumed=${v.fully_consumed}. ` +
+            `Reason: ${reason || '(none given)'}`;
+        setImmediate(() => auditLog(pool, req.user.playerId, 'rating_vote_deleted', v.subject_player_id, detail));
+
+        res.json({ ok: true, deleted: v });
+    } catch (e) {
+        console.error('DELETE /api/admin/rating-feedback/votes/:id error:', e);
+        res.status(500).json({ error: 'Failed to delete vote', detail: e.message });
+    }
+});
+
+// FIX-262: POST /api/admin/players/:id/rating-feedback/recalc
+// Force re-aggregation of a player's rating feedback. Useful after admin
+// deletes spurious votes. Calls _aggregateRatingFeedback() which is the
+// same function FIX-245 uses on every vote.
+app.post('/api/admin/players/:id/rating-feedback/recalc', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const playerId = req.params.id;
+        // Confirm player exists
+        const pR = await pool.query(`SELECT id, alias FROM players WHERE id = $1`, [playerId]);
+        if (pR.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        const result = await _aggregateRatingFeedback(playerId);
+        setImmediate(() => auditLog(pool, req.user.playerId, 'rating_recalc_forced', playerId,
+            `Admin-triggered rating-feedback aggregation. Applied=${result && result.applied} reason=${result && result.reason}`));
+        res.json({ ok: true, result });
+    } catch (e) {
+        console.error('POST /api/admin/players/:id/rating-feedback/recalc error:', e);
+        res.status(500).json({ error: 'Failed to recalculate', detail: e.message });
+    }
+});
+
+// FIX-267: GET /api/admin/players/feedback-diagnostic
+// Per-player diagnostic view: what does the system "think" each player's OVR
+// should be, based on the rating feedback aggregator's logic, plus a
+// confidence score. Returns ALL players who have received at least 1 vote,
+// regardless of whether thresholds are currently met.
+app.get('/api/admin/players/feedback-diagnostic', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        // Pull all players who've received at least one vote, with their
+        // per-vote breakdown joined in. We do this client-side aggregation
+        // (in JS, after the SQL fetch) because the math is involved and
+        // duplicating the aggregator's logic in SQL would be brittle.
+        const playersR = await pool.query(
+            `SELECT DISTINCT
+                p.id, p.alias, p.full_name, p.squad_number, p.position,
+                p.overall_rating, p.total_appearances, p.total_wins, p.total_draws,
+                p.ovr_suspicion, p.last_ovr_change_at
+               FROM players p
+              WHERE EXISTS (
+                  SELECT 1 FROM player_rating_feedback prf
+                   WHERE prf.subject_player_id = p.id AND prf.delta_vote IS NOT NULL
+              )
+              ORDER BY p.alias NULLS LAST, p.full_name NULLS LAST`
+        );
+        if (playersR.rows.length === 0) {
+            return res.json({ players: [] });
+        }
+        const playerIds = playersR.rows.map(r => r.id);
+
+        // Pull all unconsumed + consumed votes in one shot. We'll bucket
+        // them per-player in JS for the calculations.
+        const votesR = await pool.query(
+            `SELECT subject_player_id, delta_vote, voter_player_id, fully_consumed,
+                    created_at
+               FROM player_rating_feedback
+              WHERE subject_player_id = ANY($1::uuid[])
+                AND delta_vote IS NOT NULL
+              ORDER BY created_at ASC`,
+            [playerIds]
+        );
+        const votesByPlayer = new Map(playerIds.map(id => [id, []]));
+        votesR.rows.forEach(v => {
+            const arr = votesByPlayer.get(v.subject_player_id);
+            if (arr) arr.push(v);
+        });
+
+        const now = Date.now();
+        const players = playersR.rows.map(p => {
+            const allVotes  = votesByPlayer.get(p.id) || [];
+            const pending   = allVotes.filter(v => !v.fully_consumed);
+            const totalVotes = allVotes.length;
+            const pendingCount = pending.length;
+
+            // Distinct voters across ALL votes (consumed + pending) — that's
+            // what tells you "social proof" volume.
+            const distinctVoters = new Set(allVotes.map(v => v.voter_player_id)).size;
+
+            // Split by direction (all votes, used for agreement metric)
+            const positive = allVotes.filter(v => v.delta_vote > 0).length;
+            const negative = allVotes.filter(v => v.delta_vote < 0).length;
+            const neutral  = allVotes.filter(v => v.delta_vote === 0).length;
+
+            // Applied magnitude — sum of |delta| where fully_consumed=true
+            // (informational; not used in suggested_change)
+            const appliedMagnitude = allVotes
+                .filter(v => v.fully_consumed)
+                .reduce((s, v) => s + Math.abs(v.delta_vote), 0);
+
+            // FIX-268c — diagnostic endpoint synced with new FIX-268a aggregator.
+            // ── suggested_change: mirror the NEW FIX-268a aggregator ──
+            // Uses the same _fix268MovementMagnitude curve the real aggregator uses,
+            // so the diagnostic and the actual recalibration agree exactly.
+            const apps        = parseInt(p.total_appearances || 0, 10);
+            const isNewPlayer = apps < FIX268_NEW_PLAYER_CUTOFF;
+            const pendingPositive = pending.filter(v => v.delta_vote > 0);
+            const pendingNegative = pending.filter(v => v.delta_vote < 0);
+            // The aggregator uses MATCHING-direction count for the curve (not net).
+            // Pick the dominant direction from PENDING votes.
+            const pendingPosCount = pendingPositive.length;
+            const pendingNegCount = pendingNegative.length;
+            let dominantDir   = 0;
+            let matchingCount = 0;
+            let matchingVoters = 0;
+            if (pendingPosCount > pendingNegCount) {
+                dominantDir   = 1;
+                matchingCount = pendingPosCount;
+                matchingVoters = new Set(pendingPositive.map(v => v.voter_player_id)).size;
+            } else if (pendingNegCount > pendingPosCount) {
+                dominantDir   = -1;
+                matchingCount = pendingNegCount;
+                matchingVoters = new Set(pendingNegative.map(v => v.voter_player_id)).size;
+            }
+            const movementMag = dominantDir !== 0
+                ? _fix268MovementMagnitude(matchingCount, matchingVoters, isNewPlayer)
+                : 0;
+            const suggestedChange = movementMag * dominantDir;
+            const suggestedOvr    = (p.overall_rating || 0) + suggestedChange;
+
+            // ── confidence: only votes received AFTER the last OVR change count.
+            // D7: confidence resets when OVR changes (any aggregator recalibration
+            // or admin manual edit stamps last_ovr_change_at).
+            const sinceTs = p.last_ovr_change_at ? new Date(p.last_ovr_change_at).getTime() : 0;
+            const freshVotes = allVotes.filter(v => new Date(v.created_at).getTime() >= sinceTs);
+            const freshVoters = new Set(freshVotes.map(v => v.voter_player_id)).size;
+            const freshPositive = freshVotes.filter(v => v.delta_vote > 0).length;
+            const freshNegative = freshVotes.filter(v => v.delta_vote < 0).length;
+            const freshDominant = Math.max(freshPositive, freshNegative);
+            const volumeScore    = Math.min(freshVoters / 5, 1) * 40;
+            const agreementScore = freshVotes.length > 0 ? (freshDominant / freshVotes.length) * 40 : 0;
+            const recencyAvg     = freshVotes.length > 0
+                ? freshVotes.reduce((s, v) => {
+                    const daysOld = (now - new Date(v.created_at).getTime()) / 86400000;
+                    return s + (1 / (1 + daysOld / 30));
+                  }, 0) / freshVotes.length
+                : 0;
+            const recencyScore   = recencyAvg * 20;
+            const confidence     = Math.round(volumeScore + agreementScore + recencyScore);
+
+            // ── signal verdict — aligns with the new FIX-268a model ──
+            // INSUFFICIENT means: too few fresh votes/voters for the new thresholds.
+            // Since the new model needs 3+ votes/2+ voters for new players (and 5+ votes/
+            // 3+ voters for established), use those minimums against PENDING votes (not
+            // all-time totals — those include consumed votes which can't trigger movement).
+            const minVotesNeeded  = isNewPlayer ? 3 : 5;
+            const minVotersNeeded = isNewPlayer ? 2 : 3;
+            let signal;
+            if (matchingCount < minVotesNeeded || matchingVoters < minVotersNeeded) {
+                signal = 'INSUFFICIENT';
+            } else if (suggestedChange < 0) {
+                signal = 'OVERRATED';
+            } else if (suggestedChange > 0) {
+                signal = 'UNDERRATED';
+            } else {
+                signal = 'STABLE';
+            }
+
+            // ── vote pattern: last 14 votes, newest last (for sparkline) ──
+            const pattern = allVotes.slice(-14).map(v => ({
+                delta: v.delta_vote,
+                days_ago: Math.round((now - new Date(v.created_at).getTime()) / 86400000),
+                consumed: v.fully_consumed,
+            }));
+
+            const lastVoteAt = allVotes.length > 0 ? allVotes[allVotes.length - 1].created_at : null;
+
+            return {
+                id: p.id,
+                alias: p.alias,
+                full_name: p.full_name,
+                squad_number: p.squad_number,
+                position: p.position,
+                overall_rating: p.overall_rating,
+                total_appearances: p.total_appearances,
+                total_wins: p.total_wins,
+                total_draws: p.total_draws,
+                current_flag: p.ovr_suspicion,
+                last_ovr_change_at: p.last_ovr_change_at,
+                // Vote counts — all-time
+                total_votes: totalVotes,
+                pending_count: pendingCount,
+                distinct_voters: distinctVoters,
+                positive_votes: positive,
+                negative_votes: negative,
+                neutral_votes: neutral,
+                applied_magnitude: appliedMagnitude,
+                // Vote counts — fresh (post last_ovr_change_at). FIX-268a bugfix:
+                // confidence is computed on fresh votes only, so the UI breakdown
+                // must show fresh counts not all-time counts to stay consistent.
+                fresh_votes:    freshVotes.length,
+                fresh_voters:   freshVoters,
+                fresh_positive: freshPositive,
+                fresh_negative: freshNegative,
+                // Diagnostic
+                suggested_change: suggestedChange,
+                suggested_ovr: suggestedOvr,
+                confidence_pct: confidence,
+                confidence_breakdown: {
+                    volume:    Math.round(volumeScore),
+                    agreement: Math.round(agreementScore),
+                    recency:   Math.round(recencyScore),
+                },
+                signal: signal,
+                last_vote_at: lastVoteAt,
+                vote_pattern: pattern,
+            };
+        });
+
+        res.json({ players });
+    } catch (e) {
+        console.error('GET /api/admin/players/feedback-diagnostic error:', e);
+        res.status(500).json({ error: 'Failed to load diagnostic', detail: e.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-262 — Rating feedback admin endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
 
 
 // FIX-043: Catch-all 404 — MUST be last, after ALL routes (including comms routes).
