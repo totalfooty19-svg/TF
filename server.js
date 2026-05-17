@@ -521,11 +521,29 @@ const AUDIT_TAG_TABLE = {
     // ─── COMMS ─────────────────────────────────────────────────────────────
     comms_campaign_sent:      { cat: 'comms', sub: 'campaigns', actor: 'admin', sev: 'med' },
     dm_reported:              { cat: 'comms', sub: 'reports',   actor: 'player', sev: 'med' },
+    // FIX-271: messaging restrictions — superadmin mute/unmute + auto-detected
+    // spree alerts. NOTE: these MUST also exist in audit.html's LEGACY_TYPE_TAG
+    // as a fallback for any synthesised events that bypass enrichAuditRow.
+    dm_block:                 { cat: 'comms', sub: 'messaging_restrictions', actor: 'admin',  sev: 'high' },
+    dm_unblock:               { cat: 'comms', sub: 'messaging_restrictions', actor: 'admin',  sev: 'med'  },
+    dm_spree_detected:        { cat: 'comms', sub: 'messaging_restrictions', actor: 'system', sev: 'med'  },
+
+    // FIX-274: substantiation queue + voter-reliability + reversals.
+    rating_auto_apply_toggled:        { cat: 'feedback', sub: 'managed',       actor: 'admin',  sev: 'high' },
+    rating_suggestion_approved:       { cat: 'feedback', sub: 'managed',       actor: 'admin',  sev: 'med'  },
+    rating_suggestion_rejected:       { cat: 'feedback', sub: 'managed',       actor: 'admin',  sev: 'low'  },
+    rating_recalibration_reversed:    { cat: 'feedback', sub: 'managed',       actor: 'admin',  sev: 'high' },
+    // FIX-275: self-correcting model
+    rating_damping_recomputed:        { cat: 'feedback', sub: 'managed',       actor: 'admin',  sev: 'low'  },
+    rating_damping_toggled:           { cat: 'feedback', sub: 'managed',       actor: 'admin',  sev: 'high' },
 
     // ─── SERIES ────────────────────────────────────────────────────────────
-    series_recreated:                { cat: 'series', sub: 'managed', actor: 'admin', sev: 'med' },
-    series_lineup_editors_updated:   { cat: 'series', sub: 'managed', actor: 'admin', sev: 'low' },
-    series_scoreline_overridden:     { cat: 'series', sub: 'managed', actor: 'admin', sev: 'med' },
+    series_recreated:                { cat: 'series', sub: 'managed', actor: 'admin',  sev: 'med' },
+    series_lineup_editors_updated:   { cat: 'series', sub: 'managed', actor: 'admin',  sev: 'low' },
+    series_scoreline_overridden:     { cat: 'series', sub: 'managed', actor: 'admin',  sev: 'med' },
+    // FIX-273: series-end + auto-finalize-on-recreate events.
+    series_auto_finalized_on_recreate:
+                                     { cat: 'series', sub: 'managed', actor: 'system', sev: 'med' },
 
     // ─── ACCESS ────────────────────────────────────────────────────────────
     page_view:                { cat: 'access', sub: 'views', actor: 'player', sev: 'low' }
@@ -2280,6 +2298,551 @@ function _fix268VindicationThresholdHit(counterVotes, counterVoters) {
     return counterVotes >= 3 && counterVoters >= 2;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-274 — Substantiation model + voter reliability + suggestion queue
+// ═══════════════════════════════════════════════════════════════════════════
+// Three priority systems on top of the existing FIX-268 aggregator:
+//   1) Outcome tracking: every applied recalibration is recorded in
+//      rating_recalibration_history with the voter IDs that contributed.
+//      Admin can REVERSE a recalibration; on reverse, every contributing
+//      voter has voter_reversed_votes incremented. Trust score is
+//      1 - (reversed / total_votes_used_in_applied_recalibrations).
+//   2) Substantiation: before applying (or surfacing as a suggestion), the
+//      aggregator computes a substantiation score 0..1 across 4 axes:
+//        - collusion (same group repeatedly voting together)
+//        - revenge (voter recently down-voted by subject)
+//        - spam (single voter dominating the vote pool)
+//        - voter trust (mean trust of contributing voters)
+//      Score < 0.5 = suspicious; surfaces in admin queue with warnings.
+//   3) Auto-apply toggle: system_settings.rating_auto_apply_enabled.
+//      When OFF (default), recalibrations are STAGED in
+//      rating_recalibration_history with status='pending' and the votes
+//      stay unconsumed. Admin reviews + approves/rejects.
+//      When ON, recalibrations apply automatically as before (preserves
+//      legacy behaviour) but still record history + voter IDs.
+
+// _settingGet — read a system_settings key; returns string or null.
+async function _ratingSettingGet(key) {
+    try {
+        const r = await pool.query(
+            'SELECT value FROM system_settings WHERE key = $1', [key]
+        );
+        return r.rows[0]?.value || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+// _settingSet — write a system_settings key (upsert).
+async function _ratingSettingSet(key, value) {
+    await pool.query(
+        `INSERT INTO system_settings (key, value, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [key, String(value)]
+    );
+}
+
+// Convenience checker for the auto-apply mode flag.
+async function _ratingAutoApplyEnabled() {
+    const v = await _ratingSettingGet('rating_auto_apply_enabled');
+    return v === 'true';
+}
+
+// _computeSubstantiation — falsification-detection score for a candidate
+// recalibration. Returns {score, warnings} where score is 0..1 (1 = clean)
+// and warnings is a list of {type, detail} strings the admin should see.
+//
+// Inputs:
+//   subjectPlayerId — who's about to be recalibrated
+//   matchingVotes   — array of {id, voter_player_id, delta_vote, created_at}
+//                     that triggered the threshold
+// Cheaper than running every check inline at vote time — only fires when the
+// aggregator is about to commit.
+async function _computeSubstantiation(subjectPlayerId, matchingVotes) {
+    const warnings = [];
+    let penalty = 0; // 0..1 — fraction of trust lost across the 4 checks
+
+    const voterIds = [...new Set(matchingVotes.map(v => String(v.voter_player_id)))];
+    if (voterIds.length === 0) return { score: 1.0, warnings };
+
+    // ─── (1) VOTER TRUST — pull per-voter scores, take the mean ─────────────
+    // A pool of voters with low individual trust is itself suspicious.
+    try {
+        const trustR = await pool.query(
+            `SELECT id, COALESCE(voter_trust_score, 1.0) AS trust,
+                    COALESCE(voter_total_votes, 0)       AS total,
+                    COALESCE(voter_reversed_votes, 0)    AS reversed,
+                    COALESCE(total_appearances, 0)       AS apps
+             FROM players WHERE id = ANY($1::uuid[])`,
+            [voterIds]
+        );
+        const trusts = trustR.rows.map(r => parseFloat(r.trust));
+        if (trusts.length > 0) {
+            const meanTrust = trusts.reduce((a, b) => a + b, 0) / trusts.length;
+            // Penalty scales with shortfall from 1.0; cap contribution at 0.4.
+            const trustPenalty = Math.min(0.4, (1.0 - meanTrust) * 0.6);
+            penalty += trustPenalty;
+            if (meanTrust < 0.7) {
+                warnings.push({
+                    type: 'low_voter_trust',
+                    detail: `mean voter trust ${(meanTrust * 100).toFixed(0)}% — some contributors have a history of reversed votes`,
+                });
+            }
+            // Sub-check: low-appearance voters ("doesn't know ball" — fresh
+            // accounts with low experience). Anyone with <5 apps counts.
+            const inexperienced = trustR.rows.filter(r => r.apps < 5).length;
+            if (inexperienced >= Math.ceil(voterIds.length / 2)) {
+                penalty += 0.15;
+                warnings.push({
+                    type: 'inexperienced_voters',
+                    detail: `${inexperienced}/${voterIds.length} voters have <5 game appearances`,
+                });
+            }
+        }
+    } catch (_) { /* missing columns pre-migration — skip silently */ }
+
+    // ─── (2) SPAM — one voter dominating the pool ──────────────────────────
+    // Count votes per voter. If any single voter > 50% of the pool AND there
+    // are at least 4 votes, that's suspicious.
+    const perVoter = {};
+    for (const v of matchingVotes) {
+        const k = String(v.voter_player_id);
+        perVoter[k] = (perVoter[k] || 0) + 1;
+    }
+    const maxCount = Math.max(...Object.values(perVoter));
+    if (matchingVotes.length >= 4 && maxCount / matchingVotes.length > 0.5) {
+        penalty += 0.20;
+        const dominator = Object.entries(perVoter).find(([_, c]) => c === maxCount)[0];
+        warnings.push({
+            type: 'vote_spam',
+            detail: `one voter cast ${maxCount}/${matchingVotes.length} of the matching votes`,
+            voter_id: dominator,
+        });
+    }
+
+    // ─── (3) REVENGE — voter recently down-voted by the subject ────────────
+    // For each voter who's pushing subject DOWN, check if subject recently
+    // pushed THEM down in the last 90 days. If so → revenge pattern.
+    try {
+        const negativeVoters = matchingVotes
+            .filter(v => v.delta_vote < 0)
+            .map(v => String(v.voter_player_id));
+        if (negativeVoters.length > 0) {
+            const revR = await pool.query(
+                `SELECT DISTINCT voter_player_id
+                 FROM player_rating_feedback
+                 WHERE subject_player_id = ANY($1::uuid[])
+                   AND voter_player_id = $2
+                   AND delta_vote < 0
+                   AND created_at > NOW() - INTERVAL '90 days'`,
+                [negativeVoters, subjectPlayerId]
+            );
+            if (revR.rows.length > 0) {
+                penalty += 0.15 + Math.min(0.10, revR.rows.length * 0.05);
+                warnings.push({
+                    type: 'revenge_pattern',
+                    detail: `${revR.rows.length} voter${revR.rows.length === 1 ? '' : 's'} were down-voted by the subject in the last 90 days`,
+                });
+            }
+        }
+    } catch (_) { /* silent — table may be young */ }
+
+    // ─── (4) COLLUSION — voter clique pattern ───────────────────────────────
+    // For pools of 3+ voters, check if these same voters have voted together
+    // (on any subject) ≥3 times in the last 60 days. Repeated co-voting on
+    // the same outcome direction is the signal.
+    if (voterIds.length >= 3) {
+        try {
+            const cluR = await pool.query(`
+                WITH joint AS (
+                    SELECT subject_player_id, COUNT(DISTINCT voter_player_id) AS pool_size
+                    FROM player_rating_feedback
+                    WHERE voter_player_id = ANY($1::uuid[])
+                      AND created_at > NOW() - INTERVAL '60 days'
+                      AND subject_player_id <> $2
+                    GROUP BY subject_player_id
+                )
+                SELECT COUNT(*)::int AS together_count
+                FROM joint WHERE pool_size = $3
+            `, [voterIds, subjectPlayerId, voterIds.length]);
+            const togetherCount = cluR.rows[0]?.together_count || 0;
+            if (togetherCount >= 3) {
+                penalty += 0.20;
+                warnings.push({
+                    type: 'collusion_pattern',
+                    detail: `same ${voterIds.length}-voter group has voted together on ${togetherCount} other subjects in the last 60 days`,
+                });
+            }
+        } catch (_) { /* silent */ }
+    }
+
+    const score = Math.max(0.0, Math.min(1.0, 1.0 - penalty));
+    return { score, warnings };
+}
+
+// _bumpVoterStats — increment voter_total_votes for each voter in the array
+// when their vote contributes to an APPLIED recalibration. Called from the
+// aggregator commit path. Idempotent-ish: if a player ID isn't in the table,
+// silently skips that row.
+async function _bumpVoterTotalVotes(client, voterIds) {
+    if (!voterIds || voterIds.length === 0) return;
+    try {
+        await client.query(
+            `UPDATE players
+                SET voter_total_votes = COALESCE(voter_total_votes, 0) + 1,
+                    voter_trust_score = CASE
+                        WHEN COALESCE(voter_total_votes, 0) + 1 = 0 THEN 1.0
+                        ELSE 1.0 - (COALESCE(voter_reversed_votes, 0)::numeric
+                                    / (COALESCE(voter_total_votes, 0) + 1))
+                    END
+              WHERE id = ANY($1::uuid[])`,
+            [voterIds]
+        );
+    } catch (_) { /* pre-migration: silent */ }
+}
+
+// _bumpVoterReversed — called when an admin REVERSES a previously-applied
+// recalibration. Increments voter_reversed_votes for each contributing voter
+// and recomputes their trust score.
+async function _bumpVoterReversedVotes(client, voterIds) {
+    if (!voterIds || voterIds.length === 0) return;
+    try {
+        await client.query(
+            `UPDATE players
+                SET voter_reversed_votes = COALESCE(voter_reversed_votes, 0) + 1,
+                    voter_trust_score = CASE
+                        WHEN COALESCE(voter_total_votes, 0) = 0 THEN 1.0
+                        ELSE 1.0 - ((COALESCE(voter_reversed_votes, 0) + 1)::numeric
+                                    / COALESCE(voter_total_votes, 1))
+                    END
+              WHERE id = ANY($1::uuid[])`,
+            [voterIds]
+        );
+    } catch (_) { /* silent */ }
+}
+
+// _recordRecalibrationHistory — write a row to rating_recalibration_history.
+// status='applied' for live recalibrations, 'pending' for queued suggestions.
+// FIX-275: also accepts `source` (default 'system') and `appearancesAtRecal`
+// so the overcorrection detector can measure followup windows in games.
+async function _recordRecalibrationHistory(client, params) {
+    const { subjectId, deltaOvr, statChanges, voterIds, suspicionFlag,
+            movementMag, substantiationScore, status,
+            source, appearancesAtRecal } = params;
+    try {
+        const r = await client.query(
+            `INSERT INTO rating_recalibration_history
+                (subject_player_id, delta_ovr, stat_changes, voter_ids,
+                 suspicion_flag, movement_magnitude, substantiation_score, status,
+                 source, appearances_at_recal)
+             VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7, $8, $9, $10)
+             RETURNING id`,
+            [subjectId, deltaOvr, JSON.stringify(statChanges || []),
+             JSON.stringify(voterIds || []), suspicionFlag, movementMag,
+             substantiationScore, status,
+             source || 'system', appearancesAtRecal || null]
+        );
+        return r.rows[0]?.id || null;
+    } catch (e) {
+        console.warn('[FIX-274] _recordRecalibrationHistory failed (non-fatal):', e.message);
+        return null;
+    }
+}
+
+// END FIX-274 helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-275 — Self-correcting recalibration model
+// ═══════════════════════════════════════════════════════════════════════════
+// Builds on FIX-274. Captures the failure mode "system overcorrected, admin
+// pushed them back". Mechanism:
+//   1) Every applied recalibration records appearances_at_recal so the
+//      followup window can be measured in games (3-5), not days.
+//   2) When a later recalibration OR a manual admin edit moves the same
+//      player in the opposite direction within the followup window, a
+//      rating_correction_links row records the relationship.
+//   3) Player.recalibration_stability + Player.voter_accuracy_score updated
+//      from those links — graded by magnitude, not binary.
+//   4) Global damping factor: nightly compute of last-90d overcorrection rate.
+//      High rate → magnitude scaling kicks in on every new recalibration.
+//   5) GAFFA's hard movement caps enforced regardless of vote magnitude:
+//      - <5 apps (new): ±3 max
+//      - 5+ apps && joined within 30 days (young): ±2 max
+//      - established (>30 days since join): ±2 hard cap, ±1 default unless
+//        substantiation_score >= 0.85 AND stability >= 0.85.
+
+// Days-since-join thresholds. "Joined" inferred from min(games.game_date)
+// for games the player has registered for, falling back to created_at.
+const FIX275_YOUNG_PLAYER_DAYS = 30;
+
+// Movement caps. Hard ceilings — enforced even when threshold curve says higher.
+const FIX275_CAP_NEW         = 3; // <5 apps
+const FIX275_CAP_YOUNG       = 2; // <30 days
+const FIX275_CAP_ESTABLISHED = 2; // ≥30 days — ABSOLUTE max for rare high-confidence moves
+const FIX275_DEFAULT_SOFT    = 1; // most established-player moves should be exactly this
+
+// Confidence thresholds that allow established-player moves to exceed the
+// soft cap of ±1. Both must be met for ±2.
+const FIX275_CONFIDENT_SUBSTANTIATION = 0.85;
+const FIX275_CONFIDENT_STABILITY      = 0.85;
+
+// Followup window — measured in player appearances after the recalibration.
+// A counter-direction move within (recal_apps_at + N) apps is a "correction".
+const FIX275_FOLLOWUP_WINDOW_GAMES = 5;
+
+// Global damping factor tiers, based on last-90d overcorrection rate (weighted).
+//   <20%   → 1.00 (no damping; healthy)
+//   20-30% → 0.85 (mild self-cooling)
+//   30-50% → 0.70 (the system is too hot — slow down)
+//   ≥50%   → 0.50 (emergency brake; admin should investigate)
+function _fix275DampingForRate(rate) {
+    if (rate < 0.20) return 1.00;
+    if (rate < 0.30) return 0.85;
+    if (rate < 0.50) return 0.70;
+    return 0.50;
+}
+
+// Compute the per-player MAX absolute OVR step given current state.
+// Returns { cap, tier, reason } so the UI can explain why.
+async function _fix275PerPlayerCap(playerRow, substantiationScore) {
+    const apps = parseInt(playerRow.total_appearances || 0, 10);
+
+    // New-player tier
+    if (apps < 5) {
+        return { cap: FIX275_CAP_NEW, tier: 'new', reason: `<5 apps (currently ${apps})` };
+    }
+
+    // Days-since-join: use created_at as the floor (it's always set).
+    let daysSinceJoin = null;
+    try {
+        const r = await pool.query(
+            `SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400 AS days
+             FROM players WHERE id = $1`,
+            [playerRow.id]
+        );
+        daysSinceJoin = parseFloat(r.rows[0]?.days || 0);
+    } catch (_) { /* silent */ }
+
+    if (daysSinceJoin !== null && daysSinceJoin < FIX275_YOUNG_PLAYER_DAYS) {
+        return { cap: FIX275_CAP_YOUNG, tier: 'young', reason: `${Math.round(daysSinceJoin)} days since join` };
+    }
+
+    // Established player. Cap depends on confidence.
+    const stability = playerRow.recalibration_stability !== null && playerRow.recalibration_stability !== undefined
+        ? parseFloat(playerRow.recalibration_stability)
+        : 1.0;
+    const sub = substantiationScore !== null && substantiationScore !== undefined
+        ? parseFloat(substantiationScore)
+        : 1.0;
+
+    if (sub >= FIX275_CONFIDENT_SUBSTANTIATION && stability >= FIX275_CONFIDENT_STABILITY) {
+        // High-confidence move — allowed to hit ±2.
+        return {
+            cap: FIX275_CAP_ESTABLISHED,
+            tier: 'established_confident',
+            reason: `established + high confidence (sub=${sub.toFixed(2)}, stab=${stability.toFixed(2)})`,
+        };
+    }
+
+    return {
+        cap: FIX275_DEFAULT_SOFT,
+        tier: 'established_soft',
+        reason: `established + lower confidence (sub=${sub.toFixed(2)}, stab=${stability.toFixed(2)})`,
+    };
+}
+
+// Apply per-player cap + global damping to a raw signedDelta.
+// playerRow must include id, total_appearances, recalibration_stability.
+// substantiationScore is from the substantiation model (0..1).
+// Returns { clampedDelta, originalDelta, cap, dampingFactor, reason }.
+async function _fix275ClampMagnitude(playerRow, signedDelta, substantiationScore) {
+    const perPlayer = await _fix275PerPlayerCap(playerRow, substantiationScore);
+    const dampSetting = await _ratingSettingGet('rating_overcorrection_damping_enabled');
+    const dampingEnabled = dampSetting !== 'false'; // default ENABLED
+    const dampingFactor = dampingEnabled
+        ? parseFloat(await _ratingSettingGet('rating_global_damping_factor') || '1.0')
+        : 1.0;
+
+    // Step 1: apply global damping (scale magnitude down, never up).
+    // Math.round to avoid fractional OVR deltas. Math.sign preserves direction.
+    const dampedMagnitude = Math.max(
+        Math.round(Math.abs(signedDelta) * dampingFactor),
+        // Floor at 1 if there's any movement at all — damping shouldn't cancel a vote entirely.
+        signedDelta === 0 ? 0 : 1
+    );
+
+    // Step 2: clamp to per-player cap.
+    const cappedMagnitude = Math.min(dampedMagnitude, perPlayer.cap);
+    const clampedDelta = Math.sign(signedDelta) * cappedMagnitude;
+
+    return {
+        clampedDelta,
+        originalDelta: signedDelta,
+        cap: perPlayer.cap,
+        capTier: perPlayer.tier,
+        capReason: perPlayer.reason,
+        dampingFactor,
+        wasDamped: dampedMagnitude !== Math.abs(signedDelta),
+        wasCapped: cappedMagnitude !== dampedMagnitude,
+    };
+}
+
+// _detectAndLogOvercorrection — called AFTER a new recalibration is recorded.
+// Looks back for a prior recalibration on the same subject within the
+// followup window (in appearances), opposite direction. If found, records a
+// rating_correction_links row + updates the original's overcorrection markers
+// + bumps per-player stability + per-voter accuracy down.
+//
+// newRecal = { id, subject_player_id, delta_ovr, appearances_at_recal, source }
+// Runs after the main commit; failures are non-fatal and logged.
+async function _detectAndLogOvercorrection(newRecal) {
+    if (!newRecal || !newRecal.id || !newRecal.subject_player_id) return;
+    if (!newRecal.delta_ovr || newRecal.delta_ovr === 0) return;
+
+    try {
+        const apps = parseInt(newRecal.appearances_at_recal || 0, 10);
+        const lookbackApps = apps - FIX275_FOLLOWUP_WINDOW_GAMES;
+
+        // Find a prior APPLIED recalibration in the opposite direction.
+        // Range: prior.appearances_at_recal must be in [lookbackApps, apps]
+        // (so the prior happened within the last 5 of THIS player's games).
+        const priorR = await pool.query(`
+            SELECT id, delta_ovr, voter_ids, appearances_at_recal, source
+              FROM rating_recalibration_history
+             WHERE subject_player_id = $1
+               AND status = 'applied'
+               AND id <> $2
+               AND delta_ovr IS NOT NULL
+               AND SIGN(delta_ovr) = $3
+               AND appearances_at_recal IS NOT NULL
+               AND appearances_at_recal >= $4
+               AND appearances_at_recal < $5
+             ORDER BY appearances_at_recal DESC, created_at DESC
+             LIMIT 1
+        `, [
+            newRecal.subject_player_id,
+            newRecal.id,
+            -Math.sign(newRecal.delta_ovr), // opposite-direction
+            lookbackApps,
+            apps,
+        ]);
+
+        if (priorR.rows.length === 0) return; // no overcorrection match
+
+        const prior = priorR.rows[0];
+        const originalMag    = Math.abs(prior.delta_ovr);
+        const correctionMag  = Math.min(Math.abs(newRecal.delta_ovr), originalMag);
+        const ratio          = correctionMag / originalMag;
+
+        const gamesBetween   = apps - parseInt(prior.appearances_at_recal || 0, 10);
+
+        // Idempotency: if this exact link already exists, skip.
+        const dupR = await pool.query(
+            `SELECT 1 FROM rating_correction_links
+             WHERE original_recal_id = $1 AND correction_recal_id = $2`,
+            [prior.id, newRecal.id]
+        );
+        if (dupR.rows.length > 0) return;
+
+        // Insert the link.
+        await pool.query(`
+            INSERT INTO rating_correction_links
+              (original_recal_id, correction_recal_id, subject_player_id,
+               games_between, correction_magnitude, overcorrection_ratio)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        `, [prior.id, newRecal.id, newRecal.subject_player_id, gamesBetween,
+            correctionMag, ratio]);
+
+        // Update player stability: recompute as 1 - (sum_corrections / sum_originals)
+        // capped to [0, 1]. Done in-line to avoid stale-read issues.
+        await pool.query(`
+            UPDATE players
+               SET recalibration_stability = GREATEST(0.0, LEAST(1.0, 1.0 - (
+                    SELECT COALESCE(SUM(rcl.overcorrection_ratio), 0)::numeric
+                           / NULLIF((SELECT COUNT(*) FROM rating_recalibration_history rrh
+                                     WHERE rrh.subject_player_id = $1 AND rrh.status = 'applied'), 0)
+                    FROM rating_correction_links rcl
+                    WHERE rcl.subject_player_id = $1
+               )))
+             WHERE id = $1
+        `, [newRecal.subject_player_id]);
+
+        // Update each contributing voter's accuracy score. The penalty is the
+        // overcorrection_ratio — partial reversals partially hurt, full
+        // reversals fully hurt. Cumulative dampening, capped at 0.
+        const voterIds = Array.isArray(prior.voter_ids) ? prior.voter_ids
+                       : (typeof prior.voter_ids === 'string' ? JSON.parse(prior.voter_ids || '[]') : []);
+        if (voterIds.length > 0) {
+            const penaltyPerVoter = (ratio / voterIds.length) * 0.10; // 10% max per full reversal across all voters
+            await pool.query(`
+                UPDATE players
+                   SET voter_accuracy_score = GREATEST(0.0, COALESCE(voter_accuracy_score, 1.0) - $1)
+                 WHERE id = ANY($2::uuid[])
+            `, [penaltyPerVoter, voterIds]);
+        }
+
+        console.log(`[FIX-275 overcorrection] subject=${newRecal.subject_player_id} ` +
+                    `prior=${prior.id}(${prior.delta_ovr}) ` +
+                    `correction=${newRecal.id}(${newRecal.delta_ovr}) ` +
+                    `ratio=${ratio.toFixed(2)} games_between=${gamesBetween}`);
+    } catch (e) {
+        console.warn('[FIX-275] _detectAndLogOvercorrection failed (non-fatal):', e.message);
+    }
+}
+
+// Nightly job: recompute the global damping factor based on the last 90 days
+// of recalibrations. Surfaces in admin UI as a banner.
+// Called from any existing nightly hook; also exposed as a manual endpoint.
+async function _fix275RecomputeGlobalDamping() {
+    try {
+        const r = await pool.query(`
+            WITH recent AS (
+                SELECT rrh.id, ABS(rrh.delta_ovr) AS mag,
+                       COALESCE((SELECT SUM(rcl.correction_magnitude)
+                                   FROM rating_correction_links rcl
+                                  WHERE rcl.original_recal_id = rrh.id), 0) AS corrected_mag
+                  FROM rating_recalibration_history rrh
+                 WHERE rrh.status = 'applied'
+                   AND rrh.source IN ('system', 'admin_approved')
+                   AND rrh.created_at >= NOW() - INTERVAL '90 days'
+                   AND rrh.delta_ovr IS NOT NULL
+            )
+            SELECT
+                COALESCE(SUM(corrected_mag), 0)::float
+              / NULLIF(SUM(mag), 0)::float AS overcorrection_rate,
+                COUNT(*)::int                AS sample_size
+              FROM recent
+        `);
+        const rate       = parseFloat(r.rows[0]?.overcorrection_rate || 0);
+        const sampleSize = parseInt(r.rows[0]?.sample_size || 0, 10);
+
+        // Don't trust the rate when there's too little data.
+        let dampingFactor;
+        if (sampleSize < 10) {
+            dampingFactor = 1.00; // healthy until proven otherwise
+        } else {
+            dampingFactor = _fix275DampingForRate(rate);
+        }
+
+        await _ratingSettingSet('rating_global_damping_factor', dampingFactor.toFixed(2));
+        await _ratingSettingSet('rating_overcorrection_rate_snapshot', rate.toFixed(3));
+        await _ratingSettingSet('rating_overcorrection_sample_size', String(sampleSize));
+
+        console.log(`[FIX-275 damping] overcorrection_rate=${rate.toFixed(3)} ` +
+                    `sample=${sampleSize} damping=${dampingFactor}`);
+        return { rate, sampleSize, dampingFactor };
+    } catch (e) {
+        console.warn('[FIX-275] _fix275RecomputeGlobalDamping failed:', e.message);
+        return null;
+    }
+}
+
+// END FIX-275 helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+
 // Pick which sub-stat(s) to change to achieve `signed_delta` OVR change.
 // Returns array of {column, oldVal, newVal} for stats that need updating.
 // If the change can't be fully absorbed by sub-stats (floor/ceiling hit on
@@ -2543,12 +3106,15 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
 
         // FIX-268a: pick stat changes for the signed delta. Reference pushback
         // kicks in if subject can't absorb the change fully.
-        const signedShift = movementMag * suspicionDir;
-        const oldOvr      = parseInt(subj.overall_rating, 10) || 0;
+        const signedShiftRaw = movementMag * suspicionDir;
+        const oldOvr         = parseInt(subj.overall_rating, 10) || 0;
 
         // Pull current stats so the picker can decide.
+        // FIX-275: also pull total_appearances + recalibration_stability for
+        // the magnitude clamp + the players.id (used by the cap helper).
         const curStatsR = await client.query(
-            `SELECT position, overall_rating,
+            `SELECT id, position, overall_rating, total_appearances,
+                    recalibration_stability,
                     defending_rating, strength_rating, fitness_rating,
                     pace_rating, decisions_rating, assisting_rating,
                     shooting_rating, goalkeeper_rating, reliability_tier
@@ -2556,8 +3122,89 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
             [subjectPlayerId]
         );
         const subjFull = curStatsR.rows[0] || {};
+
+        // ═══════════════════════════════════════════════════════════════════
+        // FIX-274 — Substantiation check + auto-apply mode routing.
+        // ═══════════════════════════════════════════════════════════════════
+        // Substantiation runs BEFORE the magnitude clamp because the clamp
+        // (FIX-275) uses the substantiation score to decide whether an
+        // established player can move ±2 vs the default ±1.
+        const substantiation = await _computeSubstantiation(subjectPlayerId, matchingVotes);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // FIX-275 — Magnitude clamp: per-player cap + global damping.
+        // ═══════════════════════════════════════════════════════════════════
+        // The threshold curve (movementMag) said how big the move COULD be.
+        // The clamp says how big it SHOULD be, given:
+        //   - per-player tier (new < young < established, with confidence gate)
+        //   - global damping factor (computed nightly from overcorrection rate)
+        // Wraps everything: signedShift is the final, applied magnitude.
+        const clamp = await _fix275ClampMagnitude(subjFull, signedShiftRaw, substantiation.score);
+        const signedShift = clamp.clampedDelta;
+
         const pick     = _fix268PickStatChange(subjFull, signedShift);
         const absorbed = signedShift - pick.shortfall;
+        const autoApply      = await _ratingAutoApplyEnabled();
+        const matchingVoterIds = [...new Set(matchingVotes.map(v => String(v.voter_player_id)))];
+
+        if (!autoApply && absorbed !== 0) {
+            // Suggestion mode. Persist the candidate without applying it.
+            // Skip when absorbed === 0 — that means subject is floor/ceiling-locked
+            // and we need ref-pushback to handle it. Ref-pushback runs in
+            // auto-apply mode regardless (matches the legacy behaviour; queueing
+            // ref-push recalibrations is out of scope for this fix).
+            // Vote consumption is intentionally skipped — votes stay in the
+            // pool so the aggregator can keep re-firing on each new vote
+            // (admin sees the freshest possible candidate).
+            // Idempotency: only insert if there's no OPEN pending suggestion
+            // for this subject (avoids spamming the queue on every new vote).
+            try {
+                const existR = await client.query(
+                    `SELECT id FROM rating_recalibration_history
+                      WHERE subject_player_id = $1 AND status = 'pending'
+                      ORDER BY created_at DESC LIMIT 1`,
+                    [subjectPlayerId]
+                );
+                if (existR.rows.length > 0) {
+                    // Replace the previous pending with the latest snapshot.
+                    await client.query(
+                        `UPDATE rating_recalibration_history
+                            SET delta_ovr = $2, stat_changes = $3::jsonb,
+                                voter_ids = $4::jsonb, suspicion_flag = $5,
+                                movement_magnitude = $6, substantiation_score = $7,
+                                created_at = NOW()
+                          WHERE id = $1`,
+                        [existR.rows[0].id, absorbed, JSON.stringify(pick.changes),
+                         JSON.stringify(matchingVoterIds), subj.ovr_suspicion,
+                         movementMag, substantiation.score]
+                    );
+                } else {
+                    await _recordRecalibrationHistory(client, {
+                        subjectId: subjectPlayerId,
+                        deltaOvr: absorbed,
+                        statChanges: pick.changes,
+                        voterIds: matchingVoterIds,
+                        suspicionFlag: subj.ovr_suspicion,
+                        movementMag: movementMag,
+                        substantiationScore: substantiation.score,
+                        status: 'pending',
+                    });
+                }
+            } catch (e) {
+                console.warn('[FIX-274] Pending-record write failed (non-fatal):', e.message);
+            }
+
+            await client.query('COMMIT'); inTxn = false;
+            return {
+                applied: false,
+                reason: 'queued_for_admin_review',
+                substantiation_score: substantiation.score,
+                substantiation_warnings: substantiation.warnings,
+                proposed_delta: absorbed,
+                movement_magnitude: movementMag,
+            };
+        }
+        // END FIX-274 substantiation/routing block — proceed to existing apply flow.
 
         // If absorbed is 0 entirely and we have a non-zero shift requested,
         // try to push a reference player in the opposite direction instead.
@@ -2703,6 +3350,27 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
             ]
         );
 
+        // FIX-274: record the applied recalibration in rating_recalibration_history
+        // so admin can reverse it later, and bump each contributing voter's
+        // voter_total_votes (recomputes trust_score on the fly). This is the
+        // 'applied' path — auto-apply mode is enabled. The suggestion path
+        // (auto_apply=false) was handled earlier with status='pending'.
+        // FIX-275: also capture source + appearances snapshot so the
+        // overcorrection detector can measure followup in games.
+        const recalRecordId = await _recordRecalibrationHistory(client, {
+            subjectId: subjectPlayerId,
+            deltaOvr: absorbed,
+            statChanges: pick.changes,
+            voterIds: matchingVoterIds,
+            suspicionFlag: subj.ovr_suspicion,
+            movementMag: movementMag,
+            substantiationScore: substantiation.score,
+            status: 'applied',
+            source: 'system',
+            appearancesAtRecal: parseInt(subjFull.total_appearances || 0, 10),
+        });
+        await _bumpVoterTotalVotes(client, matchingVoterIds);
+
         await client.query('COMMIT'); inTxn = false;
 
         // Re-classify suspicion with new OVR (separate connection)
@@ -2710,6 +3378,20 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
         if (refPush && refPush.pushed) {
             // Also re-classify the pushed reference player.
             await _recomputeOvrSuspicion(refPush.refPlayerId);
+        }
+
+        // FIX-275: detect if this recalibration partially/fully reverses a
+        // recent one on the same subject (within the 5-game followup window).
+        // Logs a rating_correction_links row + updates stability + voter
+        // accuracy. Non-fatal; the recalibration is already committed.
+        if (recalRecordId) {
+            await _detectAndLogOvercorrection({
+                id: recalRecordId,
+                subject_player_id: subjectPlayerId,
+                delta_ovr: absorbed,
+                appearances_at_recal: parseInt(subjFull.total_appearances || 0, 10),
+                source: 'system',
+            });
         }
 
         console.log(`[FIX-268 recalibration] player ${subjectPlayerId}: OVR ${oldOvr} → ${newOvr} (movement=${movementMag}, absorbed=${absorbed}, isNew=${isNewPlayer}, refPush=${refPush?.pushed||false})`);
@@ -3882,6 +4564,46 @@ app.get('/api/players/organisers', authenticateToken, requireCLMAdmin, async (re
     }
 });
 
+// FIX-271: lightweight player search for admin tooling — matches alias,
+// full_name, or squad_number (numeric exact match). Returns up to 20 rows
+// with just the columns the mute form needs. Cheap, deliberately narrow
+// projection so we don't leak unrelated fields (the master prompt's "no
+// SELECT *" convention). Admin auth required.
+app.get('/api/admin/players/search', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const q = (req.query.q || '').toString().trim();
+        if (!q) return res.json({ players: [] });
+
+        const like = '%' + q.toLowerCase() + '%';
+        const squadNum = parseInt(q, 10);
+        const isNumeric = Number.isFinite(squadNum) && String(squadNum) === q;
+
+        // Two-branch query: numeric input also matches exact squad_number.
+        // LIMIT 20 caps result size for the dropdown.
+        const sql = isNumeric
+            ? `SELECT id, alias, full_name, squad_number
+                 FROM players
+                WHERE LOWER(alias)     LIKE $1
+                   OR LOWER(full_name) LIKE $1
+                   OR squad_number = $2
+                ORDER BY (squad_number = $2) DESC, alias NULLS LAST, full_name
+                LIMIT 20`
+            : `SELECT id, alias, full_name, squad_number
+                 FROM players
+                WHERE LOWER(alias)     LIKE $1
+                   OR LOWER(full_name) LIKE $1
+                ORDER BY alias NULLS LAST, full_name
+                LIMIT 20`;
+        const params = isNumeric ? [like, squadNum] : [like];
+
+        const result = await pool.query(sql, params);
+        res.json({ players: result.rows });
+    } catch (e) {
+        console.error('GET /api/admin/players/search error:', e);
+        res.status(500).json({ error: 'server_error', detail: e.message });
+    }
+});
+
 app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -4587,6 +5309,124 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
 //   -- DM notification preference (per-player opt-out for new-message pushes/toasts).
 //   -- Default TRUE so existing users keep getting notified — they explicitly opt out.
 //   ALTER TABLE players ADD COLUMN IF NOT EXISTS dm_notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+//
+//   -- FIX-271: Superadmin can mute a player from sending DMs platform-wide.
+//   --   messaging_blocked_at:    when the current mute started (NULL = not currently muted)
+//   --   messaging_blocked_until: when the mute auto-expires (NULL while blocked_at IS NOT NULL = forever)
+//   --   messaging_block_reason:  optional admin note shown back to the player in the 403 detail
+//   --   last_dm_spree_alert_at:  date of last "3+ unique recipients" alert sent to superadmin for this player.
+//   --                            Throttles the auto-alert to at most once per UTC day per sender.
+//   -- Currently-blocked check: messaging_blocked_at IS NOT NULL AND
+//   --   (messaging_blocked_until IS NULL OR messaging_blocked_until > now()).
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS messaging_blocked_at    TIMESTAMPTZ;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS messaging_blocked_until TIMESTAMPTZ;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS messaging_block_reason  TEXT;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS last_dm_spree_alert_at  DATE;
+//
+//   -- FIX-274: voter reliability tracking + recalibration history.
+//   -- voter_trust_score: 0.0..1.0 — fraction of this voter's recalibration
+//   --   contributions that have NOT been reversed by an admin. Default 1.0
+//   --   (full trust until proven wrong). Used to:
+//   --     1) downweight unreliable voters in the substantiation score
+//   --     2) drive the voter-reliability dashboard
+//   --     3) (future) ignore votes from voters whose trust drops below threshold
+//   -- voter_total_votes: lifetime count of votes this player has cast that
+//   --   contributed to an applied recalibration.
+//   -- voter_reversed_votes: subset of voter_total_votes whose recalibration
+//   --   was later reversed by admin. trust = 1 - (reversed / total).
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS voter_trust_score      NUMERIC(4,3) NOT NULL DEFAULT 1.000;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS voter_total_votes      INTEGER      NOT NULL DEFAULT 0;
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS voter_reversed_votes   INTEGER      NOT NULL DEFAULT 0;
+//
+//   -- Recalibration history — per-event record of what was applied, so the
+//   -- admin can reverse a specific recalibration and the system can attribute
+//   -- the reversal back to the voters who contributed.
+//   --   subject_player_id: who got recalibrated
+//   --   delta_ovr:         signed change applied to overall_rating
+//   --   stat_changes:      JSONB array of {column, oldVal, newVal}
+//   --   voter_ids:         JSONB array of voter player_ids who contributed
+//   --   suspicion_flag:    snapshot of subject's flag at time of recal
+//   --   movement_magnitude: the threshold tier the votes hit
+//   --   substantiation_score: 0.0..1.0 score from the falsification check
+//   --   status:           'applied' (live), 'reversed' (undone), 'pending' (queue)
+//   --   reversed_at:      timestamp of reversal
+//   --   reversed_by:      admin player_id who reversed it
+//   CREATE TABLE IF NOT EXISTS rating_recalibration_history (
+//     id                   SERIAL PRIMARY KEY,
+//     subject_player_id    UUID    NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+//     delta_ovr            INTEGER NOT NULL,
+//     stat_changes         JSONB   NOT NULL DEFAULT '[]'::jsonb,
+//     voter_ids            JSONB   NOT NULL DEFAULT '[]'::jsonb,
+//     suspicion_flag       TEXT,
+//     movement_magnitude   INTEGER,
+//     substantiation_score NUMERIC(4,3),
+//     status               TEXT NOT NULL DEFAULT 'applied',
+//     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//     reversed_at          TIMESTAMPTZ,
+//     reversed_by          UUID REFERENCES players(id) ON DELETE SET NULL
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_rrh_subject ON rating_recalibration_history(subject_player_id, created_at DESC);
+//   CREATE INDEX IF NOT EXISTS idx_rrh_status  ON rating_recalibration_history(status, created_at DESC);
+//
+//   -- system_settings keys used by FIX-274 (no schema change; just runtime config):
+//   --   'rating_auto_apply_enabled' = 'true' | 'false' (default 'false' → suggestions queue)
+//   --   'rating_substantiation_strict' = 'true' | 'false' (default 'false' → warnings only)
+//
+//   -- FIX-275: self-correcting model — overcorrection detection + magnitude
+//   -- damping + manual-admin edit tracking. Builds on FIX-274's history table.
+//   --
+//   -- 1) Add a `source` column so rating_recalibration_history can distinguish
+//   --    system-driven recalibrations from admin manual stat-edits.
+//   ALTER TABLE rating_recalibration_history
+//     ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'system';
+//   --    Allowed values: 'system', 'manual_admin', 'admin_reversal', 'admin_approved'.
+//   --    The (NOT NULL DEFAULT 'system') backfills existing rows correctly —
+//   --    every row that was pre-FIX-275 IS a system recalibration.
+//   --
+//   -- 2) Track the player's appearance counter AT the moment of the move so
+//   --    the followup window can be measured in games-played, not days.
+//   ALTER TABLE rating_recalibration_history
+//     ADD COLUMN IF NOT EXISTS appearances_at_recal INTEGER;
+//   --
+//   -- 3) Correction-link table: when a later move (recalibration or manual
+//   --    admin edit) goes in the OPPOSITE direction to a prior move within
+//   --    the player's followup window, we record the link here. This is the
+//   --    "this corrected that" relationship — drives the overcorrection-rate
+//   --    metric + per-player stability + per-voter accuracy.
+//   --    correction_magnitude: how much of the original was undone (in OVR points).
+//   --                          partial (1 of 3 reversed) → 1.0. full reversal → original magnitude.
+//   --    overcorrection_ratio: correction_magnitude / abs(original.delta_ovr). 1.0 = full reversal.
+//   --                          >1.0 = the correction OVERSHOT the other way.
+//   CREATE TABLE IF NOT EXISTS rating_correction_links (
+//     id                     SERIAL PRIMARY KEY,
+//     original_recal_id      INTEGER NOT NULL REFERENCES rating_recalibration_history(id) ON DELETE CASCADE,
+//     correction_recal_id    INTEGER NOT NULL REFERENCES rating_recalibration_history(id) ON DELETE CASCADE,
+//     subject_player_id      UUID    NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+//     games_between          INTEGER NOT NULL DEFAULT 0,
+//     correction_magnitude   INTEGER NOT NULL,
+//     overcorrection_ratio   NUMERIC(5,3) NOT NULL,
+//     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+//     UNIQUE (original_recal_id, correction_recal_id)
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_rcl_subject  ON rating_correction_links(subject_player_id, created_at DESC);
+//   CREATE INDEX IF NOT EXISTS idx_rcl_original ON rating_correction_links(original_recal_id);
+//
+//   -- 4) Per-player stability score: how often THIS player's recalibrations
+//   --    end up being corrected. Used to dampen future moves on that player.
+//   --    NULL = no recalibration history yet (full confidence). 1.0 = none
+//   --    have been corrected. 0.0 = every single one was reversed.
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS recalibration_stability NUMERIC(4,3);
+//
+//   -- 5) Per-voter accuracy score: like voter_trust_score but graded by the
+//   --    MAGNITUDE of overcorrection rather than binary. A voter who
+//   --    contributed to a "−3 then +2" recalibration scores worse than one
+//   --    whose vote stuck cleanly. Computed cumulatively.
+//   ALTER TABLE players ADD COLUMN IF NOT EXISTS voter_accuracy_score NUMERIC(4,3) NOT NULL DEFAULT 1.000;
+//
+//   -- system_settings keys used by FIX-275 (runtime config, no schema change):
+//   --   'rating_overcorrection_damping_enabled' = 'true' | 'false' (default 'true')
+//   --   'rating_global_damping_factor' = 1.0 (recomputed nightly based on
+//   --                                         last-90d overcorrection rate)
 //
 //   -- Late-dropout protection: when a player self-drops within 2 hours of kick-off,
 //   -- discipline points are auto-applied + the player can leave a reason. Admin can
@@ -5388,6 +6228,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             g.max_players, g.star_rating, g.exclusivity,
             g.team_selection_type, g.tournament_name, g.external_opponent,
             g.teams_generated,
+            g.series_id,              -- FIX-269: needed by dashboard FAV toggle (client matches against player_favourite_series)
             opp.logo_url AS opponent_logo_url,
             v.name AS venue_name, v.region AS region,
             v.background_image_filename AS venue_background_image,
@@ -6009,6 +6850,64 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireAdmin, async (
             if ((b.overall_rating ?? null) !== (overall ?? null)
                 || (b.goalkeeper_rating ?? null) !== (goalkeeper ?? null)) {
                 reviewStarsForPlayers(pool, [req.params.id]).catch(() => {});
+            }
+
+            // ═════════════════════════════════════════════════════════════════
+            // FIX-275 — Record manual OVR changes in rating_recalibration_history
+            // so the overcorrection detector can match "admin pushed them back".
+            // Only fires when OVR actually changed; non-fatal on error.
+            // ═════════════════════════════════════════════════════════════════
+            try {
+                const oldOvr = parseInt(b.overall_rating, 10);
+                const newOvr = parseInt(overall, 10);
+                if (Number.isFinite(oldOvr) && Number.isFinite(newOvr) && oldOvr !== newOvr) {
+                    const deltaOvr = newOvr - oldOvr;
+                    // Build minimal stat_changes diff so a reversal can restore it.
+                    const allowed = [
+                        ['defending_rating', b.defending_rating, defending],
+                        ['strength_rating',  b.strength_rating,  strength],
+                        ['fitness_rating',   b.fitness_rating,   fitness],
+                        ['pace_rating',      b.pace_rating,      pace],
+                        ['decisions_rating', b.decisions_rating, decisions],
+                        ['assisting_rating', b.assisting_rating, assisting],
+                        ['shooting_rating',  b.shooting_rating,  shooting],
+                        ['goalkeeper_rating',b.goalkeeper_rating,goalkeeper],
+                    ];
+                    const statChanges = allowed
+                        .filter(([_, oldV, newV]) => parseInt(oldV, 10) !== parseInt(newV, 10))
+                        .map(([col, oldV, newV]) => ({ column: col, oldVal: parseInt(oldV, 10), newVal: parseInt(newV, 10) }));
+
+                    // Snapshot current appearance count.
+                    const appR = await pool.query('SELECT total_appearances FROM players WHERE id = $1', [req.params.id]);
+                    const apps = parseInt(appR.rows[0]?.total_appearances || 0, 10);
+
+                    // Use pool directly — this is a fire-and-forget post-response hook.
+                    const recalId = await _recordRecalibrationHistory(pool, {
+                        subjectId: req.params.id,
+                        deltaOvr,
+                        statChanges,
+                        voterIds: [], // no voters — admin direct edit
+                        suspicionFlag: null,
+                        movementMag: Math.abs(deltaOvr),
+                        substantiationScore: 1.0, // admin moves are by-definition authoritative
+                        status: 'applied',
+                        source: 'manual_admin',
+                        appearancesAtRecal: apps,
+                    });
+
+                    // Then check if THIS move corrects a prior recalibration.
+                    if (recalId) {
+                        await _detectAndLogOvercorrection({
+                            id: recalId,
+                            subject_player_id: req.params.id,
+                            delta_ovr: deltaOvr,
+                            appearances_at_recal: apps,
+                            source: 'manual_admin',
+                        });
+                    }
+                }
+            } catch (e) {
+                console.warn('[FIX-275] manual_admin recal record failed (non-fatal):', e.message);
             }
         });
     } catch (error) {
@@ -8661,6 +9560,82 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
         }
 
         await client.query('COMMIT');
+
+        // FIX-273: silently auto-finalize the parent series on recreate. The
+        // user's mental model when they hit "recreate" is "this series is
+        // ending and being reborn" — so close out the old one in the same
+        // shot. Runs AFTER commit (intentionally) because finalize is
+        // self-contained, idempotent on already-completed series, and we
+        // don't want a finalize failure to roll back the new series creation.
+        // Failures here are non-fatal — log and move on.
+        (async () => {
+            try {
+                // Run the entire auto-finalize inside ONE transaction with a
+                // SELECT ... FOR UPDATE on the parent series row. This
+                // serializes concurrent recreates (e.g. double-click on the
+                // button) — the second worker blocks on the row lock, then
+                // sees status='completed' and short-circuits. Without this,
+                // both workers could see 'active', both run the full compute,
+                // and the second worker's DELETE+INSERT would clobber the
+                // first's locked snapshot.
+                const tClient = await pool.connect();
+                try {
+                    await tClient.query('BEGIN');
+                    const lockR = await tClient.query(
+                        'SELECT series_status FROM game_series WHERE id = $1 FOR UPDATE',
+                        [parent_series_id]
+                    );
+                    if (lockR.rows.length === 0) {
+                        // Parent vanished (deleted between recreate and finalize) — bail.
+                        await tClient.query('ROLLBACK');
+                        return;
+                    }
+                    if (lockR.rows[0].series_status === 'completed') {
+                        // Either already finalized, or another worker just got here first.
+                        await tClient.query('ROLLBACK');
+                        return;
+                    }
+                    const tRows = await tClient.query(
+                        'SELECT id, metric_id, calculation_type FROM series_trophies WHERE series_id = $1',
+                        [parent_series_id]
+                    );
+                    for (const t of tRows.rows) {
+                        const leaderboard = await calcSeriesLeaderboard(
+                            parent_series_id, t.metric_id, t.calculation_type
+                        );
+                        await tClient.query(
+                            'DELETE FROM series_trophy_results WHERE trophy_id = $1',
+                            [t.id]
+                        );
+                        for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
+                            const row = leaderboard[i];
+                            await tClient.query(`
+                                INSERT INTO series_trophy_results (trophy_id, player_id, rank, primary_stat, supporting_stat)
+                                VALUES ($1, $2, $3, $4, $5)`,
+                                [t.id, row.player_id, i + 1, row.primary_stat, row.supporting_stat]
+                            );
+                        }
+                    }
+                    await tClient.query(`
+                        UPDATE game_series SET series_status = 'completed', finalized_at = NOW()
+                        WHERE id = $1`, [parent_series_id]);
+                    await tClient.query('COMMIT');
+
+                    setImmediate(() => auditLog(pool, req.user.playerId,
+                        'series_auto_finalized_on_recreate',
+                        parent_series_id,
+                        `Auto-finalized when recreated into ${newSeriesId}`
+                    ).catch(() => {}));
+                } catch (innerE) {
+                    await tClient.query('ROLLBACK').catch(() => {});
+                    console.warn('[recreate] Auto-finalize parent failed (non-fatal):', innerE.message);
+                } finally {
+                    tClient.release();
+                }
+            } catch (e) {
+                console.warn('[recreate] Auto-finalize check failed (non-fatal):', e.message);
+            }
+        })();
 
         // Audit log (async, non-blocking)
         setImmediate(() => gameAuditLog(pool, null, req.user.playerId, 'series_recreated',
@@ -21678,9 +22653,14 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 -- (per Q1 — trophies can only be edited before series start)
                 CASE WHEN g.series_id IS NULL THEN FALSE
                      ELSE g.game_date = (SELECT MIN(g2.game_date) FROM games g2 WHERE g2.series_id = g.series_id)
-                END AS is_first_in_series
+                END AS is_first_in_series,
+                -- FIX-273: expose series_status so the green-tick "complete
+                -- series" button can be conditionally rendered on the game card
+                -- without a per-card fetch. NULL when game has no series.
+                gs.series_status AS series_status
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 LEFT JOIN opponents opp_mgr ON opp_mgr.id = g.opponent_id
+                LEFT JOIN game_series gs ON gs.id = g.series_id
                 ORDER BY g.game_date DESC`;
             params = [];
         } else {
@@ -21772,9 +22752,12 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ) AS multi_vote_awaiting_pick,
                 CASE WHEN g.series_id IS NULL THEN FALSE
                      ELSE g.game_date = (SELECT MIN(g2.game_date) FROM games g2 WHERE g2.series_id = g.series_id)
-                END AS is_first_in_series
+                END AS is_first_in_series,
+                -- FIX-273: same series_status exposure as the full-admin path above.
+                gs.series_status AS series_status
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 LEFT JOIN opponents opp_clm ON opp_clm.id = g.opponent_id
+                LEFT JOIN game_series gs ON gs.id = g.series_id
                 WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
             params = player.is_organiser ? [playerId] : [];
@@ -23794,6 +24777,162 @@ app.get('/api/admin/dm-thread/:subjectId/:otherId', authenticateToken, requireAd
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-271 — MESSAGING RESTRICTIONS (superadmin)
+// ═══════════════════════════════════════════════════════════════════════════
+// Block/mute a player from sending DMs platform-wide. Three duration modes:
+//   - 24h, 7d, or forever (durationHours = 24, 168, or null).
+// The check fires inside POST /api/dm/:playerId — currently-blocked senders
+// receive 403 { error: 'messaging_blocked', detail: <reason + until> }.
+// Audit-logged via comms.messaging_restrictions sub.
+
+// Helper — single source of truth for "is this player currently blocked".
+// SQL clause used by both the DM send gate and the admin listing endpoint.
+const _MSG_BLOCKED_SQL = `
+    messaging_blocked_at IS NOT NULL
+    AND (messaging_blocked_until IS NULL OR messaging_blocked_until > NOW())
+`;
+
+// GET /api/admin/messaging/blocked — list players currently blocked from sending.
+app.get('/api/admin/messaging/blocked', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT id, alias, full_name, squad_number,
+                   messaging_blocked_at,
+                   messaging_blocked_until,
+                   messaging_block_reason
+              FROM players
+             WHERE ${_MSG_BLOCKED_SQL}
+             ORDER BY messaging_blocked_at DESC
+        `);
+        res.json({ blocked: result.rows });
+    } catch (e) {
+        console.error('GET /api/admin/messaging/blocked error:', e);
+        res.status(500).json({ error: 'server_error', detail: e.message });
+    }
+});
+
+// POST /api/admin/messaging/block/:playerId
+// Body: { durationHours: 24 | 168 | null, reason: string }
+//   durationHours === null  →  forever (messaging_blocked_until = NULL)
+//   durationHours === N     →  mute expires at NOW() + N hours
+app.post('/api/admin/messaging/block/:playerId', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const { durationHours, reason } = req.body || {};
+
+        // Validate durationHours — must be null OR a positive number ≤ a year.
+        let hours = null;
+        if (durationHours !== null && durationHours !== undefined) {
+            const n = Number(durationHours);
+            if (!Number.isFinite(n) || n <= 0 || n > 24 * 365) {
+                return res.status(400).json({ error: 'durationHours must be null or between 1 and 8760 (1 year)' });
+            }
+            hours = n;
+        }
+
+        // Verify target exists (avoid silently 'updating' nothing — return 404).
+        const targetR = await pool.query(
+            'SELECT id, alias, full_name FROM players WHERE id = $1', [playerId]
+        );
+        if (targetR.rows.length === 0) return res.status(404).json({ error: 'player_not_found' });
+        const target = targetR.rows[0];
+
+        const cleanReason = (reason && typeof reason === 'string')
+            ? reason.trim().slice(0, 500) || null
+            : null;
+
+        const upd = await pool.query(`
+            UPDATE players
+               SET messaging_blocked_at    = NOW(),
+                   messaging_blocked_until = $2,
+                   messaging_block_reason  = $3
+             WHERE id = $1
+            RETURNING messaging_blocked_at, messaging_blocked_until, messaging_block_reason
+        `, [
+            playerId,
+            hours === null ? null : new Date(Date.now() + hours * 3600 * 1000),
+            cleanReason,
+        ]);
+
+        const durationLabel = hours === null ? 'forever' : (hours === 24 ? '24h' : (hours === 168 ? '7d' : `${hours}h`));
+        auditLog(pool, req.user.playerId, 'dm_block', playerId,
+            `Muted ${target.alias || target.full_name} for ${durationLabel}${cleanReason ? ` — ${cleanReason}` : ''}`)
+            .catch(() => {});
+
+        res.json({
+            ok: true,
+            blocked_at:    upd.rows[0].messaging_blocked_at,
+            blocked_until: upd.rows[0].messaging_blocked_until,
+            reason:        upd.rows[0].messaging_block_reason,
+        });
+    } catch (e) {
+        console.error('POST /api/admin/messaging/block error:', e);
+        res.status(500).json({ error: 'server_error', detail: e.message });
+    }
+});
+
+// POST /api/admin/messaging/unblock/:playerId — clear all three block columns.
+app.post('/api/admin/messaging/unblock/:playerId', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        const targetR = await pool.query(
+            'SELECT id, alias, full_name FROM players WHERE id = $1', [playerId]
+        );
+        if (targetR.rows.length === 0) return res.status(404).json({ error: 'player_not_found' });
+        const target = targetR.rows[0];
+
+        await pool.query(`
+            UPDATE players
+               SET messaging_blocked_at    = NULL,
+                   messaging_blocked_until = NULL,
+                   messaging_block_reason  = NULL
+             WHERE id = $1
+        `, [playerId]);
+
+        auditLog(pool, req.user.playerId, 'dm_unblock', playerId,
+            `Unmuted ${target.alias || target.full_name}`).catch(() => {});
+
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('POST /api/admin/messaging/unblock error:', e);
+        res.status(500).json({ error: 'server_error', detail: e.message });
+    }
+});
+
+// GET /api/admin/messaging/spree-history?days=N — players who hit ≥3 unique recipients
+// on any single calendar day (Europe/London) in the last N days. Useful for retrospective
+// review even if the email alert was missed. Default N = 7, capped at 60 for safety.
+app.get('/api/admin/messaging/spree-history', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const days = Math.min(60, Math.max(1, parseInt(req.query.days) || 7));
+        const result = await pool.query(`
+            SELECT
+              dm.sender_id                                              AS sender_id,
+              COALESCE(p.alias, p.full_name)                            AS sender_name,
+              p.squad_number                                            AS squad_number,
+              (dm.created_at AT TIME ZONE 'Europe/London')::date        AS day,
+              COUNT(DISTINCT dm.recipient_id)::int                      AS unique_recipients,
+              COUNT(*)::int                                             AS total_messages
+              FROM direct_messages dm
+              JOIN players p ON p.id = dm.sender_id
+             WHERE dm.deleted_at IS NULL
+               AND dm.created_at >= NOW() - ($1 || ' days')::interval
+             GROUP BY dm.sender_id, p.alias, p.full_name, p.squad_number, day
+            HAVING COUNT(DISTINCT dm.recipient_id) >= 3
+             ORDER BY day DESC, unique_recipients DESC
+        `, [String(days)]);
+        res.json({ days, rows: result.rows });
+    } catch (e) {
+        console.error('GET /api/admin/messaging/spree-history error:', e);
+        res.status(500).json({ error: 'server_error', detail: e.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// END FIX-271
+// ═══════════════════════════════════════════════════════════════════════════
+
 // ==========================================
 // PUSH NOTIFICATION TOKEN MANAGEMENT
 // ==========================================
@@ -24310,6 +25449,39 @@ app.post('/api/dm/:playerId', authenticateToken, dmSendLimiter, async (req, res)
     }
 
     try {
+        // FIX-271: gate on sender's messaging-block state before doing any other
+        // work. If the sender is currently muted, return 403 with the admin's
+        // reason (if set) so the client can show a meaningful error. Defensive:
+        // fall back to a plain SELECT if the columns don't exist yet (server
+        // deployed before the ALTER TABLE), treating "no column" as "not muted".
+        try {
+            const blockCheck = await pool.query(
+                `SELECT messaging_blocked_at, messaging_blocked_until, messaging_block_reason
+                   FROM players WHERE id = $1`,
+                [senderId]
+            );
+            const row = blockCheck.rows[0];
+            if (row && row.messaging_blocked_at) {
+                const expired = row.messaging_blocked_until &&
+                                new Date(row.messaging_blocked_until).getTime() <= Date.now();
+                if (!expired) {
+                    const until = row.messaging_blocked_until
+                        ? `until ${new Date(row.messaging_blocked_until).toISOString()}`
+                        : 'indefinitely';
+                    const detail = row.messaging_block_reason
+                        ? `${row.messaging_block_reason} (${until})`
+                        : `You're temporarily restricted from sending messages (${until}). Contact an admin if you think this is in error.`;
+                    return res.status(403).json({ error: 'messaging_blocked', detail });
+                }
+            }
+        } catch (e) {
+            // Column-missing or transient — fall through and allow the send.
+            // Better to occasionally let through than block all DMs on a deploy lag.
+            if (!/column.*does not exist/i.test(e.message || '')) {
+                console.warn('messaging-block check failed (non-fatal):', e.message);
+            }
+        }
+
         // Verify recipient exists. Try to pull dm_notifications_enabled so we
         // can gate the push notification below — message itself still gets
         // stored regardless of the pref (opt-out of pings, not of receiving).
@@ -24371,6 +25543,75 @@ app.post('/api/dm/:playerId', authenticateToken, dmSendLimiter, async (req, res)
                 senderId,   // so app can navigate to the correct DM thread
             }).catch(() => {});
         }
+
+        // FIX-271: DM spree detection — alert superadmin (once per day per sender)
+        // when a sender hits 3+ unique recipients on a single day. "Today" =
+        // calendar day in Europe/London (matches the timezone used elsewhere for
+        // user-facing dates). Fire-and-forget; never blocks the response. If any
+        // of the new columns don't exist yet (pre-migration), the entire check
+        // silently no-ops.
+        (async () => {
+            try {
+                const sprR = await pool.query(`
+                    SELECT
+                      COUNT(DISTINCT recipient_id)::int AS unique_recipients_today,
+                      (
+                        SELECT last_dm_spree_alert_at
+                          FROM players
+                         WHERE id = $1
+                      ) AS last_alert_day,
+                      (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date AS london_today
+                      FROM direct_messages
+                     WHERE sender_id = $1
+                       AND deleted_at IS NULL
+                       AND (created_at AT TIME ZONE 'Europe/London')::date
+                           = (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date
+                `, [senderId]);
+                const row = sprR.rows[0] || {};
+                const unique = row.unique_recipients_today || 0;
+                const londonToday = row.london_today; // 'YYYY-MM-DD' as Date
+                const lastAlert   = row.last_alert_day;
+
+                // Already alerted today → silent return.
+                const alreadyAlerted = lastAlert &&
+                    new Date(lastAlert).toISOString().slice(0, 10) ===
+                    new Date(londonToday).toISOString().slice(0, 10);
+
+                if (unique >= 3 && !alreadyAlerted) {
+                    // Mark before sending to avoid duplicate alerts on the very
+                    // next message landing milliseconds apart from concurrent
+                    // workers (best-effort idempotency).
+                    await pool.query(
+                        `UPDATE players SET last_dm_spree_alert_at = $1 WHERE id = $2`,
+                        [londonToday, senderId]
+                    );
+
+                    notifyAdmin(
+                        `⚠️ DM spree — ${senderName} messaged ${unique} different players today`,
+                        [
+                            ['Sender',           `${senderName} (id ${senderId})`],
+                            ['Unique recipients today', String(unique)],
+                            ['Most recent recipient',   `${recipient.alias || recipient.full_name} (id ${recipient.id})`],
+                            ['Time (UTC)',       new Date().toISOString()],
+                            ['Review',           'https://totalfooty.co.uk/manage-players.html?player=' + senderId],
+                        ]
+                    ).catch(() => {});
+
+                    // Audit-log the detection (not the alert send) so it appears
+                    // in the messaging-restrictions sub of the comms category.
+                    // Pass null as adminId — this is a system-detected event,
+                    // not an admin action (matches the pattern used for
+                    // badge_auto_awarded elsewhere in this file).
+                    auditLog(pool, null, 'dm_spree_detected', senderId,
+                        `${unique} unique recipients today — admin alerted`).catch(() => {});
+                }
+            } catch (e) {
+                // Pre-migration column-missing is the most common cause; treat as no-op.
+                if (!/column.*does not exist/i.test(e.message || '')) {
+                    console.warn('DM spree check failed (non-fatal):', e.message);
+                }
+            }
+        })();
 
         res.status(201).json(newMsg);
     } catch (error) {
@@ -34784,11 +36025,45 @@ async function _getSeriesTrophyPayload(seriesId, includeIds) {
         SELECT id, metric_id, calculation_type, tier, created_at
         FROM series_trophies WHERE series_id = $1 ORDER BY metric_id, calculation_type`, [seriesId]);
 
+    // FIX-273: for completed (finalized) series, read the LOCKED top-3 from
+    // series_trophy_results instead of recomputing via calcSeriesLeaderboard.
+    // The whole point of finalize is to snapshot the winners — if the read
+    // path always recomputes, then editing an old game's score after finalize
+    // would silently change the displayed winners, breaking the lock.
+    // For active series we still compute live so admins see the current state.
+    const isCompleted = series.series_status === 'completed';
     const trophies = [];
     for (const t of trophiesRow.rows) {
-        const leaderboard = completedGames > 0
-            ? await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type)
-            : [];
+        let leaderboard = [];
+        if (completedGames > 0) {
+            if (isCompleted) {
+                // Pull from the locked results table, JOIN players for the alias.
+                const lockedR = await pool.query(`
+                    SELECT str.rank, str.primary_stat, str.supporting_stat,
+                           str.player_id,
+                           COALESCE(p.alias, p.full_name) AS player_name
+                      FROM series_trophy_results str
+                      JOIN players p ON p.id = str.player_id
+                     WHERE str.trophy_id = $1
+                     ORDER BY str.rank ASC`, [t.id]);
+                leaderboard = lockedR.rows.map(r => ({
+                    player_id:       r.player_id,
+                    player_name:     r.player_name,
+                    appearances:     null, // not stored at finalize-time; UI can fall back gracefully
+                    primary_stat:    r.primary_stat,
+                    supporting_stat: r.supporting_stat,
+                }));
+                // Fallback: if the locked snapshot is empty (e.g. trophy added
+                // after finalize, which the existing add-trophy guard prevents
+                // but treat defensively), fall through to a live compute so the
+                // UI isn't empty.
+                if (leaderboard.length === 0) {
+                    leaderboard = await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type);
+                }
+            } else {
+                leaderboard = await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type);
+            }
+        }
         const cfg = METRIC_CONFIG[parseInt(t.metric_id)];
         const entry = {
             metric_id: t.metric_id,
@@ -36363,6 +37638,163 @@ app.get('/api/admin/comms/games-pool', authenticateToken, requireAdmin, async (r
         res.status(500).json({ error: 'Failed to load games' });
     }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-272 — PHONE EXPORT TOOL (admin)
+// ═══════════════════════════════════════════════════════════════════════════
+// Lets the superadmin pull the player roster behind a past game OR a venue
+// (everyone who ever played there) and export them as a vCard (.vcf) file so
+// the contacts can be bulk-imported into a phone and messaged via WhatsApp /
+// SMS / etc. The vCard itself is built on the client; these endpoints just
+// return the player rows + phone numbers.
+
+// GET /api/admin/comms/past-games?days=N — past games picker source.
+// Default N = 90 (capped at 365). Most recent first. Includes a current_players
+// count so the dropdown can show e.g. "Tue 12 May · 7-a-side @ Goals · 14/14".
+app.get('/api/admin/comms/past-games', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 90));
+        const result = await pool.query(`
+            SELECT g.id, g.format, g.game_date,
+                   v.name AS venue_name, v.region AS venue_region,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))::int AS current_players
+              FROM games g
+              LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE g.game_date < NOW()
+               AND g.game_date >= NOW() - ($1::int || ' days')::interval
+               AND COALESCE(g.game_status, 'available') NOT IN ('cancelled')
+             ORDER BY g.game_date DESC
+             LIMIT 200
+        `, [days]);
+        res.json({ days, games: result.rows });
+    } catch (error) {
+        console.error('Comms past-games error:', error);
+        res.status(500).json({ error: 'Failed to load past games' });
+    }
+});
+
+// GET /api/admin/comms/player-history?gameId=UUID  OR  ?venueId=N
+// Returns the player roster for export — full_name, alias, phone, region,
+// last_played_at (when they last played a completed game), is_at_this_venue.
+// Region resolution: region_code if set, else first item of preferred_locations,
+// else null. Includes players with NULL phone — caller still wants the contact
+// listing for reference (per FIX-272 spec).
+app.get('/api/admin/comms/player-history', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const gameIdRaw  = req.query.gameId  ? String(req.query.gameId)  : null;
+        const venueIdRaw = req.query.venueId ? String(req.query.venueId) : null;
+
+        if (!gameIdRaw && !venueIdRaw) {
+            return res.status(400).json({ error: 'must supply gameId or venueId' });
+        }
+        if (gameIdRaw && venueIdRaw) {
+            return res.status(400).json({ error: 'supply gameId OR venueId, not both' });
+        }
+
+        let players;
+        let sourceLabel = '';
+        if (gameIdRaw) {
+            if (!isValidUuid(gameIdRaw)) {
+                return res.status(400).json({ error: 'invalid gameId' });
+            }
+            // Game-mode: include both confirmed AND backup registrations. Excludes
+            // dropouts and no-shows (status outside {confirmed, backup}). Backups
+            // are kept because they showed willingness — useful for a short-of-
+            // players nudge.
+            const r = await pool.query(`
+                SELECT DISTINCT
+                       p.id, p.full_name, p.alias, p.phone,
+                       p.region_code, p.preferred_locations,
+                       (SELECT MAX(g2.game_date)
+                          FROM registrations r2
+                          JOIN games g2 ON g2.id = r2.game_id
+                         WHERE r2.player_id = p.id
+                           AND r2.status = 'confirmed'
+                           AND g2.game_date <= NOW()) AS last_played_at,
+                       r.status AS reg_status_for_this_game
+                  FROM players p
+                  JOIN registrations r ON r.player_id = p.id
+                 WHERE r.game_id = $1
+                   AND r.status IN ('confirmed','backup')
+                 ORDER BY p.alias NULLS LAST, p.full_name
+            `, [gameIdRaw]);
+            players = r.rows;
+            // Label for the result row (game name) — small follow-up query.
+            const gR = await pool.query(`
+                SELECT g.game_date, g.format, v.name AS venue_name
+                  FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+                 WHERE g.id = $1`, [gameIdRaw]);
+            const gameRow = gR.rows[0];
+            sourceLabel = gameRow
+                ? `${new Date(gameRow.game_date).toISOString().slice(0,10)} · ${gameRow.format || ''} · ${gameRow.venue_name || ''}`.trim()
+                : 'Selected game';
+        } else {
+            const venueId = parseInt(venueIdRaw, 10);
+            if (!Number.isFinite(venueId)) {
+                return res.status(400).json({ error: 'invalid venueId' });
+            }
+            // Venue-mode: anyone who's EVER registered (confirmed) for a game at
+            // this venue. Backups excluded here — venue scope is broader so we
+            // want a higher signal-to-noise ratio. Cancelled games excluded
+            // because the player never actually played them; their reg status
+            // can stay 'confirmed' through cancellation, so date+status alone
+            // would produce a false positive.
+            const r = await pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.phone,
+                       p.region_code, p.preferred_locations,
+                       MAX(g.game_date) AS last_played_at,
+                       COUNT(*)::int    AS appearances_at_venue
+                  FROM players p
+                  JOIN registrations r ON r.player_id = p.id
+                  JOIN games        g ON g.id = r.game_id
+                 WHERE g.venue_id = $1
+                   AND r.status = 'confirmed'
+                   AND g.game_date <= NOW()
+                   AND COALESCE(g.game_status, 'available') <> 'cancelled'
+                 GROUP BY p.id, p.full_name, p.alias, p.phone, p.region_code, p.preferred_locations
+                 ORDER BY MAX(g.game_date) DESC NULLS LAST
+            `, [venueId]);
+            players = r.rows;
+            const vR = await pool.query('SELECT name FROM venues WHERE id = $1', [venueId]);
+            sourceLabel = vR.rows[0]?.name || 'Selected venue';
+        }
+
+        // Compute the "region" each player should be tagged with in the vCard.
+        // Priority: region_code (their declared primary) → first preferred location.
+        // Null when neither is set — frontend just drops the region from the label.
+        const enriched = players.map(p => {
+            let region = p.region_code || null;
+            if (!region && p.preferred_locations) {
+                const first = String(p.preferred_locations).split(',')[0].trim();
+                if (first) region = first;
+            }
+            return {
+                id:              p.id,
+                full_name:       p.full_name,
+                alias:           p.alias,
+                phone:           p.phone || null,
+                region:          region,
+                last_played_at:  p.last_played_at,
+                reg_status_for_this_game: p.reg_status_for_this_game || null,
+                appearances_at_venue:     p.appearances_at_venue     || null,
+            };
+        });
+        res.json({
+            source: gameIdRaw ? 'game' : 'venue',
+            sourceLabel,
+            total:  enriched.length,
+            players: enriched,
+        });
+    } catch (error) {
+        console.error('Comms player-history error:', error);
+        res.status(500).json({ error: 'Failed to load player history' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// END FIX-272
+// ═══════════════════════════════════════════════════════════════════════════
 
 // POST /api/admin/comms/send — create campaign + insert recipients + dispatch emails.
 // Body: { type: 'game_signup'|'credit_grant', subject, bodyTemplate, expiryDays,
@@ -38151,6 +39583,505 @@ app.post('/api/admin/players/:id/rating-feedback/recalc', authenticateToken, req
         res.status(500).json({ error: 'Failed to recalculate', detail: e.message });
     }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-274 — Admin endpoints for substantiation queue, voter reliability,
+//           recalibration history + reversal, and the auto-apply toggle.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/rating-feedback/settings — current auto-apply state.
+app.get('/api/admin/rating-feedback/settings', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const autoApply = await _ratingAutoApplyEnabled();
+        res.json({ rating_auto_apply_enabled: autoApply });
+    } catch (e) {
+        console.error('GET /api/admin/rating-feedback/settings error:', e);
+        res.status(500).json({ error: 'Failed to load settings', detail: e.message });
+    }
+});
+
+// PUT /api/admin/rating-feedback/settings — toggle auto-apply.
+// Body: { rating_auto_apply_enabled: boolean }
+// Audit-logged so we know who flipped it and when.
+app.put('/api/admin/rating-feedback/settings', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const v = !!req.body?.rating_auto_apply_enabled;
+        await _ratingSettingSet('rating_auto_apply_enabled', v);
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'rating_auto_apply_toggled', null,
+            `Auto-apply ${v ? 'ENABLED' : 'DISABLED'}`).catch(() => {}));
+        res.json({ ok: true, rating_auto_apply_enabled: v });
+    } catch (e) {
+        console.error('PUT /api/admin/rating-feedback/settings error:', e);
+        res.status(500).json({ error: 'Failed to save settings', detail: e.message });
+    }
+});
+
+// GET /api/admin/rating-feedback/suggestions — pending recalibrations.
+// Returns the candidate stat changes + substantiation score + warnings so the
+// admin can review before approving. Ordered by lowest-substantiation-first
+// (most suspicious surfaces at the top — needs more scrutiny).
+app.get('/api/admin/rating-feedback/suggestions', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT h.id, h.subject_player_id, h.delta_ovr, h.stat_changes,
+                   h.voter_ids, h.suspicion_flag, h.movement_magnitude,
+                   h.substantiation_score, h.created_at,
+                   COALESCE(p.alias, p.full_name) AS subject_alias,
+                   p.overall_rating AS current_ovr,
+                   p.total_appearances
+              FROM rating_recalibration_history h
+              JOIN players p ON p.id = h.subject_player_id
+             WHERE h.status = 'pending'
+             ORDER BY h.substantiation_score ASC NULLS LAST, h.created_at DESC
+             LIMIT 200
+        `);
+        // Recompute substantiation warnings live on each fetch — score column
+        // on the row was the snapshot at stage time; warnings aren't stored
+        // (they're a UI artifact, recomputed cheaply from voter_ids).
+        const suggestions = [];
+        for (const row of r.rows) {
+            const voterIds = Array.isArray(row.voter_ids) ? row.voter_ids
+                           : (typeof row.voter_ids === 'string' ? JSON.parse(row.voter_ids) : []);
+            // Fetch the votes that contributed (for the warnings recompute).
+            const votesR = voterIds.length > 0
+                ? await pool.query(
+                    `SELECT id, voter_player_id, delta_vote, created_at
+                       FROM player_rating_feedback
+                      WHERE subject_player_id = $1
+                        AND voter_player_id = ANY($2::uuid[])
+                        AND fully_consumed = false`,
+                    [row.subject_player_id, voterIds])
+                : { rows: [] };
+            const sub = await _computeSubstantiation(row.subject_player_id, votesR.rows);
+            suggestions.push({
+                id: row.id,
+                subject_player_id: row.subject_player_id,
+                subject_alias: row.subject_alias,
+                current_ovr: row.current_ovr,
+                proposed_delta: row.delta_ovr,
+                proposed_ovr: (row.current_ovr || 0) + (row.delta_ovr || 0),
+                stat_changes: row.stat_changes,
+                voter_count: voterIds.length,
+                voter_ids: voterIds,
+                suspicion_flag: row.suspicion_flag,
+                movement_magnitude: row.movement_magnitude,
+                substantiation_score: parseFloat(row.substantiation_score),
+                substantiation_warnings: sub.warnings,
+                total_appearances: row.total_appearances,
+                created_at: row.created_at,
+            });
+        }
+        res.json({ count: suggestions.length, suggestions });
+    } catch (e) {
+        console.error('GET /api/admin/rating-feedback/suggestions error:', e);
+        res.status(500).json({ error: 'Failed to load suggestions', detail: e.message });
+    }
+});
+
+// POST /api/admin/rating-feedback/suggestions/:id/approve — apply a pending suggestion.
+// Replays the recalibration apply path: updates OVR + stat changes + consumes
+// the voter's contributing votes + marks history row as 'applied' + bumps
+// voter_total_votes. Mirrors the auto-apply path inline for safety (we don't
+// want to re-trigger the full aggregator because the vote pool may have
+// shifted since the snapshot was taken — admin approved what they saw).
+app.post('/api/admin/rating-feedback/suggestions/:id/approve', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    let inTxn = false;
+    try {
+        const sugR = await pool.query(
+            `SELECT * FROM rating_recalibration_history WHERE id = $1`,
+            [req.params.id]
+        );
+        if (sugR.rows.length === 0) return res.status(404).json({ error: 'Suggestion not found' });
+        const sug = sugR.rows[0];
+        if (sug.status !== 'pending') return res.status(400).json({ error: 'Suggestion is not pending', current_status: sug.status });
+
+        await client.query('BEGIN'); inTxn = true;
+
+        const stChanges = Array.isArray(sug.stat_changes) ? sug.stat_changes
+                        : (typeof sug.stat_changes === 'string' ? JSON.parse(sug.stat_changes) : []);
+        const voterIds  = Array.isArray(sug.voter_ids) ? sug.voter_ids
+                        : (typeof sug.voter_ids === 'string' ? JSON.parse(sug.voter_ids) : []);
+
+        // Pull current OVR (it may have moved since snapshot — log if so).
+        const curR = await client.query(
+            'SELECT overall_rating FROM players WHERE id = $1', [sug.subject_player_id]
+        );
+        if (curR.rows.length === 0) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return res.status(404).json({ error: 'Subject player not found' });
+        }
+        const curOvr = parseInt(curR.rows[0].overall_rating, 10) || 0;
+        const newOvr = curOvr + (parseInt(sug.delta_ovr, 10) || 0);
+
+        // Apply stat changes + new OVR.
+        const setParts = ['overall_rating = $2', 'last_ovr_change_at = NOW()'];
+        const params   = [sug.subject_player_id, newOvr];
+        let paramIdx = 3;
+        for (const ch of stChanges) {
+            // Whitelist column names — these are the stat columns _fix268PickStatChange writes.
+            const allowed = ['defending_rating','strength_rating','fitness_rating','pace_rating',
+                             'decisions_rating','assisting_rating','shooting_rating','goalkeeper_rating'];
+            if (!allowed.includes(ch.column)) continue;
+            setParts.push(`${ch.column} = $${paramIdx}`);
+            params.push(ch.newVal);
+            paramIdx++;
+        }
+        await client.query(`UPDATE players SET ${setParts.join(', ')} WHERE id = $1`, params);
+
+        // Mark contributing votes as consumed.
+        if (voterIds.length > 0) {
+            await client.query(
+                `UPDATE player_rating_feedback
+                    SET applied_amount = ABS(delta_vote), fully_consumed = true
+                  WHERE subject_player_id = $1
+                    AND voter_player_id = ANY($2::uuid[])
+                    AND fully_consumed = false`,
+                [sug.subject_player_id, voterIds]
+            );
+        }
+
+        // Flip the history row to 'applied'.
+        await client.query(
+            `UPDATE rating_recalibration_history SET status = 'applied' WHERE id = $1`,
+            [sug.id]
+        );
+
+        // Bump voter stats.
+        await _bumpVoterTotalVotes(client, voterIds);
+
+        // Audit log.
+        await client.query(
+            `INSERT INTO audit_logs (admin_id, action, target_id, detail, created_at)
+             VALUES ($1, $2, $3, $4, NOW())`,
+            [req.user.playerId, 'rating_suggestion_approved', sug.subject_player_id,
+             JSON.stringify({
+                suggestion_id: sug.id, delta_ovr: sug.delta_ovr,
+                old_ovr: curOvr, new_ovr: newOvr,
+                substantiation_score: parseFloat(sug.substantiation_score),
+                voter_count: voterIds.length,
+             })]
+        );
+
+        await client.query('COMMIT'); inTxn = false;
+
+        // Reclassify suspicion (separate connection — own write).
+        await _recomputeOvrSuspicion(sug.subject_player_id);
+
+        res.json({ ok: true, old_ovr: curOvr, new_ovr: newOvr, applied: true });
+    } catch (e) {
+        if (inTxn) await client.query('ROLLBACK').catch(() => {});
+        console.error('POST /api/admin/rating-feedback/suggestions/:id/approve error:', e);
+        res.status(500).json({ error: 'Failed to approve suggestion', detail: e.message });
+    } finally {
+        client.release();
+    }
+});
+
+// POST /api/admin/rating-feedback/suggestions/:id/reject — discard a suggestion.
+// Marks history row as 'rejected' and OPTIONALLY consumes the voters' votes
+// (so they don't keep re-triggering the same suggestion). Body:
+//   { consume_votes: boolean }  — default true
+app.post('/api/admin/rating-feedback/suggestions/:id/reject', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const consumeVotes = req.body?.consume_votes !== false; // default true
+        const sugR = await pool.query(
+            `SELECT * FROM rating_recalibration_history WHERE id = $1`,
+            [req.params.id]
+        );
+        if (sugR.rows.length === 0) return res.status(404).json({ error: 'Suggestion not found' });
+        const sug = sugR.rows[0];
+        if (sug.status !== 'pending') return res.status(400).json({ error: 'Suggestion is not pending', current_status: sug.status });
+
+        const voterIds = Array.isArray(sug.voter_ids) ? sug.voter_ids
+                       : (typeof sug.voter_ids === 'string' ? JSON.parse(sug.voter_ids) : []);
+
+        await pool.query(
+            `UPDATE rating_recalibration_history SET status = 'rejected' WHERE id = $1`,
+            [sug.id]
+        );
+
+        if (consumeVotes && voterIds.length > 0) {
+            await pool.query(
+                `UPDATE player_rating_feedback
+                    SET applied_amount = ABS(delta_vote), fully_consumed = true
+                  WHERE subject_player_id = $1
+                    AND voter_player_id = ANY($2::uuid[])
+                    AND fully_consumed = false`,
+                [sug.subject_player_id, voterIds]
+            );
+        }
+
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'rating_suggestion_rejected', sug.subject_player_id,
+            `Suggestion #${sug.id} rejected${consumeVotes ? ' (votes consumed)' : ' (votes preserved)'}`
+        ).catch(() => {}));
+
+        res.json({ ok: true, votes_consumed: consumeVotes ? voterIds.length : 0 });
+    } catch (e) {
+        console.error('POST /api/admin/rating-feedback/suggestions/:id/reject error:', e);
+        res.status(500).json({ error: 'Failed to reject suggestion', detail: e.message });
+    }
+});
+
+// POST /api/admin/rating-feedback/recalibration/:id/reverse — undo an APPLIED recalibration.
+// Restores the player's stats to pre-recalibration values (using stat_changes oldVal),
+// flips status to 'reversed', and bumps voter_reversed_votes for each contributor
+// (this is the LEARN-FROM-MISTAKES loop — voters whose votes get reversed lose trust).
+app.post('/api/admin/rating-feedback/recalibration/:id/reverse', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    let inTxn = false;
+    try {
+        const recR = await pool.query(
+            `SELECT * FROM rating_recalibration_history WHERE id = $1`,
+            [req.params.id]
+        );
+        if (recR.rows.length === 0) return res.status(404).json({ error: 'Recalibration not found' });
+        const rec = recR.rows[0];
+        if (rec.status !== 'applied') return res.status(400).json({ error: 'Only applied recalibrations can be reversed', current_status: rec.status });
+
+        await client.query('BEGIN'); inTxn = true;
+
+        const stChanges = Array.isArray(rec.stat_changes) ? rec.stat_changes
+                        : (typeof rec.stat_changes === 'string' ? JSON.parse(rec.stat_changes) : []);
+        const voterIds  = Array.isArray(rec.voter_ids) ? rec.voter_ids
+                        : (typeof rec.voter_ids === 'string' ? JSON.parse(rec.voter_ids) : []);
+
+        // Pull current OVR — reverse the recalibration's delta on it.
+        const curR = await client.query(
+            'SELECT overall_rating FROM players WHERE id = $1', [rec.subject_player_id]
+        );
+        if (curR.rows.length === 0) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return res.status(404).json({ error: 'Subject player not found' });
+        }
+        const curOvr = parseInt(curR.rows[0].overall_rating, 10) || 0;
+        const restoredOvr = curOvr - (parseInt(rec.delta_ovr, 10) || 0);
+
+        // Restore stat values to oldVal.
+        const setParts = ['overall_rating = $2', 'last_ovr_change_at = NOW()'];
+        const params   = [rec.subject_player_id, restoredOvr];
+        let paramIdx = 3;
+        for (const ch of stChanges) {
+            const allowed = ['defending_rating','strength_rating','fitness_rating','pace_rating',
+                             'decisions_rating','assisting_rating','shooting_rating','goalkeeper_rating'];
+            if (!allowed.includes(ch.column)) continue;
+            setParts.push(`${ch.column} = $${paramIdx}`);
+            params.push(ch.oldVal);
+            paramIdx++;
+        }
+        await client.query(`UPDATE players SET ${setParts.join(', ')} WHERE id = $1`, params);
+
+        await client.query(
+            `UPDATE rating_recalibration_history
+                SET status = 'reversed', reversed_at = NOW(), reversed_by = $2
+              WHERE id = $1`,
+            [rec.id, req.user.playerId]
+        );
+
+        // Bump every contributing voter's reversed-vote count. This is the
+        // core "learn from mistakes" mechanism.
+        await _bumpVoterReversedVotes(client, voterIds);
+
+        await client.query(
+            `INSERT INTO audit_logs (admin_id, action, target_id, detail, created_at)
+             VALUES ($1, $2, $3, $4, NOW())`,
+            [req.user.playerId, 'rating_recalibration_reversed', rec.subject_player_id,
+             JSON.stringify({
+                recalibration_id: rec.id, delta_reversed: -rec.delta_ovr,
+                old_ovr_before_reversal: curOvr, restored_ovr: restoredOvr,
+                voter_count: voterIds.length,
+                reason: req.body?.reason || null,
+             })]
+        );
+
+        await client.query('COMMIT'); inTxn = false;
+
+        await _recomputeOvrSuspicion(rec.subject_player_id);
+
+        res.json({
+            ok: true, old_ovr: curOvr, restored_ovr: restoredOvr,
+            voter_trust_decremented_for: voterIds.length,
+        });
+    } catch (e) {
+        if (inTxn) await client.query('ROLLBACK').catch(() => {});
+        console.error('POST /api/admin/rating-feedback/recalibration/:id/reverse error:', e);
+        res.status(500).json({ error: 'Failed to reverse recalibration', detail: e.message });
+    } finally {
+        client.release();
+    }
+});
+
+// GET /api/admin/rating-feedback/voter-reliability — voter trust leaderboard.
+// Default sort: lowest trust first (worst offenders surface). Filter by
+// ?min_votes=N to exclude voters with too few data points.
+app.get('/api/admin/rating-feedback/voter-reliability', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const minVotes = Math.max(0, parseInt(req.query.min_votes, 10) || 0);
+        const r = await pool.query(`
+            SELECT id,
+                   COALESCE(alias, full_name) AS alias,
+                   squad_number,
+                   COALESCE(total_appearances, 0)    AS apps,
+                   COALESCE(voter_trust_score, 1.0)  AS trust,
+                   COALESCE(voter_total_votes, 0)    AS total_votes,
+                   COALESCE(voter_reversed_votes, 0) AS reversed_votes
+              FROM players
+             WHERE COALESCE(voter_total_votes, 0) >= $1
+             ORDER BY voter_trust_score ASC NULLS LAST, voter_total_votes DESC
+             LIMIT 200
+        `, [minVotes]);
+        res.json({ count: r.rows.length, voters: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/rating-feedback/voter-reliability error:', e);
+        res.status(500).json({ error: 'Failed to load voter reliability', detail: e.message });
+    }
+});
+
+// GET /api/admin/rating-feedback/recalibration-history — applied + reversed log.
+// Sortable by date. Default last 90 days. Includes who reversed + why.
+app.get('/api/admin/rating-feedback/recalibration-history', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 90));
+        const r = await pool.query(`
+            SELECT h.id, h.subject_player_id, h.delta_ovr, h.stat_changes,
+                   h.voter_ids, h.suspicion_flag, h.movement_magnitude,
+                   h.substantiation_score, h.status, h.created_at,
+                   h.reversed_at,
+                   COALESCE(p.alias, p.full_name) AS subject_alias,
+                   COALESCE(rp.alias, rp.full_name) AS reversed_by_alias
+              FROM rating_recalibration_history h
+              JOIN players p   ON p.id  = h.subject_player_id
+              LEFT JOIN players rp ON rp.id = h.reversed_by
+             WHERE h.created_at >= NOW() - ($1::int || ' days')::interval
+               AND h.status IN ('applied','reversed')
+             ORDER BY h.created_at DESC
+             LIMIT 300
+        `, [days]);
+        res.json({ days, count: r.rows.length, history: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/rating-feedback/recalibration-history error:', e);
+        res.status(500).json({ error: 'Failed to load history', detail: e.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// END FIX-274
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-275 — Overcorrection insights + damping admin endpoints
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/rating-feedback/overcorrection-overview
+// Returns the global picture: damping factor + rate + sample size + the
+// raw "what just got corrected" feed for the dashboard banner & queue list.
+app.get('/api/admin/rating-feedback/overcorrection-overview', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const [dampingF, rateSnap, sample, dampEn] = await Promise.all([
+            _ratingSettingGet('rating_global_damping_factor'),
+            _ratingSettingGet('rating_overcorrection_rate_snapshot'),
+            _ratingSettingGet('rating_overcorrection_sample_size'),
+            _ratingSettingGet('rating_overcorrection_damping_enabled'),
+        ]);
+        // Snapshot may be stale (computed nightly) — show the value but flag age.
+        const links = await pool.query(`
+            SELECT rcl.id, rcl.original_recal_id, rcl.correction_recal_id,
+                   rcl.subject_player_id, rcl.games_between,
+                   rcl.correction_magnitude, rcl.overcorrection_ratio,
+                   rcl.created_at,
+                   COALESCE(p.alias, p.full_name) AS subject_alias,
+                   orig.delta_ovr AS original_delta, orig.source AS original_source,
+                   corr.delta_ovr AS correction_delta, corr.source AS correction_source
+              FROM rating_correction_links rcl
+              JOIN players p     ON p.id    = rcl.subject_player_id
+              JOIN rating_recalibration_history orig ON orig.id = rcl.original_recal_id
+              JOIN rating_recalibration_history corr ON corr.id = rcl.correction_recal_id
+             WHERE rcl.created_at >= NOW() - INTERVAL '90 days'
+             ORDER BY rcl.created_at DESC
+             LIMIT 100
+        `);
+        res.json({
+            damping_factor:         parseFloat(dampingF || '1.0'),
+            damping_enabled:        dampEn !== 'false',
+            overcorrection_rate:    parseFloat(rateSnap || '0'),
+            sample_size:            parseInt(sample || '0', 10),
+            recent_links:           links.rows,
+        });
+    } catch (e) {
+        console.error('GET /api/admin/rating-feedback/overcorrection-overview error:', e);
+        res.status(500).json({ error: 'Failed to load overcorrection overview', detail: e.message });
+    }
+});
+
+// POST /api/admin/rating-feedback/recompute-damping
+// Manually re-run the damping calculation (normally nightly). Superadmin only —
+// it's a side-effect-write so we don't want anyone bumping it.
+app.post('/api/admin/rating-feedback/recompute-damping', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const result = await _fix275RecomputeGlobalDamping();
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'rating_damping_recomputed', null,
+            `rate=${(result?.rate ?? 0).toFixed(3)} sample=${result?.sampleSize ?? 0} damping=${result?.dampingFactor ?? 1.0}`
+        ).catch(() => {}));
+        res.json({ ok: true, ...result });
+    } catch (e) {
+        console.error('POST /api/admin/rating-feedback/recompute-damping error:', e);
+        res.status(500).json({ error: 'Failed to recompute', detail: e.message });
+    }
+});
+
+// PUT /api/admin/rating-feedback/damping-settings
+// Body: { enabled: boolean }
+app.put('/api/admin/rating-feedback/damping-settings', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const enabled = !!req.body?.enabled;
+        await _ratingSettingSet('rating_overcorrection_damping_enabled', enabled);
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'rating_damping_toggled', null,
+            `Damping ${enabled ? 'ENABLED' : 'DISABLED'}`).catch(() => {}));
+        res.json({ ok: true, damping_enabled: enabled });
+    } catch (e) {
+        console.error('PUT /api/admin/rating-feedback/damping-settings error:', e);
+        res.status(500).json({ error: 'Failed to save', detail: e.message });
+    }
+});
+
+// GET /api/admin/rating-feedback/player-stability
+// Per-player stability leaderboard. Sorted by lowest stability first.
+app.get('/api/admin/rating-feedback/player-stability', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT p.id,
+                   COALESCE(p.alias, p.full_name) AS alias,
+                   p.squad_number,
+                   p.overall_rating,
+                   COALESCE(p.total_appearances, 0) AS apps,
+                   p.recalibration_stability,
+                   (SELECT COUNT(*) FROM rating_recalibration_history rrh
+                     WHERE rrh.subject_player_id = p.id
+                       AND rrh.status = 'applied') AS total_recals,
+                   (SELECT COUNT(*) FROM rating_correction_links rcl
+                     WHERE rcl.subject_player_id = p.id) AS total_corrections
+              FROM players p
+             WHERE EXISTS (SELECT 1 FROM rating_recalibration_history rrh
+                           WHERE rrh.subject_player_id = p.id AND rrh.status = 'applied')
+             ORDER BY p.recalibration_stability ASC NULLS LAST,
+                      (SELECT COUNT(*) FROM rating_correction_links rcl
+                        WHERE rcl.subject_player_id = p.id) DESC
+             LIMIT 200
+        `);
+        res.json({ count: r.rows.length, players: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/rating-feedback/player-stability error:', e);
+        res.status(500).json({ error: 'Failed to load stability', detail: e.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// END FIX-275
+// ═══════════════════════════════════════════════════════════════════════════
 
 // FIX-267: GET /api/admin/players/feedback-diagnostic
 // Per-player diagnostic view: what does the system "think" each player's OVR
