@@ -491,6 +491,35 @@ const AUDIT_TAG_TABLE = {
     ban_lifted:               { cat: 'discipline', sub: 'bans',   actor: 'system', sev: 'med' },
     player_unbanned:          { cat: 'discipline', sub: 'bans',   actor: 'admin',  sev: 'high' },
 
+    // ─── FIX-277: ADMIN ACTION QUEUE (injury reports + future types) ──────
+    // 'injury_reported'         — organiser flagged a player as injured from
+    //                             the post-game completion wizard.
+    // 'injury_refund_approved'  — admin approved the refund; money moved.
+    // 'injury_refund_rejected'  — admin rejected the flag; no refund, no email.
+    injury_reported:          { cat: 'participation', sub: 'injury', actor: 'admin', sev: 'med'  },
+    injury_refund_approved:   { cat: 'participation', sub: 'injury', actor: 'admin', sev: 'high' },
+    injury_refund_rejected:   { cat: 'participation', sub: 'injury', actor: 'admin', sev: 'med'  },
+
+    // ─── FIX-276: TEAM BALANCE CALIBRATION ────────────────────────────────
+    // calibration_experiment_recorded    — system event, fires post-commit
+    //                                      after every system-generated game
+    //                                      completion. Captures predicted vs
+    //                                      actual into team_balance_experiments.
+    // calibration_backfill_run           — admin one-shot to pull historic
+    //                                      completed games into the table.
+    // calibration_experiment_mode_toggled — admin flipped a series's flag.
+    calibration_experiment_recorded:    { cat: 'results', sub: 'calibration', actor: 'system', sev: 'low'  },
+    calibration_backfill_run:           { cat: 'results', sub: 'calibration', actor: 'admin',  sev: 'med'  },
+    calibration_experiment_mode_toggled:{ cat: 'results', sub: 'calibration', actor: 'admin',  sev: 'med'  },
+
+    // FIX-281: fine-tune intent inference events.
+    //   fine_tune_suggestion_engine_run — admin ran the suggestion engine.
+    //   pair_suggestion_accepted        — player turned a suggestion into a formal BFF/Rival.
+    //   pair_suggestion_dismissed       — player dismissed a suggestion.
+    fine_tune_suggestion_engine_run:    { cat: 'results', sub: 'calibration', actor: 'admin',  sev: 'med'  },
+    pair_suggestion_accepted:           { cat: 'participation', sub: 'preferences', actor: 'player', sev: 'low'  },
+    pair_suggestion_dismissed:          { cat: 'participation', sub: 'preferences', actor: 'player', sev: 'low'  },
+
     // ─── FINANCE ───────────────────────────────────────────────────────────
     game_fee:                 { cat: 'finance', sub: 'ledger',   actor: 'player', sev: 'low'  },
     refund:                   { cat: 'finance', sub: 'ledger',   actor: 'system', sev: 'low'  },
@@ -4435,6 +4464,50 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
 
 app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res) => {
     try {
+        // FIX-284: light mode skips the 4 expensive CTEs (player_stats,
+        // motm_stats, win_stats with team_players+teams join, ext_wins),
+        // the badges subquery, and the users JOIN. Used by picker UIs
+        // (Edit Players search, friend/DM/ref pickers) that need only
+        // basic identity + rating + balance. ~100x faster than full mode.
+        // Heavy mode preserved for manage-players grid + public directory.
+        const isLight = req.query.light === '1' || req.query.light === 'true';
+        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+
+        if (isLight) {
+            // Single-table query plus credits JOIN. No CTEs, no subqueries.
+            // FIX-290 audit-fix: include email + phone in the base select so
+            // friend picker can search by them. Non-admin callers get those
+            // stripped below (same privacy contract as heavy mode).
+            const lightResult = await pool.query(`
+                SELECT
+                    p.id, p.full_name, p.alias, p.squad_number, p.photo_url,
+                    p.reliability_tier, p.phone,
+                    COALESCE(p.position, 'outfield') AS position,
+                    p.overall_rating, p.goalkeeper_rating,
+                    COALESCE(p.is_featured, false)      AS is_featured,
+                    COALESCE(p.is_external_ref, false)  AS is_external_ref,
+                    COALESCE(p.is_active, true)         AS is_active,
+                    c.balance AS credits,
+                    u.email
+                FROM players p
+                LEFT JOIN credits c ON c.player_id = p.id
+                LEFT JOIN users u ON u.id = p.user_id
+                ORDER BY p.squad_number NULLS LAST, p.full_name
+                LIMIT 500
+            `);
+            if (isAdmin) {
+                return res.json(lightResult.rows);
+            }
+            // Non-admin: strip sensitive fields (credits, rating, email, phone)
+            // to match the heavy-mode privacy contract.
+            const safeRows = lightResult.rows.map(p => {
+                const { credits, overall_rating, goalkeeper_rating, email, phone, ...safe } = p;
+                return safe;
+            });
+            return res.json(safeRows);
+        }
+
+        // ── HEAVY MODE (default, backwards compatible) ──
         const result = await pool.query(`
             WITH player_stats AS (
                 SELECT
@@ -4518,8 +4591,6 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
             ORDER BY p.squad_number NULLS LAST, p.full_name
             LIMIT 500
         `);
-        
-        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
         
         if (isAdmin) {
             res.json(result.rows);
@@ -8126,7 +8197,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                 (g.game_status = 'available' AND g.game_date >= CURRENT_TIMESTAMP)
                 OR (g.game_status = 'confirmed')
                 OR (g.game_status = 'completed' AND (
-                    ${isAdmin ? 'TRUE' : 'EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1)'}
+                    ${isAdmin ? "(g.game_date >= NOW() - INTERVAL '30 days')" : 'EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1)'}
                 ))
             )
             ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
@@ -11032,12 +11103,29 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         );
         let referralCode = refResult.rows[0]?.referral_code;
         if (!referralCode) {
-            referralCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
-            await client.query('UPDATE players SET referral_code = $1 WHERE id = $2', [referralCode, playerId]);
-            await pool.query(
-                'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                [playerId, referralCode]
-            );
+            // FIX-289: wrap on-the-fly generation in a SAVEPOINT. If the UPDATE
+            // hits a unique-constraint collision or any other error, we don't
+            // want to abort the parent transaction (which has already inserted
+            // the guest). Worst case: referralCode stays null → host loses the
+            // RAF block in the modal but still gets the A2 invite block.
+            try {
+                await client.query('SAVEPOINT refcode_gen');
+                const newCode = 'TF' + crypto.randomBytes(4).toString('hex').toUpperCase();
+                await client.query('UPDATE players SET referral_code = $1 WHERE id = $2', [newCode, playerId]);
+                // referrals row uses pool (separate connection — survives parent rollback).
+                // ON CONFLICT DO NOTHING keeps it idempotent.
+                await pool.query(
+                    'INSERT INTO referrals (referrer_id, referral_code) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+                    [playerId, newCode]
+                );
+                await client.query('RELEASE SAVEPOINT refcode_gen');
+                referralCode = newCode;
+            } catch (e) {
+                try { await client.query('ROLLBACK TO SAVEPOINT refcode_gen'); } catch (_) {}
+                try { await client.query('RELEASE SAVEPOINT refcode_gen'); } catch (_) {}
+                console.warn('[FIX-289] referral_code generation failed (non-fatal, parent tx preserved):', e.message);
+                referralCode = null;
+            }
         }
 
         await client.query('COMMIT');
@@ -13338,14 +13426,17 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             // + manual entries (game_id NULL). Re-using existing tierFromRevolvingPoints().
             if (_appliedLateDropout) {
                 try {
+                    // FIX-292: explicit ::uuid casts on $1 — same PG 14+ inference
+                    // bug seen in the discipline remove/add endpoints. Same param
+                    // used in outer SELECT and inner correlated subquery.
                     const revolvingResult = await pool.query(`
                         SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
                         FROM discipline_records dr
-                        WHERE dr.player_id = $1
+                        WHERE dr.player_id = $1::uuid
                         AND (dr.game_id IS NULL OR dr.game_id IN (
                             SELECT r.game_id FROM registrations r
                             JOIN games g ON g.id = r.game_id
-                            WHERE r.player_id = $1 AND r.status = 'confirmed'
+                            WHERE r.player_id = $1::uuid AND r.status = 'confirmed'
                             AND g.game_status = 'completed'
                             ORDER BY g.game_date DESC LIMIT 10
                         ))
@@ -14704,7 +14795,20 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                     brokenMA * _components.mutual_avoid_weight +
                     brokenMP * _components.mutual_pair_weight +
                     brokenOwA * _components.oneway_avoid_weight +
-                    brokenOwP * _components.oneway_pair_weight,
+                    brokenOwP * _components.oneway_pair_weight +
+                    // FIX-276: variance penalty — abs difference between the
+                    // two teams' internal OVR variance. Penalises 90+82 over
+                    // 86+86 of same sum. _fix276PopVariance returns 0 on
+                    // empty/single-element arrays so guests-only teams are safe.
+                    // Uses the FUNCTION'S red/blue parameters (not outer-scope
+                    // redTeam/blueTeam) so candidate-swap scoring works correctly.
+                    Math.abs(_fix276PopVariance(red.map(p  => Number(p.overall_rating) || 0))
+                           - _fix276PopVariance(blue.map(p => Number(p.overall_rating) || 0)))
+                                                            * _components.team_variance_weight +
+                    // FIX-276: top-player gap penalty — abs difference of each
+                    // team's max OVR. Drives the stars-against-stars pairing.
+                    Math.abs(_fix276MaxOvr(red) - _fix276MaxOvr(blue))
+                                                            * _components.top_player_pairing_weight,
             };
         }
 
@@ -14939,6 +15043,135 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId,
                 'team_gen_beef5_widened', JSON.stringify({ widened_to: 5 })).catch(() => {}));
         }
+
+        // ─── FIX-276 Layer 4: experiment-mode diversification ────────────────
+        // When this game's series has experiment_mode=true, deliberately swap
+        // players post-optimisation to maximise compositional flip from the
+        // most recent completed game's lineup. Goal: gather richer calibration
+        // data by spreading the SAME roster across DIFFERENT compositions.
+        //
+        // Bounded by thresholdsMet — every accepted swap still meets hard
+        // constraints (beef5 atomicity, GK balance, defender balance, overall
+        // gap). The diversification is in the SPACE OF ACCEPTABLE solutions,
+        // not outside it.
+        //
+        // Conservative skips (no host-with-guests, no beef5 members, no
+        // guests-vs-guests) so the swap doesn't orphan guests or break
+        // atomicity. Maximum 3 successful swaps — bounded so we don't drift
+        // too far from the algorithm's chosen optimum.
+        try {
+            const _l4SeriesRes = await pool.query(
+                `SELECT g.series_id FROM games g WHERE g.id = $1`, [gameId]);
+            const _l4SeriesId = _l4SeriesRes.rows[0]?.series_id;
+            if (_l4SeriesId) {
+                const _l4FlagRes = await pool.query(
+                    `SELECT COALESCE(experiment_mode, false) AS em
+                       FROM game_series WHERE id = $1`, [_l4SeriesId]);
+                if (_l4FlagRes.rows[0]?.em === true) {
+                    // Find most-recent completed game in the series (≠ this one).
+                    const _l4PrevRes = await pool.query(`
+                        SELECT g.id FROM games g
+                         WHERE g.series_id = $1
+                           AND g.id != $2
+                           AND g.game_status = 'completed'
+                         ORDER BY g.game_date DESC, g.id DESC
+                         LIMIT 1`, [_l4SeriesId, gameId]);
+                    const _l4PrevGameId = _l4PrevRes.rows[0]?.id;
+                    if (_l4PrevGameId) {
+                        // Read the prev game's confirmed/completed composition.
+                        // status IN ('completed','superseded') because /complete
+                        // flips 'confirmed'→'completed', but if someone
+                        // regenerates teams late it may be 'superseded'. We
+                        // want the lineup as it was lived.
+                        const _l4CompRes = await pool.query(`
+                            SELECT team_composition
+                              FROM team_setups
+                             WHERE game_id = $1
+                               AND status IN ('completed','superseded','confirmed')
+                             ORDER BY id DESC LIMIT 1`, [_l4PrevGameId]);
+                        const _l4PrevComp = _l4CompRes.rows[0]?.team_composition;
+                        if (_l4PrevComp && Array.isArray(_l4PrevComp.red)
+                                        && Array.isArray(_l4PrevComp.blue)) {
+                            // Build the prev-team lookup.
+                            const _l4PrevTeamOf = new Map();
+                            for (const id of _l4PrevComp.red)  _l4PrevTeamOf.set(toStrId(id), 'red');
+                            for (const id of _l4PrevComp.blue) _l4PrevTeamOf.set(toStrId(id), 'blue');
+
+                            const MAX_L4_SWAPS = 3;
+                            let _l4SwapsApplied = 0;
+                            const _l4SwapAudit = [];
+
+                            // _l4Skippable — same atomicity rules as trySwapPair.
+                            const _l4Skippable = (p) => {
+                                if (!p) return true;
+                                if (p.is_guest) return true;
+                                if (beef5MemberIds.has(toStrId(p.player_id))) return true;
+                                // Host with attached guests — can't move solo.
+                                if ((guestGroups.get(p.player_id) || []).length > 0) return true;
+                                return false;
+                            };
+
+                            for (let iter = 0; iter < MAX_L4_SWAPS; iter++) {
+                                let bestI = -1, bestJ = -1, bestGain = 0;
+                                for (let i = 0; i < redTeam.length; i++) {
+                                    const r = redTeam[i];
+                                    if (_l4Skippable(r)) continue;
+                                    const prevR = _l4PrevTeamOf.get(toStrId(r.player_id));
+                                    if (!prevR) continue; // didn't play last time
+                                    for (let j = 0; j < blueTeam.length; j++) {
+                                        const b = blueTeam[j];
+                                        if (_l4Skippable(b)) continue;
+                                        const prevB = _l4PrevTeamOf.get(toStrId(b.player_id));
+                                        if (!prevB) continue;
+                                        // Gain: how many players will flip from
+                                        // their previous team after this swap?
+                                        //   r was red, will become blue → flip if prevR='red'.
+                                        //   b was blue, will become red → flip if prevB='blue'.
+                                        const gain = (prevR === 'red' ? 1 : 0)
+                                                   + (prevB === 'blue' ? 1 : 0);
+                                        if (gain <= 0) continue;
+                                        // Simulate swap; accept only if still passes
+                                        // thresholdsMet (hard constraints honoured).
+                                        const newRed  = redTeam.slice();
+                                        const newBlue = blueTeam.slice();
+                                        newRed[i]  = b;
+                                        newBlue[j] = r;
+                                        if (!thresholdsMet(newRed, newBlue)) continue;
+                                        if (gain > bestGain) {
+                                            bestGain = gain;
+                                            bestI = i; bestJ = j;
+                                        }
+                                    }
+                                }
+                                if (bestI === -1) break; // no further beneficial swap
+                                // Apply best swap.
+                                const rOut = redTeam[bestI];
+                                const bOut = blueTeam[bestJ];
+                                redTeam[bestI]  = bOut;
+                                blueTeam[bestJ] = rOut;
+                                _l4SwapsApplied++;
+                                _l4SwapAudit.push({
+                                    out_red: rOut.player_id, in_red: bOut.player_id,
+                                    gain: bestGain,
+                                });
+                            }
+
+                            if (_l4SwapsApplied > 0) {
+                                // Warnings already lands in team_setups.algorithm_diagnostics
+                                // (persisted with every generate-teams call). No separate
+                                // audit log entry — the diagnostics record is the audit trail
+                                // for "this game's teams were diversified".
+                                warnings.push(`Experiment mode: ${_l4SwapsApplied} diversification swap${_l4SwapsApplied === 1 ? '' : 's'} applied vs game ${_l4PrevGameId}`);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_l4Err) {
+            // Non-fatal — the algorithm's own result stands.
+            console.warn('[FIX-276 L4] diversification pass failed (non-fatal):', _l4Err.message);
+        }
+        // ─── END FIX-276 Layer 4 ──────────────────────────────────────────────
 
         const finalDiss = computeDissatisfaction(redTeam, blueTeam);
         if (finalDiss.beef5Broken > 0) {
@@ -17137,6 +17370,10 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
         // wizard). Without this, WS3 stats would analyse the stale algorithm
         // composition rather than the deployed teams. Mark admin_fine_tuned=true
         // when this update materially changes anything.
+        let _fix281ConfirmTeamsPriorComposition = null;
+        let _fix281ConfirmTeamsSetupId = null;
+        let _fix281ConfirmTeamsAdminEdited = false;
+        let _fix281ConfirmTeamsNewComposition = null;
         try {
             const _composition = {
                 red:  Array.isArray(redTeam)  ? redTeam.map(String)  : [],
@@ -17146,14 +17383,21 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
             // We can't easily detect "did admin edit" without reading the prior
             // composition, so we always update + flag fine_tuned only if hash
             // differs from the existing value.
+            // FIX-281: also fetch the prior composition for fine-tune diff capture.
             const priorRow = await pool.query(
-                `SELECT team_composition_hash FROM team_setups
+                `SELECT id, team_composition_hash, team_composition FROM team_setups
                   WHERE game_id = $1 AND status = 'confirmed'
                   ORDER BY id DESC LIMIT 1`,
                 [gameId]
             );
             const priorHash = priorRow.rows[0]?.team_composition_hash;
             const adminEdited = priorHash && _newHash && priorHash !== _newHash;
+            // Snapshot for the FIX-281 hook below (outside the try block so a
+            // late failure doesn't lose us the data).
+            _fix281ConfirmTeamsPriorComposition = priorRow.rows[0]?.team_composition || null;
+            _fix281ConfirmTeamsSetupId = priorRow.rows[0]?.id || null;
+            _fix281ConfirmTeamsAdminEdited = !!adminEdited;
+            _fix281ConfirmTeamsNewComposition = _composition;
             await pool.query(
                 `UPDATE team_setups
                     SET team_composition = $1::jsonb,
@@ -17164,6 +17408,24 @@ app.post('/api/admin/games/:gameId/confirm-teams', authenticateToken, requireGam
             );
         } catch (e) {
             console.warn('[confirm-teams] team_setup composition sync failed (non-fatal):', e.message);
+        }
+
+        // FIX-281: capture this as a fine-tune edit IF the admin actually
+        // edited the composition during confirmation (hash differed from the
+        // algorithm's output). This is the third tuning surface — see the
+        // other two at /team-setups/:setupId/fine-tune and
+        // /team-setups/:id/composition. Fire-and-forget.
+        if (_fix281ConfirmTeamsAdminEdited && _fix281ConfirmTeamsSetupId
+            && _fix281ConfirmTeamsPriorComposition
+            && _fix281ConfirmTeamsNewComposition) {
+            setImmediate(() => _fix281InsertFineTuneEdit({
+                gameId,
+                teamSetupId: _fix281ConfirmTeamsSetupId,
+                adminPlayerId: req.user.playerId,
+                compositionBefore: _fix281ConfirmTeamsPriorComposition,
+                compositionAfter: _fix281ConfirmTeamsNewComposition,
+                positionalChanges: [],
+            }).catch(() => {}));
         }
         
         // Get full game details with venue for response
@@ -18139,7 +18401,41 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 );
             }
         }
-        
+
+        // FIX-277: Injury reports → admin_action_queue. Orthogonal to discipline:
+        // a player can be both "10+ Min Late" (disciplined) AND injured (here).
+        // Each report becomes one pending queue row for GAFFA to review later.
+        // Wrapped in try/catch so a missing table (pre-migration) can't fail
+        // the completion — wizard-side payload is harmless in that case.
+        const _fix277InjuryReports = Array.isArray(req.body.injuryReports) ? req.body.injuryReports : [];
+        for (const inj of _fix277InjuryReports) {
+            if (!inj || !inj.playerId) continue;
+            if (!confirmedPlayerSet.has(inj.playerId)) continue; // skip non-participants
+            const _injNote = (typeof inj.note === 'string') ? inj.note.trim().slice(0, 2000) : null;
+            const _injRecRefund = !!inj.recommendRefund;
+            try {
+                const ins = await client.query(
+                    `INSERT INTO admin_action_queue
+                        (type, status, game_id, subject_player_id, flagged_by,
+                         notes, recommend_refund)
+                     VALUES ('injury_report', 'pending', $1, $2, $3, $4, $5)
+                     RETURNING id`,
+                    [gameId, inj.playerId, req.user.playerId, _injNote, _injRecRefund]
+                );
+                // Audit log fires post-commit so the row is visible to listeners.
+                const _injQid = ins.rows[0]?.id;
+                setImmediate(() => auditLog(pool, req.user.playerId,
+                    'injury_reported', inj.playerId,
+                    `Injury flagged for game ${gameId} (queue #${_injQid}` +
+                    `${_injRecRefund ? ' · refund recommended' : ''}` +
+                    `${_injNote ? ' · note: ' + _injNote.slice(0, 80) : ''})`
+                ).catch(() => {}));
+            } catch (e) {
+                // Table missing or constraint hit — log + continue. Completion must succeed.
+                console.warn('[FIX-277] injury_report INSERT failed (non-fatal):', e.message);
+            }
+        }
+
         // 3b. Collect disciplined player IDs for tier recalc AFTER commit
         // (same pattern as unconfirm — never call calculate_player_tier inside a transaction)
         const uniqueDisciplinedIds = [...new Set(
@@ -18195,6 +18491,11 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         await client.query('COMMIT');
         // FIX-063: Single summary log replacing all step-by-step debug logs
         console.log(`Game ${gameId} completed. Winner: ${winningTeam}. MOTM nominees: ${nomineesInserted}`);
+
+        // FIX-276: record calibration experiment post-commit. Non-fatal —
+        // failure must not affect the completion response. The helper enforces
+        // skip rules (draft_memory, vs_external, venue_clash, no team_setup).
+        setImmediate(() => _fix276InsertExperiment(gameId).catch(() => {}));
 
         // ── A2: Pay £2 cashback to hosts whose guest invite tokens were claimed by NEW users ──
         // Helper handles per-token transactions, pre-migration safety, and idempotency.
@@ -20027,11 +20328,74 @@ app.get('/api/players/:playerId/admin-contact', authenticateToken, async (req, r
 // GAME PLAYER EDITING (ADMIN)
 // ==========================================
 
+// FIX-282: stale-lock cleanup. Locks acquired but never released (browser
+// crash, tab close, network drop, JS error mid-flow) used to persist
+// indefinitely, blocking every other admin from editing the game and
+// breaking the heavy-use Edit Players / Force Unlock buttons. Locks older
+// than this many minutes are now auto-released by:
+//   (a) the /lock endpoint itself, before each acquire attempt
+//   (b) a startup sweep below, so a server restart wipes any old locks
+//   (c) [future] could add a periodic cron if we ever observe extended
+//       sessions hitting the boundary
+// 15 minutes is long enough to cover a slow admin reviewing a roster, short
+// enough that an abandoned lock doesn't strand other admins for an hour.
+const LOCK_STALE_MINUTES = 15;
+
+// Helper: release any lock older than LOCK_STALE_MINUTES. Returns count of
+// rows touched. Safe to call any time — no-op when no stale locks exist.
+async function _fix282SweepStaleLocks(scopeGameId) {
+    try {
+        const params = [];
+        let whereGame = '';
+        if (scopeGameId) {
+            whereGame = ' AND id = $1';
+            params.push(scopeGameId);
+        }
+        const r = await pool.query(
+            `UPDATE games
+                SET player_editing_locked = FALSE,
+                    locked_by = NULL,
+                    locked_at = NULL
+              WHERE player_editing_locked = TRUE
+                AND locked_at < NOW() - INTERVAL '${LOCK_STALE_MINUTES} minutes'${whereGame}
+              RETURNING id, locked_by`,
+            params
+        );
+        if (r.rowCount > 0) {
+            console.log(`[FIX-282] auto-released ${r.rowCount} stale lock(s)`);
+            // Best-effort audit. setImmediate so we don't block the caller.
+            for (const row of r.rows) {
+                setImmediate(() => gameAuditLog(pool, row.id, row.locked_by,
+                    'game_unlocked', `auto-released (stale ${LOCK_STALE_MINUTES}min)`
+                ).catch(() => {}));
+            }
+        }
+        return r.rowCount;
+    } catch (e) {
+        console.warn('[FIX-282] _fix282SweepStaleLocks failed (non-fatal):', e.message);
+        return 0;
+    }
+}
+
+// Startup sweep — fires once shortly after boot to clear any lingering
+// locks from before the server restart. setTimeout instead of immediate
+// so it doesn't compete with normal startup work; non-fatal on failure.
+setTimeout(() => {
+    _fix282SweepStaleLocks(null).catch(() => {});
+}, 5000);
+
 // Lock game for player editing
 app.post('/api/admin/games/:gameId/lock', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        
+
+        // FIX-282: sweep stale lock for THIS game before attempting acquire.
+        // Releases any lock older than LOCK_STALE_MINUTES — fixes the most
+        // common cause of "Edit Players just doesn't work for this game":
+        // the original admin's lock was abandoned (browser crash, tab close,
+        // network drop) and stuck the game indefinitely.
+        await _fix282SweepStaleLocks(gameId);
+
         // FIX-041: Atomic acquire — single UPDATE avoids check-then-act race condition
         const result = await pool.query(`
             UPDATE games
@@ -20042,11 +20406,39 @@ app.post('/api/admin/games/:gameId/lock', authenticateToken, requireCLMAdmin, as
             RETURNING id`,
             [req.user.playerId, gameId]
         );
-        
+
         if (result.rowCount === 0) {
-            return res.status(409).json({ error: 'Game is locked by another admin' });
+            // FIX-282: richer 409 response — return locker identity + timestamp
+            // so the client can render a useful "Locked by [X] since [Y]" UI
+            // with a Force Unlock button, instead of just a tiny alert.
+            // Best-effort lookup — fall back to the generic message on failure.
+            let lockerInfo = null;
+            try {
+                const lockerRes = await pool.query(`
+                    SELECT g.locked_by, g.locked_at,
+                           COALESCE(p.alias, p.full_name) AS locker_name
+                      FROM games g
+                      LEFT JOIN players p ON p.id = g.locked_by
+                     WHERE g.id = $1 AND g.player_editing_locked = TRUE`,
+                    [gameId]
+                );
+                if (lockerRes.rows.length > 0) {
+                    const row = lockerRes.rows[0];
+                    lockerInfo = {
+                        locked_by_id:    row.locked_by,
+                        locked_by_name:  row.locker_name || 'another admin',
+                        locked_at_iso:   row.locked_at ? new Date(row.locked_at).toISOString() : null,
+                    };
+                }
+            } catch (e) {
+                console.warn('[FIX-282] locker-info lookup failed (non-fatal):', e.message);
+            }
+            return res.status(409).json({
+                error: 'Game is locked by another admin',
+                ...(lockerInfo || {}),
+            });
         }
-        
+
         res.json({ message: 'Game locked for editing' });
         setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_locked', 'Player editing locked'));
     } catch (error) {
@@ -22149,14 +22541,15 @@ app.get('/api/players/me/discipline/recent', authenticateToken, async (req, res)
             [playerId]
         );
         // Current revolving points total — last 10 completed games the player confirmed for + manual entries
+        // FIX-292: explicit ::uuid casts on $1 — see discipline remove/add endpoints.
         const ptsRow = await pool.query(
             `SELECT COALESCE(SUM(dr.points),0) as total
              FROM discipline_records dr
-             WHERE dr.player_id = $1
+             WHERE dr.player_id = $1::uuid
                AND (dr.game_id IS NULL OR dr.game_id IN (
                  SELECT r.game_id FROM registrations r
                  JOIN games g2 ON g2.id = r.game_id
-                 WHERE r.player_id = $1 AND r.status = 'confirmed'
+                 WHERE r.player_id = $1::uuid AND r.status = 'confirmed'
                  AND g2.game_status = 'completed'
                  ORDER BY g2.game_date DESC LIMIT 10
                ))`,
@@ -22661,8 +23054,18 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
                 LEFT JOIN opponents opp_mgr ON opp_mgr.id = g.opponent_id
                 LEFT JOIN game_series gs ON gs.id = g.series_id
+                -- FIX-285: cap completed-games at last 30 days. Without this we run
+                -- ~25 correlated subqueries against every completed game ever, but
+                -- the frontend only renders the latest 10 (completedGames.slice(0,10)).
+                -- An admin who needs to see older games can use the reports page.
+                -- Escape hatch: ?include_history=1 returns everything (no cap).
+                WHERE (
+                    g.game_status != 'completed'
+                    OR g.game_date >= NOW() - INTERVAL '30 days'
+                    OR $1::boolean = TRUE
+                )
                 ORDER BY g.game_date DESC`;
-            params = [];
+            params = [req.query.include_history === '1' || req.query.include_history === 'true'];
         } else {
             // Build OR conditions for each role the player has
             const conditions = [];
@@ -23413,6 +23816,38 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
                 tournamentDisciplinedIds.push(record.playerId);
             }
         }
+
+        // FIX-277: Injury reports → admin_action_queue (tournament path).
+        // Mirrors the /complete handler — single source of behaviour for the
+        // queue regardless of which game-completion endpoint the wizard hits.
+        // NOTE: tournament scope has `allPlayerIds` (Array), not the
+        // `confirmedPlayerSet` (Set) used by /complete.
+        const _fix277TournInjuries = Array.isArray(req.body.injuryReports) ? req.body.injuryReports : [];
+        for (const inj of _fix277TournInjuries) {
+            if (!inj || !inj.playerId) continue;
+            if (!allPlayerIds.includes(inj.playerId)) continue; // skip non-participants
+            const _injNote = (typeof inj.note === 'string') ? inj.note.trim().slice(0, 2000) : null;
+            const _injRecRefund = !!inj.recommendRefund;
+            try {
+                const ins = await client.query(
+                    `INSERT INTO admin_action_queue
+                        (type, status, game_id, subject_player_id, flagged_by,
+                         notes, recommend_refund)
+                     VALUES ('injury_report', 'pending', $1, $2, $3, $4, $5)
+                     RETURNING id`,
+                    [gameId, inj.playerId, req.user.playerId, _injNote, _injRecRefund]
+                );
+                const _injQid = ins.rows[0]?.id;
+                setImmediate(() => auditLog(pool, req.user.playerId,
+                    'injury_reported', inj.playerId,
+                    `Injury flagged for tournament ${gameId} (queue #${_injQid}` +
+                    `${_injRecRefund ? ' · refund recommended' : ''}` +
+                    `${_injNote ? ' · note: ' + _injNote.slice(0, 80) : ''})`
+                ).catch(() => {}));
+            } catch (e) {
+                console.warn('[FIX-277] tournament injury_report INSERT failed (non-fatal):', e.message);
+            }
+        }
         
         // 4. Create MOTM nominees (from winning team only)
         let nomineesInserted = 0;
@@ -23425,6 +23860,11 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
         }
         
         await client.query('COMMIT');
+
+        // FIX-276: record calibration experiment for the tournament path too.
+        // Tournaments ARE eligible (only draft_memory + vs_external + venue_clash
+        // are skipped). Fire-and-forget.
+        setImmediate(() => _fix276InsertExperiment(gameId).catch(() => {}));
 
         // ── A2: Pay £2 cashback to hosts whose guest invite tokens were claimed by NEW users ──
         // Same hook as standard /complete — tournament games can have guests too.
@@ -25142,14 +25582,18 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
         // Compute revolving points inline — includes manual (game_id IS NULL) entries.
         // calculate_player_tier() is a DB function that filters game_id IS NOT NULL so it
         // never counts manual entries. We bypass it here and derive tier ourselves.
+        //
+        // FIX-292: explicit ::uuid casts on $1 (same reason as the discipline-remove
+        // endpoint — PG 14+ can deduce inconsistent types for $1 when it's used
+        // in both the outer SELECT and the inner correlated subquery).
         const revolvingResult = await client.query(`
             SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
             FROM discipline_records dr
-            WHERE dr.player_id = $1
+            WHERE dr.player_id = $1::uuid
             AND (dr.game_id IS NULL OR dr.game_id IN (
                 SELECT r.game_id FROM registrations r
                 JOIN games g ON g.id = r.game_id
-                WHERE r.player_id = $1 AND r.status = 'confirmed'
+                WHERE r.player_id = $1::uuid AND r.status = 'confirmed'
                 AND g.game_status = 'completed'
                 ORDER BY g.game_date DESC LIMIT 10
             ))
@@ -25205,12 +25649,21 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
         // Restructure as a derived-table LEFT JOIN for clarity and to make the
         // 10-most-recent-completed-games intent explicit. Same result, lower
         // surprise factor for future maintainers.
+        //
+        // FIX-292: explicit ::uuid casts on $1. Without them, PG 14+ raises
+        //   "inconsistent types deduced for parameter $1" (SQLSTATE 42P08)
+        // because $1 is referenced both inside the CTE (registrations.player_id)
+        // AND in the outer SELECT (discipline_records.player_id). Both columns
+        // ARE uuid per the FK migration, but the planner deduces the type
+        // independently per CTE scope and the two deductions can disagree
+        // under some plan shapes. A single explicit cast pins the type and
+        // makes the query bulletproof.
         const revolvingResult = await client.query(`
             WITH recent_games AS (
                 SELECT r.game_id
                 FROM registrations r
                 JOIN games g ON g.id = r.game_id
-                WHERE r.player_id = $1
+                WHERE r.player_id = $1::uuid
                   AND r.status = 'confirmed'
                   AND g.game_status = 'completed'
                 ORDER BY g.game_date DESC
@@ -25218,7 +25671,7 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
             )
             SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
             FROM discipline_records dr
-            WHERE dr.player_id = $1
+            WHERE dr.player_id = $1::uuid
               AND (dr.game_id IS NULL OR dr.game_id IN (SELECT game_id FROM recent_games))
         `, [playerId]);
         const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
@@ -25261,14 +25714,15 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
 app.post('/api/admin/players/:id/recalc-tier', authenticateToken, requireAdmin, async (req, res) => {
     const { id } = req.params;
     try {
+        // FIX-292: explicit ::uuid casts on $1 — same PG inference issue.
         const revolvingResult = await pool.query(`
             SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
             FROM discipline_records dr
-            WHERE dr.player_id = $1
+            WHERE dr.player_id = $1::uuid
             AND (dr.game_id IS NULL OR dr.game_id IN (
                 SELECT r.game_id FROM registrations r
                 JOIN games g ON g.id = r.game_id
-                WHERE r.player_id = $1 AND r.status = 'confirmed'
+                WHERE r.player_id = $1::uuid AND r.status = 'confirmed'
                 AND g.game_status = 'completed'
                 ORDER BY g.game_date DESC LIMIT 10
             ))
@@ -26461,6 +26915,11 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
         // FIX-265: shop + feedback groups (extended with FIX-268a audit actions + FIX-268b/d additions)
         shop:       ['shop_order_placed','shop_order_cancelled','shop_order_admin_cancelled','shop_status_changed','shop_squad_claimed'],
         feedback:   ['rating_vote_cast','rating_vote_skipped','rating_vote_deleted','suspicion_cleared','rating_recalc_forced','rating_recalibrated_via_feedback','rating_recalibration_stalled','rating_reference_pushed','rating_suspicion_redirected','rating_feedback_pairs_requested'],
+        // FIX-277: admin action queue events.
+        injury:     ['injury_reported','injury_refund_approved','injury_refund_rejected'],
+        // FIX-276: team-balance calibration events.
+        calibration:['calibration_experiment_recorded','calibration_backfill_run','calibration_experiment_mode_toggled',
+                     'fine_tune_suggestion_engine_run','pair_suggestion_accepted','pair_suggestion_dismissed'],
     };
 
     const allGroups = Object.keys(GROUP_ACTIONS);
@@ -26987,6 +27446,16 @@ const ALGORITHM_COMPONENT_DEFAULTS = Object.freeze({
     mutual_pair_weight:      6,
     oneway_avoid_weight:     4,
     oneway_pair_weight:      2,
+    // FIX-276: calibration-driven penalty terms. BOTH default to 0 so
+    // existing templates keep current behaviour exactly. Per-template opt-in
+    // (set a non-zero weight in the template's components override).
+    //   team_variance_weight     — penalises a team with high INTERNAL OVR
+    //                              variance vs the other. Encourages even-
+    //                              spread teams over equal-sum-but-uneven.
+    //   top_player_pairing_weight — penalises a large gap between each team's
+    //                              top player. Pairs the stars across teams.
+    team_variance_weight:        0,
+    top_player_pairing_weight:   0,
     // Buffers / tolerances
     overall_buffer:          1,
     def_buffer:              3,
@@ -27004,6 +27473,8 @@ const _COMPONENT_NUMERIC_KEYS = Object.freeze([
     'overall_gap_weight','defender_gap_weight','def_sum_weight','fit_sum_weight',
     'beef5_weight','beef4_weight','beef3_weight','beef2_weight','beef1_weight',
     'mutual_avoid_weight','mutual_pair_weight','oneway_avoid_weight','oneway_pair_weight',
+    // FIX-276: new calibration-driven penalty terms (default 0 → disabled).
+    'team_variance_weight','top_player_pairing_weight',
     'overall_buffer','def_buffer','fit_buffer','defender_gap_tolerance',
 ]);
 const _COMPONENT_BOOLEAN_KEYS = Object.freeze([
@@ -29343,12 +29814,16 @@ app.post('/api/admin/games/:gameId/team-setups/:setupId/fine-tune', authenticate
     }
 
     const client = await pool.connect();
+    // FIX-281: capture BEFORE composition for the post-commit fine-tune
+    // edit recorder. Filled inside the try block from the SELECT result.
+    let _fix281PreTuneComposition = null;
     try {
         await client.query('BEGIN');
 
         // Validate setup belongs to game and is in a state that allows fine-tuning
+        // FIX-281: also pull team_composition for fine-tune capture (pre-tune state).
         const ts = await client.query(
-            `SELECT id, game_id, status FROM team_setups WHERE id = $1`,
+            `SELECT id, game_id, status, team_composition FROM team_setups WHERE id = $1`,
             [setupId]
         );
         if (ts.rows.length === 0) {
@@ -29363,6 +29838,11 @@ app.post('/api/admin/games/:gameId/team-setups/:setupId/fine-tune', authenticate
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Only confirmed or completed setups can be fine-tuned' });
         }
+
+        // FIX-281: snapshot the pre-tune composition for post-commit recording.
+        _fix281PreTuneComposition = ts.rows[0] && ts.rows[0].team_composition
+            ? ts.rows[0].team_composition
+            : { red: [], blue: [] };
 
         // Update team_setups row + flip admin_fine_tuned
         await client.query(`
@@ -29395,6 +29875,18 @@ app.post('/api/admin/games/:gameId/team-setups/:setupId/fine-tune', authenticate
 
         try { await auditLog(pool, req.user.playerId, 'team_setup_fine_tuned', gameId,
             `setup=${setupId}`); } catch (e) {}
+
+        // FIX-281: capture this tune as a structured edit for pattern detection.
+        // Reads the pre-tune composition from the ts variable captured before
+        // the UPDATE. Fire-and-forget — failure must not affect the response.
+        setImmediate(() => _fix281InsertFineTuneEdit({
+            gameId,
+            teamSetupId: setupId,
+            adminPlayerId: req.user.playerId,
+            compositionBefore: _fix281PreTuneComposition,
+            compositionAfter: team_composition,
+            positionalChanges: [],
+        }).catch(() => {}));
 
         res.json({ fine_tuned: true, team_setup_id: setupId });
     } catch (error) {
@@ -30190,7 +30682,8 @@ app.patch('/api/admin/games/:gameId/team-setups/:id/composition',
     try {
         // Validate setup
         const sRes = await pool.query(
-            `SELECT id, game_id, status, voting_opened_at, voting_closed_at, slot_number
+            `SELECT id, game_id, status, voting_opened_at, voting_closed_at, slot_number,
+                    team_composition
                FROM team_setups WHERE id = $1`,
             [id]
         );
@@ -30276,6 +30769,18 @@ app.patch('/api/admin/games/:gameId/team-setups/:id/composition',
             await auditLog(pool, req.user.playerId, 'team_setup_composition_edited', gameId,
                 `setup=${id} slot=${setup.slot_number ?? 'NULL'} hash=${newHash || 'null'}`);
         } catch (e) {}
+
+        // FIX-281: capture this tune as a structured edit for pattern detection.
+        // `setup` holds the pre-tune team_composition (from the SELECT earlier
+        // in the handler). newComposition is the post-tune state.
+        setImmediate(() => _fix281InsertFineTuneEdit({
+            gameId,
+            teamSetupId: id,
+            adminPlayerId: req.user.playerId,
+            compositionBefore: setup.team_composition || { red: [], blue: [] },
+            compositionAfter: newComposition,
+            positionalChanges: [],
+        }).catch(() => {}));
 
         res.json({
             id, slot_number: setup.slot_number,
@@ -36025,27 +36530,37 @@ async function _getSeriesTrophyPayload(seriesId, includeIds) {
         SELECT id, metric_id, calculation_type, tier, created_at
         FROM series_trophies WHERE series_id = $1 ORDER BY metric_id, calculation_type`, [seriesId]);
 
-    // FIX-273: for completed (finalized) series, read the LOCKED top-3 from
+    // FIX-273: for finalized series, read the LOCKED top-3 from
     // series_trophy_results instead of recomputing via calcSeriesLeaderboard.
     // The whole point of finalize is to snapshot the winners — if the read
     // path always recomputes, then editing an old game's score after finalize
     // would silently change the displayed winners, breaking the lock.
-    // For active series we still compute live so admins see the current state.
-    const isCompleted = series.series_status === 'completed';
+    //
+    // FIX-278b: branch on "locked rows EXIST for this trophy" instead of
+    // "series_status === 'completed'". Both signals flip atomically inside
+    // /finalize's transaction (DELETE+INSERT+UPDATE all visible together
+    // after COMMIT), so reading locked rows is authoritative. This closes
+    // the race where a reader's pre-flight series_status SELECT fired
+    // before the writer's COMMIT but the per-trophy reads land after it
+    // — previously that returned LIVE results despite a locked snapshot
+    // being live; now it returns the locked snapshot.
     const trophies = [];
     for (const t of trophiesRow.rows) {
         let leaderboard = [];
         if (completedGames > 0) {
-            if (isCompleted) {
-                // Pull from the locked results table, JOIN players for the alias.
-                const lockedR = await pool.query(`
-                    SELECT str.rank, str.primary_stat, str.supporting_stat,
-                           str.player_id,
-                           COALESCE(p.alias, p.full_name) AS player_name
-                      FROM series_trophy_results str
-                      JOIN players p ON p.id = str.player_id
-                     WHERE str.trophy_id = $1
-                     ORDER BY str.rank ASC`, [t.id]);
+            // Try locked snapshot first. If non-empty, that's the authoritative
+            // truth regardless of what series_status said. If empty (active
+            // series, OR trophy added post-finalize edge case), fall through
+            // to live compute so the UI isn't blank.
+            const lockedR = await pool.query(`
+                SELECT str.rank, str.primary_stat, str.supporting_stat,
+                       str.player_id,
+                       COALESCE(p.alias, p.full_name) AS player_name
+                  FROM series_trophy_results str
+                  JOIN players p ON p.id = str.player_id
+                 WHERE str.trophy_id = $1
+                 ORDER BY str.rank ASC`, [t.id]);
+            if (lockedR.rows.length > 0) {
                 leaderboard = lockedR.rows.map(r => ({
                     player_id:       r.player_id,
                     player_name:     r.player_name,
@@ -36053,13 +36568,6 @@ async function _getSeriesTrophyPayload(seriesId, includeIds) {
                     primary_stat:    r.primary_stat,
                     supporting_stat: r.supporting_stat,
                 }));
-                // Fallback: if the locked snapshot is empty (e.g. trophy added
-                // after finalize, which the existing add-trophy guard prevents
-                // but treat defensively), fall through to a live compute so the
-                // UI isn't empty.
-                if (leaderboard.length === 0) {
-                    leaderboard = await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type);
-                }
             } else {
                 leaderboard = await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type);
             }
@@ -36191,53 +36699,65 @@ app.delete('/api/admin/series/:id/trophies/:tid', authenticateToken, requireAdmi
 });
 
 // POST /api/admin/series/:id/finalize — lock results permanently
+// FIX-278a: serialise concurrent finalize calls via SELECT ... FOR UPDATE on
+// the game_series row INSIDE the transaction (same pattern as FIX-273's
+// auto-finalize-on-recreate block). Without this, two concurrent callers
+// (e.g. double-click on the ✅ button, or human + auto-finalize-on-recreate
+// racing each other) could both see status='active' in the pre-flight check,
+// both run the full leaderboard compute, and the second worker's DELETE+INSERT
+// would clobber the first's locked snapshot.
 app.post('/api/admin/series/:id/finalize', authenticateToken, requireAdmin, async (req, res) => {
+    const seriesId = req.params.id;
+    const client = await pool.connect();
     try {
-        const seriesId = req.params.id;
+        await client.query('BEGIN');
 
-        const seriesRow = await pool.query(
-            `SELECT series_status FROM game_series WHERE id = $1`, [seriesId]);
-        if (!seriesRow.rows.length) return res.status(404).json({ error: 'Series not found' });
-        if (seriesRow.rows[0].series_status === 'completed') {
+        // Lock the series row + re-check status atomically. Concurrent workers
+        // block here; the second one sees 'completed' and short-circuits.
+        const lockR = await client.query(
+            `SELECT series_status FROM game_series WHERE id = $1 FOR UPDATE`,
+            [seriesId]
+        );
+        if (lockR.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Series not found' });
+        }
+        if (lockR.rows[0].series_status === 'completed') {
+            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Series already finalised' });
         }
 
-        const trophiesRow = await pool.query(
-            `SELECT id, metric_id, calculation_type FROM series_trophies WHERE series_id = $1`, [seriesId]);
+        const trophiesRow = await client.query(
+            `SELECT id, metric_id, calculation_type FROM series_trophies WHERE series_id = $1`,
+            [seriesId]
+        );
 
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-
-            for (const t of trophiesRow.rows) {
-                console.log(`[finalize] Computing metric_id=${t.metric_id} calc=${t.calculation_type}`);
-                const leaderboard = await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type);
-                console.log(`[finalize] Leaderboard rows: ${leaderboard.length}`);
-                await client.query('DELETE FROM series_trophy_results WHERE trophy_id = $1', [t.id]);
-                for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
-                    const row = leaderboard[i];
-                    await client.query(`
-                        INSERT INTO series_trophy_results (trophy_id, player_id, rank, primary_stat, supporting_stat)
-                        VALUES ($1, $2, $3, $4, $5)`,
-                        [t.id, row.player_id, i + 1, row.primary_stat, row.supporting_stat]);
-                }
+        for (const t of trophiesRow.rows) {
+            console.log(`[finalize] Computing metric_id=${t.metric_id} calc=${t.calculation_type}`);
+            const leaderboard = await calcSeriesLeaderboard(seriesId, t.metric_id, t.calculation_type);
+            console.log(`[finalize] Leaderboard rows: ${leaderboard.length}`);
+            await client.query('DELETE FROM series_trophy_results WHERE trophy_id = $1', [t.id]);
+            for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
+                const row = leaderboard[i];
+                await client.query(`
+                    INSERT INTO series_trophy_results (trophy_id, player_id, rank, primary_stat, supporting_stat)
+                    VALUES ($1, $2, $3, $4, $5)`,
+                    [t.id, row.player_id, i + 1, row.primary_stat, row.supporting_stat]);
             }
-
-            await client.query(`
-                UPDATE game_series SET series_status = 'completed', finalized_at = NOW()
-                WHERE id = $1`, [seriesId]);
-
-            await client.query('COMMIT');
-            res.json({ ok: true, message: 'Series finalised — trophy winners locked permanently' });
-        } catch (e) {
-            await client.query('ROLLBACK');
-            throw e;
-        } finally {
-            client.release();
         }
+
+        await client.query(`
+            UPDATE game_series SET series_status = 'completed', finalized_at = NOW()
+            WHERE id = $1`, [seriesId]);
+
+        await client.query('COMMIT');
+        res.json({ ok: true, message: 'Series finalised — trophy winners locked permanently' });
     } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('POST /api/admin/series/:id/finalize error:', e.message);
         res.status(500).json({ error: 'Failed to finalise series' });
+    } finally {
+        client.release();
     }
 });
 
@@ -37674,7 +38194,39 @@ app.get('/api/admin/comms/past-games', authenticateToken, requireAdmin, async (r
     }
 });
 
-// GET /api/admin/comms/player-history?gameId=UUID  OR  ?venueId=N
+// FIX-294: GET /api/admin/comms/past-series — series picker source for phone export.
+// Returns all series that have at least one completed (past, non-cancelled)
+// game with at least one confirmed registration. Sorted by most recent activity
+// so the dropdown bubbles up the ones admins are most likely to want.
+// Reports completed_games and unique_players for the dropdown label.
+app.get('/api/admin/comms/past-series', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT gs.id,
+                   gs.series_name,
+                   gs.series_status,
+                   gs.series_type,
+                   COUNT(DISTINCT g.id)::int                                    AS completed_games,
+                   COUNT(DISTINCT r.player_id) FILTER (WHERE r.status = 'confirmed')::int AS unique_players,
+                   MAX(g.game_date)                                             AS last_game_date
+              FROM game_series gs
+              JOIN games g ON g.series_id = gs.id
+              LEFT JOIN registrations r ON r.game_id = g.id
+             WHERE g.game_date <= NOW()
+               AND COALESCE(g.game_status, 'available') <> 'cancelled'
+             GROUP BY gs.id, gs.series_name, gs.series_status, gs.series_type
+            HAVING COUNT(DISTINCT g.id) > 0
+             ORDER BY MAX(g.game_date) DESC NULLS LAST
+             LIMIT 200
+        `);
+        res.json({ series: result.rows });
+    } catch (error) {
+        console.error('Comms past-series error:', error);
+        res.status(500).json({ error: 'Failed to load past series' });
+    }
+});
+
+// GET /api/admin/comms/player-history?gameId=UUID  OR  ?venueId=N  OR  ?seriesId=UUID (FIX-294)
 // Returns the player roster for export — full_name, alias, phone, region,
 // last_played_at (when they last played a completed game), is_at_this_venue.
 // Region resolution: region_code if set, else first item of preferred_locations,
@@ -37682,14 +38234,20 @@ app.get('/api/admin/comms/past-games', authenticateToken, requireAdmin, async (r
 // listing for reference (per FIX-272 spec).
 app.get('/api/admin/comms/player-history', authenticateToken, requireAdmin, async (req, res) => {
     try {
-        const gameIdRaw  = req.query.gameId  ? String(req.query.gameId)  : null;
-        const venueIdRaw = req.query.venueId ? String(req.query.venueId) : null;
+        const gameIdRaw   = req.query.gameId   ? String(req.query.gameId)   : null;
+        const venueIdRaw  = req.query.venueId  ? String(req.query.venueId)  : null;
+        // FIX-294: series mode — pull all players who ever played a completed
+        // game inside a specific series. Mirrors venue-mode semantics: only
+        // 'confirmed' registrations, only games that actually went ahead
+        // (no 'cancelled'), de-duplicated by player.
+        const seriesIdRaw = req.query.seriesId ? String(req.query.seriesId) : null;
 
-        if (!gameIdRaw && !venueIdRaw) {
-            return res.status(400).json({ error: 'must supply gameId or venueId' });
+        const provided = [gameIdRaw, venueIdRaw, seriesIdRaw].filter(Boolean);
+        if (provided.length === 0) {
+            return res.status(400).json({ error: 'must supply gameId, venueId or seriesId' });
         }
-        if (gameIdRaw && venueIdRaw) {
-            return res.status(400).json({ error: 'supply gameId OR venueId, not both' });
+        if (provided.length > 1) {
+            return res.status(400).json({ error: 'supply exactly one of gameId, venueId, seriesId' });
         }
 
         let players;
@@ -37729,7 +38287,7 @@ app.get('/api/admin/comms/player-history', authenticateToken, requireAdmin, asyn
             sourceLabel = gameRow
                 ? `${new Date(gameRow.game_date).toISOString().slice(0,10)} · ${gameRow.format || ''} · ${gameRow.venue_name || ''}`.trim()
                 : 'Selected game';
-        } else {
+        } else if (venueIdRaw) {
             const venueId = parseInt(venueIdRaw, 10);
             if (!Number.isFinite(venueId)) {
                 return res.status(400).json({ error: 'invalid venueId' });
@@ -37758,6 +38316,38 @@ app.get('/api/admin/comms/player-history', authenticateToken, requireAdmin, asyn
             players = r.rows;
             const vR = await pool.query('SELECT name FROM venues WHERE id = $1', [venueId]);
             sourceLabel = vR.rows[0]?.name || 'Selected venue';
+        } else {
+            // FIX-294: SERIES mode — every player who registered (confirmed) for
+            // at least one completed game in this series. Same exclusion rules
+            // as venue-mode: cancelled games dropped, only past games count.
+            // appearances_in_series is a useful diagnostic for the picker UI.
+            if (!isValidUuid(seriesIdRaw)) {
+                return res.status(400).json({ error: 'invalid seriesId' });
+            }
+            const r = await pool.query(`
+                SELECT p.id, p.full_name, p.alias, p.phone,
+                       p.region_code, p.preferred_locations,
+                       MAX(g.game_date) AS last_played_at,
+                       COUNT(*)::int    AS appearances_in_series
+                  FROM players p
+                  JOIN registrations r ON r.player_id = p.id
+                  JOIN games        g ON g.id = r.game_id
+                 WHERE g.series_id = $1::uuid
+                   AND r.status = 'confirmed'
+                   AND g.game_date <= NOW()
+                   AND COALESCE(g.game_status, 'available') <> 'cancelled'
+                 GROUP BY p.id, p.full_name, p.alias, p.phone, p.region_code, p.preferred_locations
+                 ORDER BY MAX(g.game_date) DESC NULLS LAST
+            `, [seriesIdRaw]);
+            players = r.rows;
+            const sR = await pool.query(
+                'SELECT series_name, series_status FROM game_series WHERE id = $1',
+                [seriesIdRaw]
+            );
+            const seriesRow = sR.rows[0];
+            sourceLabel = seriesRow
+                ? `${seriesRow.series_name}${seriesRow.series_status === 'completed' ? ' (finalised)' : ''}`
+                : 'Selected series';
         }
 
         // Compute the "region" each player should be tagged with in the vCard.
@@ -37778,10 +38368,11 @@ app.get('/api/admin/comms/player-history', authenticateToken, requireAdmin, asyn
                 last_played_at:  p.last_played_at,
                 reg_status_for_this_game: p.reg_status_for_this_game || null,
                 appearances_at_venue:     p.appearances_at_venue     || null,
+                appearances_in_series:    p.appearances_in_series    || null,
             };
         });
         res.json({
-            source: gameIdRaw ? 'game' : 'venue',
+            source: gameIdRaw ? 'game' : (venueIdRaw ? 'venue' : 'series'),
             sourceLabel,
             total:  enriched.length,
             players: enriched,
@@ -40083,6 +40674,1661 @@ app.get('/api/admin/rating-feedback/player-stability', authenticateToken, requir
 // END FIX-275
 // ═══════════════════════════════════════════════════════════════════════════
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-277 — Admin Action Queue CRM (injury reports + future types)
+// ═══════════════════════════════════════════════════════════════════════════
+// Generic-typed admin approval queue. First type: 'injury_report'. The
+// wizard inserts pending rows during game completion (see EDIT 3/4 above);
+// these endpoints serve the admin-queue.html SPA for review + resolution.
+//
+// Auth: requireAdmin (admins AND superadmin per GAFFA spec — not just
+// superadmin, because regional admins also need to action injury refunds
+// for their games).
+//
+// Refund mechanics on approve:
+//   - bucket='free_credits'   → entire amount → credits.free_credit_balance
+//   - bucket='real_balance'   → entire amount → credits.balance
+//   - bucket='split_as_paid'  → pro-rata split matching registration's
+//                               amount_paid (real) and amount_paid_free.
+// Email gates ONLY on approve (rejection is silent — no notification).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Email template — editable via system_settings, hardcoded sensible default
+// ──────────────────────────────────────────────────────────────────────────
+// Keys:
+//   injury_refund_email_subject  — line shown in player's inbox
+//   injury_refund_email_body     — HTML body wrapped in wrapEmailHtml()
+// Both default to the wording locked in the FIX-277 handover. Edits apply
+// from next approval onward.
+const _FIX277_DEFAULT_EMAIL_SUBJECT = "We hope you're back soon — Total Footy";
+const _FIX277_DEFAULT_EMAIL_BODY = `
+    <h2 style="color:#fff;margin:0 0 16px 0;">Sorry to hear about your injury</h2>
+    <p style="color:#bbb;font-size:14px;line-height:1.6;">
+        Sorry to hear you got injured at one of our games — we hope to catch you at a Total Footy match in the near future.
+    </p>
+    <p style="color:#bbb;font-size:14px;line-height:1.6;">
+        We've credited <strong style="color:#fff;">{{REFUND_LINE}}</strong> back to your account as a gesture from the team.
+        It'll be ready to use as soon as you're back playing.
+    </p>
+    <p style="color:#888;font-size:13px;line-height:1.6;margin-top:24px;">
+        Take it easy and rest up.<br>— GAFFA
+    </p>
+`;
+
+// _fix277SettingGet — read system_settings key (string) or null. Defensive
+// against missing table.
+async function _fix277SettingGet(key) {
+    try {
+        const r = await pool.query('SELECT value FROM system_settings WHERE key = $1', [key]);
+        return r.rows[0]?.value || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+// _fix277FormatRefundLine — human refund summary for the email body.
+function _fix277FormatRefundLine(amount, bucket) {
+    const amt = (parseFloat(amount) || 0).toFixed(2);
+    if (bucket === 'free_credits')   return `£${amt} in free credits`;
+    if (bucket === 'real_balance')   return `£${amt} to your wallet`;
+    if (bucket === 'split_as_paid')  return `£${amt} (matched to how you paid)`;
+    return `£${amt}`;
+}
+
+// _fix277SendApprovalEmail — post-commit fire-and-forget. Failures logged,
+// never thrown. Subject + body both run through system_settings overrides.
+async function _fix277SendApprovalEmail(toEmail, recipientName, refundAmount, refundBucket) {
+    if (!toEmail) {
+        console.warn('[FIX-277] approval email skipped — no recipient email on file');
+        return;
+    }
+    const subject = (await _fix277SettingGet('injury_refund_email_subject')) || _FIX277_DEFAULT_EMAIL_SUBJECT;
+    const bodyRaw = (await _fix277SettingGet('injury_refund_email_body'))    || _FIX277_DEFAULT_EMAIL_BODY;
+    const refundLine = (refundAmount && refundBucket)
+        ? _fix277FormatRefundLine(refundAmount, refundBucket)
+        : '';
+    // Replace {{REFUND_LINE}} placeholder. If there's no refund, drop the
+    // refund paragraph entirely so we don't email "£0.00 back to your account".
+    let body;
+    if (refundLine) {
+        body = bodyRaw.replace(/\{\{REFUND_LINE\}\}/g, refundLine);
+    } else {
+        // No-refund variant — strip the entire <p>...{{REFUND_LINE}}...</p>
+        body = bodyRaw.replace(/<p[^>]*>[^<]*\{\{REFUND_LINE\}\}[\s\S]*?<\/p>/g, '');
+    }
+    try {
+        await emailTransporter.sendMail({
+            from: '"Total Footy" <totalfooty19@gmail.com>',
+            to: toEmail,
+            subject,
+            html: wrapEmailHtml(body),
+        });
+        console.log(`[FIX-277] approval email sent → ${toEmail}`);
+    } catch (e) {
+        console.warn('[FIX-277] approval email failed:', e.message);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /api/admin/queue/pending — list pending items joined with game + player
+// Most-recent-first; refund-flagged items bubble up via the ORDER BY.
+// ──────────────────────────────────────────────────────────────────────────
+app.get('/api/admin/queue/pending', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT q.id, q.type, q.status, q.notes, q.recommend_refund,
+                   q.created_at,
+                   q.game_id, q.subject_player_id, q.flagged_by,
+                   COALESCE(p.alias, p.full_name) AS subject_alias,
+                   p.squad_number AS subject_squad_number,
+                   COALESCE(fb.alias, fb.full_name) AS flagged_by_alias,
+                   g.game_date, g.format AS game_format,
+                   v.name AS venue_name, v.region AS venue_region,
+                   r2.amount_paid AS registered_amount_paid,
+                   r2.amount_paid_free AS registered_amount_paid_free,
+                   g.cost_per_player AS game_cost_per_player
+              FROM admin_action_queue q
+              LEFT JOIN players p   ON p.id  = q.subject_player_id
+              LEFT JOIN players fb  ON fb.id = q.flagged_by
+              LEFT JOIN games   g   ON g.id  = q.game_id
+              LEFT JOIN venues  v   ON v.id  = g.venue_id
+              LEFT JOIN registrations r2
+                     ON r2.game_id = q.game_id
+                    AND r2.player_id = q.subject_player_id
+                    AND r2.status = 'confirmed'
+             WHERE q.status = 'pending'
+             ORDER BY q.recommend_refund DESC, q.created_at DESC
+             LIMIT 200
+        `);
+        res.json({ count: r.rows.length, items: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/queue/pending error:', e);
+        res.status(500).json({ error: 'Failed to load pending queue', detail: e.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /api/admin/queue/resolved?days=30 — recent resolved items
+// ──────────────────────────────────────────────────────────────────────────
+app.get('/api/admin/queue/resolved', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30));
+        const r = await pool.query(`
+            SELECT q.id, q.type, q.status, q.notes, q.recommend_refund,
+                   q.created_at, q.resolved_at, q.refund_amount, q.refund_bucket,
+                   q.resolution_note,
+                   q.game_id, q.subject_player_id, q.flagged_by, q.resolved_by,
+                   COALESCE(p.alias, p.full_name) AS subject_alias,
+                   p.squad_number AS subject_squad_number,
+                   COALESCE(fb.alias, fb.full_name) AS flagged_by_alias,
+                   COALESCE(rb.alias, rb.full_name) AS resolved_by_alias,
+                   g.game_date, g.format AS game_format,
+                   v.name AS venue_name, v.region AS venue_region
+              FROM admin_action_queue q
+              LEFT JOIN players p   ON p.id  = q.subject_player_id
+              LEFT JOIN players fb  ON fb.id = q.flagged_by
+              LEFT JOIN players rb  ON rb.id = q.resolved_by
+              LEFT JOIN games   g   ON g.id  = q.game_id
+              LEFT JOIN venues  v   ON v.id  = g.venue_id
+             WHERE q.status IN ('approved', 'rejected')
+               AND q.resolved_at >= NOW() - ($1::int || ' days')::interval
+             ORDER BY q.resolved_at DESC
+             LIMIT 200
+        `, [days]);
+        res.json({ days, count: r.rows.length, items: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/queue/resolved error:', e);
+        res.status(500).json({ error: 'Failed to load resolved queue', detail: e.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /api/admin/queue/:id/approve
+// Body: { refundAmount?: number, refundBucket?: 'free_credits'|'real_balance'|'split_as_paid', resolutionNote?: string }
+// If refundAmount > 0 AND refundBucket present, money moves + email sends.
+// If refundAmount is 0/null, just resolves the item (no money, no email).
+// ──────────────────────────────────────────────────────────────────────────
+app.post('/api/admin/queue/:id/approve', authenticateToken, requireAdmin, async (req, res) => {
+    const queueId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(queueId) || queueId <= 0) {
+        return res.status(400).json({ error: 'Invalid queue id' });
+    }
+    const refundAmount = req.body?.refundAmount;
+    const refundBucket = req.body?.refundBucket || null;
+    const resolutionNote = (typeof req.body?.resolutionNote === 'string')
+        ? req.body.resolutionNote.trim().slice(0, 2000) : null;
+
+    const refundAmtNum = (refundAmount === null || refundAmount === undefined || refundAmount === '')
+        ? 0 : parseFloat(refundAmount);
+    if (refundAmtNum < 0 || !Number.isFinite(refundAmtNum)) {
+        return res.status(400).json({ error: 'refundAmount must be a non-negative number' });
+    }
+    if (refundAmtNum > 0 && !['free_credits', 'real_balance', 'split_as_paid'].includes(refundBucket)) {
+        return res.status(400).json({ error: 'refundBucket must be free_credits, real_balance, or split_as_paid when refundAmount > 0' });
+    }
+    // Defensive cap to stop a typo costing £10,000.
+    if (refundAmtNum > 500) {
+        return res.status(400).json({ error: 'refundAmount exceeds £500 safety cap. Use the credits page for larger adjustments.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Lock the queue row to prevent two admins double-approving.
+        const qr = await client.query(
+            `SELECT q.id, q.type, q.status, q.game_id, q.subject_player_id,
+                    q.recommend_refund, q.notes,
+                    r.amount_paid AS reg_amount_paid,
+                    r.amount_paid_free AS reg_amount_paid_free
+               FROM admin_action_queue q
+               LEFT JOIN registrations r
+                      ON r.game_id = q.game_id
+                     AND r.player_id = q.subject_player_id
+                     AND r.status = 'confirmed'
+              WHERE q.id = $1
+              FOR UPDATE`,
+            [queueId]
+        );
+        if (qr.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Queue item not found' });
+        }
+        const item = qr.rows[0];
+        if (item.status !== 'pending') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: `Queue item is already ${item.status}` });
+        }
+
+        let realRefunded = 0;
+        let freeRefunded = 0;
+
+        if (refundAmtNum > 0 && refundBucket) {
+            // Lock the credits row before any update.
+            await client.query('SELECT id FROM credits WHERE player_id = $1 FOR UPDATE', [item.subject_player_id]);
+
+            if (refundBucket === 'free_credits') {
+                freeRefunded = refundAmtNum;
+            } else if (refundBucket === 'real_balance') {
+                realRefunded = refundAmtNum;
+            } else if (refundBucket === 'split_as_paid') {
+                // Pro-rata split matching how they paid. If no registration row
+                // (player removed post-completion), fall back to free_credits.
+                const paidReal = parseFloat(item.reg_amount_paid || 0);
+                const paidFree = parseFloat(item.reg_amount_paid_free || 0);
+                const paidTotal = paidReal + paidFree;
+                if (paidTotal > 0) {
+                    realRefunded = +((refundAmtNum * paidReal) / paidTotal).toFixed(2);
+                    freeRefunded = +(refundAmtNum - realRefunded).toFixed(2);
+                } else {
+                    // No paid record → goodwill free credits.
+                    freeRefunded = refundAmtNum;
+                }
+            }
+
+            if (realRefunded > 0) {
+                await client.query(
+                    `UPDATE credits SET balance = balance + $1,
+                            last_updated = CURRENT_TIMESTAMP
+                      WHERE player_id = $2`,
+                    [realRefunded, item.subject_player_id]
+                );
+                await recordCreditTransaction(client, item.subject_player_id, realRefunded, 'refund',
+                    `Injury refund — game ${item.game_id} (queue #${queueId})`);
+            }
+            if (freeRefunded > 0) {
+                await client.query(
+                    `UPDATE credits SET free_credit_balance = free_credit_balance + $1,
+                            last_updated = CURRENT_TIMESTAMP
+                      WHERE player_id = $2`,
+                    [freeRefunded, item.subject_player_id]
+                );
+                await recordCreditTransaction(client, item.subject_player_id, freeRefunded, 'free_credit',
+                    `Injury refund — game ${item.game_id} (queue #${queueId})`);
+            }
+        }
+
+        // Mark the queue row resolved.
+        await client.query(
+            `UPDATE admin_action_queue
+                SET status = 'approved',
+                    resolved_by = $1,
+                    resolved_at = NOW(),
+                    refund_amount = $2,
+                    refund_bucket = $3,
+                    resolution_note = $4
+              WHERE id = $5`,
+            [req.user.playerId,
+             refundAmtNum > 0 ? refundAmtNum : null,
+             refundAmtNum > 0 ? refundBucket : null,
+             resolutionNote,
+             queueId]
+        );
+
+        await client.query('COMMIT');
+
+        // Audit log + email fire post-commit so a transient failure doesn't
+        // leave a half-resolved row.
+        const auditDetail =
+            `Injury queue #${queueId} APPROVED · player ${item.subject_player_id} · ` +
+            (refundAmtNum > 0
+                ? `refund £${refundAmtNum.toFixed(2)} via ${refundBucket} (real £${realRefunded.toFixed(2)} + free £${freeRefunded.toFixed(2)})`
+                : 'no refund') +
+            (resolutionNote ? ` · note: ${resolutionNote.slice(0, 80)}` : '');
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'injury_refund_approved', item.subject_player_id, auditDetail
+        ).catch(() => {}));
+
+        // Send the "Sorry to hear" email if there's a subject player email on file.
+        setImmediate(async () => {
+            try {
+                const er = await pool.query(
+                    `SELECT u.email, COALESCE(p.alias, p.full_name) AS name
+                       FROM players p
+                       JOIN users u ON u.id = p.user_id
+                      WHERE p.id = $1`,
+                    [item.subject_player_id]
+                );
+                const email = er.rows[0]?.email;
+                const name  = er.rows[0]?.name;
+                if (email) {
+                    await _fix277SendApprovalEmail(
+                        email, name,
+                        refundAmtNum > 0 ? refundAmtNum : null,
+                        refundAmtNum > 0 ? refundBucket : null
+                    );
+                }
+            } catch (e) {
+                console.warn('[FIX-277] approval email lookup failed:', e.message);
+            }
+        });
+
+        res.json({
+            ok: true,
+            queueId,
+            refundAmount: refundAmtNum,
+            refundBucket: refundAmtNum > 0 ? refundBucket : null,
+            realRefunded, freeRefunded,
+        });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('POST /api/admin/queue/:id/approve error:', e);
+        res.status(500).json({ error: 'Failed to approve queue item', detail: e.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /api/admin/queue/:id/reject
+// Body: { resolutionNote?: string }
+// Silent rejection — no email, no refund, audit only.
+// ──────────────────────────────────────────────────────────────────────────
+app.post('/api/admin/queue/:id/reject', authenticateToken, requireAdmin, async (req, res) => {
+    const queueId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(queueId) || queueId <= 0) {
+        return res.status(400).json({ error: 'Invalid queue id' });
+    }
+    const resolutionNote = (typeof req.body?.resolutionNote === 'string')
+        ? req.body.resolutionNote.trim().slice(0, 2000) : null;
+
+    try {
+        // Atomic conditional update — only resolves if still pending. No row lock
+        // needed because the WHERE clause does the guard.
+        const r = await pool.query(
+            `UPDATE admin_action_queue
+                SET status = 'rejected',
+                    resolved_by = $1,
+                    resolved_at = NOW(),
+                    resolution_note = $2
+              WHERE id = $3 AND status = 'pending'
+              RETURNING subject_player_id, game_id`,
+            [req.user.playerId, resolutionNote, queueId]
+        );
+        if (r.rows.length === 0) {
+            // Either id is wrong or item already resolved. Probe to give a precise error.
+            const probe = await pool.query('SELECT status FROM admin_action_queue WHERE id = $1', [queueId]);
+            if (probe.rows.length === 0) return res.status(404).json({ error: 'Queue item not found' });
+            return res.status(409).json({ error: `Queue item is already ${probe.rows[0].status}` });
+        }
+        const subjectId = r.rows[0].subject_player_id;
+        const gameId    = r.rows[0].game_id;
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'injury_refund_rejected', subjectId,
+            `Injury queue #${queueId} REJECTED · player ${subjectId} · game ${gameId}` +
+            (resolutionNote ? ` · note: ${resolutionNote.slice(0, 80)}` : '')
+        ).catch(() => {}));
+        res.json({ ok: true, queueId });
+    } catch (e) {
+        console.error('POST /api/admin/queue/:id/reject error:', e);
+        res.status(500).json({ error: 'Failed to reject queue item', detail: e.message });
+    }
+});
+
+// END FIX-277
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-276 — Team Balance Calibration
+// ═══════════════════════════════════════════════════════════════════════════
+// Captures predicted-vs-actual into team_balance_experiments + exposes the
+// analytics endpoints behind the admin dashboard. All 5 endpoints are
+// requireAdmin (admins + superadmin). The recorder is fire-and-forget so
+// completion never blocks on calibration.
+//
+// SKIP RULES (no row inserted):
+//   - team_selection_type IN ('draft_memory','vs_external') — GAFFA's call:
+//     calibration only valid for games WE picked the teams for.
+//   - is_venue_clash games — same logic (teams not ours).
+//   - team_setups row missing or status != 'completed' — no prediction to
+//     compare against.
+//
+// The 2 new penalty terms (team_variance_weight + top_player_pairing_weight)
+// default to 0. No live template uses them yet. They activate per-template
+// when an admin sets a non-zero override via the existing template editor.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Helpers used by EDIT 3 (inline scoring) ────────────────────────────────
+// Population variance of a numeric array. Returns 0 for empty/single-element.
+function _fix276PopVariance(arr) {
+    if (!Array.isArray(arr) || arr.length < 2) return 0;
+    let sum = 0;
+    for (const v of arr) sum += v;
+    const mean = sum / arr.length;
+    let sq = 0;
+    for (const v of arr) { const d = v - mean; sq += d * d; }
+    return sq / arr.length;
+}
+// Max OVR within a team array. Returns 0 if team is empty.
+function _fix276MaxOvr(team) {
+    if (!Array.isArray(team) || team.length === 0) return 0;
+    let mx = 0;
+    for (const p of team) {
+        const o = Number(p && p.overall_rating) || 0;
+        if (o > mx) mx = o;
+    }
+    return mx;
+}
+
+// ── Recorder ──────────────────────────────────────────────────────────────
+// Called from BOTH game-completion paths AFTER COMMIT. Looks up the
+// confirmed team_setups row, computes predicted stats from the composition,
+// and inserts one experiment row. Idempotent via UNIQUE(game_id): if a row
+// already exists, the INSERT no-ops (ON CONFLICT DO NOTHING).
+async function _fix276InsertExperiment(gameId) {
+    try {
+        // 1) Game basics + skip rules.
+        const gRes = await pool.query(`
+            SELECT g.id, g.team_selection_type, g.is_venue_clash,
+                   g.winning_team, g.team_balance_score, g.admin_marked_unfair,
+                   g.format,
+                   v.region AS venue_region
+              FROM games g
+              LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE g.id = $1`, [gameId]);
+        const game = gRes.rows[0];
+        if (!game) return { skipped: 'game_not_found' };
+        const tst = (game.team_selection_type || '').toLowerCase();
+        if (tst === 'draft_memory' || tst === 'vs_external') {
+            return { skipped: 'team_selection_type=' + tst };
+        }
+        if (game.is_venue_clash) return { skipped: 'venue_clash' };
+
+        // 2) Find the active completed team_setups row for this game.
+        // FIX-280: also pull admin_fine_tuned so we can distinguish pure
+        // algorithm output from admin-edited compositions on the dashboard.
+        const tsRes = await pool.query(`
+            SELECT id, team_composition, algorithm_score,
+                   COALESCE(admin_fine_tuned, false) AS admin_fine_tuned
+              FROM team_setups
+             WHERE game_id = $1 AND status = 'completed'
+             ORDER BY id DESC LIMIT 1`, [gameId]);
+        if (!tsRes.rows.length) return { skipped: 'no_completed_team_setup' };
+        const ts = tsRes.rows[0];
+        const comp = ts.team_composition || {};
+        // team_composition is { red: [<id>, <id>, ...], blue: [<id>, ...] } where
+        // each entry is a STRING — either a UUID (real player) or 'guest_<n>'
+        // (guest stub). Older code may also write objects with .player_id, so
+        // we handle both forms. Guests are filtered out (no OVR data).
+        const extractIds = (arr) => (Array.isArray(arr) ? arr : [])
+            .map(x => {
+                if (typeof x === 'string') return x;
+                if (x && typeof x === 'object') return x.player_id || x.id || null;
+                return null;
+            })
+            .filter(id => typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id));
+        const redIds  = extractIds(comp.red);
+        const blueIds = extractIds(comp.blue);
+        if (redIds.length === 0 && blueIds.length === 0) {
+            return { skipped: 'no_uuid_players_in_composition' };
+        }
+
+        // 3) Look up OVR for every player in the composition (single query).
+        const allIds = [...redIds, ...blueIds];
+        const ovrRes = await pool.query(
+            `SELECT id, COALESCE(overall_rating, 0) AS ovr FROM players WHERE id = ANY($1::uuid[])`,
+            [allIds]
+        );
+        const ovrMap = new Map(ovrRes.rows.map(r => [r.id, parseFloat(r.ovr)]));
+        const redOvrs  = redIds.map(id => ovrMap.get(id) || 0);
+        const blueOvrs = blueIds.map(id => ovrMap.get(id) || 0);
+        const sum = (arr) => arr.reduce((a, b) => a + b, 0);
+        const max = (arr) => arr.length ? Math.max(...arr) : 0;
+        const variance = (arr) => {
+            if (arr.length < 2) return 0;
+            const m = sum(arr) / arr.length;
+            return arr.reduce((a, x) => a + (x - m) * (x - m), 0) / arr.length;
+        };
+        const redSum  = sum(redOvrs),  blueSum  = sum(blueOvrs);
+        const redVar  = variance(redOvrs), blueVar = variance(blueOvrs);
+        const redTop  = max(redOvrs),  blueTop  = max(blueOvrs);
+        const predictedGap = redSum - blueSum; // signed: +ve = red expected stronger
+
+        // 4) Derived: prediction_error + direction_correct.
+        // The slider is -3..+3; predicted_gap is on the OVR scale (typically
+        // 0..30). Normalise both to a comparable signed scale via mapping:
+        //   - predictedGap → /10 (so 30 OVR → 3 slider points)
+        // This is a rough mapping; the dashboard can override it. We store
+        // a single normalised error for quick filtering.
+        // games.team_balance_score is the canonical column. (There is no
+        // games.balance_score — earlier draft of this helper had a defensive
+        // fallback that was always undefined.) NULL when admin set no slider.
+        const balScore = (game.team_balance_score == null) ? null : game.team_balance_score;
+        let predictionError = null, directionCorrect = null;
+        if (balScore !== null && balScore !== undefined) {
+            const normPred = predictedGap / 10.0; // OVR-points → slider-units
+            predictionError = +(Math.abs(normPred - balScore)).toFixed(2);
+            // direction_correct: same sign, or both essentially zero (|x|<0.5)
+            const sgn = (v) => (Math.abs(v) < 0.5 ? 0 : (v > 0 ? 1 : -1));
+            directionCorrect = (sgn(normPred) === sgn(balScore));
+        }
+
+        // 5) INSERT. ON CONFLICT DO NOTHING so re-runs are safe (e.g. if the
+        // post-commit hook fires twice via some retry).
+        await pool.query(`
+            INSERT INTO team_balance_experiments (
+                game_id, team_setup_id, team_selection_type, region, format,
+                red_player_ids, blue_player_ids,
+                predicted_gap, red_ovr_sum, blue_ovr_sum,
+                red_ovr_variance, blue_ovr_variance,
+                red_top_ovr, blue_top_ovr,
+                algorithm_score,
+                winning_team, balance_score, admin_marked_unfair,
+                prediction_error, direction_correct,
+                admin_fine_tuned
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6::jsonb, $7::jsonb,
+                $8, $9, $10,
+                $11, $12,
+                $13, $14,
+                $15,
+                $16, $17, $18,
+                $19, $20,
+                $21
+            )
+            ON CONFLICT (game_id) DO NOTHING
+        `, [
+            gameId, ts.id, tst, game.venue_region, game.format,
+            JSON.stringify(redIds), JSON.stringify(blueIds),
+            predictedGap, redSum, blueSum,
+            redVar, blueVar,
+            redTop, blueTop,
+            ts.algorithm_score,
+            game.winning_team, balScore, !!game.admin_marked_unfair,
+            predictionError, directionCorrect,
+            // FIX-280: admin_fine_tuned passthrough from team_setups.
+            !!ts.admin_fine_tuned,
+        ]);
+
+        // Audit (system actor).
+        setImmediate(() => auditLog(pool, null,
+            'calibration_experiment_recorded', gameId,
+            `predicted_gap=${predictedGap.toFixed(2)} balance=${balScore ?? 'null'} ` +
+            `error=${predictionError ?? 'null'} dir_correct=${directionCorrect ?? 'null'}`
+        ).catch(() => {}));
+
+        return { ok: true, predicted_gap: predictedGap, prediction_error: predictionError };
+    } catch (e) {
+        // Non-fatal — completion already succeeded. Log + move on.
+        console.warn('[FIX-276] _fix276InsertExperiment failed (non-fatal):', e.message);
+        return { error: e.message };
+    }
+}
+
+// ── /api/admin/calibration/summary ─────────────────────────────────────────
+// Top-of-dashboard health card. Aggregates across the last 90 days by
+// default; ?days=N overrides. Excludes admin_marked_unfair when ?excludeUnfair=1.
+app.get('/api/admin/calibration/summary', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 90));
+        const excludeUnfair = req.query.excludeUnfair === '1' || req.query.excludeUnfair === 'true';
+        // FIX-280: ?onlyPure=1 narrows the headline metrics to games where
+        // the admin DIDN'T edit the algorithm's chosen teams. This is the
+        // right filter for "is the algorithm any good?" questions.
+        // Default off — backward compatible: existing dashboard fetches
+        // that don't pass this param keep current behaviour.
+        const onlyPure = req.query.onlyPure === '1' || req.query.onlyPure === 'true';
+        const r = await pool.query(`
+            SELECT
+                COUNT(*)                                        AS sample_size,
+                COUNT(*) FILTER (WHERE direction_correct = true) AS direction_hits,
+                COUNT(*) FILTER (WHERE balance_score IS NOT NULL) AS scored_games,
+                COUNT(*) FILTER (WHERE admin_fine_tuned = true)   AS tuned_count,
+                AVG(prediction_error) FILTER (WHERE prediction_error IS NOT NULL) AS avg_error,
+                AVG(ABS(balance_score)) FILTER (WHERE balance_score IS NOT NULL) AS avg_abs_slider,
+                AVG(ABS(predicted_gap)) FILTER (WHERE predicted_gap IS NOT NULL) AS avg_abs_predicted_gap
+              FROM team_balance_experiments
+             WHERE completed_at >= NOW() - ($1::int || ' days')::interval
+               AND ($2::boolean = false OR admin_marked_unfair = false)
+               AND ($3::boolean = false OR admin_fine_tuned = false)
+        `, [days, excludeUnfair, onlyPure]);
+        const row = r.rows[0] || {};
+        const sample = parseInt(row.sample_size || 0, 10);
+        const scored = parseInt(row.scored_games || 0, 10);
+        const hits   = parseInt(row.direction_hits || 0, 10);
+        const tuned  = parseInt(row.tuned_count || 0, 10);
+        res.json({
+            days, exclude_unfair: excludeUnfair, only_pure: onlyPure,
+            sample_size:           sample,
+            scored_games:          scored,
+            direction_hits:        hits,
+            direction_hit_rate:    scored > 0 ? (hits / scored) : null,
+            tuned_count:           tuned,
+            tuned_share:           sample > 0 ? (tuned / sample) : null,
+            avg_prediction_error:  row.avg_error == null ? null : parseFloat(row.avg_error),
+            avg_abs_slider:        row.avg_abs_slider == null ? null : parseFloat(row.avg_abs_slider),
+            avg_abs_predicted_gap: row.avg_abs_predicted_gap == null ? null : parseFloat(row.avg_abs_predicted_gap),
+        });
+    } catch (e) {
+        console.error('GET /api/admin/calibration/summary error:', e);
+        res.status(500).json({ error: 'Failed to load calibration summary', detail: e.message });
+    }
+});
+
+// ── /api/admin/calibration/experiments ─────────────────────────────────────
+// Paged experiment rows for the dashboard feed. Most recent first.
+app.get('/api/admin/calibration/experiments', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days  = Math.min(365, Math.max(1, parseInt(req.query.days,  10) || 90));
+        const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 50));
+        const r = await pool.query(`
+            SELECT tbe.id, tbe.game_id, tbe.completed_at,
+                   tbe.team_selection_type, tbe.region, tbe.format,
+                   tbe.predicted_gap, tbe.red_ovr_sum, tbe.blue_ovr_sum,
+                   tbe.red_ovr_variance, tbe.blue_ovr_variance,
+                   tbe.red_top_ovr, tbe.blue_top_ovr,
+                   tbe.algorithm_score,
+                   tbe.winning_team, tbe.balance_score, tbe.admin_marked_unfair,
+                   tbe.prediction_error, tbe.direction_correct,
+                   tbe.admin_fine_tuned,
+                   v.name AS venue_name
+              FROM team_balance_experiments tbe
+              LEFT JOIN games g ON g.id = tbe.game_id
+              LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE tbe.completed_at >= NOW() - ($1::int || ' days')::interval
+             ORDER BY tbe.completed_at DESC
+             LIMIT $2
+        `, [days, limit]);
+        res.json({ days, count: r.rows.length, experiments: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/calibration/experiments error:', e);
+        res.status(500).json({ error: 'Failed to load experiments', detail: e.message });
+    }
+});
+
+// ── /api/admin/calibration/ovr-rung-spacing ────────────────────────────────
+// "Is the 14→15 gap the same as 12→13?" — bins games by the team-sum gap
+// (in OVR-points), reports avg actual |balance_score| per bin. If rungs are
+// evenly spaced, the avg slider value should grow linearly with bin.
+app.get('/api/admin/calibration/ovr-rung-spacing', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 180));
+        // Bins: 0-2, 2-4, 4-6, 6-8, 8-12, 12-20, 20+ OVR points of total-sum gap.
+        const r = await pool.query(`
+            WITH binned AS (
+                SELECT
+                    CASE
+                        WHEN ABS(predicted_gap) <  2  THEN '0-2'
+                        WHEN ABS(predicted_gap) <  4  THEN '2-4'
+                        WHEN ABS(predicted_gap) <  6  THEN '4-6'
+                        WHEN ABS(predicted_gap) <  8  THEN '6-8'
+                        WHEN ABS(predicted_gap) < 12  THEN '8-12'
+                        WHEN ABS(predicted_gap) < 20  THEN '12-20'
+                        ELSE '20+'
+                    END AS bin,
+                    ABS(balance_score)::numeric AS abs_slider,
+                    balance_score
+                  FROM team_balance_experiments
+                 WHERE completed_at >= NOW() - ($1::int || ' days')::interval
+                   AND balance_score IS NOT NULL
+                   AND admin_marked_unfair = false
+            )
+            SELECT bin,
+                   COUNT(*)            AS sample,
+                   AVG(abs_slider)     AS avg_abs_slider,
+                   STDDEV_POP(abs_slider) AS stddev_abs_slider
+              FROM binned
+             GROUP BY bin
+             ORDER BY
+                CASE bin
+                    WHEN '0-2' THEN 1 WHEN '2-4' THEN 2 WHEN '4-6' THEN 3
+                    WHEN '6-8' THEN 4 WHEN '8-12' THEN 5 WHEN '12-20' THEN 6
+                    WHEN '20+' THEN 7 END
+        `, [days]);
+        res.json({ days, bins: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/calibration/ovr-rung-spacing error:', e);
+        res.status(500).json({ error: 'Failed to load rung spacing', detail: e.message });
+    }
+});
+
+// ── /api/admin/calibration/variance-vs-even ────────────────────────────────
+// "Do 86+86 teams outperform 90+82 of same sum?" — for games where teams
+// had similar total OVR (|predicted_gap| < 3), bin by variance-difference
+// magnitude and report avg outcome.
+app.get('/api/admin/calibration/variance-vs-even', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 180));
+        const r = await pool.query(`
+            WITH balanced_only AS (
+                SELECT
+                    ABS(red_ovr_variance - blue_ovr_variance) AS variance_diff,
+                    ABS(balance_score)::numeric AS abs_slider
+                  FROM team_balance_experiments
+                 WHERE completed_at >= NOW() - ($1::int || ' days')::interval
+                   AND balance_score IS NOT NULL
+                   AND ABS(predicted_gap) < 3      -- only games we predicted balanced
+                   AND admin_marked_unfair = false
+            ),
+            binned AS (
+                SELECT
+                    CASE
+                        WHEN variance_diff <  4  THEN 'even (<4)'
+                        WHEN variance_diff <  9  THEN 'mild (4-9)'
+                        WHEN variance_diff < 16  THEN 'noticeable (9-16)'
+                        ELSE                          'severe (16+)'
+                    END AS variance_bin,
+                    abs_slider
+                  FROM balanced_only
+            )
+            SELECT variance_bin,
+                   COUNT(*) AS sample,
+                   AVG(abs_slider) AS avg_abs_slider
+              FROM binned
+             GROUP BY variance_bin
+             ORDER BY
+                CASE variance_bin
+                    WHEN 'even (<4)' THEN 1 WHEN 'mild (4-9)' THEN 2
+                    WHEN 'noticeable (9-16)' THEN 3 WHEN 'severe (16+)' THEN 4 END
+        `, [days]);
+        res.json({ days, bins: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/calibration/variance-vs-even error:', e);
+        res.status(500).json({ error: 'Failed to load variance analysis', detail: e.message });
+    }
+});
+
+// ── /api/admin/calibration/backfill ────────────────────────────────────────
+// One-shot: pulls every completed system-generated game that doesn't yet
+// have an experiment row and inserts one. Idempotent via the recorder's
+// ON CONFLICT DO NOTHING. Body: { limit?: int (default 500, cap 5000) }.
+app.post('/api/admin/calibration/backfill', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const limit = Math.min(5000, Math.max(1, parseInt(req.body?.limit, 10) || 500));
+        // Find candidates: completed games not yet in experiments, not skipped types.
+        const r = await pool.query(`
+            SELECT g.id
+              FROM games g
+             WHERE g.game_status = 'completed'
+               AND COALESCE(LOWER(g.team_selection_type), '') NOT IN ('draft_memory','vs_external')
+               AND COALESCE(g.is_venue_clash, false) = false
+               AND NOT EXISTS (SELECT 1 FROM team_balance_experiments tbe WHERE tbe.game_id = g.id)
+               AND EXISTS (SELECT 1 FROM team_setups ts WHERE ts.game_id = g.id AND ts.status = 'completed')
+             ORDER BY g.game_date DESC
+             LIMIT $1
+        `, [limit]);
+        let processed = 0, inserted = 0, skipped = 0, failed = 0;
+        for (const row of r.rows) {
+            processed++;
+            try {
+                const out = await _fix276InsertExperiment(row.id);
+                if (out && out.ok) inserted++;
+                else if (out && out.skipped) skipped++;
+                else if (out && out.error) failed++;
+                else skipped++;
+            } catch (e) {
+                failed++;
+            }
+        }
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'calibration_backfill_run', null,
+            `candidates=${r.rows.length} inserted=${inserted} skipped=${skipped} failed=${failed} limit=${limit}`
+        ).catch(() => {}));
+        res.json({ ok: true, candidates: r.rows.length, processed, inserted, skipped, failed });
+    } catch (e) {
+        console.error('POST /api/admin/calibration/backfill error:', e);
+        res.status(500).json({ error: 'Backfill failed', detail: e.message });
+    }
+});
+
+// ── /api/admin/series/:id/experiment-mode (toggle) ─────────────────────────
+// Body: { enabled: boolean }. Flips the experiment_mode flag on a series.
+// ROTATION ENFORCEMENT IS NOT YET WIRED — the flag is durably stored so the
+// dashboard can read it and the toggle UI is functional, but the generate-
+// teams algorithm doesn't yet vary compositions based on it. That's the
+// deferred layer-4 work; ship the flag now so the schema is stable.
+app.put('/api/admin/series/:id/experiment-mode', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const seriesId = req.params.id;
+        const enabled = !!req.body?.enabled;
+        const r = await pool.query(
+            `UPDATE game_series SET experiment_mode = $1 WHERE id = $2
+             RETURNING id, series_name, experiment_mode`,
+            [enabled, seriesId]
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Series not found' });
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'calibration_experiment_mode_toggled', seriesId,
+            `Series "${r.rows[0].series_name}" experiment_mode ${enabled ? 'ENABLED' : 'DISABLED'}`
+        ).catch(() => {}));
+        res.json({ ok: true, series: r.rows[0] });
+    } catch (e) {
+        console.error('PUT /api/admin/series/:id/experiment-mode error:', e);
+        res.status(500).json({ error: 'Failed to toggle experiment mode', detail: e.message });
+    }
+});
+
+// END FIX-276
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-281 — Fine-tune Intent Inference
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A: capture every admin fine-tune as a structured diff into
+// fine_tune_edits. Computes overall_gap + def_gap before and after using
+// current player OVR/defending lookups. Fires post-commit (setImmediate)
+// so completion of the underlying endpoint isn't blocked.
+//
+// Phase B / C / D layer on top: pattern detection engine, player-facing
+// suggestions, and admin metrics on the calibration tab respectively.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Extract player IDs from a team_composition array. Same shape-tolerance
+// rules as _fix276InsertExperiment — accepts strings ('uuid' or 'guest_X')
+// and objects ({player_id} or {id}). Returns only valid UUIDs (filters guests).
+function _fix281ExtractIds(arr) {
+    if (!Array.isArray(arr)) return [];
+    return arr.map(x => {
+        if (typeof x === 'string') return x;
+        if (x && typeof x === 'object') return x.player_id || x.id || null;
+        return null;
+    }).filter(id => typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id));
+}
+
+// Compute overall_gap + def_gap for a given (red, blue) composition,
+// looking up players' overall_rating + defending columns. Returns
+// { overall_gap, def_gap, red_sum_ovr, blue_sum_ovr, red_sum_def, blue_sum_def }
+// or null on lookup failure. Both gaps are ABSOLUTE (non-negative) — that's
+// how computeDissatisfaction uses them.
+async function _fix281ComputeScoreSnapshot(redIds, blueIds) {
+    try {
+        const allIds = [...redIds, ...blueIds];
+        if (allIds.length === 0) return null;
+        const r = await pool.query(`
+            SELECT id, COALESCE(overall_rating, 0) AS ovr, COALESCE(defending_rating, 0) AS def
+              FROM players WHERE id = ANY($1::uuid[])
+        `, [allIds]);
+        const stats = new Map(r.rows.map(row => [row.id, {
+            ovr: parseFloat(row.ovr) || 0,
+            def: parseFloat(row.def) || 0,
+        }]));
+        const sumOvr = (ids) => ids.reduce((s, id) => s + ((stats.get(id) || {}).ovr || 0), 0);
+        const sumDef = (ids) => ids.reduce((s, id) => s + ((stats.get(id) || {}).def || 0), 0);
+        const redOvr = sumOvr(redIds), blueOvr = sumOvr(blueIds);
+        const redDef = sumDef(redIds), blueDef = sumDef(blueIds);
+        return {
+            overall_gap:  Math.abs(redOvr - blueOvr),
+            def_gap:      Math.abs(redDef - blueDef),
+            red_sum_ovr:  redOvr,
+            blue_sum_ovr: blueOvr,
+            red_sum_def:  redDef,
+            blue_sum_def: blueDef,
+        };
+    } catch (e) {
+        console.warn('[FIX-281] _fix281ComputeScoreSnapshot failed:', e.message);
+        return null;
+    }
+}
+
+// Compute swap diff between two compositions. Returns an array of
+// { player_id, from, to } entries — one per player whose team changed.
+// Players present in only one composition are ignored (player added/removed
+// is a registration change, not a swap).
+function _fix281ComputeSwaps(beforeRed, beforeBlue, afterRed, afterBlue) {
+    const teamBefore = new Map();
+    for (const id of beforeRed)  teamBefore.set(id, 'red');
+    for (const id of beforeBlue) teamBefore.set(id, 'blue');
+    const teamAfter = new Map();
+    for (const id of afterRed)   teamAfter.set(id, 'red');
+    for (const id of afterBlue)  teamAfter.set(id, 'blue');
+    const swaps = [];
+    for (const [id, after] of teamAfter) {
+        const before = teamBefore.get(id);
+        if (!before) continue;        // newly added — not a swap
+        if (before === after) continue; // didn't move
+        swaps.push({ player_id: id, from: before, to: after });
+    }
+    return swaps;
+}
+
+// Insert one fine_tune_edits row. Fire-and-forget — caller wraps in
+// setImmediate so the endpoint's response isn't blocked. Non-fatal on any
+// failure (DB hiccup, missing table pre-migration, etc.).
+async function _fix281InsertFineTuneEdit(payload) {
+    try {
+        const before = payload.compositionBefore || { red: [], blue: [] };
+        const after  = payload.compositionAfter  || { red: [], blue: [] };
+
+        const beforeRed  = _fix281ExtractIds(before.red);
+        const beforeBlue = _fix281ExtractIds(before.blue);
+        const afterRed   = _fix281ExtractIds(after.red);
+        const afterBlue  = _fix281ExtractIds(after.blue);
+
+        const swaps = _fix281ComputeSwaps(beforeRed, beforeBlue, afterRed, afterBlue);
+        const positionalChanges = Array.isArray(payload.positionalChanges)
+            ? payload.positionalChanges : [];
+
+        // Skip writing if nothing actually changed. Defensive — guards against
+        // accidental re-fires of the helper on no-op edits.
+        if (swaps.length === 0 && positionalChanges.length === 0) {
+            return { skipped: 'no_changes' };
+        }
+
+        // Score snapshots — best-effort. NULL stored if computation fails.
+        const snapBefore = await _fix281ComputeScoreSnapshot(beforeRed, beforeBlue);
+        const snapAfter  = await _fix281ComputeScoreSnapshot(afterRed, afterBlue);
+
+        const overallBefore = snapBefore ? snapBefore.overall_gap : null;
+        const overallAfter  = snapAfter  ? snapAfter.overall_gap  : null;
+        const defBefore     = snapBefore ? snapBefore.def_gap     : null;
+        const defAfter      = snapAfter  ? snapAfter.def_gap      : null;
+        const overallImp    = (overallBefore != null && overallAfter != null)
+            ? (overallAfter < overallBefore) : null;
+        const defImp        = (defBefore != null && defAfter != null)
+            ? (defAfter < defBefore) : null;
+
+        // Edit type detection.
+        let editType = 'both';
+        if (swaps.length > 0 && positionalChanges.length === 0) editType = 'team_swap';
+        else if (swaps.length === 0 && positionalChanges.length > 0) editType = 'positional';
+
+        await pool.query(`
+            INSERT INTO fine_tune_edits (
+                game_id, team_setup_id, admin_player_id, edit_type,
+                composition_before, composition_after,
+                swaps, positional_changes,
+                overall_gap_before, overall_gap_after,
+                def_gap_before, def_gap_after,
+                overall_gap_improved, def_gap_improved
+            ) VALUES (
+                $1, $2, $3, $4,
+                $5::jsonb, $6::jsonb,
+                $7::jsonb, $8::jsonb,
+                $9, $10,
+                $11, $12,
+                $13, $14
+            )
+        `, [
+            payload.gameId, payload.teamSetupId, payload.adminPlayerId, editType,
+            JSON.stringify(before), JSON.stringify(after),
+            JSON.stringify(swaps), JSON.stringify(positionalChanges),
+            overallBefore, overallAfter,
+            defBefore, defAfter,
+            overallImp, defImp,
+        ]);
+        return { ok: true, swaps: swaps.length, positional: positionalChanges.length };
+    } catch (e) {
+        console.warn('[FIX-281] _fix281InsertFineTuneEdit failed (non-fatal):', e.message);
+        return { error: e.message };
+    }
+}
+
+// END FIX-281 Phase A helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-281 Phase B — pattern detection engine
+// ═══════════════════════════════════════════════════════════════════════════
+// Two pattern sources feed into pair_suggestions:
+//
+//   1. ADMIN_TUNE_PATTERN — player pairs co-occurring in fine_tune_edits
+//      at ≥75% rate across ≥4 games:
+//        - Same-team co-occurrence after tune → BFF suggestion to BOTH
+//        - Opposite-team co-occurrence after tune → RIVAL suggestion to BOTH
+//
+//   2. PLAYER_AVOID_CLICKS — registration_preferences entries where the same
+//      player repeatedly avoid-clicks the same target across ≥4 games at
+//      ≥75% rate → RIVAL suggestion to the clicker only.
+//
+// Excludes pairs that already have a player_bffs/player_rivals row in
+// either direction (don't suggest formalising what's already formal).
+// Uses UPSERT so re-running just refreshes the evidence + timestamp.
+//
+// Threshold knobs: FIX281_MIN_GAMES = 4, FIX281_MIN_RATE = 0.75.
+
+const FIX281_MIN_GAMES = 4;
+const FIX281_MIN_RATE  = 0.75;
+
+// Generate UNORDERED pair key from two UUIDs (lexicographic). So (A,B)
+// and (B,A) hash identically — we count co-occurrences once per game.
+function _fix281PairKey(a, b) {
+    return a < b ? a + '|' + b : b + '|' + a;
+}
+
+// Helper: does this pair already have a formal relationship?
+// Checks player_bffs + player_rivals in BOTH directions.
+async function _fix281HasFormalRelationship(playerA, playerB) {
+    try {
+        const r = await pool.query(`
+            SELECT 1 FROM (
+                SELECT player_id, bff_player_id AS other FROM player_bffs
+                UNION ALL
+                SELECT player_id, rival_player_id AS other FROM player_rivals
+            ) sub
+            WHERE (player_id = $1 AND other = $2)
+               OR (player_id = $2 AND other = $1)
+            LIMIT 1
+        `, [playerA, playerB]);
+        return r.rows.length > 0;
+    } catch (e) {
+        // FIX-281 audit-fix: never throw — engine should keep scanning past
+        // a bad UUID. Returning false means we'll try to insert the
+        // suggestion; if THAT also fails, the per-pair try/catch above
+        // catches it and we move on.
+        console.warn(`[FIX-281] _fix281HasFormalRelationship lookup failed for ${playerA}<->${playerB}: ${e.message}`);
+        return false;
+    }
+}
+
+// Run the suggestion engine. Bounded by ?days (default 90). Returns counts.
+async function _fix281RunSuggestionEngine(days = 90) {
+    const result = {
+        edits_scanned: 0,
+        pairs_evaluated: 0,
+        bff_suggestions_created: 0,
+        bff_suggestions_updated: 0,
+        rival_suggestions_created: 0,
+        rival_suggestions_updated: 0,
+        avoid_suggestions_created: 0,
+        avoid_suggestions_updated: 0,
+        skipped_already_formal: 0,
+    };
+
+    // ── PASS 1: admin tune pattern ───────────────────────────────────
+    // Pull every fine_tune_edit in window. For each, derive the AFTER
+    // composition and tally pair co-occurrences across games.
+    const eRes = await pool.query(`
+        SELECT id, game_id, composition_after
+          FROM fine_tune_edits
+         WHERE created_at >= NOW() - ($1::int || ' days')::interval
+           AND edit_type IN ('team_swap', 'both')
+         ORDER BY created_at DESC
+    `, [days]);
+    result.edits_scanned = eRes.rows.length;
+
+    // pairCoOcc[pairKey] = { same_team_games: Set<gameId>, opp_team_games: Set<gameId> }
+    const pairCoOcc = new Map();
+
+    for (const edit of eRes.rows) {
+        const comp = edit.composition_after || {};
+        const redIds  = _fix281ExtractIds(comp.red);
+        const blueIds = _fix281ExtractIds(comp.blue);
+
+        // Same-team pairs.
+        for (const team of [redIds, blueIds]) {
+            for (let i = 0; i < team.length; i++) {
+                for (let j = i + 1; j < team.length; j++) {
+                    const key = _fix281PairKey(team[i], team[j]);
+                    if (!pairCoOcc.has(key)) {
+                        pairCoOcc.set(key, { same: new Set(), opp: new Set() });
+                    }
+                    pairCoOcc.get(key).same.add(edit.game_id);
+                }
+            }
+        }
+        // Opposite-team pairs.
+        for (const r of redIds) {
+            for (const b of blueIds) {
+                const key = _fix281PairKey(r, b);
+                if (!pairCoOcc.has(key)) {
+                    pairCoOcc.set(key, { same: new Set(), opp: new Set() });
+                }
+                pairCoOcc.get(key).opp.add(edit.game_id);
+            }
+        }
+    }
+
+    // Evaluate each pair: enough games + dominant direction?
+    for (const [key, counts] of pairCoOcc) {
+        result.pairs_evaluated++;
+        const [a, b] = key.split('|');
+        const sameN  = counts.same.size;
+        const oppN   = counts.opp.size;
+        const totalN = sameN + oppN;
+        if (totalN < FIX281_MIN_GAMES) continue;
+
+        const sameRate = sameN / totalN;
+        const oppRate  = oppN  / totalN;
+        let suggestionType = null;
+        let rate = 0;
+        let dominantGames = [];
+        if (sameRate >= FIX281_MIN_RATE) {
+            suggestionType = 'bff';
+            rate = sameRate;
+            dominantGames = Array.from(counts.same);
+        } else if (oppRate >= FIX281_MIN_RATE) {
+            suggestionType = 'rival';
+            rate = oppRate;
+            dominantGames = Array.from(counts.opp);
+        }
+        if (!suggestionType) continue;
+
+        // Skip if formal relationship already exists in either direction.
+        const formal = await _fix281HasFormalRelationship(a, b);
+        if (formal) { result.skipped_already_formal++; continue; }
+
+        // Insert one suggestion per direction (suggest to BOTH players).
+        const evidence = {
+            source: 'admin_tune_pattern',
+            same_team_games: sameN,
+            opposite_team_games: oppN,
+            rate: +rate.toFixed(3),
+            game_ids: dominantGames.slice(0, 10), // cap for storage size
+            generated_at: new Date().toISOString(),
+        };
+
+        for (const direction of [[a, b], [b, a]]) {
+            const [suggTo, subj] = direction;
+            // FIX-281 audit-fix: per-pair try/catch so a deleted/orphaned
+            // player (FK violation on INSERT) doesn't poison subsequent pairs.
+            try {
+                const upR = await pool.query(`
+                    INSERT INTO pair_suggestions
+                        (suggested_to_player_id, subject_player_id, suggestion_type,
+                         source, evidence, status, created_at)
+                    VALUES ($1, $2, $3, 'admin_tune_pattern', $4::jsonb, 'pending', NOW())
+                    ON CONFLICT (suggested_to_player_id, subject_player_id, suggestion_type)
+                    DO UPDATE SET
+                        evidence = EXCLUDED.evidence,
+                        status   = CASE WHEN pair_suggestions.status = 'dismissed'
+                                        THEN pair_suggestions.status
+                                        ELSE 'pending' END,
+                        created_at = CASE WHEN pair_suggestions.status = 'pending'
+                                          THEN pair_suggestions.created_at
+                                          ELSE NOW() END
+                    RETURNING (xmax = 0) AS inserted
+                `, [suggTo, subj, suggestionType, JSON.stringify(evidence)]);
+                const inserted = upR.rows[0]?.inserted;
+                if (suggestionType === 'bff') {
+                    if (inserted) result.bff_suggestions_created++;
+                    else          result.bff_suggestions_updated++;
+                } else {
+                    if (inserted) result.rival_suggestions_created++;
+                    else          result.rival_suggestions_updated++;
+                }
+            } catch (e) {
+                // Skip this direction silently (FK violation, etc.) but
+                // continue scanning. Log for visibility.
+                console.warn(`[FIX-281] pair suggestion insert skipped for ${suggTo}->${subj}: ${e.message}`);
+            }
+        }
+    }
+
+    // ── PASS 2: player avoid-click patterns ──────────────────────────
+    // For each (clicker, target) pair, count distinct games where clicker
+    // avoid-listed target. If ≥4 games and that's ≥75% of the clicker's
+    // recent registrations, suggest formal Rival.
+    const aRes = await pool.query(`
+        WITH clicks AS (
+            SELECT r.player_id AS clicker, rp.target_player_id AS target, r.game_id
+              FROM registration_preferences rp
+              JOIN registrations r ON r.id = rp.registration_id
+             WHERE rp.preference_type = 'avoid'
+               AND r.registered_at >= NOW() - ($1::int || ' days')::interval
+               AND r.player_id IS NOT NULL
+               AND rp.target_player_id IS NOT NULL
+        ),
+        pair_counts AS (
+            SELECT clicker, target, COUNT(DISTINCT game_id) AS click_games
+              FROM clicks
+             GROUP BY clicker, target
+        ),
+        clicker_totals AS (
+            SELECT r.player_id AS clicker, COUNT(DISTINCT r.game_id) AS total_games
+              FROM registrations r
+             WHERE r.registered_at >= NOW() - ($1::int || ' days')::interval
+               AND r.player_id IS NOT NULL
+             GROUP BY r.player_id
+        )
+        SELECT pc.clicker, pc.target, pc.click_games, ct.total_games
+          FROM pair_counts pc
+          JOIN clicker_totals ct ON ct.clicker = pc.clicker
+         WHERE pc.click_games >= $2
+           AND (pc.click_games::float / NULLIF(ct.total_games, 0)) >= $3
+    `, [days, FIX281_MIN_GAMES, FIX281_MIN_RATE]);
+
+    for (const row of aRes.rows) {
+        const clicker = row.clicker;
+        const target  = row.target;
+        if (clicker === target) continue;
+        const rate = row.click_games / row.total_games;
+
+        // Skip formal relationships (in either direction).
+        const formal = await _fix281HasFormalRelationship(clicker, target);
+        if (formal) { result.skipped_already_formal++; continue; }
+
+        const evidence = {
+            source: 'player_avoid_clicks',
+            avoid_games: parseInt(row.click_games, 10),
+            total_games: parseInt(row.total_games, 10),
+            rate: +rate.toFixed(3),
+            generated_at: new Date().toISOString(),
+        };
+
+        // Avoid-click pattern only suggests Rival, only to the clicker.
+        // FIX-281 audit-fix: per-pair try/catch so a bad row doesn't kill the run.
+        try {
+            const upR = await pool.query(`
+                INSERT INTO pair_suggestions
+                    (suggested_to_player_id, subject_player_id, suggestion_type,
+                     source, evidence, status, created_at)
+                VALUES ($1, $2, 'rival', 'player_avoid_clicks', $3::jsonb, 'pending', NOW())
+                ON CONFLICT (suggested_to_player_id, subject_player_id, suggestion_type)
+                DO UPDATE SET
+                    evidence = EXCLUDED.evidence,
+                    status   = CASE WHEN pair_suggestions.status = 'dismissed'
+                                    THEN pair_suggestions.status
+                                    ELSE 'pending' END
+                RETURNING (xmax = 0) AS inserted
+            `, [clicker, target, JSON.stringify(evidence)]);
+            if (upR.rows[0]?.inserted) result.avoid_suggestions_created++;
+            else                       result.avoid_suggestions_updated++;
+        } catch (e) {
+            console.warn(`[FIX-281] avoid-click suggestion insert skipped for ${clicker}->${target}: ${e.message}`);
+        }
+    }
+
+    return result;
+}
+
+// ── /api/admin/fine-tune-intent/run ───────────────────────────────────────
+// Admin trigger to run the suggestion engine. Returns the counts.
+app.post('/api/admin/fine-tune-intent/run', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days = Math.min(365, Math.max(7, parseInt(req.body?.days, 10) || 90));
+        const counts = await _fix281RunSuggestionEngine(days);
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'fine_tune_suggestion_engine_run', null,
+            `days=${days} edits=${counts.edits_scanned} bff_new=${counts.bff_suggestions_created} ` +
+            `rival_new=${counts.rival_suggestions_created} avoid_new=${counts.avoid_suggestions_created} ` +
+            `skipped_formal=${counts.skipped_already_formal}`
+        ).catch(() => {}));
+        res.json({ ok: true, days, counts });
+    } catch (e) {
+        console.error('POST /api/admin/fine-tune-intent/run error:', e);
+        res.status(500).json({ error: 'Engine run failed', detail: e.message });
+    }
+});
+
+// END FIX-281 Phase B
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-281 Phase C — player-facing suggestion endpoints
+// ═══════════════════════════════════════════════════════════════════════════
+// Players see their own pair_suggestions on their profile screen. Each
+// suggestion is one row of "we noticed X — want to formalise as BFF/Rival?".
+// Accept converts to the existing player_bffs/player_rivals relationship.
+// Dismiss silently drops it (status='dismissed' — won't be regenerated
+// until pattern detection sees genuinely new evidence).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET — list pending suggestions for the current player.
+app.get('/api/players/me/pair-suggestions', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.browseOnly) return res.json({ suggestions: [] });
+        const playerId = req.user.playerId;
+        if (!playerId) return res.status(403).json({ error: 'No player profile' });
+        const r = await pool.query(`
+            SELECT ps.id, ps.suggestion_type, ps.source, ps.evidence,
+                   ps.created_at,
+                   ps.subject_player_id,
+                   COALESCE(p.alias, p.full_name) AS subject_name,
+                   p.squad_number              AS subject_squad_number
+              FROM pair_suggestions ps
+              JOIN players p ON p.id = ps.subject_player_id
+             WHERE ps.suggested_to_player_id = $1
+               AND ps.status = 'pending'
+               AND p.is_active = true
+             ORDER BY ps.created_at DESC
+        `, [playerId]);
+        res.json({ suggestions: r.rows });
+    } catch (e) {
+        console.error('GET /api/players/me/pair-suggestions error:', e);
+        res.status(500).json({ error: 'Failed to load suggestions' });
+    }
+});
+
+// POST /:id/accept — convert suggestion to formal BFF/Rival relationship.
+// Reuses the cap + swap logic from /api/player/relationships rather than
+// importing-by-calling (avoids cross-endpoint plumbing). Cap-reached and
+// already-formal cases respond clearly so the UI can message correctly.
+app.post('/api/players/me/pair-suggestions/:id/accept', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        if (req.user.browseOnly) return res.status(403).json({ error: 'Browse-only accounts cannot manage relationships' });
+        const playerId = req.user.playerId;
+        if (!playerId) return res.status(403).json({ error: 'No player profile' });
+        const suggestionId = parseInt(req.params.id, 10);
+        if (!Number.isInteger(suggestionId) || suggestionId <= 0) {
+            return res.status(400).json({ error: 'Invalid suggestion id' });
+        }
+
+        await client.query('BEGIN');
+
+        // Load + lock the suggestion row.
+        const sR = await client.query(
+            `SELECT id, suggested_to_player_id, subject_player_id, suggestion_type, status
+               FROM pair_suggestions WHERE id = $1 FOR UPDATE`,
+            [suggestionId]
+        );
+        if (sR.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Suggestion not found' });
+        }
+        const sugg = sR.rows[0];
+        if (sugg.suggested_to_player_id !== playerId) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'Not your suggestion' });
+        }
+        if (sugg.status !== 'pending') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Suggestion already resolved', status: sugg.status });
+        }
+
+        const type      = sugg.suggestion_type; // 'bff' | 'rival'
+        const targetId  = sugg.subject_player_id;
+        const targetTable    = type === 'bff' ? 'player_bffs'   : 'player_rivals';
+        const targetCol      = type === 'bff' ? 'bff_player_id' : 'rival_player_id';
+        const oppositeTable  = type === 'bff' ? 'player_rivals' : 'player_bffs';
+        const oppositeCol    = type === 'bff' ? 'rival_player_id' : 'bff_player_id';
+        const cap            = type === 'bff' ? BFF_MAX : RIVAL_MAX;
+
+        // Validate target still active.
+        const tR = await client.query(
+            'SELECT id FROM players WHERE id = $1 AND is_active = TRUE',
+            [targetId]
+        );
+        if (tR.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Target player no longer active' });
+        }
+
+        // If already on the SAME list, just mark suggestion accepted.
+        const already = await client.query(
+            `SELECT id FROM ${targetTable} WHERE player_id = $1 AND ${targetCol} = $2`,
+            [playerId, targetId]
+        );
+        if (already.rows.length > 0) {
+            await client.query(
+                `UPDATE pair_suggestions SET status = 'accepted', resolved_at = NOW() WHERE id = $1`,
+                [suggestionId]
+            );
+            await client.query('COMMIT');
+            return res.json({ ok: true, already: true, type });
+        }
+
+        // Cap check on target list.
+        const cnt = await client.query(
+            `SELECT COUNT(*)::int AS n FROM ${targetTable} WHERE player_id = $1`,
+            [playerId]
+        );
+        if (cnt.rows[0].n >= cap) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                error: `Cap reached — max ${cap} ${type === 'bff' ? 'BFFs' : 'Rivals'}`,
+                cap, current: cnt.rows[0].n,
+            });
+        }
+
+        // If on the OPPOSITE list, remove that row first (swap semantics
+        // matching /api/player/relationships).
+        const oppRem = await client.query(
+            `DELETE FROM ${oppositeTable} WHERE player_id = $1 AND ${oppositeCol} = $2 RETURNING id`,
+            [playerId, targetId]
+        );
+        const isSwap = oppRem.rows.length > 0;
+
+        // Insert into the target list.
+        await client.query(
+            `INSERT INTO ${targetTable} (player_id, ${targetCol}, created_at)
+             VALUES ($1, $2, NOW())`,
+            [playerId, targetId]
+        );
+
+        // FIX-281 audit-fix: materialise auto rows in upcoming eligible games.
+        // Mirrors the logic in POST /api/player/relationships — without this
+        // step, accepting a suggestion would leave the BFF/Rival inert until
+        // the player manually edited their next game registration's prefs.
+        const autoSource   = type === 'bff' ? 'auto_bff' : 'auto_rival';
+        const autoPrefType = type === 'bff' ? 'pair'     : 'avoid';
+
+        // Direction A: this player's upcoming registrations → target as pref.
+        await client.query(
+            `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type, source)
+             SELECT r1.id, $1, $2, $3
+             FROM registrations r1
+             JOIN games g ON g.id = r1.game_id
+             JOIN registrations r2 ON r2.game_id = g.id
+                                   AND r2.player_id = $1
+                                   AND r2.status = 'confirmed'
+             WHERE r1.player_id = $4
+               AND r1.status = 'confirmed'
+               AND g.game_date > NOW()
+               AND g.team_selection_type NOT IN ('draft_memory', 'vs_external')
+               AND g.is_venue_clash IS NOT TRUE
+               AND g.venue_clash_team1_name IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM registration_preferences rp
+                   WHERE rp.registration_id = r1.id AND rp.target_player_id = $1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM registration_preference_overrides rpo
+                   WHERE rpo.registration_id = r1.id AND rpo.target_player_id = $1
+               )
+               AND (
+                   SELECT COUNT(*) FROM registration_preferences WHERE registration_id = r1.id
+               ) < 6`,
+            [targetId, autoPrefType, autoSource, playerId]
+        );
+
+        // Direction B: target's upcoming registrations → this player as pref.
+        // Only fires if MUTUAL (target also has me on their list of same type).
+        await client.query(
+            `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type, source)
+             SELECT r1.id, $1, $2, $3
+             FROM ${targetTable} pr
+             JOIN registrations r1 ON r1.player_id = pr.player_id AND r1.status = 'confirmed'
+             JOIN games g ON g.id = r1.game_id
+             JOIN registrations r2 ON r2.game_id = g.id
+                                   AND r2.player_id = $1
+                                   AND r2.status = 'confirmed'
+             WHERE pr.player_id = $4
+               AND pr.${targetCol} = $1
+               AND g.game_date > NOW()
+               AND g.team_selection_type NOT IN ('draft_memory', 'vs_external')
+               AND g.is_venue_clash IS NOT TRUE
+               AND g.venue_clash_team1_name IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM registration_preferences rp
+                   WHERE rp.registration_id = r1.id AND rp.target_player_id = $1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM registration_preference_overrides rpo
+                   WHERE rpo.registration_id = r1.id AND rpo.target_player_id = $1
+               )
+               AND (
+                   SELECT COUNT(*) FROM registration_preferences WHERE registration_id = r1.id
+               ) < 6`,
+            [playerId, autoPrefType, autoSource, targetId]
+        );
+
+        // Mark suggestion accepted.
+        await client.query(
+            `UPDATE pair_suggestions SET status = 'accepted', resolved_at = NOW() WHERE id = $1`,
+            [suggestionId]
+        );
+
+        await client.query('COMMIT');
+
+        // Audit (player as actor — use the same audit tags the existing
+        // POST /api/player/relationships endpoint uses).
+        const auditAction = isSwap ? 'relationship_swapped' : 'relationship_added';
+        setImmediate(() => auditLog(pool, playerId,
+            auditAction, targetId,
+            `type=${type}${isSwap ? ' (swapped from opposite list)' : ''} via_suggestion_id=${suggestionId}`
+        ).catch(() => {}));
+        // FIX-281 audit-fix: also emit a calibration-categorised event so the
+        // dashboard's suggestion-acceptance metrics + audit chip work.
+        setImmediate(() => auditLog(pool, playerId,
+            'pair_suggestion_accepted', targetId,
+            `suggestion_id=${suggestionId} type=${type}`
+        ).catch(() => {}));
+
+        res.json({ ok: true, type, target_player_id: targetId, swapped: isSwap });
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        console.error('POST /api/players/me/pair-suggestions/:id/accept error:', e);
+        res.status(500).json({ error: 'Failed to accept suggestion' });
+    } finally {
+        client.release();
+    }
+});
+
+// POST /:id/dismiss — silent dismissal.
+app.post('/api/players/me/pair-suggestions/:id/dismiss', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.browseOnly) return res.status(403).json({ error: 'Browse-only accounts cannot dismiss suggestions' });
+        const playerId = req.user.playerId;
+        if (!playerId) return res.status(403).json({ error: 'No player profile' });
+        const suggestionId = parseInt(req.params.id, 10);
+        if (!Number.isInteger(suggestionId) || suggestionId <= 0) {
+            return res.status(400).json({ error: 'Invalid suggestion id' });
+        }
+        const r = await pool.query(`
+            UPDATE pair_suggestions
+               SET status = 'dismissed', resolved_at = NOW()
+             WHERE id = $1
+               AND suggested_to_player_id = $2
+               AND status = 'pending'
+             RETURNING id
+        `, [suggestionId, playerId]);
+        if (r.rows.length === 0) {
+            return res.status(404).json({ error: 'Suggestion not found or already resolved' });
+        }
+        // FIX-281 audit-fix: log the dismissal so it shows on the audit page
+        // under the calibration sub. r.rows[0] is the dismissed row's id but
+        // we want the subject player as target for the audit row.
+        setImmediate(() => auditLog(pool, playerId,
+            'pair_suggestion_dismissed', null,
+            `suggestion_id=${suggestionId}`
+        ).catch(() => {}));
+        res.json({ ok: true, id: suggestionId });
+    } catch (e) {
+        console.error('POST /api/players/me/pair-suggestions/:id/dismiss error:', e);
+        res.status(500).json({ error: 'Failed to dismiss suggestion' });
+    }
+});
+
+// END FIX-281 Phase C
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-281 Phase D — admin summary endpoint for calibration dashboard
+// ═══════════════════════════════════════════════════════════════════════════
+// Surfaces aggregate metrics:
+//   - Edit volume + improvement rates (Δoverall_gap, Δdef_gap)
+//   - Pending / accepted / dismissed suggestion counts
+//   - Top 10 pending suggestions across all players (anonymised counts only)
+// ═══════════════════════════════════════════════════════════════════════════
+
+app.get('/api/admin/fine-tune-intent/summary', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 90));
+
+        // Edit metrics.
+        const eRes = await pool.query(`
+            SELECT
+                COUNT(*)                                                      AS edit_count,
+                COUNT(*) FILTER (WHERE overall_gap_improved = true)           AS overall_improved,
+                COUNT(*) FILTER (WHERE def_gap_improved = true)               AS def_improved,
+                COUNT(*) FILTER (WHERE overall_gap_improved = true AND def_gap_improved = true)
+                                                                              AS both_improved,
+                AVG(overall_gap_after - overall_gap_before)
+                    FILTER (WHERE overall_gap_after IS NOT NULL AND overall_gap_before IS NOT NULL)
+                                                                              AS avg_overall_gap_delta,
+                AVG(def_gap_after - def_gap_before)
+                    FILTER (WHERE def_gap_after IS NOT NULL AND def_gap_before IS NOT NULL)
+                                                                              AS avg_def_gap_delta
+              FROM fine_tune_edits
+             WHERE created_at >= NOW() - ($1::int || ' days')::interval
+        `, [days]);
+        const e = eRes.rows[0] || {};
+        const editCount = parseInt(e.edit_count || 0, 10);
+
+        // Suggestion metrics.
+        const sRes = await pool.query(`
+            SELECT
+                status,
+                COUNT(*)::int AS n,
+                COUNT(*) FILTER (WHERE suggestion_type = 'bff')::int   AS bff_n,
+                COUNT(*) FILTER (WHERE suggestion_type = 'rival')::int AS rival_n
+              FROM pair_suggestions
+             WHERE created_at >= NOW() - ($1::int || ' days')::interval
+             GROUP BY status
+        `, [days]);
+        const statusMap = {};
+        for (const row of sRes.rows) {
+            statusMap[row.status] = { total: row.n, bff: row.bff_n, rival: row.rival_n };
+        }
+
+        // Top-10 pending suggestions across all players. For each pair
+        // (a, b, type), show only ONE row (using LEAST/GREATEST to canonicalise)
+        // plus the highest evidence rate seen across the two directions.
+        // Filter to active players only.
+        const tRes = await pool.query(`
+            WITH canonical AS (
+                SELECT LEAST(ps.suggested_to_player_id, ps.subject_player_id) AS a,
+                       GREATEST(ps.suggested_to_player_id, ps.subject_player_id) AS b,
+                       ps.suggestion_type,
+                       ps.source,
+                       (ps.evidence->>'rate')::numeric AS rate,
+                       ps.created_at
+                  FROM pair_suggestions ps
+                 WHERE ps.status = 'pending'
+            ),
+            grouped AS (
+                SELECT a, b, suggestion_type, MAX(rate) AS rate, MIN(source) AS source,
+                       MAX(created_at) AS created_at
+                  FROM canonical
+                 GROUP BY a, b, suggestion_type
+            )
+            SELECT g.a, g.b, g.suggestion_type, g.source, g.rate, g.created_at,
+                   COALESCE(pa.alias, pa.full_name) AS a_name,
+                   COALESCE(pb.alias, pb.full_name) AS b_name
+              FROM grouped g
+              JOIN players pa ON pa.id = g.a
+              JOIN players pb ON pb.id = g.b
+             WHERE pa.is_active = true AND pb.is_active = true
+             ORDER BY g.rate DESC, g.created_at DESC
+             LIMIT 10
+        `);
+
+        res.json({
+            days,
+            edits: {
+                count: editCount,
+                overall_improved:       parseInt(e.overall_improved || 0, 10),
+                def_improved:           parseInt(e.def_improved     || 0, 10),
+                both_improved:          parseInt(e.both_improved    || 0, 10),
+                avg_overall_gap_delta:  e.avg_overall_gap_delta == null ? null : parseFloat(e.avg_overall_gap_delta),
+                avg_def_gap_delta:      e.avg_def_gap_delta     == null ? null : parseFloat(e.avg_def_gap_delta),
+                overall_improved_rate:  editCount > 0 ? parseInt(e.overall_improved || 0, 10) / editCount : null,
+                def_improved_rate:      editCount > 0 ? parseInt(e.def_improved     || 0, 10) / editCount : null,
+            },
+            suggestions: {
+                pending:   statusMap.pending   || { total: 0, bff: 0, rival: 0 },
+                accepted:  statusMap.accepted  || { total: 0, bff: 0, rival: 0 },
+                dismissed: statusMap.dismissed || { total: 0, bff: 0, rival: 0 },
+            },
+            top_pending: tRes.rows,
+        });
+    } catch (e) {
+        console.error('GET /api/admin/fine-tune-intent/summary error:', e);
+        res.status(500).json({ error: 'Failed to load intent summary', detail: e.message });
+    }
+});
+
+// END FIX-281 Phase D
+// ═══════════════════════════════════════════════════════════════════════════
+
 // FIX-267: GET /api/admin/players/feedback-diagnostic
 // Per-player diagnostic view: what does the system "think" each player's OVR
 // should be, based on the rating feedback aggregator's logic, plus a
@@ -40769,14 +43015,15 @@ app.listen(PORT, () => {
 
             for (const { id: pid } of expired.rows) {
                 try {
+                    // FIX-292: explicit ::uuid casts on $1.
                     const revRes = await pool.query(`
                         SELECT COALESCE(SUM(dr.points), 0) AS pts
                         FROM discipline_records dr
-                        WHERE dr.player_id = $1
+                        WHERE dr.player_id = $1::uuid
                           AND (dr.game_id IS NULL OR dr.game_id IN (
                               SELECT r.game_id FROM registrations r
                               JOIN games g ON g.id = r.game_id
-                              WHERE r.player_id = $1
+                              WHERE r.player_id = $1::uuid
                                 AND r.status = 'confirmed'
                                 AND g.game_status = 'completed'
                               ORDER BY g.game_date DESC LIMIT 10
