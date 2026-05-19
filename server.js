@@ -25546,16 +25546,28 @@ function tierFromRevolvingPoints(pts) {
 // Writes tier to DB and manages white_ban_started_at:
 // becoming white → stamps NOW() (if not already set)
 // leaving white  → clears to NULL; other transitions → leave column alone
+//
+// FIX-296: explicit $1::text casts on all three uses of $1. Without them,
+// PG 14+ raises "inconsistent types deduced for parameter $1" (SQLSTATE 42P08,
+// detail: text versus character varying) because reliability_tier is a
+// varchar column (suggests $1::varchar) while the literal 'white' comparisons
+// are text (suggest $1::text), and the planner can't reconcile across the
+// SET clause and the CASE WHEN clauses. Casting $1 to text pins the type;
+// the SET clause auto-implicit-casts text→varchar which is allowed under
+// PG assignment-cast rules. Same root cause as FIX-292's $1::uuid fixes,
+// just for text/varchar deduction instead of uuid/text. Patching this
+// helper fixes all 6 call sites at once (discipline add, discipline remove,
+// admin recalc-tier, white-ban cron, late-dropout setImmediate, etc).
 async function applyTierChange(db, playerId, newTier) {
     await db.query(
         `UPDATE players
-         SET reliability_tier     = $1,
+         SET reliability_tier     = $1::text,
              white_ban_started_at = CASE
-               WHEN $1 = 'white' AND white_ban_started_at IS NULL THEN NOW()
-               WHEN $1 != 'white' THEN NULL
+               WHEN $1::text = 'white' AND white_ban_started_at IS NULL THEN NOW()
+               WHEN $1::text != 'white' THEN NULL
                ELSE white_ban_started_at
              END
-         WHERE id = $2`,
+         WHERE id = $2::uuid`,
         [newTier, playerId]
     );
 }
@@ -39846,13 +39858,20 @@ app.put('/api/admin/shop/orders/:id/status', authenticateToken, requireSuperAdmi
                 `Admin-cancelled shop order #${orderId}`);
         }
 
-        // Apply status update
+        // Apply status update.
+        // FIX-297: explicit $1::text casts — same text-vs-varchar 42P08 fix as
+        // FIX-296/applyTierChange. status column is varchar; the 'cancelled'
+        // literal comparisons are text. Without casts, PG 14+ deduces
+        // inconsistent types for $1 across SET + 2× CASE and raises
+        // SQLSTATE 42P08 detail "text versus character varying". One cast
+        // per usage pins the type; text→varchar assignment is implicit-cast
+        // allowed under PG assignment-cast rules.
         await client.query(
             `UPDATE shop_orders
-                SET status = $1,
+                SET status = $1::text,
                     notes = COALESCE($2, notes),
-                    cancelled_at = CASE WHEN $1 = 'cancelled' AND cancelled_at IS NULL THEN NOW() ELSE cancelled_at END,
-                    cancelled_reason = CASE WHEN $1 = 'cancelled' THEN COALESCE($3, cancelled_reason) ELSE cancelled_reason END,
+                    cancelled_at = CASE WHEN $1::text = 'cancelled' AND cancelled_at IS NULL THEN NOW() ELSE cancelled_at END,
+                    cancelled_reason = CASE WHEN $1::text = 'cancelled' THEN COALESCE($3, cancelled_reason) ELSE cancelled_reason END,
                     updated_at = NOW()
               WHERE id = $4`,
             [newStatus, notes, cancelReason, orderId]
