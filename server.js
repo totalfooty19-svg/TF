@@ -4369,6 +4369,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                 SELECT 
                     p.squad_number, 
                     p.player_number, 
+                    p.player_number_text, /* FIX-302: include region-prefixed ID for Birmingham/Manchester */
                     p.photo_url, 
                     p.reliability_tier, 
                     COALESCE(p.position, 'outfield') AS position_preference,
@@ -4552,7 +4553,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 GROUP BY r.player_id
             )
             SELECT 
-                p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.photo_url, 
+                p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.player_number_text, p.photo_url, /* FIX-302 */
                 p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins, p.total_draws,
                 p.phone, u.email,
                 p.is_clm_admin, p.is_organiser,
@@ -4679,7 +4680,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
     try {
         const result = await pool.query(`
             SELECT 
-                p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.photo_url, 
+                p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.player_number_text, p.photo_url, /* FIX-302 */
                 p.reliability_tier, p.phone,
                 p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
@@ -10662,7 +10663,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 await sendNotification(notifType, req.user.playerId, gameData);
                 // Superadmin: notify on game/tournament registration
                 const playerRow = await pool.query(
-                    'SELECT p.full_name, p.alias, p.player_number, p.squad_number, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+                    'SELECT p.full_name, p.alias, p.player_number, p.player_number_text, p.squad_number, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1', /* FIX-302 */
                     [req.user.playerId]
                 );
                 const pName = playerRow.rows[0]?.alias || playerRow.rows[0]?.full_name || req.user.playerId;
@@ -22632,18 +22633,19 @@ app.post('/api/players/me/topup-request', authenticateToken, topupLimiter, async
         const { amount } = req.body;
         const playerId = req.user.playerId;
         const playerResult = await pool.query(
-            'SELECT p.full_name, p.alias, p.player_number, p.squad_number, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+            'SELECT p.full_name, p.alias, p.player_number, p.player_number_text, p.squad_number, u.email FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1', /* FIX-302 */
             [playerId]
         );
         if (playerResult.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
         const player = playerResult.rows[0];
         const displayName = player.alias || player.full_name;
         const amountStr = amount ? `£${parseFloat(amount).toFixed(2)}` : 'Amount not specified';
-        // Short payment reference: squad_number takes priority (1-999), else player_number (1000+)
-        // Use squad_number if set (including 0='00'), else player_number, else N/A
+        // Short payment reference: squad_number takes priority (1-999),
+        // else region-prefixed player_number_text (B1234/M1234 for Birmingham/Manchester — FIX-302),
+        // else numeric player_number (1000+), else N/A.
         const paymentRef = (player.squad_number !== null && player.squad_number !== undefined)
             ? (player.squad_number === 0 ? '00' : player.squad_number)
-            : (player.player_number ?? 'N/A');
+            : (player.player_number_text || player.player_number || 'N/A');
 
         setImmediate(async () => {
             try {
