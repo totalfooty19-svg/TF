@@ -500,6 +500,17 @@ const AUDIT_TAG_TABLE = {
     injury_refund_approved:   { cat: 'participation', sub: 'injury', actor: 'admin', sev: 'high' },
     injury_refund_rejected:   { cat: 'participation', sub: 'injury', actor: 'admin', sev: 'med'  },
 
+    // ─── FIX-308: UNIVERSAL CRM TASKS ─────────────────────────────────────
+    // Events fired by the CRM task system (Phase 1). 'admin_task_created' is
+    // a manually-typed task from /api/admin/tasks. 'admin_task_resolved' /
+    // 'admin_task_rejected' fire when /approve or /reject is called on a
+    // non-injury queue row (injury_report keeps its existing event names).
+    admin_task_created:       { cat: 'ops', sub: 'tasks', actor: 'admin', sev: 'low'  },
+    admin_task_updated:       { cat: 'ops', sub: 'tasks', actor: 'admin', sev: 'low'  },
+    admin_task_deleted:       { cat: 'ops', sub: 'tasks', actor: 'admin', sev: 'med'  },
+    admin_task_resolved:      { cat: 'ops', sub: 'tasks', actor: 'admin', sev: 'low'  },
+    admin_task_rejected:      { cat: 'ops', sub: 'tasks', actor: 'admin', sev: 'low'  },
+
     // ─── FIX-276: TEAM BALANCE CALIBRATION ────────────────────────────────
     // calibration_experiment_recorded    — system event, fires post-commit
     //                                      after every system-generated game
@@ -26072,6 +26083,32 @@ app.post('/api/dm/:playerId', authenticateToken, dmSendLimiter, async (req, res)
                     // badge_auto_awarded elsewhere in this file).
                     auditLog(pool, null, 'dm_spree_detected', senderId,
                         `${unique} unique recipients today — admin alerted`).catch(() => {});
+
+                    // FIX-308: also create a CRM task so the spree shows up in
+                    // the admin's task inbox (not just email). One row per sender
+                    // per day — uniqueness enforced by the once-per-day
+                    // last_dm_spree_alert_at gate above, so this is safe to
+                    // unconditionally insert here. Type='message_spree' is a new
+                    // queue entry kind; UI groups it under "Comms / Moderation".
+                    try {
+                        await pool.query(`
+                            INSERT INTO admin_action_queue
+                                (type, status, title, notes,
+                                 subject_player_id, flagged_by, recommend_refund)
+                            VALUES ('message_spree', 'pending', $1, $2, $3, NULL, FALSE)
+                        `, [
+                            `DM spree — ${senderName} messaged ${unique} different players today`,
+                            `Auto-flagged by the spree detector. Review the conversation history before considering a temporary mute. Subject: player ${senderId}.`,
+                            senderId,
+                        ]);
+                    } catch (qe) {
+                        // Non-fatal — email already fired, audit row already
+                        // logged. Just log the failure (column-missing pre-FIX-308
+                        // or transient DB issue).
+                        if (!/column.*does not exist|relation.*does not exist/i.test(qe.message || '')) {
+                            console.warn('[FIX-308] message_spree task insert failed:', qe.message);
+                        }
+                    }
                 }
             } catch (e) {
                 // Pre-migration column-missing is the most common cause; treat as no-op.
@@ -34160,6 +34197,26 @@ app.post('/api/coaching/apply', authenticateToken, express.json({ limit: '5mb' }
     const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
     notifyAdmin('New Coach Application', [['Details', `${htmlEncode(playerName)} has applied to become a TotalFooty coach. Certifications: ${htmlEncode(certifications.substring(0,100))}`]]);
 
+    // FIX-309: also create a CRM task so coaching applications surface in
+    // the admin task inbox alongside the email notification. Type='coaching_app'.
+    // Fire-and-forget — if the queue table fails, the application is already
+    // saved and the admin email already sent, so no rollback needed.
+    try {
+        await pool.query(`
+            INSERT INTO admin_action_queue
+                (type, status, title, notes, subject_player_id, flagged_by, recommend_refund)
+            VALUES ('coaching_app', 'pending', $1, $2, $3, $4, FALSE)
+        `, [
+            `Coach application — ${playerName}`,
+            `Application submitted. Review at /?page=manage-coaching or use Coaching → Applications.\n\nCertifications:\n${certifications.substring(0, 500)}`,
+            req.user.playerId, req.user.playerId,
+        ]);
+    } catch (qe) {
+        if (!/column.*does not exist|relation.*does not exist/i.test(qe.message || '')) {
+            console.warn('[FIX-309] coaching_app task insert failed:', qe.message);
+        }
+    }
+
     await logCoachingAudit(null, null, req.user.playerId, 'coach_application_submitted',
         `Certifications: ${certifications.substring(0,100)}`);
 
@@ -34415,6 +34472,24 @@ app.post('/api/ref/apply', authenticateToken, express.json({ limit: '5mb' }), re
 
     const playerName = (await pool.query('SELECT full_name AS player_name FROM players WHERE id=$1', [req.user.playerId])).rows[0]?.player_name || 'A player';
     notifyAdmin('New Referee Application', [['Details', `${htmlEncode(playerName)} has applied to become a TotalFooty referee. Certifications: ${htmlEncode(certifications.substring(0,100))}`]]);
+
+    // FIX-309: also create a CRM task so referee applications surface in
+    // the admin task inbox alongside the email notification. Type='ref_app'.
+    try {
+        await pool.query(`
+            INSERT INTO admin_action_queue
+                (type, status, title, notes, subject_player_id, flagged_by, recommend_refund)
+            VALUES ('ref_app', 'pending', $1, $2, $3, $4, FALSE)
+        `, [
+            `Referee application — ${playerName}`,
+            `Application submitted. Review via Manage → Ref Applications (superadmin only).\n\nCertifications:\n${certifications.substring(0, 500)}`,
+            req.user.playerId, req.user.playerId,
+        ]);
+    } catch (qe) {
+        if (!/column.*does not exist|relation.*does not exist/i.test(qe.message || '')) {
+            console.warn('[FIX-309] ref_app task insert failed:', qe.message);
+        }
+    }
 
     await auditLog(pool, req.user.playerId, 'ref_application_submitted', null,
         `Certifications: ${certifications.substring(0,100)}`);
@@ -38848,6 +38923,26 @@ const FIX257_VALID_DESIGNS = new Set([
     'Boca Blue/Yellow'
 ]);
 
+// FIX-314: read active design names from shop_designs table. Returns Set
+// for O(1) check. Falls back to FIX257_VALID_DESIGNS if table missing
+// (pre-migration). The hardcoded set above is preserved as the fallback —
+// matches what the migration seeds, so behaviour is identical until the
+// admin adds new designs through the UI.
+async function _shopGetActiveDesignNames(db) {
+    try {
+        const r = await db.query(
+            `SELECT name FROM shop_designs WHERE active = TRUE`
+        );
+        return new Set(r.rows.map(row => row.name));
+    } catch (e) {
+        if (/relation.*does not exist/i.test(e.message || '')) {
+            console.warn('[FIX-314] shop_designs table missing — falling back to hardcoded set. Run FIX-314_migration.sql.');
+            return FIX257_VALID_DESIGNS;
+        }
+        throw e;
+    }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 // Build a human-readable variant label from the variant row + product_type.
@@ -39244,6 +39339,9 @@ app.post('/api/shop/order', authenticateToken, async (req, res) => {
         // Validate each line semantically + compute total
         let totalCredits = 0;
         const enrichedLines = [];
+        // FIX-314: per-order cache of active design names; populated lazily on
+        // first reversible_shirt line. Avoids redundant SELECTs across lines.
+        let _validDesignSet = null;
         for (const l of lines) {
             const product = productsById.get(l.product_id);
             if (!product || !product.active) {
@@ -39305,9 +39403,21 @@ app.post('/api/shop/order', authenticateToken, async (req, res) => {
                 });
             }
             if (needsDesigns) {
-                if (!FIX257_VALID_DESIGNS.has(design1) || !FIX257_VALID_DESIGNS.has(design2)) {
+                // FIX-314: validate against active designs in shop_designs table.
+                // Cached on the closure variable so multi-line reversible orders
+                // only hit the DB once.
+                if (!_validDesignSet) {
+                    _validDesignSet = await _shopGetActiveDesignNames(client);
+                }
+                if (!_validDesignSet.has(design1) || !_validDesignSet.has(design2)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: `Reversible shirt requires two valid designs` });
+                }
+                // FIX-314: server-side enforce different designs (UI also blocks,
+                // but server is source of truth).
+                if (design1 === design2) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: `Reversible shirt requires two DIFFERENT designs` });
                 }
             }
 
@@ -39685,6 +39795,155 @@ app.put('/api/admin/shop/variants/:id', authenticateToken, requireSuperAdmin, as
         res.status(500).json({ error: 'Failed to update variant', detail: e.message });
     }
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-314: SHOP DESIGNS — admin-managed kit designs for reversible shirts
+// ──────────────────────────────────────────────────────────────────────────
+
+// GET /api/shop/designs — public (any logged-in player). Active only, sorted.
+// Used by the design tile picker on reversible product pages.
+app.get('/api/shop/designs', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, name, image_url
+               FROM shop_designs
+              WHERE active = TRUE
+              ORDER BY sort_order ASC, id ASC`
+        );
+        res.json({ designs: r.rows });
+    } catch (e) {
+        if (/relation.*does not exist/i.test(e.message || '')) {
+            // Pre-migration fallback so the shop still works pre-deploy.
+            console.warn('[FIX-314] GET /api/shop/designs — table missing, returning legacy list');
+            return res.json({
+                designs: [...FIX257_VALID_DESIGNS].map((name, i) => ({
+                    id: -(i + 1), name, image_url: null,
+                })),
+            });
+        }
+        console.error('GET /api/shop/designs error:', e);
+        res.status(500).json({ error: 'Failed to load designs' });
+    }
+});
+
+// GET /api/admin/shop/designs — superadmin. Returns ALL designs including
+// inactive (admin reactivation path).
+app.get('/api/admin/shop/designs', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, name, image_url, sort_order, active, created_at, updated_at
+               FROM shop_designs
+              ORDER BY sort_order ASC, id ASC`
+        );
+        res.json({ designs: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/shop/designs error:', e);
+        res.status(500).json({ error: 'Failed to load designs', detail: e.message });
+    }
+});
+
+// POST /api/admin/shop/designs — create. Body: { name, image_url?, sort_order? }
+app.post('/api/admin/shop/designs', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { name, image_url, sort_order } = req.body || {};
+        if (!name || typeof name !== 'string' || !name.trim()) {
+            return res.status(400).json({ error: 'name required' });
+        }
+        const cleanName = name.trim().slice(0, 80);
+        const cleanImage = (typeof image_url === 'string' && image_url.trim())
+            ? image_url.trim().slice(0, 500) : null;
+        const cleanSort = Number.isInteger(parseInt(sort_order, 10))
+            ? parseInt(sort_order, 10) : 0;
+
+        const r = await pool.query(
+            `INSERT INTO shop_designs (name, image_url, sort_order)
+             VALUES ($1, $2, $3)
+             RETURNING id, name, image_url, sort_order, active`,
+            [cleanName, cleanImage, cleanSort]
+        );
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'shop_design_created', null,
+            `Created design "${cleanName}" (id ${r.rows[0].id})`
+        ).catch(() => {}));
+        res.json({ ok: true, design: r.rows[0] });
+    } catch (e) {
+        if (e.code === '23505') {
+            return res.status(409).json({ error: 'A design with that name already exists' });
+        }
+        console.error('POST /api/admin/shop/designs error:', e);
+        res.status(500).json({ error: 'Failed to create design', detail: e.message });
+    }
+});
+
+// PUT /api/admin/shop/designs/:id — edit name/image/sort/active.
+// Note: renaming an active design WILL break any in-flight basket items
+// using the old name (server validates against current names at order time).
+// Hidden risk acceptable because: (a) admin action, deliberate; (b) tiny
+// fleet of users; (c) bad orders fail at submit with a clear error.
+app.put('/api/admin/shop/designs/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isInteger(id) || id <= 0) {
+            return res.status(400).json({ error: 'Invalid id' });
+        }
+        const fields = [];
+        const vals   = [];
+        let pi = 1;
+        if (req.body.name !== undefined) {
+            if (typeof req.body.name !== 'string' || !req.body.name.trim()) {
+                return res.status(400).json({ error: 'name must be non-empty' });
+            }
+            fields.push(`name = $${pi++}`);
+            vals.push(req.body.name.trim().slice(0, 80));
+        }
+        if (req.body.image_url !== undefined) {
+            const v = req.body.image_url;
+            fields.push(`image_url = $${pi++}`);
+            vals.push(v == null || v === '' ? null
+                : (typeof v === 'string' ? v.trim().slice(0, 500) : null));
+        }
+        if (req.body.sort_order !== undefined) {
+            const s = parseInt(req.body.sort_order, 10);
+            if (!Number.isInteger(s)) {
+                return res.status(400).json({ error: 'sort_order must be integer' });
+            }
+            fields.push(`sort_order = $${pi++}`);
+            vals.push(s);
+        }
+        if (req.body.active !== undefined) {
+            fields.push(`active = $${pi++}`);
+            vals.push(!!req.body.active);
+        }
+        if (fields.length === 0) {
+            return res.status(400).json({ error: 'No editable fields supplied' });
+        }
+        fields.push(`updated_at = NOW()`);
+        vals.push(id);
+
+        const r = await pool.query(
+            `UPDATE shop_designs SET ${fields.join(', ')}
+              WHERE id = $${pi}
+              RETURNING id, name, image_url, sort_order, active`,
+            vals
+        );
+        if (r.rows.length === 0) {
+            return res.status(404).json({ error: 'Design not found' });
+        }
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'shop_design_updated', null,
+            `Updated design #${id} (${fields.length - 1} field${fields.length === 2 ? '' : 's'})`
+        ).catch(() => {}));
+        res.json({ ok: true, design: r.rows[0] });
+    } catch (e) {
+        if (e.code === '23505') {
+            return res.status(409).json({ error: 'A design with that name already exists' });
+        }
+        console.error('PUT /api/admin/shop/designs/:id error:', e);
+        res.status(500).json({ error: 'Failed to update design', detail: e.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
 
 // FIX-257: GET /api/admin/shop/orders
 // All orders with player + lines + status. Supports ?status filter and
@@ -40796,22 +41055,41 @@ async function _fix277SendApprovalEmail(toEmail, recipientName, refundAmount, re
 // Most-recent-first; refund-flagged items bubble up via the ORDER BY.
 // ──────────────────────────────────────────────────────────────────────────
 app.get('/api/admin/queue/pending', authenticateToken, requireAdmin, async (req, res) => {
+    // FIX-308: extended for the universal CRM tasks system. Now returns
+    // title/due_date/assigned_to alongside the original injury-report fields,
+    // computes is_overdue server-side (Europe/London calendar day), and sorts
+    // overdue → due-today → due-soon → no-date.
     try {
         const r = await pool.query(`
             SELECT q.id, q.type, q.status, q.notes, q.recommend_refund,
                    q.created_at,
                    q.game_id, q.subject_player_id, q.flagged_by,
+                   q.title, q.due_date, q.assigned_to,                              -- FIX-308 new cols
                    COALESCE(p.alias, p.full_name) AS subject_alias,
                    p.squad_number AS subject_squad_number,
                    COALESCE(fb.alias, fb.full_name) AS flagged_by_alias,
+                   COALESCE(at.alias, at.full_name) AS assigned_to_alias,           -- FIX-308
                    g.game_date, g.format AS game_format,
                    v.name AS venue_name, v.region AS venue_region,
                    r2.amount_paid AS registered_amount_paid,
                    r2.amount_paid_free AS registered_amount_paid_free,
-                   g.cost_per_player AS game_cost_per_player
+                   g.cost_per_player AS game_cost_per_player,
+                   -- FIX-308: overdue computation in Europe/London calendar day.
+                   -- NULL due_date → never overdue. Past due_date → true.
+                   CASE
+                     WHEN q.due_date IS NULL THEN FALSE
+                     WHEN q.due_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date THEN TRUE
+                     ELSE FALSE
+                   END AS is_overdue,
+                   CASE
+                     WHEN q.due_date IS NULL THEN FALSE
+                     WHEN q.due_date = (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date THEN TRUE
+                     ELSE FALSE
+                   END AS is_due_today
               FROM admin_action_queue q
               LEFT JOIN players p   ON p.id  = q.subject_player_id
               LEFT JOIN players fb  ON fb.id = q.flagged_by
+              LEFT JOIN players at  ON at.id = q.assigned_to                        -- FIX-308
               LEFT JOIN games   g   ON g.id  = q.game_id
               LEFT JOIN venues  v   ON v.id  = g.venue_id
               LEFT JOIN registrations r2
@@ -40819,7 +41097,14 @@ app.get('/api/admin/queue/pending', authenticateToken, requireAdmin, async (req,
                     AND r2.player_id = q.subject_player_id
                     AND r2.status = 'confirmed'
              WHERE q.status = 'pending'
-             ORDER BY q.recommend_refund DESC, q.created_at DESC
+             -- FIX-308 ordering: overdue first, then due-today, then by due_date asc
+             -- (nulls last), then refund-recommended, then created_at desc.
+             ORDER BY
+               (CASE WHEN q.due_date IS NOT NULL AND q.due_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date THEN 0 ELSE 1 END),
+               (CASE WHEN q.due_date IS NOT NULL AND q.due_date = (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date THEN 0 ELSE 1 END),
+               q.due_date NULLS LAST,
+               q.recommend_refund DESC,
+               q.created_at DESC
              LIMIT 200
         `);
         res.json({ count: r.rows.length, items: r.rows });
@@ -40830,6 +41115,371 @@ app.get('/api/admin/queue/pending', authenticateToken, requireAdmin, async (req,
 });
 
 // ──────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-308: POST /api/admin/tasks — manually create a task (admin/superadmin).
+// Phase 1 of the CRM build. Auto-tasks (injury/spree/etc) still go through
+// their own paths; this is the entry point for manually-typed tasks with
+// optional due_date and assignee.
+// Body: { title, notes?, dueDate?, assignedTo?, gameId?, subjectPlayerId? }
+//   • title is required (≤200 chars).
+//   • dueDate, if present, must be YYYY-MM-DD and >= today (Europe/London).
+//   • assignedTo, if present, must be a player_id of an admin/organiser.
+//   • gameId / subjectPlayerId are optional context links.
+// Returns the inserted row enriched with the joins from queue/pending so the
+// client can render it immediately without a refetch.
+// ──────────────────────────────────────────────────────────────────────────
+app.post('/api/admin/tasks', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { title, notes, dueDate, assignedTo, gameId, subjectPlayerId } = req.body || {};
+        if (typeof title !== 'string' || !title.trim()) {
+            return res.status(400).json({ error: 'title is required' });
+        }
+        const cleanTitle = title.trim().slice(0, 200);
+        const cleanNotes = (typeof notes === 'string' && notes.trim())
+            ? notes.trim().slice(0, 2000)
+            : null;
+
+        // dueDate validation: YYYY-MM-DD shape only. Past dates rejected so we
+        // don't create instantly-overdue tasks by accident (admin can edit
+        // server-side via psql if backdating is ever legitimately needed).
+        let cleanDueDate = null;
+        if (dueDate) {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) {
+                return res.status(400).json({ error: 'dueDate must be YYYY-MM-DD' });
+            }
+            cleanDueDate = dueDate;
+        }
+
+        // assignedTo: must resolve to a player who is admin/superadmin/organiser.
+        // Skipping the role check creates the risk of assigning to a regular
+        // player who can't see the queue — better to fail fast.
+        let cleanAssignedTo = null;
+        if (assignedTo) {
+            if (!/^[0-9a-f-]{36}$/i.test(String(assignedTo))) {
+                return res.status(400).json({ error: 'assignedTo must be a UUID' });
+            }
+            const ar = await pool.query(
+                'SELECT role, is_organiser FROM players WHERE id = $1',
+                [assignedTo]
+            );
+            if (ar.rows.length === 0) {
+                return res.status(404).json({ error: 'assigned player not found' });
+            }
+            const _r = ar.rows[0];
+            const _ok = (_r.role === 'admin' || _r.role === 'superadmin' || _r.is_organiser);
+            if (!_ok) {
+                return res.status(400).json({ error: 'assignee must be admin or organiser' });
+            }
+            cleanAssignedTo = assignedTo;
+        }
+
+        // Optional context links — only validated for shape, not existence
+        // (deletion afterwards just leaves orphaned context; queries LEFT JOIN).
+        const cleanGameId = (gameId && /^[0-9a-f-]{36}$/i.test(String(gameId)))
+            ? gameId : null;
+        const cleanSubjectPid = (subjectPlayerId && /^[0-9a-f-]{36}$/i.test(String(subjectPlayerId)))
+            ? subjectPlayerId : null;
+
+        const ins = await pool.query(`
+            INSERT INTO admin_action_queue
+                (type, status, title, notes, due_date, assigned_to,
+                 game_id, subject_player_id, flagged_by, recommend_refund)
+            VALUES ('custom', 'pending', $1, $2, $3, $4, $5, $6, $7, FALSE)
+            RETURNING id
+        `, [
+            cleanTitle, cleanNotes, cleanDueDate, cleanAssignedTo,
+            cleanGameId, cleanSubjectPid, req.user.playerId,
+        ]);
+
+        const newId = ins.rows[0].id;
+
+        // Audit log — caller's playerId, not null (this is an admin action).
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'admin_task_created', newId,
+            `Custom task: "${cleanTitle}"` +
+            `${cleanDueDate ? ' · due ' + cleanDueDate : ''}` +
+            `${cleanAssignedTo ? ' · assigned' : ''}`
+        ).catch(() => {}));
+
+        // FIX-309: shape now matches GET /pending exactly — added
+        // registrations join + 3 refund-context fields so the client can
+        // render the row without any field-missing surprises.
+        const ret = await pool.query(`
+            SELECT q.id, q.type, q.status, q.notes, q.recommend_refund,
+                   q.created_at, q.game_id, q.subject_player_id, q.flagged_by,
+                   q.title, q.due_date, q.assigned_to,
+                   COALESCE(p.alias, p.full_name) AS subject_alias,
+                   p.squad_number AS subject_squad_number,
+                   COALESCE(fb.alias, fb.full_name) AS flagged_by_alias,
+                   COALESCE(at.alias, at.full_name) AS assigned_to_alias,
+                   g.game_date, g.format AS game_format,
+                   v.name AS venue_name, v.region AS venue_region,
+                   r2.amount_paid AS registered_amount_paid,
+                   r2.amount_paid_free AS registered_amount_paid_free,
+                   g.cost_per_player AS game_cost_per_player,
+                   CASE
+                     WHEN q.due_date IS NULL THEN FALSE
+                     WHEN q.due_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date THEN TRUE
+                     ELSE FALSE
+                   END AS is_overdue,
+                   CASE
+                     WHEN q.due_date IS NULL THEN FALSE
+                     WHEN q.due_date = (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date THEN TRUE
+                     ELSE FALSE
+                   END AS is_due_today
+              FROM admin_action_queue q
+              LEFT JOIN players p   ON p.id  = q.subject_player_id
+              LEFT JOIN players fb  ON fb.id = q.flagged_by
+              LEFT JOIN players at  ON at.id = q.assigned_to
+              LEFT JOIN games   g   ON g.id  = q.game_id
+              LEFT JOIN venues  v   ON v.id  = g.venue_id
+              LEFT JOIN registrations r2
+                     ON r2.game_id = q.game_id
+                    AND r2.player_id = q.subject_player_id
+                    AND r2.status = 'confirmed'
+             WHERE q.id = $1
+        `, [newId]);
+
+        res.status(201).json({ task: ret.rows[0] });
+    } catch (e) {
+        console.error('POST /api/admin/tasks error:', e);
+        res.status(500).json({ error: 'Failed to create task', detail: e.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-309: PUT /api/admin/tasks/:id — edit an existing task.
+// Editable: title, notes, dueDate, assignedTo. Only the creator (flagged_by)
+// or a superadmin can edit; regular admins can't edit each other's tasks.
+// Custom tasks only — system-generated tasks (injury_report, message_spree,
+// coaching_app, ref_app) are immutable from this endpoint.
+// ──────────────────────────────────────────────────────────────────────────
+app.put('/api/admin/tasks/:id', authenticateToken, requireAdmin, async (req, res) => {
+    const taskId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+        return res.status(400).json({ error: 'Invalid task id' });
+    }
+    try {
+        // Load + permission check.
+        const cur = await pool.query(
+            `SELECT id, type, status, flagged_by FROM admin_action_queue WHERE id = $1`,
+            [taskId]
+        );
+        if (cur.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+        const task = cur.rows[0];
+        if (task.status !== 'pending') {
+            return res.status(409).json({ error: `Task is already ${task.status}` });
+        }
+
+        // FIX-313: per-field editability. Custom tasks: all 4 fields editable.
+        // Auto-tasks (injury_report, message_spree, coaching_app, ref_app):
+        // only notes + due_date editable — title is system-generated and
+        // assigning to someone else doesn't make sense for these.
+        const isCustom = (task.type === 'custom');
+        const isSuperadmin = req.user.role === 'superadmin';
+        const isCreator = String(task.flagged_by) === String(req.user.playerId);
+        if (isCustom) {
+            // Custom tasks: only creator or superadmin can edit.
+            if (!isSuperadmin && !isCreator) {
+                return res.status(403).json({ error: 'You can only edit tasks you created' });
+            }
+        }
+        // For auto-tasks, requireAdmin middleware already passed, so any admin
+        // can update notes/due_date — that's a moderation activity, not "owning"
+        // someone else's task.
+
+        // Validate inputs (same rules as POST).
+        const { title, notes, dueDate, assignedTo } = req.body || {};
+        const updates = [];
+        const params = [];
+        let i = 1;
+        if (title !== undefined) {
+            if (!isCustom) {
+                return res.status(400).json({ error: 'title can only be edited on custom tasks' });
+            }
+            if (typeof title !== 'string' || !title.trim()) {
+                return res.status(400).json({ error: 'title must be non-empty' });
+            }
+            updates.push(`title = $${i++}`);
+            params.push(title.trim().slice(0, 200));
+        }
+        if (notes !== undefined) {
+            const cleanNotes = (typeof notes === 'string' && notes.trim())
+                ? notes.trim().slice(0, 2000) : null;
+            updates.push(`notes = $${i++}`);
+            params.push(cleanNotes);
+        }
+        if (dueDate !== undefined) {
+            if (dueDate === null || dueDate === '') {
+                updates.push(`due_date = NULL`);
+            } else {
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) {
+                    return res.status(400).json({ error: 'dueDate must be YYYY-MM-DD or null' });
+                }
+                updates.push(`due_date = $${i++}`);
+                params.push(dueDate);
+            }
+        }
+        if (assignedTo !== undefined) {
+            // FIX-313: assignedTo is also custom-only — auto-tasks have an
+            // implicit owner (the admin queue / superadmin).
+            if (!isCustom) {
+                return res.status(400).json({ error: 'assignedTo can only be edited on custom tasks' });
+            }
+            if (assignedTo === null || assignedTo === '') {
+                updates.push(`assigned_to = NULL`);
+            } else {
+                if (!/^[0-9a-f-]{36}$/i.test(String(assignedTo))) {
+                    return res.status(400).json({ error: 'assignedTo must be a UUID or null' });
+                }
+                const ar = await pool.query(
+                    'SELECT role, is_organiser FROM players WHERE id = $1',
+                    [assignedTo]
+                );
+                if (ar.rows.length === 0) return res.status(404).json({ error: 'assigned player not found' });
+                const _r = ar.rows[0];
+                if (!(_r.role === 'admin' || _r.role === 'superadmin' || _r.is_organiser)) {
+                    return res.status(400).json({ error: 'assignee must be admin or organiser' });
+                }
+                updates.push(`assigned_to = $${i++}`);
+                params.push(assignedTo);
+            }
+        }
+        if (updates.length === 0) {
+            return res.status(400).json({ error: 'No editable fields supplied' });
+        }
+        params.push(taskId);
+        await pool.query(
+            `UPDATE admin_action_queue SET ${updates.join(', ')} WHERE id = $${i}`,
+            params
+        );
+
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'admin_task_updated', taskId,
+            `Custom task #${taskId} edited (${updates.length} field${updates.length === 1 ? '' : 's'})`
+        ).catch(() => {}));
+
+        // Re-fetch with same shape as GET /pending and POST /tasks.
+        const ret = await pool.query(`
+            SELECT q.id, q.type, q.status, q.notes, q.recommend_refund,
+                   q.created_at, q.game_id, q.subject_player_id, q.flagged_by,
+                   q.title, q.due_date, q.assigned_to,
+                   COALESCE(p.alias, p.full_name) AS subject_alias,
+                   p.squad_number AS subject_squad_number,
+                   COALESCE(fb.alias, fb.full_name) AS flagged_by_alias,
+                   COALESCE(at.alias, at.full_name) AS assigned_to_alias,
+                   g.game_date, g.format AS game_format,
+                   v.name AS venue_name, v.region AS venue_region,
+                   CASE
+                     WHEN q.due_date IS NULL THEN FALSE
+                     WHEN q.due_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date THEN TRUE
+                     ELSE FALSE
+                   END AS is_overdue,
+                   CASE
+                     WHEN q.due_date IS NULL THEN FALSE
+                     WHEN q.due_date = (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date THEN TRUE
+                     ELSE FALSE
+                   END AS is_due_today
+              FROM admin_action_queue q
+              LEFT JOIN players p   ON p.id  = q.subject_player_id
+              LEFT JOIN players fb  ON fb.id = q.flagged_by
+              LEFT JOIN players at  ON at.id = q.assigned_to
+              LEFT JOIN games   g   ON g.id  = q.game_id
+              LEFT JOIN venues  v   ON v.id  = g.venue_id
+             WHERE q.id = $1
+        `, [taskId]);
+        res.json({ task: ret.rows[0] });
+    } catch (e) {
+        console.error('PUT /api/admin/tasks/:id error:', e);
+        res.status(500).json({ error: 'Failed to update task', detail: e.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-309: DELETE /api/admin/tasks/:id — hard-delete a custom task.
+// Only the creator or superadmin can delete. Custom tasks only.
+// For auto-generated tasks, use /approve or /reject instead (they preserve
+// the audit trail).
+// ──────────────────────────────────────────────────────────────────────────
+app.delete('/api/admin/tasks/:id', authenticateToken, requireAdmin, async (req, res) => {
+    const taskId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+        return res.status(400).json({ error: 'Invalid task id' });
+    }
+    try {
+        const cur = await pool.query(
+            `SELECT type, flagged_by, title FROM admin_action_queue WHERE id = $1`,
+            [taskId]
+        );
+        if (cur.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+        const task = cur.rows[0];
+        if (task.type !== 'custom') {
+            return res.status(400).json({ error: 'Only custom tasks can be deleted. Use approve/reject for auto-tasks.' });
+        }
+        const isSuperadmin = req.user.role === 'superadmin';
+        const isCreator = String(task.flagged_by) === String(req.user.playerId);
+        if (!isSuperadmin && !isCreator) {
+            return res.status(403).json({ error: 'You can only delete tasks you created' });
+        }
+        await pool.query(`DELETE FROM admin_action_queue WHERE id = $1`, [taskId]);
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            'admin_task_deleted', taskId,
+            `Custom task #${taskId} deleted: "${(task.title || '').slice(0, 80)}"`
+        ).catch(() => {}));
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('DELETE /api/admin/tasks/:id error:', e);
+        res.status(500).json({ error: 'Failed to delete task', detail: e.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-309: GET /api/admin/tasks/assignable — list players who can be assignees.
+// Returns admin, superadmin, and organiser players (role + is_organiser flag),
+// sorted by alias. Used by the create-task modal's assignee picker.
+// ──────────────────────────────────────────────────────────────────────────
+app.get('/api/admin/tasks/assignable', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT id, COALESCE(alias, full_name) AS name, role, is_organiser
+              FROM players
+             WHERE role IN ('admin', 'superadmin') OR is_organiser = TRUE
+             ORDER BY COALESCE(alias, full_name) ASC
+        `);
+        res.json({ assignable: r.rows });
+    } catch (e) {
+        console.error('GET /api/admin/tasks/assignable error:', e);
+        res.status(500).json({ error: 'Failed to fetch assignable players', detail: e.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-309: GET /api/admin/tasks/pending-count — cheap count for sidebar badge.
+// Returns { total, overdue, dueToday } so the badge can show a number and
+// the dashboard can flag overdue separately if needed.
+// ──────────────────────────────────────────────────────────────────────────
+app.get('/api/admin/tasks/pending-count', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT
+              COUNT(*)::int AS total,
+              COUNT(*) FILTER (
+                WHERE due_date IS NOT NULL
+                  AND due_date < (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date
+              )::int AS overdue,
+              COUNT(*) FILTER (
+                WHERE due_date = (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/London')::date
+              )::int AS due_today
+              FROM admin_action_queue
+             WHERE status = 'pending'
+        `);
+        res.json(r.rows[0] || { total: 0, overdue: 0, due_today: 0 });
+    } catch (e) {
+        console.error('GET /api/admin/tasks/pending-count error:', e);
+        res.status(500).json({ error: 'Failed to count tasks', detail: e.message });
+    }
+});
+
 // GET /api/admin/queue/resolved?days=30 — recent resolved items
 // ──────────────────────────────────────────────────────────────────────────
 app.get('/api/admin/queue/resolved', authenticateToken, requireAdmin, async (req, res) => {
@@ -40989,41 +41639,55 @@ app.post('/api/admin/queue/:id/approve', authenticateToken, requireAdmin, async 
 
         await client.query('COMMIT');
 
-        // Audit log + email fire post-commit so a transient failure doesn't
-        // leave a half-resolved row.
-        const auditDetail =
-            `Injury queue #${queueId} APPROVED · player ${item.subject_player_id} · ` +
-            (refundAmtNum > 0
-                ? `refund £${refundAmtNum.toFixed(2)} via ${refundBucket} (real £${realRefunded.toFixed(2)} + free £${freeRefunded.toFixed(2)})`
-                : 'no refund') +
-            (resolutionNote ? ` · note: ${resolutionNote.slice(0, 80)}` : '');
+        // FIX-308: type-aware post-commit handling. The original FIX-277 code
+        // unconditionally fired an injury-themed audit log + apology email to
+        // the subject_player_id. With the queue now hosting other task types
+        // (message_spree, custom), that would (a) mis-categorise the audit
+        // entry and (b) email irrelevant people. Branch by item.type:
+        //   • injury_report → injury_refund_approved audit + apology email
+        //   • everything else → admin_task_resolved audit, no email
+        const isInjury = (item.type === 'injury_report');
+        const auditAction = isInjury ? 'injury_refund_approved' : 'admin_task_resolved';
+        const auditDetail = isInjury
+            ? (`Injury queue #${queueId} APPROVED · player ${item.subject_player_id} · ` +
+               (refundAmtNum > 0
+                   ? `refund £${refundAmtNum.toFixed(2)} via ${refundBucket} (real £${realRefunded.toFixed(2)} + free £${freeRefunded.toFixed(2)})`
+                   : 'no refund') +
+               (resolutionNote ? ` · note: ${resolutionNote.slice(0, 80)}` : ''))
+            : (`Task #${queueId} (${item.type}) resolved` +
+               (resolutionNote ? ` · note: ${resolutionNote.slice(0, 80)}` : ''));
         setImmediate(() => auditLog(pool, req.user.playerId,
-            'injury_refund_approved', item.subject_player_id, auditDetail
+            auditAction, item.subject_player_id, auditDetail
         ).catch(() => {}));
 
-        // Send the "Sorry to hear" email if there's a subject player email on file.
-        setImmediate(async () => {
-            try {
-                const er = await pool.query(
-                    `SELECT u.email, COALESCE(p.alias, p.full_name) AS name
-                       FROM players p
-                       JOIN users u ON u.id = p.user_id
-                      WHERE p.id = $1`,
-                    [item.subject_player_id]
-                );
-                const email = er.rows[0]?.email;
-                const name  = er.rows[0]?.name;
-                if (email) {
-                    await _fix277SendApprovalEmail(
-                        email, name,
-                        refundAmtNum > 0 ? refundAmtNum : null,
-                        refundAmtNum > 0 ? refundBucket : null
+        // Email send is INJURY-ONLY — non-injury tasks shouldn't trigger the
+        // "Sorry to hear about your injury" template. Sparing the spammer
+        // who finds themselves the subject of a message_spree task from
+        // receiving a confusing apology email.
+        if (isInjury) {
+            setImmediate(async () => {
+                try {
+                    const er = await pool.query(
+                        `SELECT u.email, COALESCE(p.alias, p.full_name) AS name
+                           FROM players p
+                           JOIN users u ON u.id = p.user_id
+                          WHERE p.id = $1`,
+                        [item.subject_player_id]
                     );
+                    const email = er.rows[0]?.email;
+                    const name  = er.rows[0]?.name;
+                    if (email) {
+                        await _fix277SendApprovalEmail(
+                            email, name,
+                            refundAmtNum > 0 ? refundAmtNum : null,
+                            refundAmtNum > 0 ? refundBucket : null
+                        );
+                    }
+                } catch (e) {
+                    console.warn('[FIX-277] approval email lookup failed:', e.message);
                 }
-            } catch (e) {
-                console.warn('[FIX-277] approval email lookup failed:', e.message);
-            }
-        });
+            });
+        }
 
         res.json({
             ok: true,
@@ -41055,6 +41719,7 @@ app.post('/api/admin/queue/:id/reject', authenticateToken, requireAdmin, async (
         ? req.body.resolutionNote.trim().slice(0, 2000) : null;
 
     try {
+        // FIX-308: also return q.type so we can pick the right audit action.
         // Atomic conditional update — only resolves if still pending. No row lock
         // needed because the WHERE clause does the guard.
         const r = await pool.query(
@@ -41064,7 +41729,7 @@ app.post('/api/admin/queue/:id/reject', authenticateToken, requireAdmin, async (
                     resolved_at = NOW(),
                     resolution_note = $2
               WHERE id = $3 AND status = 'pending'
-              RETURNING subject_player_id, game_id`,
+              RETURNING subject_player_id, game_id, type`,
             [req.user.playerId, resolutionNote, queueId]
         );
         if (r.rows.length === 0) {
@@ -41075,10 +41740,17 @@ app.post('/api/admin/queue/:id/reject', authenticateToken, requireAdmin, async (
         }
         const subjectId = r.rows[0].subject_player_id;
         const gameId    = r.rows[0].game_id;
+        const itemType  = r.rows[0].type;
+        // FIX-308: type-aware audit action (same logic as /approve).
+        const isInjury = (itemType === 'injury_report');
+        const rejAction = isInjury ? 'injury_refund_rejected' : 'admin_task_rejected';
+        const rejDetail = isInjury
+            ? (`Injury queue #${queueId} REJECTED · player ${subjectId} · game ${gameId}` +
+               (resolutionNote ? ` · note: ${resolutionNote.slice(0, 80)}` : ''))
+            : (`Task #${queueId} (${itemType}) dismissed` +
+               (resolutionNote ? ` · note: ${resolutionNote.slice(0, 80)}` : ''));
         setImmediate(() => auditLog(pool, req.user.playerId,
-            'injury_refund_rejected', subjectId,
-            `Injury queue #${queueId} REJECTED · player ${subjectId} · game ${gameId}` +
-            (resolutionNote ? ` · note: ${resolutionNote.slice(0, 80)}` : '')
+            rejAction, subjectId, rejDetail
         ).catch(() => {}));
         res.json({ ok: true, queueId });
     } catch (e) {
