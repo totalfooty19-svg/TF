@@ -117,6 +117,616 @@ app.use((req, res, next) => {
     express.json({ limit: '500kb' })(req, res, next);
 });
 // 5mb body parser for large-payload routes — applied via LARGE_PAYLOAD_PATHS middleware above.
+// ════════════════════════════════════════════════════════════════════════
+// FIX-315 — RSVP system helpers
+// ════════════════════════════════════════════════════════════════════════
+// RSVP_DEADLINE_HOURS — default hours before kickoff that an RSVP must be
+// paid by. Mitchell-locked at 24.
+// RSVP_WARNING_HOURS — hours before deadline that the warning email fires.
+// Locked at 48.
+// RSVP_ACCEL_HOURS — when the accelerator fires, the new deadline is at
+// most this many hours from now (LEAST of original deadline, NOW + this).
+// Locked at 24.
+const RSVP_DEADLINE_HOURS = 24;
+const RSVP_WARNING_HOURS  = 48;
+const RSVP_ACCEL_HOURS    = 24;
+
+// Short deadline label for push notifications (e.g. "Sun 7pm").
+function _rsvpFormatDeadline(date) {
+    try {
+        const d = date instanceof Date ? date : new Date(date);
+        if (isNaN(d.getTime())) return 'soon';
+        const day  = d.toLocaleDateString('en-GB', { weekday: 'short', timeZone: 'Europe/London' });
+        const hm   = d.toLocaleTimeString('en-GB', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Europe/London' })
+                      .replace(':00', '').replace(' ', '').toLowerCase();
+        return `${day} ${hm}`;
+    } catch { return 'soon'; }
+}
+
+// Pretty long-form deadline for emails (e.g. "Sunday 8 June at 7:30pm").
+function _rsvpFormatDeadlineLong(date) {
+    try {
+        const d = date instanceof Date ? date : new Date(date);
+        if (isNaN(d.getTime())) return 'shortly';
+        const day  = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'Europe/London' });
+        const hm   = d.toLocaleTimeString('en-GB', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Europe/London' })
+                      .replace(':00', '').replace(' ', '').toLowerCase();
+        return `${day} at ${hm}`;
+    } catch { return 'shortly'; }
+}
+
+// Look up a player's email + alias for RSVP comms.
+async function _rsvpGetPlayer(playerId) {
+    try {
+        const r = await pool.query(
+            'SELECT u.email, p.alias, p.full_name FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+            [playerId]
+        );
+        return r.rows[0] || null;
+    } catch (e) {
+        console.warn('[FIX-315] _rsvpGetPlayer failed:', e.message);
+        return null;
+    }
+}
+
+// Send one of the 4 FIX-315 emails. type ∈ {confirmation, warning, accelerated, bumped}.
+// Fire-and-forget — caller never awaits a result. Errors are swallowed.
+async function _sendRsvpEmail(type, playerId, gameData, extra = {}) {
+    try {
+        const player = await _rsvpGetPlayer(playerId);
+        if (!player || !player.email) return;
+        const venue = gameData?.venue || 'TBC';
+        const day   = gameData?.day   || 'soon';
+        const gameUrl = gameData?.game_url ? `https://totalfooty.co.uk/game.html?id=${encodeURIComponent(gameData.game_url)}` : 'https://totalfooty.co.uk';
+        const alias = player.alias || player.full_name || 'player';
+
+        let subject, html;
+        if (type === 'confirmation') {
+            const deadlineLong = _rsvpFormatDeadlineLong(extra.deadline);
+            subject = `RSVP held — pay by ${deadlineLong} or lose your spot`;
+            html = wrapEmailHtml(`
+                <h2 style="color:#fff;font-size:20px;margin:0 0 12px">RSVP held ⏰</h2>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Hi ${alias},</p>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">You've RSVP'd for <strong style="color:#fff">${venue}</strong> on <strong style="color:#fff">${day}</strong>. Your spot is held until <strong style="color:#fff">${deadlineLong}</strong>.</p>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Pay by then to confirm, or cancel for free if your plans change.</p>
+                <p style="margin:24px 0"><a href="${gameUrl}" style="background:#22c55e;color:#000;font-weight:700;padding:14px 28px;text-decoration:none;border-radius:6px;display:inline-block">PAY NOW</a></p>
+                <p style="color:#888;font-size:12px;line-height:1.6">If the game fills up and another player pays upfront as a Confirmed Backup, your deadline will be brought forward to 24 hours from that moment.</p>
+            `);
+        } else if (type === 'warning') {
+            const deadlineLong = _rsvpFormatDeadlineLong(extra.deadline);
+            subject = `⏰ 48 hours to pay — ${venue}`;
+            html = wrapEmailHtml(`
+                <h2 style="color:#fff;font-size:20px;margin:0 0 12px">48 hours to pay ⏰</h2>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Hi ${alias},</p>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Your RSVP deadline for <strong style="color:#fff">${venue}</strong> on <strong style="color:#fff">${day}</strong> is in 48 hours.</p>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Pay by <strong style="color:#fff">${deadlineLong}</strong> or you'll lose your spot to backups.</p>
+                <p style="margin:24px 0"><a href="${gameUrl}" style="background:#22c55e;color:#000;font-weight:700;padding:14px 28px;text-decoration:none;border-radius:6px;display:inline-block">PAY NOW</a></p>
+            `);
+        } else if (type === 'accelerated') {
+            const deadlineLong = _rsvpFormatDeadlineLong(extra.deadline);
+            subject = `🔥 Deadline brought forward — ${venue} is full`;
+            html = wrapEmailHtml(`
+                <h2 style="color:#fff;font-size:20px;margin:0 0 12px">Deadline brought forward 🔥</h2>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Hi ${alias},</p>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">The game at <strong style="color:#fff">${venue}</strong> on <strong style="color:#fff">${day}</strong> is now full. Players are paying upfront to claim backup spots.</p>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Your deadline has been brought forward to <strong style="color:#fff">${deadlineLong}</strong> (within 24 hours).</p>
+                <p style="margin:24px 0"><a href="${gameUrl}" style="background:#f59e0b;color:#000;font-weight:700;padding:14px 28px;text-decoration:none;border-radius:6px;display:inline-block">PAY NOW</a></p>
+            `);
+        } else if (type === 'bumped') {
+            const hasOpen = !!extra.hasOpenSpots;
+            const openCount = extra.openCount || 0;
+            subject = hasOpen
+                ? `🚫 Lost your spot — reclaim ASAP at ${venue}`
+                : `🚫 Lost your spot — backup option at ${venue}`;
+            const body = hasOpen
+                ? `<p style="color:#ddd;font-size:14px;line-height:1.6">Other RSVPs didn't pay either. ${openCount} spot${openCount===1?'':'s'} available — race to reclaim. First to pay wins.</p>`
+                : `<p style="color:#ddd;font-size:14px;line-height:1.6">The slots have been filled by backups. You can pay to become a Confirmed Backup yourself if any of them withdraw.</p>`;
+            const ctaLabel = hasOpen ? 'PAY NOW' : 'BECOME BACKUP';
+            html = wrapEmailHtml(`
+                <h2 style="color:#fff;font-size:20px;margin:0 0 12px">Lost your spot 🚫</h2>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Hi ${alias},</p>
+                <p style="color:#ddd;font-size:14px;line-height:1.6">Your RSVP for <strong style="color:#fff">${venue}</strong> on <strong style="color:#fff">${day}</strong> wasn't paid in time, so it's been released.</p>
+                ${body}
+                <p style="margin:24px 0"><a href="${gameUrl}" style="background:#ef4444;color:#fff;font-weight:700;padding:14px 28px;text-decoration:none;border-radius:6px;display:inline-block">${ctaLabel}</a></p>
+            `);
+        } else {
+            return;
+        }
+
+        await emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to: player.email,
+            subject,
+            html,
+        });
+    } catch (e) {
+        console.warn('[FIX-315] _sendRsvpEmail (' + type + ') failed (non-critical):', e.message);
+    }
+}
+
+// Promote confirmed_backups when slots open (from RSVP bumps or admin actions).
+// MUST be called inside an existing client transaction. slotsToFill = number of
+// spots to promote into. Returns array of promoted player_ids.
+//
+// Promotion order: earliest paid (registered_at ASC). Ties broken by id.
+// GK slot cap respected: skip GK candidates if game is at GK max.
+async function _fix315PromoteConfirmedBackups(client, gameId, slotsToFill, gameMeta) {
+    if (slotsToFill <= 0) return [];
+    const promoted = [];
+
+    // Fetch the confirmed_backups in promotion order
+    const candidates = await client.query(`
+        SELECT r.id, r.player_id, r.position_preference, r.is_comped, p.alias, p.full_name
+          FROM registrations r
+          JOIN players p ON p.id = r.player_id
+         WHERE r.game_id = $1 AND r.status = 'backup' AND r.backup_type = 'confirmed_backup'
+         ORDER BY r.registered_at ASC, r.id ASC
+         FOR UPDATE OF r
+    `, [gameId]);
+
+    if (candidates.rows.length === 0) return [];
+
+    // GK count for cap check
+    const maxGKSlots = gameMeta?.team_selection_type === 'vs_external' ? 1
+                     : gameMeta?.team_selection_type === 'tournament'  ? (gameMeta.tournament_team_count || 4)
+                     : 2;
+    let currentGKs = 0;
+    try {
+        const gkRes = await client.query(
+            `SELECT COUNT(*) AS cnt FROM registrations WHERE game_id = $1 AND status IN ('confirmed', 'rsvp') /* FIX-315 */ AND UPPER(TRIM(position_preference)) = 'GK'`,
+            [gameId]
+        );
+        currentGKs = parseInt(gkRes.rows[0]?.cnt || 0);
+    } catch (_) { currentGKs = 0; }
+
+    for (const c of candidates.rows) {
+        if (promoted.length >= slotsToFill) break;
+        const isGK = (c.position_preference || '').trim().toUpperCase() === 'GK';
+        if (isGK && currentGKs >= maxGKSlots) continue;
+
+        await client.query(
+            `UPDATE registrations SET status = 'confirmed', backup_type = NULL WHERE id = $1`,
+            [c.id]
+        );
+        // FIX-315: parity with drop-out promotion flow — BFFs/Rivals auto-fill
+        // fires for the newly-confirmed player (mode/cap/override guards inside helper).
+        try { await applyBffRivalAutoFill(client, c.player_id, gameId, c.id); }
+        catch (e) { console.warn('[FIX-315] BFF auto-fill on RSVP-bump promote failed (non-fatal):', e.message); }
+        promoted.push({ player_id: c.player_id, alias: c.alias || c.full_name, reg_id: c.id });
+        if (isGK) currentGKs++;
+
+        // Audit + push the promotion. Same channels as the existing drop-out
+        // promotion flow at line ~13123 (uses backup_promoted notification type).
+        try {
+            const gd = await getGameDataForNotification(gameId);
+            sendNotification('backup_promoted', c.player_id, gd).catch(() => {});
+            client.query(
+                `INSERT INTO notifications (player_id, type, message, game_id)
+                 VALUES ($1, 'backup_promoted', $2, $3)
+                 ON CONFLICT DO NOTHING`,
+                [c.player_id, `You're confirmed! A spot opened at ${gd.venue} on ${gd.day}.`, gameId]
+            ).catch(() => {});
+            await gameAuditLog(pool, gameId, null, 'player_backup_joined',
+                `${c.alias || c.full_name} promoted from confirmed_backup (FIX-315 auto-promote)`).catch(() => {});
+        } catch (_) { /* non-critical */ }
+    }
+
+    return promoted;
+}
+
+// END FIX-315 helpers ════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-316 — MASS MESSAGING helpers
+// ════════════════════════════════════════════════════════════════════════
+
+// Normalise a phone number to E.164 without the leading '+' (wa.me format).
+// Handles common UK formats: '07700900000', '+447700900000', '447700 900 000',
+// '0044 7700 900000'. Returns null for garbage/empty/short numbers.
+// IMPORTANT: this is the FIRST thing called for any channel that needs phone
+// (WhatsApp/VCF/CSV) — a bad normaliser breaks every recipient row downstream.
+function _normalisePhoneE164(raw) {
+    if (raw == null) return null;
+    let s = String(raw).trim();
+    if (!s) return null;
+    // Strip spaces, dashes, parens, dots — anything that isn't a digit or '+'.
+    s = s.replace(/[\s().\-_]/g, '');
+    if (!s) return null;
+    // Strip leading '+' so we can normalise prefixes.
+    if (s.startsWith('+')) s = s.slice(1);
+    // Strip leading '00' (international dialling prefix used in some countries).
+    if (s.startsWith('00')) s = s.slice(2);
+    // UK leading '0' → '44'. Most likely the case for TF.
+    if (s.startsWith('0') && s.length === 11) s = '44' + s.slice(1);
+    // Final sanity: digits only, length between 10 and 15.
+    if (!/^[0-9]+$/.test(s)) return null;
+    if (s.length < 10 || s.length > 15) return null;
+    return s;
+}
+
+// HMAC-sign a playerId so an unsubscribe link can be served without auth.
+// Format: '<playerId>.<base64url(HMAC-SHA256)>'. Same secret as JWT — re-use
+// avoids new env var. JWT_SECRET is guaranteed present (server fails fast at
+// boot if missing — line ~1786).
+function _signUnsubToken(playerId) {
+    const h = crypto.createHmac('sha256', JWT_SECRET).update('unsub:' + playerId).digest('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    return `${playerId}.${h}`;
+}
+function _verifyUnsubToken(token) {
+    if (!token || typeof token !== 'string') return null;
+    const dot = token.lastIndexOf('.');
+    if (dot < 1) return null;
+    const playerId = token.slice(0, dot);
+    const sig      = token.slice(dot + 1);
+    const expected = crypto.createHmac('sha256', JWT_SECRET).update('unsub:' + playerId).digest('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    // Constant-time compare.
+    try {
+        if (sig.length !== expected.length) return null;
+        if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+    } catch { return null; }
+    return playerId;
+}
+
+// Pretty date for templates (e.g. "Sunday 8 June at 7:30pm").
+function _massFriendlyDate(d) {
+    try {
+        const dt = d instanceof Date ? d : new Date(d);
+        if (isNaN(dt.getTime())) return '';
+        const day  = dt.toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long', timeZone:'Europe/London' });
+        const hm   = dt.toLocaleTimeString('en-GB', { hour:'numeric', minute:'2-digit', hour12:true, timeZone:'Europe/London' })
+                       .replace(':00', '').replace(' ', '').toLowerCase();
+        return `${day} at ${hm}`;
+    } catch { return ''; }
+}
+function _massShortDate(d) {
+    try {
+        const dt = d instanceof Date ? d : new Date(d);
+        if (isNaN(dt.getTime())) return '';
+        return dt.toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short', timeZone:'Europe/London' });
+    } catch { return ''; }
+}
+
+// Mass-message template definitions. Hardcoded in v1 (admin can edit the body
+// in the UI before sending, but the 6 default texts live here).
+const MASS_MESSAGE_TEMPLATES = {
+    game_reminder: {
+        label: 'Game Reminder',
+        subject_template: '{venue_name} game — {game_date_friendly}',
+        body_template:
+`Hi {first_name}!
+
+We've got a game on {game_date_friendly} at {venue_name} ({format}). £{price_credits} per player.
+
+Sign up here: {signup_link}
+
+— TotalFooty`,
+    },
+    last_call_24h: {
+        label: 'Last Call (24h)',
+        subject_template: '🚨 Last call — {venue_name} game tomorrow',
+        body_template:
+`🚨 Last call for tomorrow's game at {venue_name}, {first_name}! Kick-off {kickoff_time}, only {spots_left} spots left.
+
+Sign up: {signup_link}
+
+— TotalFooty`,
+    },
+    game_cancelled: {
+        label: 'Game Cancelled',
+        subject_template: 'Game cancelled — {venue_name}, {game_date_friendly}',
+        body_template:
+`Hi {first_name},
+
+Unfortunately {game_date_friendly}'s game at {venue_name} has been cancelled.
+
+Anyone who paid will be refunded automatically — credit returned to your TotalFooty balance within minutes.
+
+Sorry for the disruption.
+
+— TotalFooty`,
+    },
+    game_rescheduled: {
+        label: 'Game Rescheduled',
+        subject_template: 'Game moved — {venue_name}',
+        body_template:
+`Hi {first_name},
+
+The game at {venue_name} has been moved to {game_date_friendly} at {kickoff_time}.
+
+Your registration carries over automatically. If the new date doesn't work, withdraw via the app for a full refund.
+
+— TotalFooty`,
+    },
+    motm_announcement: {
+        label: 'MOTM Announcement',
+        subject_template: 'MOTM — {venue_name}',
+        body_template:
+`🏆 MOTM was voted for {game_date_friendly}'s game at {venue_name}!
+
+Check the app for the full results.
+
+Next game: {signup_link}
+
+— TotalFooty`,
+    },
+    custom: {
+        label: 'Custom (blank)',
+        subject_template: '',
+        body_template: '',
+    },
+};
+
+// Resolve placeholders in a template string per recipient. Game-level vars
+// (venue, date, format etc) resolved once. Player-level vars (first_name)
+// per recipient. Missing placeholders → empty string + warning logged.
+function _resolvePlaceholders(text, player, game, extras) {
+    if (!text) return '';
+    extras = extras || {};
+    const friendlyDate = _massFriendlyDate(game?.game_date);
+    const kickoffTime  = (() => {
+        try {
+            const dt = new Date(game?.game_date);
+            if (isNaN(dt.getTime())) return '';
+            return dt.toLocaleTimeString('en-GB', { hour:'numeric', minute:'2-digit', hour12:true, timeZone:'Europe/London' })
+                    .replace(':00', '').replace(' ', '').toLowerCase();
+        } catch { return ''; }
+    })();
+    const signupLink = game?.game_url ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(game.game_url)}` : 'https://totalfooty.co.uk';
+    const spotsLeft  = (() => {
+        const max = parseInt(game?.max_players || 0);
+        const cur = parseInt(extras.current_players != null ? extras.current_players : game?.current_players || 0);
+        const left = max - cur;
+        return isFinite(left) && left > 0 ? String(left) : '0';
+    })();
+    const map = {
+        '{first_name}':         (player?.first_name || player?.alias || 'there'),
+        '{alias}':              (player?.alias || player?.first_name || ''),
+        '{full_name}':          (player?.full_name || ''),
+        '{venue_name}':         (game?.venue_name || ''),
+        '{game_date_friendly}': friendlyDate,
+        '{kickoff_time}':       kickoffTime,
+        '{format}':             (game?.format || ''),
+        '{price_credits}':      (game?.cost_per_player != null ? parseFloat(game.cost_per_player).toFixed(2) : ''),
+        '{signup_link}':        signupLink,
+        '{spots_left}':         spotsLeft,
+        '{region}':             (game?.venue_region || ''),
+        '{series_name}':        (game?.series_name || ''),
+    };
+    let out = text;
+    for (const k of Object.keys(map)) {
+        out = out.split(k).join(map[k] || '');
+    }
+    return out;
+}
+
+// Build the recipient audience for a mass-message. Returns array of
+// { id, first_name, full_name, alias, email, phone_raw, phone_e164, has_app, last_game_date, last_game_venue }.
+// Always-excluded (registered for THIS game / messaging-blocked / broadcasts-unsub).
+// Inclusion buckets are intersected (AND). If no buckets selected, returns [].
+async function _buildMassMessageAudience(client, gameId, buckets, opts = {}) {
+    // Validate buckets
+    const VALID = new Set(['not_registered', 'played_venue', 'played_region', 'played_series', 'played_recent']);
+    const selected = (Array.isArray(buckets) ? buckets : []).filter(b => VALID.has(b));
+    if (selected.length === 0) return [];
+
+    // Resolve game scope (venue_id, region, series_id) once.
+    const gRes = await client.query(`
+        SELECT g.id, g.venue_id, g.series_id, v.region AS venue_region
+          FROM games g
+          LEFT JOIN venues v ON v.id = g.venue_id
+         WHERE g.id = $1`,
+        [gameId]
+    );
+    if (gRes.rows.length === 0) throw new Error('Game not found');
+    const game = gRes.rows[0];
+
+    // Build dynamic SQL. Each selected bucket becomes an AND clause via EXISTS.
+    const params = [gameId];
+    let p = params.length;  // next bind index
+    const bucketClauses = [];
+
+    if (selected.includes('not_registered')) {
+        // Trivially true: the bucket is "all players minus excluded" so just rely on
+        // the always-excluded filter. No EXISTS clause needed.
+    }
+    if (selected.includes('played_venue') && game.venue_id) {
+        params.push(game.venue_id); p++;
+        bucketClauses.push(`EXISTS (
+            SELECT 1 FROM registrations r2
+              JOIN games g2 ON g2.id = r2.game_id
+             WHERE r2.player_id = p.id
+               AND g2.venue_id = $${p}
+               AND r2.status = 'confirmed'
+        )`);
+    }
+    if (selected.includes('played_region') && game.venue_region) {
+        params.push(game.venue_region); p++;
+        bucketClauses.push(`EXISTS (
+            SELECT 1 FROM registrations r3
+              JOIN games g3 ON g3.id = r3.game_id
+              JOIN venues v3 ON v3.id = g3.venue_id
+             WHERE r3.player_id = p.id
+               AND v3.region = $${p}
+               AND r3.status = 'confirmed'
+        )`);
+    }
+    if (selected.includes('played_series') && game.series_id) {
+        params.push(game.series_id); p++;
+        bucketClauses.push(`EXISTS (
+            SELECT 1 FROM registrations r4
+              JOIN games g4 ON g4.id = r4.game_id
+             WHERE r4.player_id = p.id
+               AND g4.series_id = $${p}
+               AND r4.status = 'confirmed'
+        )`);
+    }
+    if (selected.includes('played_recent')) {
+        bucketClauses.push(`EXISTS (
+            SELECT 1 FROM registrations r5
+              JOIN games g5 ON g5.id = r5.game_id
+             WHERE r5.player_id = p.id
+               AND g5.game_date >= NOW() - INTERVAL '4 weeks'
+               AND r5.status = 'confirmed'
+        )`);
+    }
+
+    const bucketSql = bucketClauses.length > 0 ? '\n   AND ' + bucketClauses.join('\n   AND ') : '';
+
+    // Note: messaging_blocked check mirrors _MSG_BLOCKED_SQL pattern from comms.
+    // We also exclude players whose status is white/black tier (banned/suspended).
+    const sql = `
+        SELECT
+            p.id, p.first_name, p.full_name, p.alias, p.phone,
+            u.email,
+            (SELECT fcm_token FROM fcm_tokens WHERE player_id = p.id ORDER BY last_used_at DESC LIMIT 1) AS fcm_token,
+            (SELECT g6.game_date FROM registrations r6 JOIN games g6 ON g6.id = r6.game_id
+              WHERE r6.player_id = p.id AND r6.status = 'confirmed' ORDER BY g6.game_date DESC LIMIT 1) AS last_game_date,
+            (SELECT v6.name FROM registrations r7 JOIN games g7 ON g7.id = r7.game_id LEFT JOIN venues v6 ON v6.id = g7.venue_id
+              WHERE r7.player_id = p.id AND r7.status = 'confirmed' ORDER BY g7.game_date DESC LIMIT 1) AS last_game_venue
+          FROM players p
+          LEFT JOIN users u ON u.id = p.user_id
+         WHERE p.broadcasts_unsubscribed = FALSE
+           AND NOT (
+               p.messaging_blocked_at IS NOT NULL
+               AND (p.messaging_blocked_until IS NULL OR p.messaging_blocked_until > NOW())
+           )
+           AND COALESCE(p.reliability_tier, 'gold') NOT IN ('white', 'black')
+           AND p.id NOT IN (
+               SELECT player_id FROM registrations
+                WHERE game_id = $1 AND status IN ('confirmed', 'rsvp', 'backup')
+           )
+           ${bucketSql}
+         ORDER BY p.full_name NULLS LAST, p.alias NULLS LAST
+    `;
+    const r = await client.query(sql, params);
+
+    // Normalise phones + flag presence of contact channels.
+    return r.rows.map(row => ({
+        id:              row.id,
+        first_name:      row.first_name || row.alias || '',
+        full_name:       row.full_name || '',
+        alias:           row.alias || '',
+        email:           row.email || null,
+        phone_raw:       row.phone || null,
+        phone_e164:      _normalisePhoneE164(row.phone),
+        has_app:         !!row.fcm_token,
+        last_game_date:  row.last_game_date || null,
+        last_game_venue: row.last_game_venue || null,
+    }));
+}
+
+// Mass push helper — batch send to Expo. Splits into chunks of 100 per request
+// (Expo's recommended max). Returns aggregate { sent, failed, failed_ids }.
+async function _sendMassPush(recipients, title, body, data = {}) {
+    const withTokens = [];
+    // Re-resolve all active tokens per recipient (one user can have multiple devices).
+    for (const r of recipients) {
+        try {
+            const t = await pool.query(
+                'SELECT fcm_token FROM fcm_tokens WHERE player_id = $1 ORDER BY last_used_at DESC LIMIT 5',
+                [r.id]
+            );
+            for (const row of t.rows) {
+                withTokens.push({ player_id: r.id, token: row.fcm_token });
+            }
+        } catch (_) { /* skip */ }
+    }
+    if (withTokens.length === 0) return { sent: 0, failed: 0, failed_ids: [] };
+
+    let sent = 0, failed = 0;
+    const failed_ids = new Set();
+    // Chunk by 100 (Expo limit).
+    for (let i = 0; i < withTokens.length; i += 100) {
+        const slice = withTokens.slice(i, i + 100);
+        const messages = slice.map(({ token }) => ({
+            to: token, sound: 'default', title, body, data,
+        }));
+        try {
+            const resp = await fetch('https://exp.host/--/api/v2/push/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                body: JSON.stringify(messages),
+            });
+            if (!resp.ok) {
+                failed += slice.length;
+                for (const s of slice) failed_ids.add(s.player_id);
+                continue;
+            }
+            const json = await resp.json().catch(() => ({}));
+            const tickets = Array.isArray(json.data) ? json.data : [];
+            for (let j = 0; j < tickets.length; j++) {
+                if (tickets[j]?.status === 'ok') sent++;
+                else { failed++; failed_ids.add(slice[j].player_id); }
+            }
+        } catch (_) {
+            failed += slice.length;
+            for (const s of slice) failed_ids.add(s.player_id);
+        }
+    }
+    return { sent, failed, failed_ids: Array.from(failed_ids) };
+}
+
+// Generate vCard 3.0 content from recipient rows. Skips rows with no phone.
+function _generateVCF(recipients) {
+    const lines = [];
+    for (const r of recipients) {
+        if (!r.phone_e164) continue;
+        const name = (r.full_name || r.alias || r.first_name || 'Unknown').replace(/[\r\n]/g, ' ');
+        const phone = '+' + r.phone_e164;
+        lines.push('BEGIN:VCARD');
+        lines.push('VERSION:3.0');
+        lines.push(`FN:${name}`);
+        lines.push(`TEL;TYPE=CELL:${phone}`);
+        if (r.email) lines.push(`EMAIL:${r.email}`);
+        lines.push('END:VCARD');
+        lines.push('');
+    }
+    return lines.join('\r\n');
+}
+
+// Generate CSV with UTF-8 BOM for Excel. Quotes any value containing comma/quote/newline.
+function _generateCSV(recipients) {
+    const esc = (v) => {
+        if (v == null) return '';
+        const s = String(v);
+        if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+        return s;
+    };
+    const header = 'first_name,full_name,phone_e164,email,last_game_date,last_game_venue';
+    const rows = recipients.map(r => [
+        esc(r.first_name), esc(r.full_name), esc(r.phone_e164 || ''),
+        esc(r.email || ''),
+        esc(r.last_game_date ? new Date(r.last_game_date).toISOString().slice(0, 10) : ''),
+        esc(r.last_game_venue || ''),
+    ].join(','));
+    return '\uFEFF' + header + '\r\n' + rows.join('\r\n');
+}
+
+// In-memory single-use download token store. {token → {content, mime, filename, expires_at, used}}.
+// Server restart clears all tokens — that's fine (1h expiry anyway).
+const _massDownloadStore = new Map();
+function _stashDownload(content, mime, filename) {
+    const token = crypto.randomBytes(24).toString('hex');
+    _massDownloadStore.set(token, {
+        content, mime, filename,
+        expires_at: Date.now() + 60 * 60 * 1000,  // 1h
+        used: false,
+    });
+    return token;
+}
+// Periodic GC for expired tokens (so the Map doesn't grow forever).
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of _massDownloadStore.entries()) {
+        if (v.expires_at < now) _massDownloadStore.delete(k);
+    }
+}, 5 * 60 * 1000);
+
+// END FIX-316 helpers ═══════════════════════════════════════════════════════
+
+
 // BUG-04: stub app.post() registrations removed — they shadowed the real handlers below and
 // caused photo upload, doc upload, coach/ref apply to hang with no response.
 const largeJson = express.json({ limit: '5mb' }); // kept for inline use in coach/ref-document handlers
@@ -205,11 +815,23 @@ function _generateClaimToken() {
 }
 
 // wrapEmailHtml: consistent dark-theme email wrapper used by signup + topup emails
-function wrapEmailHtml(inner) {
+function wrapEmailHtml(inner, options) {
+    // FIX-316: optional broadcast-footer (unsubscribe link) for mass messages.
+    // Transactional emails (registration, payment, RSVP) MUST NOT pass options —
+    // legally we only need an unsubscribe link on marketing / broadcast emails.
+    // Backward-compat: existing call sites with single arg get the original behaviour.
+    const broadcastFooter = (options && options.unsubToken)
+        ? `<p style="color:#333;font-size:11px;margin-top:16px;letter-spacing:0.5px;">
+              Don't want broadcast emails from TotalFooty?
+              <a href="https://totalfooty.co.uk/api/unsubscribe/broadcasts/${options.unsubToken}" style="color:#555;text-decoration:underline;">Unsubscribe</a>
+              — you'll still get game confirmations and payment receipts.
+           </p>`
+        : '';
     return `<div style="background:#0d0d0d;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
         <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
         ${inner}
         <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
+        ${broadcastFooter}
     </div>`;
 }
 
@@ -482,6 +1104,39 @@ const AUDIT_TAG_TABLE = {
     player_stats_updated:     { cat: 'rating', sub: 'per_game',  actor: 'system', sev: 'low' },
     stats_updated:            { cat: 'rating', sub: 'override',  actor: 'admin',  sev: 'med' },
     tier_recalculated:        { cat: 'rating', sub: 'auto',      actor: 'system', sev: 'low' },
+
+    // ─── FIX-315: RSVP SYSTEM ─────────────────────────────────────────────
+    // rsvp_created                 — player created an RSVP (held a spot without paying).
+    // rsvp_cancelled               — player cancelled their own RSVP (free, no penalty).
+    // rsvp_paid                    — player paid their RSVP → status flipped to 'confirmed'.
+    // rsvp_bumped                  — cron auto-bumped the RSVP (deadline passed unpaid).
+    // rsvp_warning_sent            — cron sent the 48h warning email.
+    // rsvp_bump_notified           — cron sent the bump notification email.
+    // rsvp_accelerator_fired       — first confirmed_backup payment fired the deadline accelerator.
+    // rsvp_admin_accelerator_fired — admin manually fired the accelerator via RSVP Pulse.
+    // rsvp_admin_bump_all          — admin emergency-bumped every pending RSVP via RSVP Pulse.
+    rsvp_created:                  { cat: 'participation', sub: 'joined',  actor: 'player', sev: 'low'  },
+    rsvp_cancelled:                { cat: 'participation', sub: 'left',    actor: 'player', sev: 'low'  },
+    rsvp_paid:                     { cat: 'participation', sub: 'joined',  actor: 'player', sev: 'low'  },
+    rsvp_bumped:                   { cat: 'participation', sub: 'left',    actor: 'system', sev: 'med'  },
+    rsvp_warning_sent:             { cat: 'participation', sub: 'joined',  actor: 'system', sev: 'low'  },
+    rsvp_bump_notified:            { cat: 'participation', sub: 'left',    actor: 'system', sev: 'low'  },
+    rsvp_accelerator_fired:        { cat: 'participation', sub: 'joined',  actor: 'system', sev: 'med'  },
+    rsvp_admin_accelerator_fired:  { cat: 'participation', sub: 'joined',  actor: 'admin',  sev: 'high' },
+    rsvp_admin_bump_all:           { cat: 'participation', sub: 'left',    actor: 'admin',  sev: 'high' },
+
+    // ─── FIX-316: MASS MESSAGING ──────────────────────────────────────────
+    // mass_msg_sent              — admin fired a broadcast across N channels.
+    // mass_msg_template_used     — which template was selected (analytics).
+    // mass_msg_recipient_excluded — system event when a filter excluded a player
+    //                              (unsubscribed / blocked / already-registered).
+    // broadcast_unsubscribed     — player clicked the unsubscribe link.
+    // broadcast_resubscribed     — admin re-enabled broadcasts for a player.
+    mass_msg_sent:                { cat: 'comms', sub: 'mass_message',  actor: 'admin',  sev: 'med'  },
+    mass_msg_template_used:       { cat: 'comms', sub: 'mass_message',  actor: 'admin',  sev: 'low'  },
+    mass_msg_recipient_excluded:  { cat: 'comms', sub: 'mass_message',  actor: 'system', sev: 'low'  },
+    broadcast_unsubscribed:       { cat: 'comms', sub: 'unsubscribe',   actor: 'player', sev: 'low'  },
+    broadcast_resubscribed:       { cat: 'comms', sub: 'unsubscribe',   actor: 'admin',  sev: 'low'  },
 
     // ─── DISCIPLINE ────────────────────────────────────────────────────────
     discipline_added:         { cat: 'discipline', sub: 'points', actor: 'admin',  sev: 'med' },
@@ -1586,6 +2241,11 @@ const NOTIF_TEMPLATES = {
         title: '🚨 Late drop-out',
         body:  `${d.alias} dropped from ${d.venue} (${d.reason}). £${d.amount} kept.`
     }),
+    // FIX-315: RSVP push notifications. Mirror the 4 emails.
+    rsvp_confirmed:    d => ({ title: 'RSVP held ⏰',              body: `Pay by ${d.deadline_short} to confirm ${d.day} at ${d.venue}.` }),
+    rsvp_warning:      d => ({ title: '⏰ 48h to pay',              body: `Your RSVP for ${d.day} at ${d.venue} needs paying soon — deadline ${d.deadline_short}.` }),
+    rsvp_accelerated:  d => ({ title: '🔥 Deadline brought forward', body: `${d.venue} is full. Your RSVP deadline is now ${d.deadline_short}.` }),
+    rsvp_bumped:       d => ({ title: '🚫 Lost your spot',          body: d.hasOpenSpots ? `Other RSVPs didn't pay either — race to reclaim ${d.day} at ${d.venue}.` : `Spots filled by backups. Pay to become a backup yourself if you still want in.` }),
 };
 
 // sendNotification: send an Expo push notification to a player's registered devices.
@@ -5118,7 +5778,7 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
         const upcomingResult = await pool.query(`
             SELECT g.id, g.game_date, g.cost_per_player, g.max_players, g.format, g.game_url,
                    v.name as venue_name,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
             FROM registrations r
             JOIN games g ON g.id = r.game_id
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -5973,7 +6633,7 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
                                    THEN NULLIF(p.goalkeeper_rating, 0)
                                    ELSE p.overall_rating END AS rating
                        FROM registrations r JOIN players p ON p.id = r.player_id
-                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       WHERE r.game_id = g.id AND r.status IN ('confirmed', 'rsvp') /* FIX-315: include RSVPs in live_avg_ovr */
                        UNION ALL
                        SELECT CASE WHEN gg.position_classification = 'gk'
                                    THEN NULLIF(gg.goalkeeper_rating, 0)
@@ -8177,13 +8837,13 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    ROUND((SELECT AVG(rating) FROM (
                        SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
                                    THEN NULLIF(p.goalkeeper_rating, 0)
                                    ELSE p.overall_rating END AS rating
                        FROM registrations r JOIN players p ON p.id = r.player_id
-                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       WHERE r.game_id = g.id AND r.status IN ('confirmed', 'rsvp') /* FIX-315: include RSVPs in live_avg_ovr */
                        UNION ALL
                        SELECT CASE WHEN gg.position_classification = 'gk'
                                    THEN NULLIF(gg.goalkeeper_rating, 0)
@@ -8448,26 +9108,33 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    ROUND((SELECT AVG(rating) FROM (
                        SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
                                    THEN NULLIF(p.goalkeeper_rating, 0)
                                    ELSE p.overall_rating END AS rating
                        FROM registrations r JOIN players p ON p.id = r.player_id
-                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       WHERE r.game_id = g.id AND r.status IN ('confirmed', 'rsvp') /* FIX-315: include RSVPs in live_avg_ovr */
                        UNION ALL
                        SELECT CASE WHEN gg.position_classification = 'gk'
                                    THEN NULLIF(gg.goalkeeper_rating, 0)
                                    ELSE gg.overall_rating END AS rating
                        FROM game_guests gg WHERE gg.game_id = g.id
                    ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK') as gk_count,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp') AND UPPER(TRIM(position_preference)) = 'GK') as gk_count /* FIX-315 */,
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1) as registration_status,
                    (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1) as my_backup_type,
                    -- P2.3: amount paid by current user (drives drop-out penalty dialog in game.html)
                    COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1), 0) as my_amount_paid,
-                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1), 0) as my_amount_paid_free
+                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1), 0) as my_amount_paid_free,
+                   -- FIX-315: RSVP system state.
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'rsvp') as rsvp_count,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup' AND backup_type = 'confirmed_backup') as confirmed_backup_count,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'bumped') as bumped_count,
+                   (SELECT rsvp_deadline FROM registrations WHERE game_id = g.id AND player_id = $2 AND status = 'rsvp' LIMIT 1) as my_rsvp_deadline,
+                   g.accelerator_fired_at,
+                   g.accelerator_fired_by_player_id
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
@@ -9871,7 +10538,7 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
             ${isDraftMemory ? `LEFT JOIN player_fixed_teams pft ON pft.player_id = p.id AND pft.series_id = $2` : ''}
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
-            WHERE r.game_id = $1 AND r.status IN ('confirmed', 'backup')
+            WHERE r.game_id = $1 AND r.status IN ('confirmed', 'rsvp', 'backup') /* FIX-315 */
             GROUP BY r.id, r.registered_by_player_id, reg_by.alias, reg_by.full_name,
                      p.id, p.full_name, p.alias, p.squad_number, p.is_organiser,
                      p.goalkeeper_rating, p.defending_rating, p.strength_rating,
@@ -10156,6 +10823,856 @@ async function cleanupBffRivalAutoFillForDroppingPlayer(client, playerId, gameId
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// FIX-315 — RSVP endpoints
+// ════════════════════════════════════════════════════════════════════════
+
+// POST /api/games/:id/rsvp — create an RSVP (hold a spot without paying).
+// Body: { position, positions, positionAreas } — same shape as /register.
+// Validates: game accepts new sign-ups, game not full, player not already
+// registered, player not tier-banned. Returns rsvp_deadline.
+app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        const { position, positions, positionAreas } = req.body || {};
+        const positionValue = positions || position || 'outfield';
+
+        // Sanitise position_areas — mirror /register
+        const _ALLOWED_AREAS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF','defence','midfield','attack']);
+        const sanitisedPositionAreas = positionAreas
+            ? positionAreas.split(',').map(s => s.trim()).filter(s => _ALLOWED_AREAS.has(s)).join(',') || null
+            : null;
+
+        await client.query('BEGIN');
+
+        const gameLock = await client.query(`
+            SELECT id, max_players, game_status, game_date, player_editing_locked,
+                   team_selection_type, tournament_team_count, requires_organiser
+              FROM games
+             WHERE id = $1
+             FOR UPDATE
+        `, [gameId]);
+        if (gameLock.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        const game = gameLock.rows[0];
+
+        if (!['available', 'confirmed'].includes(game.game_status)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This game is no longer accepting registrations' });
+        }
+        if (game.player_editing_locked) {
+            await client.query('ROLLBACK');
+            return res.status(423).json({ error: 'Game is currently being edited by an admin. Please try again in a few minutes.' });
+        }
+
+        // Block White/Black tier — same as /register
+        const tierRes = await client.query('SELECT reliability_tier FROM players WHERE id = $1', [req.user.playerId]);
+        const tier = tierRes.rows[0]?.reliability_tier;
+        if (tier === 'white') { await client.query('ROLLBACK'); return res.status(403).json({ error: 'You are currently serving a 1-week signup ban.' }); }
+        if (tier === 'black') { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Your account has been suspended.' }); }
+
+        // Existing registration check — RSVP / confirmed / backup / bumped are
+        // all considered "already involved" — no double-signup.
+        const existing = await client.query(
+            'SELECT id, status FROM registrations WHERE game_id = $1 AND player_id = $2',
+            [gameId, req.user.playerId]
+        );
+        if (existing.rows.length > 0) {
+            await client.query('ROLLBACK');
+            const exStatus = existing.rows[0].status;
+            const msg = exStatus === 'confirmed' ? 'You are already confirmed for this game.'
+                      : exStatus === 'rsvp'      ? "You've already RSVP'd — pay to confirm or cancel first."
+                      : exStatus === 'backup'    ? 'You are already on the backup list.'
+                      : exStatus === 'bumped'    ? 'You were bumped from this game. Re-pay via the game page to claim a spot.'
+                      : 'You are already involved with this game.';
+            return res.status(400).json({ error: msg });
+        }
+
+        // Capacity check — confirmed + rsvp count against max.
+        const countRes = await client.query(
+            "SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS current_players",
+            [gameId]
+        );
+        const currentPlayers = parseInt(countRes.rows[0].current_players);
+        // Same organiser-reservation guard as /register.
+        let effectiveMax = parseInt(game.max_players);
+        if (game.requires_organiser) {
+            const _orgCheck = await client.query('SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]);
+            const _playerIsOrganiser = _orgCheck.rows[0]?.is_organiser || false;
+            if (!_playerIsOrganiser) {
+                const _orgCount = await client.query(`
+                    SELECT COUNT(*) AS cnt FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                    WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
+                `, [gameId]);
+                if (parseInt(_orgCount.rows[0].cnt) === 0) {
+                    effectiveMax = parseInt(game.max_players) - 1;
+                }
+            }
+        }
+        if (currentPlayers >= effectiveMax) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                error: 'game_full',
+                message: 'Game is full. Use the Confirmed Backup option to pay upfront and queue for a spot.',
+                currentPlayers, maxPlayers: parseInt(game.max_players)
+            });
+        }
+
+        // Compute deadline. Floor at NOW (in case a game is < 24h away — RSVP
+        // is still allowed but the deadline is essentially "ASAP"; the warning
+        // email won't fire because we're already past the 48h window).
+        const gameDate = new Date(game.game_date);
+        const defaultDeadline = new Date(gameDate.getTime() - RSVP_DEADLINE_HOURS * 3600 * 1000);
+        const minDeadline     = new Date(Date.now() + 60 * 1000); // at least 1 min in future
+        const rsvpDeadline    = defaultDeadline > minDeadline ? defaultDeadline : minDeadline;
+
+        // Insert the RSVP row. amount_paid / amount_paid_free stay 0 — no money moved.
+        await client.query(
+            `INSERT INTO registrations
+                (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, is_comped, position_areas, rsvp_deadline)
+             VALUES ($1, $2, 'rsvp', $3, 0, 0, false, $4, $5)`,
+            [gameId, req.user.playerId, positionValue, sanitisedPositionAreas, rsvpDeadline]
+        );
+
+        await client.query('COMMIT');
+
+        // Post-commit: email + push + audit (fire and forget).
+        try {
+            const gd = await getGameDataForNotification(gameId);
+            _sendRsvpEmail('confirmation', req.user.playerId, gd, { deadline: rsvpDeadline }).catch(() => {});
+            sendNotification('rsvp_confirmed', req.user.playerId, {
+                ...gd,
+                deadline_short: _rsvpFormatDeadline(rsvpDeadline)
+            }).catch(() => {});
+            await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_created',
+                `RSVP created, deadline ${rsvpDeadline.toISOString()}`).catch(() => {});
+        } catch (_) { /* non-critical */ }
+
+        return res.json({ ok: true, rsvp_deadline: rsvpDeadline.toISOString() });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('[FIX-315] POST /api/games/:id/rsvp error:', err);
+        return res.status(500).json({ error: 'Failed to RSVP' });
+    } finally {
+        client.release();
+    }
+});
+
+// DELETE /api/games/:id/rsvp — cancel own RSVP. Free, no penalty, anytime.
+app.delete('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        await client.query('BEGIN');
+        const reg = await client.query(
+            `SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'rsvp' FOR UPDATE`,
+            [gameId, req.user.playerId]
+        );
+        if (reg.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'No active RSVP to cancel' });
+        }
+        await client.query('DELETE FROM registrations WHERE id = $1', [reg.rows[0].id]);
+        await client.query('COMMIT');
+        await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_cancelled',
+            'Player cancelled own RSVP').catch(() => {});
+        return res.json({ ok: true });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('[FIX-315] DELETE /api/games/:id/rsvp error:', err);
+        return res.status(500).json({ error: 'Failed to cancel RSVP' });
+    } finally {
+        client.release();
+    }
+});
+
+// POST /api/games/:id/rsvp/pay — convert an RSVP into a confirmed registration.
+// Charges credits at the CURRENT effective price (per spec — pay at conversion
+// time, not at RSVP time). Mirrors /claim-spot's payment path.
+app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        await client.query('BEGIN');
+
+        const gameRow = await client.query(`
+            SELECT id, cost_per_player, early_bird_price, super_early_bird_price, game_date,
+                   max_players, game_status, player_editing_locked
+              FROM games WHERE id = $1 FOR UPDATE`,
+            [gameId]
+        );
+        if (gameRow.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        const game = gameRow.rows[0];
+        if (!['available', 'confirmed'].includes(game.game_status)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This game is no longer accepting payments' });
+        }
+
+        const reg = await client.query(
+            `SELECT id, position_preference, is_comped, rsvp_deadline
+               FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'rsvp' FOR UPDATE`,
+            [gameId, req.user.playerId]
+        );
+        if (reg.rows.length === 0) {
+            // Could be already bumped (cron raced). Check and surface a clear error.
+            const checkBumped = await client.query(
+                `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2`,
+                [gameId, req.user.playerId]
+            );
+            await client.query('ROLLBACK');
+            if (checkBumped.rows[0]?.status === 'bumped') {
+                return res.status(409).json({ error: 'Your RSVP deadline passed. Race for an open spot if any remain.', code: 'rsvp_bumped' });
+            }
+            return res.status(404).json({ error: 'No active RSVP to convert' });
+        }
+
+        const { price: effectiveCost, tier: pricingTier } = getEffectivePrice(game);
+        const isComped = !!reg.rows[0].is_comped;
+
+        let realCharged = 0, freeCharged = 0;
+        if (!isComped && parseFloat(game.cost_per_player) > 0) {
+            const creditRes = await client.query(
+                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                   FROM credits WHERE player_id = $1`,
+                [req.user.playerId]
+            );
+            const balance = parseFloat(creditRes.rows[0]?.total_available || 0);
+            if (Math.round(balance * 100) < Math.round(effectiveCost * 100)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    error: `Insufficient credits. You need £${effectiveCost.toFixed(2)} but have £${balance.toFixed(2)}.`,
+                    code: 'INSUFFICIENT_CREDITS'
+                });
+            }
+            const charge = await applyGameFee(client, req.user.playerId, effectiveCost,
+                `RSVP converted to paid - game ${gameId} (${pricingTier} pricing)`);
+            realCharged = charge.realCharged;
+            freeCharged = charge.freeCharged;
+        }
+
+        // Promote the row — status flips to 'confirmed', deadline & warning fields cleared.
+        await client.query(
+            `UPDATE registrations
+                SET status = 'confirmed',
+                    amount_paid = $2,
+                    amount_paid_free = $3,
+                    rsvp_deadline = NULL,
+                    rsvp_warned_at = NULL
+              WHERE id = $1`,
+            [reg.rows[0].id, isComped ? 0 : (realCharged || effectiveCost), isComped ? 0 : (freeCharged || 0)]
+        );
+
+        // BFFs/Rivals auto-fill for the newly-confirmed player (matches /claim-spot).
+        try {
+            await applyBffRivalAutoFill(client, req.user.playerId, gameId, reg.rows[0].id);
+        } catch (e) { console.warn('[FIX-315] BFF auto-fill on RSVP pay failed (non-fatal):', e.message); }
+
+        await client.query('COMMIT');
+
+        await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_paid',
+            `RSVP converted to confirmed at £${effectiveCost.toFixed(2)} (${pricingTier})`).catch(() => {});
+        try {
+            const gd = await getGameDataForNotification(gameId);
+            sendNotification('game_registered', req.user.playerId, gd).catch(() => {});
+        } catch (_) { /* non-critical */ }
+
+        return res.json({ ok: true, charged: effectiveCost, pricingTier });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('[FIX-315] POST /api/games/:id/rsvp/pay error:', err);
+        return res.status(500).json({ error: 'Failed to convert RSVP' });
+    } finally {
+        client.release();
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-315 — Admin RSVP Pulse endpoints (CRM tile)
+// ════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/rsvp-pulse/games — list of upcoming games with at least
+// one RSVP, confirmed_backup, or bumped row. Used by CRM Pulse tile.
+app.get('/api/admin/rsvp-pulse/games', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT g.id, g.game_date, g.game_status, g.max_players,
+                   v.name AS venue_name,
+                   g.accelerator_fired_at,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') AS confirmed_count,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'rsvp')      AS rsvp_count,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup' AND backup_type = 'confirmed_backup') AS confirmed_backup_count,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'bumped')    AS bumped_count,
+                   (SELECT MIN(rsvp_deadline) FROM registrations WHERE game_id = g.id AND status = 'rsvp') AS earliest_rsvp_deadline
+              FROM games g
+              LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE g.game_status IN ('available', 'confirmed')
+               AND g.game_date > NOW() - INTERVAL '1 day'
+             ORDER BY g.game_date ASC
+        `);
+        // Only return games that actually have RSVP-system activity
+        const filtered = r.rows.filter(g =>
+            parseInt(g.rsvp_count) > 0 ||
+            parseInt(g.confirmed_backup_count) > 0 ||
+            parseInt(g.bumped_count) > 0 ||
+            !!g.accelerator_fired_at
+        );
+        return res.json({ games: filtered });
+    } catch (err) {
+        console.error('[FIX-315] rsvp-pulse/games error:', err);
+        return res.status(500).json({ error: 'Failed to load Pulse games' });
+    }
+});
+
+// GET /api/admin/games/:id/rsvp-pulse — counts + deadline + accelerator state.
+app.get('/api/admin/games/:id/rsvp-pulse', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        const result = await pool.query(`
+            SELECT
+                g.id, g.game_date, g.max_players, g.game_status,
+                v.name AS venue_name,
+                g.accelerator_fired_at, g.accelerator_fired_by_player_id,
+                COALESCE((SELECT alias FROM players WHERE id = g.accelerator_fired_by_player_id), NULL) AS accelerator_fired_by_alias,
+                (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') AS confirmed_count,
+                (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'rsvp')      AS rsvp_count,
+                (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup' AND backup_type = 'confirmed_backup') AS confirmed_backup_count,
+                (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'bumped')    AS bumped_count
+              FROM games g
+              LEFT JOIN venues v ON v.id = g.venue_id
+             WHERE g.id = $1
+        `, [gameId]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+
+        // Per-RSVP list
+        const rsvps = await pool.query(`
+            SELECT r.id, r.player_id, r.rsvp_deadline, r.rsvp_warned_at, r.registered_at,
+                   p.alias, p.full_name
+              FROM registrations r
+              JOIN players p ON p.id = r.player_id
+             WHERE r.game_id = $1 AND r.status = 'rsvp'
+             ORDER BY r.rsvp_deadline ASC NULLS LAST, r.registered_at ASC
+        `, [gameId]);
+
+        return res.json({
+            game: result.rows[0],
+            rsvps: rsvps.rows
+        });
+    } catch (err) {
+        console.error('[FIX-315] rsvp-pulse GET error:', err);
+        return res.status(500).json({ error: 'Failed to load RSVP Pulse' });
+    }
+});
+
+// POST /api/admin/games/:id/rsvp-pulse/force-accelerator — manual accelerator fire.
+app.post('/api/admin/games/:id/rsvp-pulse/force-accelerator', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        await client.query('BEGIN');
+        const gRes = await client.query(`SELECT id, accelerator_fired_at FROM games WHERE id = $1 FOR UPDATE`, [gameId]);
+        if (gRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Game not found' }); }
+        if (gRes.rows[0].accelerator_fired_at) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Accelerator already fired for this game' });
+        }
+        const upd = await client.query(`
+            UPDATE registrations
+               SET rsvp_deadline = LEAST(rsvp_deadline, NOW() + ($2 || ' hours')::interval),
+                   rsvp_warned_at = NULL
+             WHERE game_id = $1 AND status = 'rsvp'
+             RETURNING id, player_id, rsvp_deadline
+        `, [gameId, String(RSVP_ACCEL_HOURS)]);
+        await client.query(`UPDATE games SET accelerator_fired_at = NOW(), accelerator_fired_by_player_id = $2 WHERE id = $1`,
+            [gameId, req.user.playerId]);
+        await client.query('COMMIT');
+
+        // Fire alerts post-commit
+        const gd = await getGameDataForNotification(gameId);
+        for (const row of upd.rows) {
+            _sendRsvpEmail('accelerated', row.player_id, gd, { deadline: row.rsvp_deadline }).catch(() => {});
+            sendNotification('rsvp_accelerated', row.player_id, { ...gd, deadline_short: _rsvpFormatDeadline(row.rsvp_deadline) }).catch(() => {});
+        }
+        await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_admin_accelerator_fired',
+            `Admin manually fired accelerator — ${upd.rows.length} RSVP deadline(s) brought forward`).catch(() => {});
+
+        return res.json({ ok: true, affected: upd.rows.length });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('[FIX-315] force-accelerator error:', err);
+        return res.status(500).json({ error: 'Failed to fire accelerator' });
+    } finally {
+        client.release();
+    }
+});
+
+// POST /api/admin/games/:id/rsvp-pulse/force-warning-email — fire the 48h warning NOW for all RSVPs.
+app.post('/api/admin/games/:id/rsvp-pulse/force-warning-email', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        await client.query('BEGIN');
+        const rsvps = await client.query(`
+            SELECT id, player_id, rsvp_deadline FROM registrations
+             WHERE game_id = $1 AND status = 'rsvp' FOR UPDATE`,
+            [gameId]
+        );
+        if (rsvps.rows.length === 0) { await client.query('ROLLBACK'); return res.json({ ok: true, sent: 0 }); }
+        await client.query(`
+            UPDATE registrations SET rsvp_warned_at = NOW()
+             WHERE game_id = $1 AND status = 'rsvp' AND rsvp_warned_at IS NULL`,
+            [gameId]
+        );
+        await client.query('COMMIT');
+        const gd = await getGameDataForNotification(gameId);
+        for (const row of rsvps.rows) {
+            _sendRsvpEmail('warning', row.player_id, gd, { deadline: row.rsvp_deadline }).catch(() => {});
+            sendNotification('rsvp_warning', row.player_id, { ...gd, deadline_short: _rsvpFormatDeadline(row.rsvp_deadline) }).catch(() => {});
+        }
+        await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_warning_sent',
+            `Admin force-sent 48h warning to ${rsvps.rows.length} RSVP(s)`).catch(() => {});
+        return res.json({ ok: true, sent: rsvps.rows.length });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('[FIX-315] force-warning-email error:', err);
+        return res.status(500).json({ error: 'Failed to send warnings' });
+    } finally {
+        client.release();
+    }
+});
+
+// POST /api/admin/games/:id/rsvp-pulse/bump-all — emergency bump every pending RSVP.
+app.post('/api/admin/games/:id/rsvp-pulse/bump-all', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const gameId = req.params.id;
+        await client.query('BEGIN');
+        const gRes = await client.query(
+            `SELECT id, max_players, team_selection_type, tournament_team_count FROM games WHERE id = $1 FOR UPDATE`,
+            [gameId]
+        );
+        if (gRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Game not found' }); }
+        const gameMeta = gRes.rows[0];
+
+        const bumped = await client.query(`
+            UPDATE registrations SET status = 'bumped', bumped_at = NOW()
+             WHERE game_id = $1 AND status = 'rsvp'
+             RETURNING id, player_id`,
+            [gameId]
+        );
+
+        // Count spots freed = # bumped. Promote confirmed_backups in paid_at order.
+        const promoted = await _fix315PromoteConfirmedBackups(client, gameId, bumped.rows.length, gameMeta);
+
+        await client.query('COMMIT');
+
+        // Post-commit: bump notifications. hasOpenSpots = whether there are
+        // still open slots AFTER backups promoted.
+        const slotsRemaining = bumped.rows.length - promoted.length;
+        const gd = await getGameDataForNotification(gameId);
+        for (const row of bumped.rows) {
+            _sendRsvpEmail('bumped', row.player_id, gd, { hasOpenSpots: slotsRemaining > 0, openCount: slotsRemaining }).catch(() => {});
+            sendNotification('rsvp_bumped', row.player_id, { ...gd, hasOpenSpots: slotsRemaining > 0 }).catch(() => {});
+        }
+        // Mark them as notified so the bump-notify cron skips them.
+        if (bumped.rows.length > 0) {
+            await pool.query(
+                `UPDATE registrations SET bumped_notified_at = NOW() WHERE id = ANY($1::uuid[])`,
+                [bumped.rows.map(r => r.id)]
+            ).catch(() => {});
+        }
+        await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_admin_bump_all',
+            `Admin emergency-bumped ${bumped.rows.length} RSVP(s); ${promoted.length} confirmed_backup(s) promoted`).catch(() => {});
+
+        return res.json({ ok: true, bumped: bumped.rows.length, promoted: promoted.length });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('[FIX-315] bump-all error:', err);
+        return res.status(500).json({ error: 'Failed to bump RSVPs' });
+    } finally {
+        client.release();
+    }
+});
+
+// END FIX-315 RSVP endpoints ════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-316 — MASS MESSAGING endpoints
+// ════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/mass-message/templates — return the 6 hardcoded templates.
+app.get('/api/admin/mass-message/templates', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        return res.json({ templates: MASS_MESSAGE_TEMPLATES });
+    } catch (e) {
+        return res.status(500).json({ error: 'Failed to load templates' });
+    }
+});
+
+// POST /api/admin/mass-message/preview — compute the audience + counts.
+// Body: { game_id, buckets: [...] }
+app.post('/api/admin/mass-message/preview', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { game_id, buckets } = req.body || {};
+        if (!game_id || !isValidUuid(String(game_id))) return res.status(400).json({ error: 'Valid game_id required' });
+        if (!Array.isArray(buckets) || buckets.length === 0) return res.status(400).json({ error: 'Select at least one audience bucket' });
+
+        const recipients = await _buildMassMessageAudience(client, game_id, buckets);
+        const per_channel_reach = {
+            push:     recipients.filter(r => r.has_app).length,
+            email:    recipients.filter(r => !!r.email).length,
+            whatsapp: recipients.filter(r => !!r.phone_e164).length,
+            vcf:      recipients.filter(r => !!r.phone_e164).length,
+            csv:      recipients.length,
+        };
+        const warnings = [];
+        if (recipients.length === 0) warnings.push('No players match the selected filters.');
+        if (per_channel_reach.email   < recipients.length) warnings.push(`${recipients.length - per_channel_reach.email} player(s) have no email on file.`);
+        if (per_channel_reach.whatsapp < recipients.length) warnings.push(`${recipients.length - per_channel_reach.whatsapp} player(s) have no valid phone number.`);
+
+        return res.json({
+            recipients: recipients.map(r => ({
+                id: r.id,
+                first_name: r.first_name,
+                full_name: r.full_name,
+                alias: r.alias,
+                has_email: !!r.email,
+                has_phone: !!r.phone_e164,
+                has_app: r.has_app,
+                last_game_date: r.last_game_date,
+                last_game_venue: r.last_game_venue,
+            })),
+            per_channel_reach,
+            warnings,
+        });
+    } catch (e) {
+        console.error('[FIX-316] preview error:', e);
+        return res.status(500).json({ error: 'Preview failed: ' + e.message });
+    } finally {
+        client.release();
+    }
+});
+
+// POST /api/admin/mass-message/send — fire the broadcast.
+// Body: { game_id, buckets, recipient_ids, template_id, custom_message?, custom_subject?, channels: ['push','email','whatsapp','vcf','csv'] }
+app.post('/api/admin/mass-message/send', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { game_id, buckets, recipient_ids, template_id, custom_message, custom_subject, channels } = req.body || {};
+        if (!game_id || !isValidUuid(String(game_id))) return res.status(400).json({ error: 'Valid game_id required' });
+        if (!Array.isArray(channels) || channels.length === 0) return res.status(400).json({ error: 'Select at least one channel' });
+        if (!Array.isArray(recipient_ids) || recipient_ids.length === 0) return res.status(400).json({ error: 'At least one recipient required' });
+        if (recipient_ids.length > 500) return res.status(400).json({ error: 'Maximum 500 recipients per send' });
+
+        const VALID_CHANNELS = new Set(['push', 'email', 'whatsapp', 'vcf', 'csv']);
+        const selectedChannels = channels.filter(c => VALID_CHANNELS.has(c));
+        if (selectedChannels.length === 0) return res.status(400).json({ error: 'No valid channel selected' });
+
+        // Template lookup.
+        const tmpl = MASS_MESSAGE_TEMPLATES[template_id] || MASS_MESSAGE_TEMPLATES.custom;
+        if (!tmpl) return res.status(400).json({ error: 'Unknown template_id' });
+        // Compose effective subject + body. Admin may override via custom_*.
+        const subjectTemplate = (typeof custom_subject === 'string' && custom_subject.trim()) ? custom_subject : tmpl.subject_template;
+        const bodyTemplate    = (typeof custom_message === 'string' && custom_message.trim()) ? custom_message : tmpl.body_template;
+        if (!bodyTemplate || bodyTemplate.trim().length < 5) return res.status(400).json({ error: 'Message body too short' });
+
+        // Build audience, then intersect with admin's selected recipient_ids.
+        const audience = await _buildMassMessageAudience(client, game_id, buckets || []);
+        const audienceMap = new Map(audience.map(r => [String(r.id), r]));
+        const recipients = recipient_ids
+            .map(id => audienceMap.get(String(id)))
+            .filter(Boolean);
+        if (recipients.length === 0) {
+            return res.status(400).json({ error: 'No valid recipients (all filtered by always-excluded list).' });
+        }
+
+        // Fetch game context for template substitution.
+        const gRes = await client.query(`
+            SELECT g.id, g.game_url, g.game_date, g.format, g.cost_per_player, g.max_players,
+                   v.name AS venue_name, v.region AS venue_region,
+                   gs.series_name,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                    + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))::int AS current_players
+              FROM games g
+              LEFT JOIN venues v ON v.id = g.venue_id
+              LEFT JOIN game_series gs ON gs.id = g.series_id
+             WHERE g.id = $1`,
+            [game_id]
+        );
+        if (gRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const game = gRes.rows[0];
+
+        // Resolve subject once (no per-recipient diff in subject — only body).
+        const subjectResolved = _resolvePlaceholders(subjectTemplate, { first_name: 'there' }, game);
+
+        // ─── Execute each channel ───────────────────────────────────────
+        // FIX-316: log_id isn't known until the INSERT at the end. The email
+        // channel's background loop needs it to UPDATE the row with final
+        // sent/failed counts. We resolve a Promise once the INSERT lands.
+        let _resolveLogId;
+        const _logIdPromise = new Promise(resolve => { _resolveLogId = resolve; });
+
+        let push_status = null, email_status = null, whatsapp_status = null, vcf_status = null, csv_status = null;
+        let whatsapp_links = [];
+        let vcf_url = null, csv_url = null;
+
+        // PUSH — fire-and-forget mass push.
+        if (selectedChannels.includes('push')) {
+            const pushRecipients = recipients.filter(r => r.has_app);
+            if (pushRecipients.length === 0) {
+                push_status = { sent: 0, failed: 0, failed_ids: [], skipped: 'no recipients with app' };
+            } else {
+                // Per-recipient title/body would need separate push per player.
+                // For now: substitute placeholders with the FIRST recipient as a representative;
+                // first_name is the most personal — leave it generic ("there") to avoid wrong-name push.
+                const pushTitle = subjectResolved || 'TotalFooty';
+                const pushBody  = _resolvePlaceholders(bodyTemplate, { first_name: 'there' }, game).slice(0, 240);
+                push_status = await _sendMassPush(pushRecipients, pushTitle, pushBody, { gameId: game.id });
+            }
+        }
+
+        // EMAIL — per-recipient substitution, sent at 10/sec via setTimeout chaining.
+        // Returns synchronous "queued" status; actual delivery happens in the background.
+        if (selectedChannels.includes('email')) {
+            const emailRecipients = recipients.filter(r => !!r.email);
+            email_status = { sent: 0, failed: 0, failed_ids: [], queued: emailRecipients.length };
+            // Background sender — capture variables in closure.
+            (async () => {
+                for (const r of emailRecipients) {
+                    try {
+                        const personalisedBody = _resolvePlaceholders(bodyTemplate, r, game);
+                        const personalisedSubject = _resolvePlaceholders(subjectTemplate, r, game) || 'TotalFooty';
+                        // Render plain-text body as HTML paragraphs.
+                        const htmlInner = '<div style="color:#fff;font-size:15px;line-height:1.65;white-space:pre-wrap;">' +
+                            personalisedBody.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') +
+                            '</div>';
+                        await emailTransporter.sendMail({
+                            from: '"TotalFooty" <totalfooty19@gmail.com>',
+                            to: r.email,
+                            subject: personalisedSubject,
+                            html: wrapEmailHtml(htmlInner, { unsubToken: _signUnsubToken(r.id) }),
+                        });
+                        email_status.sent++;
+                    } catch (e) {
+                        email_status.failed++;
+                        email_status.failed_ids.push(r.id);
+                        console.warn('[FIX-316] email send failed for', r.id, ':', e.message);
+                    }
+                    // Throttle: 10/sec.
+                    await new Promise(r2 => setTimeout(r2, 100));
+                }
+                console.log(`[FIX-316] mass email complete — sent ${email_status.sent}, failed ${email_status.failed}`);
+                // FIX-316: persist final email_status to the log row so admin can
+                // see actual sent/failed counts in /api/admin/mass-message/log.
+                try {
+                    const lid = await _logIdPromise;
+                    await pool.query(
+                        'UPDATE mass_message_log SET email_status = $1 WHERE id = $2',
+                        [JSON.stringify(email_status), lid]
+                    );
+                } catch (e) { console.warn('[FIX-316] email final-status update failed:', e.message); }
+            })().catch(e => console.error('[FIX-316] email background sender crashed:', e.message));
+        }
+
+        // WHATSAPP — generate wa.me links, return to client. No async send.
+        if (selectedChannels.includes('whatsapp')) {
+            const waRecipients = recipients.filter(r => !!r.phone_e164);
+            whatsapp_links = waRecipients.map(r => {
+                const personalisedBody = _resolvePlaceholders(bodyTemplate, r, game);
+                return {
+                    player_id: r.id,
+                    name: r.full_name || r.alias || r.first_name,
+                    link: `https://wa.me/${r.phone_e164}?text=${encodeURIComponent(personalisedBody)}`,
+                };
+            });
+            whatsapp_status = { links_generated: whatsapp_links.length };
+        }
+
+        // VCF — generate file, stash, return signed URL.
+        if (selectedChannels.includes('vcf')) {
+            const vcfContent = _generateVCF(recipients);
+            const fname = `totalfooty-${(_massShortDate(game.game_date) || 'broadcast').replace(/\s+/g, '_')}.vcf`;
+            const tok = _stashDownload(vcfContent, 'text/vcard; charset=utf-8', fname);
+            vcf_url = `/api/admin/mass-message/download/${tok}`;
+            vcf_status = { generated: true, recipient_count: recipients.filter(r => !!r.phone_e164).length, download_url: vcf_url };
+        }
+
+        // CSV — same pattern.
+        if (selectedChannels.includes('csv')) {
+            const csvContent = _generateCSV(recipients);
+            const fname = `totalfooty-${(_massShortDate(game.game_date) || 'broadcast').replace(/\s+/g, '_')}.csv`;
+            const tok = _stashDownload(csvContent, 'text/csv; charset=utf-8', fname);
+            csv_url = `/api/admin/mass-message/download/${tok}`;
+            csv_status = { generated: true, recipient_count: recipients.length, download_url: csv_url };
+        }
+
+        // ─── Persist log row + audit ────────────────────────────────────
+        const logRes = await client.query(`
+            INSERT INTO mass_message_log
+                (sent_by, game_id, audience_filter, recipient_count, recipient_ids,
+                 channels_used, template_id, message_text,
+                 push_status, email_status, whatsapp_status, vcf_status, csv_status)
+            VALUES ($1, $2, $3, $4, $5::uuid[], $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id
+        `, [
+            req.user.playerId, game_id,
+            JSON.stringify({ buckets, game_id }),
+            recipients.length, recipients.map(r => r.id),
+            selectedChannels, template_id || 'custom',
+            bodyTemplate,
+            push_status ? JSON.stringify(push_status) : null,
+            email_status ? JSON.stringify(email_status) : null,
+            whatsapp_status ? JSON.stringify(whatsapp_status) : null,
+            vcf_status ? JSON.stringify(vcf_status) : null,
+            csv_status ? JSON.stringify(csv_status) : null,
+        ]);
+        // FIX-316: unblock email background loop's final-status persist.
+        if (typeof _resolveLogId === 'function') _resolveLogId(logRes.rows[0].id);
+
+
+        await gameAuditLog(pool, game_id, req.user.playerId, 'mass_msg_sent',
+            `Sent to ${recipients.length} via [${selectedChannels.join(',')}] (template: ${template_id || 'custom'})`).catch(() => {});
+        if (template_id && template_id !== 'custom') {
+            await gameAuditLog(pool, game_id, req.user.playerId, 'mass_msg_template_used',
+                `Template: ${template_id}`).catch(() => {});
+        }
+
+        return res.json({
+            ok: true,
+            log_id: logRes.rows[0].id,
+            recipient_count: recipients.length,
+            channels_used: selectedChannels,
+            push_status, email_status, whatsapp_status, vcf_status, csv_status,
+            whatsapp_links,
+            vcf_url, csv_url,
+        });
+    } catch (e) {
+        console.error('[FIX-316] send error:', e);
+        return res.status(500).json({ error: 'Send failed: ' + e.message });
+    } finally {
+        client.release();
+    }
+});
+
+// GET /api/admin/mass-message/log — admin's send history.
+// Query: ?game_id=... &limit=50
+app.get('/api/admin/mass-message/log', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit || '50'), 200);
+        const params = [];
+        let where = '';
+        if (req.query.game_id && isValidUuid(String(req.query.game_id))) {
+            params.push(req.query.game_id);
+            where = `WHERE m.game_id = $1`;
+        }
+        params.push(limit);
+        const r = await pool.query(`
+            SELECT m.id, m.sent_at, m.recipient_count, m.channels_used, m.template_id,
+                   m.audience_filter, m.push_status, m.email_status, m.whatsapp_status,
+                   m.vcf_status, m.csv_status,
+                   p.alias AS sent_by_alias, p.full_name AS sent_by_name,
+                   v.name AS venue_name, m.game_id, g.game_date
+              FROM mass_message_log m
+              LEFT JOIN players p ON p.id = m.sent_by
+              LEFT JOIN games g ON g.id = m.game_id
+              LEFT JOIN venues v ON v.id = g.venue_id
+              ${where}
+             ORDER BY m.sent_at DESC
+             LIMIT $${params.length}
+        `, params);
+        return res.json({ log: r.rows });
+    } catch (e) {
+        console.error('[FIX-316] log error:', e);
+        return res.status(500).json({ error: 'Failed to load log' });
+    }
+});
+
+// GET /api/admin/mass-message/download/:token — single-use signed download.
+app.get('/api/admin/mass-message/download/:token', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const tok = String(req.params.token || '');
+        const entry = _massDownloadStore.get(tok);
+        if (!entry) return res.status(404).send('Download token not found or expired');
+        if (entry.expires_at < Date.now()) { _massDownloadStore.delete(tok); return res.status(410).send('Download expired'); }
+        if (entry.used) return res.status(410).send('Download already consumed');
+        entry.used = true;
+        res.setHeader('Content-Type', entry.mime);
+        res.setHeader('Content-Disposition', `attachment; filename="${entry.filename}"`);
+        return res.send(entry.content);
+    } catch (e) {
+        return res.status(500).send('Download failed');
+    }
+});
+
+// GET /api/unsubscribe/broadcasts/:token — public endpoint, no auth.
+// Verifies HMAC, sets broadcasts_unsubscribed=TRUE, returns confirmation HTML.
+app.get('/api/unsubscribe/broadcasts/:token', async (req, res) => {
+    try {
+        const playerId = _verifyUnsubToken(req.params.token);
+        if (!playerId) {
+            return res.status(400).send(`<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#0d0d0d;color:#fff;padding:40px;text-align:center;"><h2>Invalid unsubscribe link</h2><p style="color:#888;">This link looks wrong or has expired. If you keep receiving broadcasts you didn't ask for, email <a href="mailto:totalfooty19@gmail.com" style="color:#22c55e;">totalfooty19@gmail.com</a>.</p></body></html>`);
+        }
+        // Set flag (idempotent — already unsubscribed → silent success).
+        const r = await pool.query(
+            `UPDATE players SET broadcasts_unsubscribed = TRUE
+              WHERE id = $1 AND broadcasts_unsubscribed = FALSE
+              RETURNING id, alias, full_name`,
+            [playerId]
+        );
+        if (r.rows.length > 0) {
+            await auditLog(pool, null, 'broadcast_unsubscribed', playerId,
+                `Player unsubscribed via email link`).catch(() => {});
+        }
+        return res.send(`<!DOCTYPE html><html><head><title>Unsubscribed — TotalFooty</title></head><body style="font-family:Arial,sans-serif;background:#0d0d0d;color:#fff;padding:40px;text-align:center;max-width:520px;margin:0 auto;">
+            <img src="https://totalfooty.co.uk/assets/logo.png" width="80" style="margin-bottom:24px"/>
+            <h2 style="color:#22c55e;">You've been unsubscribed</h2>
+            <p style="color:#ddd;line-height:1.6;">We won't include you in broadcast messages from now on. You'll still get:</p>
+            <ul style="color:#888;text-align:left;display:inline-block;line-height:1.8;">
+                <li>Game registration confirmations</li>
+                <li>Payment receipts</li>
+                <li>RSVP reminders for games you're signed up to</li>
+                <li>1-on-1 messages from admins</li>
+            </ul>
+            <p style="color:#666;font-size:13px;margin-top:24px;">Changed your mind? Reply to any TotalFooty email and we'll re-enable broadcasts.</p>
+            <p style="color:#333;font-size:11px;margin-top:32px;letter-spacing:1px;">TOTALFOOTY — COVENTRY FOOTBALL COMMUNITY</p>
+        </body></html>`);
+    } catch (e) {
+        console.error('[FIX-316] unsubscribe error:', e);
+        return res.status(500).send('Unsubscribe failed — please email us if this persists.');
+    }
+});
+
+// POST /api/admin/mass-message/resubscribe/:playerId — admin override.
+app.post('/api/admin/mass-message/resubscribe/:playerId', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const pid = String(req.params.playerId || '');
+        if (!isValidUuid(pid)) return res.status(400).json({ error: 'Invalid player id' });
+        const r = await pool.query(
+            `UPDATE players SET broadcasts_unsubscribed = FALSE
+              WHERE id = $1 AND broadcasts_unsubscribed = TRUE
+              RETURNING id, alias, full_name`,
+            [pid]
+        );
+        if (r.rows.length === 0) return res.json({ ok: true, no_op: true, reason: 'already subscribed' });
+        await auditLog(pool, req.user.playerId, 'broadcast_resubscribed', pid,
+            `Admin re-enabled broadcasts for ${r.rows[0].alias || r.rows[0].full_name}`).catch(() => {});
+        return res.json({ ok: true });
+    } catch (e) {
+        console.error('[FIX-316] resubscribe error:', e);
+        return res.status(500).json({ error: 'Resubscribe failed' });
+    }
+});
+
+// END FIX-316 mass-message endpoints ════════════════════════════════════════
+
+
 app.post('/api/games/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -10210,9 +11727,11 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             return res.status(400).json({ error: 'This game is no longer accepting registrations' });
         }
         
-        // Get current player count separately
+        // FIX-315: capacity now counts confirmed + rsvp. An RSVP holds a real
+        // spot until its deadline; once full (12 confirmed + 6 rsvp = 18) new
+        // sign-ups must go through the confirmed_backup route.
         const countResult = await client.query(
-            "SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS current_players",
+            "SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS current_players",
             [gameId]
         );
         game.current_players = parseInt(countResult.rows[0].current_players);
@@ -10424,6 +11943,58 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     regAmountPaid = backupCharged;
                     regAmountPaidFree = backupFreeCharged;
                 }
+
+                // FIX-315: ACCELERATOR — first confirmed_backup payment when game
+                // has unpaid RSVPs fires a deadline shortening. One-shot per game.
+                // Only fires for confirmed_backup (not normal_backup or gk_backup).
+                if (regBackupType === 'confirmed_backup') {
+                    try {
+                        const accelCheck = await client.query(
+                            `SELECT accelerator_fired_at FROM games WHERE id = $1 FOR UPDATE`,
+                            [gameId]
+                        );
+                        const acceleratorAlreadyFired = !!accelCheck.rows[0]?.accelerator_fired_at;
+
+                        if (!acceleratorAlreadyFired) {
+                            const rsvpRowsRes = await client.query(
+                                `SELECT id, player_id, rsvp_deadline FROM registrations
+                                  WHERE game_id = $1 AND status = 'rsvp'`,
+                                [gameId]
+                            );
+                            if (rsvpRowsRes.rows.length > 0) {
+                                // Fire accelerator: set new deadline = LEAST(existing, NOW() + 24h).
+                                // Atomic per-row update — preserves any RSVP whose original deadline
+                                // was already sooner (rare but possible if game is < 48h away).
+                                const newDeadlineRes = await client.query(
+                                    `UPDATE registrations
+                                        SET rsvp_deadline = LEAST(rsvp_deadline, NOW() + ($2 || ' hours')::interval),
+                                            rsvp_warned_at = NULL  -- reset so warning fires again if new deadline > 48h
+                                      WHERE game_id = $1 AND status = 'rsvp'
+                                      RETURNING id, player_id, rsvp_deadline`,
+                                    [gameId, String(RSVP_ACCEL_HOURS)]
+                                );
+                                await client.query(
+                                    `UPDATE games SET accelerator_fired_at = NOW(), accelerator_fired_by_player_id = $2 WHERE id = $1`,
+                                    [gameId, req.user.playerId]
+                                );
+
+                                // Post-commit: email + push the affected RSVPs. Capture for the
+                                // post-commit hook (can't await inside the txn for side-effects
+                                // that don't depend on the txn outcome — but here we already
+                                // committed below, so post-commit alerts are safe).
+                                const _acceleratorAffected = newDeadlineRes.rows.map(r => ({
+                                    playerId: r.player_id,
+                                    deadline: r.rsvp_deadline
+                                }));
+                                // Stash on req so the post-commit block can pick it up.
+                                req._fix315AcceleratorFiredFor = _acceleratorAffected;
+                                req._fix315AcceleratorFiredGameId = gameId;
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('[FIX-315] accelerator check failed (non-critical):', e.message);
+                    }
+                }
             }
         } else {
             // Game has space - confirm registration
@@ -10558,6 +12129,25 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         }
 
         await client.query('COMMIT');
+
+        // FIX-315: post-commit accelerator side-effects (email + push to all
+        // RSVPs whose deadline was just brought forward). Fired only when a
+        // confirmed_backup payment triggered the accelerator above.
+        if (req._fix315AcceleratorFiredFor && req._fix315AcceleratorFiredGameId) {
+            try {
+                const gd = await getGameDataForNotification(req._fix315AcceleratorFiredGameId);
+                for (const aff of req._fix315AcceleratorFiredFor) {
+                    _sendRsvpEmail('accelerated', aff.playerId, gd, { deadline: aff.deadline }).catch(() => {});
+                    sendNotification('rsvp_accelerated', aff.playerId, {
+                        ...gd,
+                        deadline_short: _rsvpFormatDeadline(aff.deadline)
+                    }).catch(() => {});
+                }
+                await gameAuditLog(pool, req._fix315AcceleratorFiredGameId, req.user.playerId,
+                    'rsvp_accelerator_fired',
+                    `Confirmed backup payment fired accelerator — ${req._fix315AcceleratorFiredFor.length} RSVP deadline(s) brought forward`).catch(() => {});
+            } catch (e) { console.warn('[FIX-315] post-commit accelerator alerts failed:', e.message); }
+        }
         
         // PREFS AUTO-ADD: After successful registration, auto-add the game's venue region
         // to the player's preferred_locations. Zero-friction preference discovery.
@@ -11788,6 +13378,9 @@ app.post('/api/games/:gameId/guests/:guestId/reset-stats', authenticateToken, re
 // DELETE /api/games/:gameId/remove-my-registration/:registrationId
 // Allows the player who signed up a friend to remove them (without game lock).
 // Only works if the calling player is the registered_by_player_id on the registration.
+// FIX-315 wrapper note: this endpoint already deletes a registration row owned
+// by the caller. RSVP rows have no payment to refund, so the existing flow
+// handles them cleanly — the row is deleted and no money moves. No change.
 app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -12196,7 +13789,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
 
         // Current player count
         const countResult = await client.query(
-            "SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS current_players",
+            "SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS current_players",
             [gameId]
         );
         const currentPlayers = parseInt(countResult.rows[0].current_players);
@@ -12208,7 +13801,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             const maxGKSlots = game.team_selection_type === 'vs_external' ? 1 : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4) : 2;
             const gkCount = await client.query(`
                 SELECT COUNT(*) as gk_count FROM registrations
-                WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'
+                WHERE game_id = $1 AND status IN ('confirmed', 'rsvp') /* FIX-315 */ AND UPPER(TRIM(position_preference)) = 'GK'
             `, [gameId]);
             if (parseInt(gkCount.rows[0].gk_count) >= maxGKSlots) {
                 await client.query('ROLLBACK');
@@ -12443,7 +14036,7 @@ app.get('/api/games/:id/gk-slots', authenticateToken, async (req, res) => {
         
         const result = await pool.query(`
             SELECT g.team_selection_type, g.tournament_team_count,
-                   COUNT(r.id) FILTER (WHERE r.status = 'confirmed' AND UPPER(TRIM(r.position_preference)) = 'GK') as gk_count
+                   COUNT(r.id) FILTER (WHERE r.status IN ('confirmed', 'rsvp') AND UPPER(TRIM(r.position_preference)) = 'GK' /* FIX-315 */) as gk_count
             FROM games g
             LEFT JOIN registrations r ON r.game_id = g.id
             WHERE g.id = $1
@@ -12941,6 +14534,19 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         const wasConfirmedBackup = droppingReg.backup_type === 'confirmed_backup';
         const wasGKOnly = droppingReg.position_preference?.trim().toUpperCase() === 'GK';
         const wasComped = !!droppingReg.is_comped;
+        // FIX-315: RSVP / bumped state — free cancellation, no refund (none was paid), no penalty.
+        const wasRsvp   = droppingReg.status === 'rsvp';
+        const wasBumped = droppingReg.status === 'bumped';
+        if (wasRsvp || wasBumped) {
+            await client.query('DELETE FROM registrations WHERE id = $1', [droppingReg.id]);
+            await client.query('COMMIT');
+            // Audit only if it was an active RSVP (bumped rows are leaving silently).
+            if (wasRsvp) {
+                await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_cancelled',
+                    `Player cancelled their RSVP for game ${gameId}`).catch(() => {});
+            }
+            return res.json({ ok: true, status: 'cancelled', wasRsvp, wasBumped });
+        }
         // If someone else paid for this registration, refund them — not the dropping player
         const refundTargetId = droppingReg.registered_by_player_id || req.user.playerId;
 
@@ -13102,7 +14708,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             const maxGKSlots = gameCheck.rows[0].team_selection_type === 'vs_external' ? 1 : gameCheck.rows[0].team_selection_type === 'tournament' ? (gameCheck.rows[0].tournament_team_count || 4) : 2;
             const gkCountResult = await client.query(
                 `SELECT COUNT(*) as gk_count FROM registrations 
-                 WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'`,
+                 WHERE game_id = $1 AND status IN ('confirmed', 'rsvp') /* FIX-315 */ AND UPPER(TRIM(position_preference)) = 'GK'`,
                 [gameId]
             );
             const currentGKs = parseInt(gkCountResult.rows[0].gk_count) || 0;
@@ -14043,7 +15649,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             if (otherSlotsRes.rows.length > 0) {
                 const currentRosterRes = await pool.query(
                     `SELECT player_id::text AS pid FROM registrations
-                      WHERE game_id = $1 AND status = 'confirmed'
+                      WHERE game_id = $1 AND status IN ('confirmed', 'rsvp') /* FIX-315 */
                       UNION ALL
                       SELECT 'guest_' || id::text FROM game_guests
                       WHERE game_id = $1`,
@@ -14210,7 +15816,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             JOIN players p ON p.id = r.player_id
             LEFT JOIN registration_preferences rp_pair ON rp_pair.registration_id = r.id AND rp_pair.preference_type = 'pair'
             LEFT JOIN registration_preferences rp_avoid ON rp_avoid.registration_id = r.id AND rp_avoid.preference_type = 'avoid'
-            WHERE r.game_id = $1 AND r.status = 'confirmed'
+            WHERE r.game_id = $1 AND r.status IN ('confirmed', 'rsvp') /* FIX-315: RSVPs included in team gen */
             GROUP BY r.id, p.id, p.full_name, p.alias, p.squad_number, p.overall_rating, p.goalkeeper_rating, p.defending_rating, p.strength_rating, p.fitness_rating, p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating, p.is_organiser, r.position_preference, r.position_areas
             ORDER BY p.overall_rating DESC
         `, [gameId]);
@@ -19176,7 +20782,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
             const nextGameResult = await pool.query(`
                 SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.format,
                        v.name as venue_name,
-                       ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                       ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                        g.max_players
                 FROM games g
                 LEFT JOIN venues v ON v.id = g.venue_id
@@ -19394,20 +21000,25 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    v.pitch_name as venue_pitch_name, v.special_instructions as venue_special_instructions, v.region as venue_region,
                    opp_pub.logo_url AS opponent_logo_url, opp_pub.star_rating AS opponent_star_rating,
                    opp_pub.social_instagram AS opponent_social_instagram, opp_pub.social_twitter AS opponent_social_twitter, opp_pub.social_website AS opponent_social_website,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                    ROUND((SELECT AVG(rating) FROM (
                        SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
                                    THEN NULLIF(p.goalkeeper_rating, 0)
                                    ELSE p.overall_rating END AS rating
                        FROM registrations r JOIN players p ON p.id = r.player_id
-                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       WHERE r.game_id = g.id AND r.status IN ('confirmed', 'rsvp') /* FIX-315: include RSVPs in live_avg_ovr */
                        UNION ALL
                        SELECT CASE WHEN gg.position_classification = 'gk'
                                    THEN NULLIF(gg.goalkeeper_rating, 0)
                                    ELSE gg.overall_rating END AS rating
                        FROM game_guests gg WHERE gg.game_id = g.id
                    ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
-                   (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) as confirmed_organiser_count
+                   (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) as confirmed_organiser_count,
+                   -- FIX-315: RSVP system state, exposed publicly so game.html can render the split.
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'rsvp') as rsvp_count,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup' AND backup_type = 'confirmed_backup') as confirmed_backup_count,
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'bumped') as bumped_count,
+                   g.accelerator_fired_at
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN opponents opp_pub ON opp_pub.id = g.opponent_id
@@ -19524,7 +21135,12 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             requires_organiser: game.requires_organiser || false,
             confirmed_organiser_count: parseInt(game.confirmed_organiser_count) || 0,
             lineup_enabled: game.lineup_enabled || false,
-            position_type: game.position_type || 'outfield_gk'
+            position_type: game.position_type || 'outfield_gk',
+            // FIX-315: RSVP system state, exposed publicly so game.html can render split + accelerator banner.
+            rsvp_count: parseInt(game.rsvp_count) || 0,
+            confirmed_backup_count: parseInt(game.confirmed_backup_count) || 0,
+            bumped_count: parseInt(game.bumped_count) || 0,
+            accelerator_fired_at: game.accelerator_fired_at || null
         });
         
     } catch (error) {
@@ -20057,7 +21673,7 @@ app.get('/api/public/games', async (req, res) => {
                                    THEN NULLIF(p.goalkeeper_rating, 0)
                                    ELSE p.overall_rating END AS rating
                        FROM registrations r JOIN players p ON p.id = r.player_id
-                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       WHERE r.game_id = g.id AND r.status IN ('confirmed', 'rsvp') /* FIX-315: include RSVPs in live_avg_ovr */
                        UNION ALL
                        SELECT CASE WHEN gg.position_classification = 'gk'
                                    THEN NULLIF(gg.goalkeeper_rating, 0)
@@ -20911,7 +22527,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
             const maxGKSlots = gameResult.rows[0].team_selection_type === 'vs_external' ? 1 : gameResult.rows[0].team_selection_type === 'tournament' ? (gameResult.rows[0].tournament_team_count || 4) : 2;
             const gkCountResult = await pool.query(
                 `SELECT COUNT(*) as gk_count FROM registrations 
-                 WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'`,
+                 WHERE game_id = $1 AND status IN ('confirmed', 'rsvp') /* FIX-315 */ AND UPPER(TRIM(position_preference)) = 'GK'`,
                 [gameId]
             );
             const currentGKs = parseInt(gkCountResult.rows[0].gk_count) || 0;
@@ -23019,7 +24635,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                                    THEN NULLIF(p.goalkeeper_rating, 0)
                                    ELSE p.overall_rating END AS rating
                        FROM registrations r JOIN players p ON p.id = r.player_id
-                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       WHERE r.game_id = g.id AND r.status IN ('confirmed', 'rsvp') /* FIX-315: include RSVPs in live_avg_ovr */
                        UNION ALL
                        SELECT CASE WHEN gg.position_classification = 'gk'
                                    THEN NULLIF(gg.goalkeeper_rating, 0)
@@ -23132,7 +24748,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                                    THEN NULLIF(p.goalkeeper_rating, 0)
                                    ELSE p.overall_rating END AS rating
                        FROM registrations r JOIN players p ON p.id = r.player_id
-                       WHERE r.game_id = g.id AND r.status = 'confirmed'
+                       WHERE r.game_id = g.id AND r.status IN ('confirmed', 'rsvp') /* FIX-315: include RSVPs in live_avg_ovr */
                        UNION ALL
                        SELECT CASE WHEN gg.position_classification = 'gk'
                                    THEN NULLIF(gg.goalkeeper_rating, 0)
@@ -43420,6 +45036,129 @@ app.listen(PORT, () => {
             console.error('✗ Keep-alive error:', error.message);
         }
     }, 5 * 60 * 1000); // 5 minutes (more aggressive)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FIX-315 — RSVP cron jobs
+    // ════════════════════════════════════════════════════════════════════════
+
+    // 48h warning sweep — hourly. Fires the warning email + push to any RSVP
+    // whose deadline is within the next 48h and hasn't been warned yet.
+    let _rsvpWarningCronRunning = false;
+    async function _rsvpWarningCron() {
+        if (_rsvpWarningCronRunning) return;
+        _rsvpWarningCronRunning = true;
+        try {
+            const due = await pool.query(`
+                SELECT r.id, r.player_id, r.game_id, r.rsvp_deadline
+                  FROM registrations r
+                 WHERE r.status = 'rsvp'
+                   AND r.rsvp_warned_at IS NULL
+                   AND r.rsvp_deadline BETWEEN NOW() AND NOW() + INTERVAL '48 hours'
+                 ORDER BY r.rsvp_deadline ASC
+                 LIMIT 200
+            `);
+            if (due.rows.length === 0) return;
+            // Mark warned immediately to prevent duplicate sends if the cron overruns.
+            await pool.query(
+                `UPDATE registrations SET rsvp_warned_at = NOW() WHERE id = ANY($1::uuid[])`,
+                [due.rows.map(r => r.id)]
+            );
+            for (const row of due.rows) {
+                try {
+                    const gd = await getGameDataForNotification(row.game_id);
+                    _sendRsvpEmail('warning', row.player_id, gd, { deadline: row.rsvp_deadline }).catch(() => {});
+                    sendNotification('rsvp_warning', row.player_id, {
+                        ...gd,
+                        deadline_short: _rsvpFormatDeadline(row.rsvp_deadline)
+                    }).catch(() => {});
+                    await gameAuditLog(pool, row.game_id, null, 'rsvp_warning_sent',
+                        `Auto 48h warning sent to player ${row.player_id}`).catch(() => {});
+                } catch (e) {
+                    console.warn('[FIX-315] warning cron row failed:', e.message);
+                }
+            }
+            console.log(`⏰ [FIX-315] RSVP warning sweep — ${due.rows.length} warning(s) sent`);
+        } catch (e) {
+            console.error('[FIX-315] _rsvpWarningCron error:', e.message);
+        } finally {
+            _rsvpWarningCronRunning = false;
+        }
+    }
+    setTimeout(_rsvpWarningCron, 90 * 1000);            // first run 90s after boot
+    setInterval(_rsvpWarningCron, 60 * 60 * 1000);      // hourly thereafter
+
+    // 24h bump sweep — every 5 minutes. Auto-bumps any RSVP whose deadline
+    // has passed, then promotes confirmed_backups in paid_at order to fill
+    // the freed slots, then fires bump notifications.
+    let _rsvpBumpCronRunning = false;
+    async function _rsvpBumpCron() {
+        if (_rsvpBumpCronRunning) return;
+        _rsvpBumpCronRunning = true;
+        try {
+            // Find games with at least one expired RSVP, process per-game (txn-safe).
+            const dueGames = await pool.query(`
+                SELECT DISTINCT game_id FROM registrations
+                 WHERE status = 'rsvp' AND rsvp_deadline < NOW()
+                 LIMIT 100
+            `);
+            for (const gRow of dueGames.rows) {
+                const client = await pool.connect();
+                try {
+                    await client.query('BEGIN');
+                    const gMeta = await client.query(
+                        `SELECT id, max_players, team_selection_type, tournament_team_count
+                           FROM games WHERE id = $1 FOR UPDATE`,
+                        [gRow.game_id]
+                    );
+                    if (gMeta.rows.length === 0) { await client.query('ROLLBACK'); client.release(); continue; }
+
+                    const bumped = await client.query(`
+                        UPDATE registrations
+                           SET status = 'bumped', bumped_at = NOW()
+                         WHERE game_id = $1 AND status = 'rsvp' AND rsvp_deadline < NOW()
+                         RETURNING id, player_id`,
+                        [gRow.game_id]
+                    );
+                    if (bumped.rows.length === 0) { await client.query('COMMIT'); client.release(); continue; }
+
+                    // Promote confirmed_backups into freed slots (paid_at order).
+                    const promoted = await _fix315PromoteConfirmedBackups(client, gRow.game_id, bumped.rows.length, gMeta.rows[0]);
+                    await client.query('COMMIT');
+
+                    const slotsRemaining = bumped.rows.length - promoted.length;
+                    const gd = await getGameDataForNotification(gRow.game_id);
+                    for (const row of bumped.rows) {
+                        _sendRsvpEmail('bumped', row.player_id, gd,
+                            { hasOpenSpots: slotsRemaining > 0, openCount: slotsRemaining }).catch(() => {});
+                        sendNotification('rsvp_bumped', row.player_id,
+                            { ...gd, hasOpenSpots: slotsRemaining > 0 }).catch(() => {});
+                        await gameAuditLog(pool, gRow.game_id, null, 'rsvp_bumped',
+                            `Auto-bumped (deadline passed)`).catch(() => {});
+                    }
+                    // Mark notified so we don't double-fire (per-row, by id).
+                    await pool.query(
+                        `UPDATE registrations SET bumped_notified_at = NOW() WHERE id = ANY($1::uuid[])`,
+                        [bumped.rows.map(r => r.id)]
+                    ).catch(() => {});
+
+                    console.log(`⏰ [FIX-315] RSVP bump for game ${gRow.game_id}: ${bumped.rows.length} bumped, ${promoted.length} promoted`);
+                } catch (e) {
+                    await client.query('ROLLBACK').catch(() => {});
+                    console.error(`[FIX-315] bump cron game ${gRow.game_id} failed:`, e.message);
+                } finally {
+                    client.release();
+                }
+            }
+        } catch (e) {
+            console.error('[FIX-315] _rsvpBumpCron error:', e.message);
+        } finally {
+            _rsvpBumpCronRunning = false;
+        }
+    }
+    setTimeout(_rsvpBumpCron, 60 * 1000);             // first run 60s after boot
+    setInterval(_rsvpBumpCron, 5 * 60 * 1000);        // every 5 minutes
+    // END FIX-315 cron ═══════════════════════════════════════════════════════
+
 
     // Game reminder scheduler DISABLED — teams_confirmed notification replaces this
     // (sendNotification('teams_confirmed') fires on admin confirm-teams action)
