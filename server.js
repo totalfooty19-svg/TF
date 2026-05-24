@@ -1466,6 +1466,65 @@ async function applyGameFee(db, playerId, cost, description) {
     return { realCharged, freeCharged: freeUsed };
 }
 
+// ── POSITION RESOLUTION HELPER (audit fix May 2026) ──────────────────────────
+// Resolves the position info for a sign-up request. Priority:
+//   1. Explicit position_areas from request body (most specific — 11-a-side picker)
+//   2. Explicit position/positions from request body ('GK' or 'outfield')
+//   3. Player's saved default_position_areas from DB
+//   4. Player's saved position_preference from DB
+// If NONE of the above resolve to a non-empty value, returns { error } so the
+// caller can return 400 with a helpful message. No silent 'outfield' fallback.
+//
+// Returns:
+//   { positionValue, positionAreas } on success
+//   { error: 'message' } when no position info available
+async function _resolvePositionForSignup(db, playerId, body) {
+    const _ALLOWED_AREAS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF','defence','midfield','attack']);
+    const { position, positions, positionAreas } = body || {};
+
+    // (1) Explicit position_areas wins.
+    let sanitisedAreas = null;
+    if (positionAreas) {
+        sanitisedAreas = String(positionAreas)
+            .split(',').map(s => s.trim())
+            .filter(s => _ALLOWED_AREAS.has(s))
+            .join(',') || null;
+    }
+    // (2) Explicit position/positions.
+    const explicit = positions || position;
+
+    if (sanitisedAreas || explicit) {
+        return { positionValue: explicit || 'outfield', positionAreas: sanitisedAreas };
+    }
+
+    // (3,4) Fall back to player's saved defaults.
+    const p = await db.query(
+        `SELECT COALESCE(default_position_areas, '') AS default_position_areas,
+                COALESCE(position, '') AS position
+           FROM players WHERE id = $1`,
+        [playerId]
+    );
+    if (p.rows.length === 0) return { error: 'Player not found' };
+    const savedAreas = String(p.rows[0].default_position_areas || '').trim();
+    const savedPos   = String(p.rows[0].position || '').trim();
+
+    if (savedAreas) {
+        // Validate stored value too (might have been set before the whitelist existed).
+        const filtered = savedAreas.split(',').map(s => s.trim()).filter(s => _ALLOWED_AREAS.has(s)).join(',');
+        if (filtered) {
+            // Derive position from areas: GK-only → 'GK', else 'outfield'.
+            const isGkOnly = (filtered === 'GK');
+            return { positionValue: isGkOnly ? 'GK' : 'outfield', positionAreas: filtered };
+        }
+    }
+    if (savedPos) {
+        return { positionValue: savedPos.toLowerCase(), positionAreas: null };
+    }
+
+    // Nothing usable. Return error for the caller to surface to the UI.
+    return { error: 'Please set your default position in your profile, or select your position before signing up.' };
+}
+
 // ── EARLY BIRD PRICING HELPER ────────────────────────────────────────────────
 // Returns the effective price and tier name for a game based on days to kickoff.
 // Tiers: 'super' (7+ days) | 'early' (3-7 days) | 'standard' (<3 days or no discount set)
@@ -10835,14 +10894,11 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
     const client = await pool.connect();
     try {
         const gameId = req.params.id;
-        const { position, positions, positionAreas } = req.body || {};
-        const positionValue = positions || position || 'outfield';
-
-        // Sanitise position_areas — mirror /register
-        const _ALLOWED_AREAS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF','defence','midfield','attack']);
-        const sanitisedPositionAreas = positionAreas
-            ? positionAreas.split(',').map(s => s.trim()).filter(s => _ALLOWED_AREAS.has(s)).join(',') || null
-            : null;
+        // Audit fix May 2026: position required (with fallback to saved defaults).
+        const _pos = await _resolvePositionForSignup(pool, req.user.playerId, req.body);
+        if (_pos.error) return res.status(400).json({ error: _pos.error, code: 'POSITION_REQUIRED' });
+        const positionValue          = _pos.positionValue;
+        const sanitisedPositionAreas = _pos.positionAreas;
 
         await client.query('BEGIN');
 
@@ -11676,9 +11732,16 @@ app.post('/api/admin/mass-message/resubscribe/:playerId', authenticateToken, req
 app.post('/api/games/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
     const client = await pool.connect();
     try {
-        const { position, positions, pairs, avoids, backupType, tournamentTeamPreference, venueClashTeamPreference, positionAreas } = req.body;
+        const { pairs, avoids, backupType, tournamentTeamPreference, venueClashTeamPreference } = req.body;
         const gameId = req.params.id;
-        const positionValue = positions || position || 'outfield';
+
+        // Audit fix May 2026: position is required (with fallback to saved defaults).
+        // Replaces the previous silent 'outfield' default which caused players to
+        // be silently registered as outfield when they hadn't set anything.
+        const _pos = await _resolvePositionForSignup(pool, req.user.playerId, req.body);
+        if (_pos.error) return res.status(400).json({ error: _pos.error, code: 'POSITION_REQUIRED' });
+        const positionValue           = _pos.positionValue;
+        const sanitisedPositionAreas  = _pos.positionAreas;
 
         // FIX-180: BFFs/Rivals — combined cap of 6 across pairs + avoids.
         const _incomingPairCount  = Array.isArray(pairs)  ? pairs.length  : 0;
@@ -11686,12 +11749,6 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         if (_incomingPairCount + _incomingAvoidCount > 6) {
             return res.status(400).json({ error: 'Max 6 combined pairs and avoids' });
         }
-
-        // Sanitise position_areas — whitelist only
-        const _ALLOWED_AREAS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF','defence','midfield','attack']);
-        const sanitisedPositionAreas = positionAreas
-            ? positionAreas.split(',').map(s => s.trim()).filter(s => _ALLOWED_AREAS.has(s)).join(',') || null
-            : null;
         
         await client.query('BEGIN');
         
@@ -13628,13 +13685,30 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         const { friendPlayerId, position, backupType, tournamentTeamPreference } = req.body;
         const gameId = req.params.id;
         const registeringPlayerId = req.user.playerId;
-        const positionValue = position || 'outfield';
 
+        // Validate friend ID first — no point doing any other work if it's missing
+        // or self-referential.
         if (!friendPlayerId) {
             return res.status(400).json({ error: 'friendPlayerId is required' });
         }
         if (String(friendPlayerId) === String(registeringPlayerId)) {
             return res.status(400).json({ error: 'You cannot sign yourself up via this route' });
+        }
+
+        // Audit fix May 2026: position required for friend sign-ups too. Falls back
+        // to the FRIEND's saved defaults (not the registering player's) — it's their game.
+        // Runs AFTER the friendPlayerId validation above so we never hit the DB with a
+        // bad ID.
+        let positionValue;
+        if (!position) {
+            const _fpos = await _resolvePositionForSignup(pool, friendPlayerId, req.body);
+            if (_fpos.error) return res.status(400).json({
+                error: "Your friend hasn't set a default position. Open their profile or pass a position explicitly.",
+                code: 'POSITION_REQUIRED'
+            });
+            positionValue = _fpos.positionValue;
+        } else {
+            positionValue = position;
         }
 
         await client.query('BEGIN');
@@ -20079,10 +20153,15 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             );
         }
         
-        // 5. Create MOTM nominees (skip if external game where opponent won)
+        // 5. Create MOTM nominees — ALL confirmed players are always eligible.
+        //    Auto-populate from the confirmed roster (computed above into
+        //    `confirmedSet`). Client-sent `motmNominees` is ignored — the admin
+        //    UI no longer chooses a shortlist. Guests aren't in `confirmedSet`
+        //    (they aren't registrations with status='confirmed'), so the FK
+        //    constraint is safe.
         let nomineesInserted = 0;
         if (shouldHaveMotm) {
-            for (const playerId of motmNominees || []) {
+            for (const playerId of confirmedSet) {
                 await client.query(
                     `INSERT INTO motm_nominees (game_id, player_id)
                      VALUES ($1, $2)
@@ -20091,7 +20170,6 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                 );
                 nomineesInserted++;
             }
-        } else {
         }
         
         // FIX-086: Series score update moved INSIDE transaction to prevent orphaned scores on crash
@@ -25478,12 +25556,19 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             }
         }
         
-        // 4. Create MOTM nominees (from winning team only)
+        // 4. Create MOTM nominees — ALL confirmed players are eligible.
+        //    Tournament path no longer restricts to winning team; admin no
+        //    longer picks a shortlist. Resolve confirmed roster from
+        //    registrations (FK-safe — excludes guests).
+        const _tourneyConfirmed = await client.query(
+            `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
         let nomineesInserted = 0;
-        for (const playerId of motmNominees || []) {
+        for (const row of _tourneyConfirmed.rows) {
             await client.query(
                 `INSERT INTO motm_nominees (game_id, player_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-                [gameId, playerId]
+                [gameId, row.player_id]
             );
             nomineesInserted++;
         }
