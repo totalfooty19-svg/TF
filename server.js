@@ -11090,7 +11090,29 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
         }
 
         const { price: effectiveCost, tier: pricingTier } = getEffectivePrice(game);
-        const isComped = !!reg.rows[0].is_comped;
+
+        // BUG-FIX (May 2026): Re-evaluate organiser comp at pay time.
+        // /rsvp inserts is_comped=false unconditionally — comp is decided at the
+        // moment of *commitment* (pay), not at soft-RSVP, so we don't reserve
+        // comp slots for players who might bail. Mirrors /register's comp logic
+        // exactly (L11944-11955). Without this re-check, organisers using the
+        // RSVP→Pay flow were always charged, even under the 6-comp cap.
+        let isComped = !!reg.rows[0].is_comped; // honour any pre-existing flag (defensive)
+        if (!isComped) {
+            const _orgCheck = await client.query(
+                'SELECT is_organiser FROM players WHERE id = $1',
+                [req.user.playerId]
+            );
+            if (_orgCheck.rows[0]?.is_organiser) {
+                const _compCount = await client.query(
+                    "SELECT COUNT(*) AS cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
+                    [gameId]
+                );
+                if (parseInt(_compCount.rows[0].cnt) < 6) {
+                    isComped = true;
+                }
+            }
+        }
 
         let realCharged = 0, freeCharged = 0;
         if (!isComped && parseFloat(game.cost_per_player) > 0) {
@@ -11113,16 +11135,26 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
             freeCharged = charge.freeCharged;
         }
 
-        // Promote the row — status flips to 'confirmed', deadline & warning fields cleared.
+        // BUG-FIX (May 2026): Previously used `realCharged || effectiveCost`
+        // and `freeCharged || 0` as fallbacks. The `||` falls through when the
+        // left operand is 0 — but 0 is a *legitimate* value here (e.g. when
+        // free credits cover the entire cost, realCharged === 0 with no error).
+        // Old behaviour: amount_paid was stored as effectiveCost AND
+        // amount_paid_free was also stored at full cost — duplicated, causing
+        // drop-out to refund 2× the actual charge. New behaviour: store exactly
+        // what applyGameFee returned (which is { 0, 0 } for free/comped games).
+        // Also set is_comped on the row so future drop-out / cancellation
+        // correctly identifies this as a comped registration.
         await client.query(
             `UPDATE registrations
                 SET status = 'confirmed',
                     amount_paid = $2,
                     amount_paid_free = $3,
+                    is_comped = $4,
                     rsvp_deadline = NULL,
                     rsvp_warned_at = NULL
               WHERE id = $1`,
-            [reg.rows[0].id, isComped ? 0 : (realCharged || effectiveCost), isComped ? 0 : (freeCharged || 0)]
+            [reg.rows[0].id, isComped ? 0 : realCharged, isComped ? 0 : freeCharged, isComped]
         );
 
         // BFFs/Rivals auto-fill for the newly-confirmed player (matches /claim-spot).
@@ -11132,14 +11164,35 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
 
         await client.query('COMMIT');
 
+        // BUG-FIX (May 2026) polish: comp-aware audit + notification +
+        // response payload. Without this, comped organisers using the
+        // RSVP→Pay path saw misleading "£X deducted" messages.
+        const _actuallyCharged = isComped ? 0 : (realCharged + freeCharged);
+
         await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_paid',
-            `RSVP converted to confirmed at £${effectiveCost.toFixed(2)} (${pricingTier})`).catch(() => {});
+            isComped
+                ? `RSVP converted to confirmed — organiser comp applied (no charge)`
+                : `RSVP converted to confirmed at £${effectiveCost.toFixed(2)} (${pricingTier})`
+        ).catch(() => {});
+
         try {
             const gd = await getGameDataForNotification(gameId);
+            // Override gd.cost so the push body reflects what actually moved.
+            // Template renders `£${(d.cost||0).toFixed(2)} deducted` — for comped
+            // users this becomes "£0.00 deducted." which is accurate (if slightly
+            // awkward). Avoids touching the shared push template which is used by
+            // /register, /register-friend, the Wonderful webhook, etc.
+            gd.cost = _actuallyCharged;
             sendNotification('game_registered', req.user.playerId, gd).catch(() => {});
         } catch (_) { /* non-critical */ }
 
-        return res.json({ ok: true, charged: effectiveCost, pricingTier });
+        return res.json({
+            ok: true,
+            charged: _actuallyCharged,        // actual amount that moved (0 for comped)
+            was_comped: isComped,             // new — client uses this for messaging
+            effective_price: effectiveCost,   // game's effective price (reference, unchanged from prior `charged` semantics)
+            pricingTier                       // preserved for backward compat
+        });
     } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('[FIX-315] POST /api/games/:id/rsvp/pay error:', err);
@@ -17476,7 +17529,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
         const { gameId } = req.params;
         await client.query('BEGIN');
         const registrations = await client.query(
-            `SELECT player_id, status, backup_type, amount_paid, amount_paid_free, registered_by_player_id FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
+            `SELECT player_id, status, backup_type, amount_paid, amount_paid_free, registered_by_player_id, is_comped FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
             [gameId]
         );
         const gameResult = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gameId]);
@@ -17509,6 +17562,14 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
 
         let totalRefunded = 0;
         for (const reg of registrations.rows) {
+            // BUG-FIX (May 2026): Skip comped players entirely — they paid £0
+            // and amount_paid + amount_paid_free are both 0 on their row, which
+            // would trip the legacy useFallback branch below and refund the
+            // full fallbackCost. They received a comp, not a payment, so no
+            // refund is owed.
+            if (reg.is_comped) {
+                continue;
+            }
             // web47 round 2 — W-71 fix: must refund BOTH the real-balance portion
             // (amount_paid) AND the free-credit portion (amount_paid_free). Previous
             // version only refunded amount_paid, so players who paid with mixed
@@ -17516,7 +17577,9 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
             const refundPaid = parseFloat(reg.amount_paid || 0);
             const refundFree = parseFloat(reg.amount_paid_free || 0);
             // Fallback: legacy rows with both amount_paid and amount_paid_free NULL
-            // get the old behaviour (full fallback cost as a real refund).
+            // get the old behaviour (full fallback cost as a real refund). Now safe
+            // because comped rows are filtered above (their 0/0 would otherwise trip
+            // this branch).
             const useFallback = !reg.amount_paid && !reg.amount_paid_free;
             const realRefund  = useFallback ? fallbackCost : refundPaid;
             const refundTarget = reg.registered_by_player_id || reg.player_id;
@@ -17659,11 +17722,17 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
             // web47 round 2 — W-71b fix: include amount_paid_free portion (mirrors
             // single-game cancellation fix above).
             const registrations = await client.query(
-                `SELECT player_id, amount_paid, amount_paid_free, registered_by_player_id FROM registrations WHERE game_id = $1 
+                `SELECT player_id, amount_paid, amount_paid_free, registered_by_player_id, is_comped FROM registrations WHERE game_id = $1 
                  AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
                 [gid]
             );
             for (const reg of registrations.rows) {
+                // BUG-FIX (May 2026): Skip comped players — see admin delete-game
+                // endpoint for full rationale. Their 0/0 amount_paid would trip
+                // the legacy useFallback branch and refund full cost.
+                if (reg.is_comped) {
+                    continue;
+                }
                 const refundPaid = parseFloat(reg.amount_paid || 0);
                 const refundFree = parseFloat(reg.amount_paid_free || 0);
                 const useFallback = !reg.amount_paid && !reg.amount_paid_free;
