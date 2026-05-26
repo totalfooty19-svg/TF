@@ -96,6 +96,20 @@ const resetLimiter = rateLimit({
     legacyHeaders: false,
     skip: (req) => req.method === 'OPTIONS',
 });
+// FIX-336: enumeration-sensitive limiter — counts EVERY request (not just
+// failures). authLimiter uses skipSuccessfulRequests:true which means a
+// 200 OK probe doesn't burn quota; that's safe for login but unsafe for
+// "does this email exist?" probes. 20 per hour is generous for legitimate
+// signup-wizard use (one probe per email typed) but blocks brute-force
+// email enumeration attacks against the recognition endpoint.
+const emailEnumLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 20,
+    message: { error: 'Too many attempts, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
+});
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', registerLimiter);
 app.use('/api/auth/forgot-password', authLimiter);
@@ -767,6 +781,108 @@ app.use('/api', (req, res, next) => {
     return csrfProtect(req, res, next);
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-317 — ROW Day 1: Multi-tenant foundations
+// ════════════════════════════════════════════════════════════════════════════
+//
+// formatPlayerDisplayId(player) — single source of truth for the player
+// number cascade. Use this everywhere a player number is rendered server-side
+// (admin emails, payment refs, audit log entries, push notifications etc).
+//
+// Cascade per A.76:
+//   1. squad_number          (1–999, TF Coventry shirted)   → "TF-42" / "TF-00"
+//   2. player_number_text    (regional codes: B1234/M1234)  → "TF-B1234"
+//   3. tenant_player_id      (6-digit, tenant-origin)       → "100123" (no prefix per A.76)
+//   4. player_number         (1000+, non-prefixed overflow) → "TF-1234"
+//   5. fallback                                             → "—"
+//
+// Player object must include all four columns. Backend SELECTs that feed this
+// helper need: squad_number, player_number_text, tenant_player_id, player_number.
+//
+// Existing TF players have tenant_player_id = NULL, so the new cascade returns
+// IDENTICAL output to the legacy inline cascade for every pre-Day-1 player.
+function formatPlayerDisplayId(player) {
+    if (!player) return '—';
+    // 1) squad_number — TF-42, or TF-00 for legacy "00" assignment
+    if (player.squad_number !== null && player.squad_number !== undefined) {
+        return `TF-${player.squad_number === 0 ? '00' : player.squad_number}`;
+    }
+    // 2) regional code (B1234 Birmingham, M1234 Manchester) — TF- prefixed
+    if (player.player_number_text) {
+        return `TF-${player.player_number_text}`;
+    }
+    // 3) tenant_player_id — 6-digit, NO prefix per spec A.76
+    if (player.tenant_player_id) {
+        return String(player.tenant_player_id);
+    }
+    // 4) numeric overflow (TF Coventry non-shirted, 1000+)
+    if (player.player_number) {
+        return `TF-${player.player_number}`;
+    }
+    return '—';
+}
+
+// Tenant path middleware: resolves the tenant from /api/t/:short_id/* requests
+// and attaches req.tenant for downstream handlers.
+//
+// Routing model (per Q3=b):
+//   /api/t/87432/something      → resolved against tenants.short_id = '87432'
+//   /api/anything-else          → no tenant context (TF root behaviour)
+//
+// Tenant status handling (per Q9):
+//   active   → req.tenant attached, request continues
+//   paused   → 503 Service Unavailable
+//   exited   → 410 Gone
+//   missing  → 404 Not Found
+//
+// Day-1 graceful degradation: if the tenants table does not exist yet
+// (pre-migration), return 404 cleanly rather than 500. This means the
+// middleware is safe to deploy BEFORE the SQL migration runs.
+app.use('/api/t/:tenant_short_id', async (req, res, next) => {
+    const shortId = req.params.tenant_short_id;
+    // short_id must be exactly 5 numeric digits per A.47
+    if (!shortId || !/^\d{5}$/.test(shortId)) {
+        return res.status(404).json({ error: 'Tenant not found' });
+    }
+    try {
+        const r = await pool.query(
+            `SELECT id, short_id, slug, name, logo_url, primary_color,
+                    status, reply_to_email
+               FROM tenants
+              WHERE short_id = $1
+              LIMIT 1`,
+            [shortId]
+        );
+        if (r.rows.length === 0) {
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        const t = r.rows[0];
+        if (t.status === 'paused') {
+            return res.status(503).json({ error: 'Tenant temporarily unavailable' });
+        }
+        if (t.status === 'exited') {
+            return res.status(410).json({ error: 'Tenant no longer active' });
+        }
+        if (t.status !== 'active') {
+            // Defensive: any other status value treated as not-found
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        req.tenant = t;
+        next();
+    } catch (e) {
+        // 42P01 = "undefined_table" — tenants table does not exist yet.
+        // Return 404 so the middleware is safe to deploy pre-migration.
+        if (e && e.code === '42P01') {
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        console.error('FIX-317 tenant resolver failed:', e.message);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+// ════════════════════════════════════════════════════════════════════════════
+// END FIX-317 helpers
+// ════════════════════════════════════════════════════════════════════════════
+
 // SEC-008: Audit log — tamper-evident record of privileged actions
 
 // BST/DST helper: add N weeks to a game date while preserving wall-clock time in Europe/London.
@@ -915,24 +1031,58 @@ function buildGuestInviteWhenAtVenue(gameDate, venueName) {
 const _UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function isValidUuid(s) { return typeof s === 'string' && _UUID_RE.test(s); }
 
-async function auditLog(pool, adminId, action, targetId, detail = '') {
+// FIX-334 (ROW Day 20): TF Coventry becomes a real tenant. This constant is
+// the fixed UUID for the TF Coventry tenant row (inserted by FIX-334 migration
+// Block 1). Code that previously special-cased tenant_id IS NULL for TF root
+// can now reference this UUID where needed.
+//
+// IMPORTANT: pre-FIX-334 deploys still have games with tenant_id IS NULL.
+// Helpers like getVisibleTenantContext continue to handle the NULL path as
+// equivalent to TF Coventry until the migration backfill runs.
+const TF_COVENTRY_TENANT_ID = '11111111-1111-1111-1111-111111111111';
+const TF_COVENTRY_SHORT_ID  = '10000';
+
+// FIX-334 (ROW Day 29): T&Cs version constants.
+//
+// These reflect the CURRENT published version of each document. Players whose
+// accepted_*_tcs_version doesn't match these need to re-accept on next login.
+//
+// Initial values 'v1.0-draft' — solicitor review pending. Bump these when:
+//   1. Solicitor returns redlines and v1.0 publishes → bump to 'v1.0'
+//   2. Material changes to T&Cs → bump to 'v1.1', 'v2.0', etc.
+//
+// Versioning policy: any change requiring re-acceptance gets a new version.
+// Cosmetic/typo fixes that don't change rights/obligations: don't bump.
+const CURRENT_PLAYER_TCS_VERSION    = 'v1.0-draft';
+const CURRENT_TENANT_TCS_VERSION    = 'v1.0-draft';
+const CURRENT_ORGANISER_TCS_VERSION = 'v1.0-draft';
+
+// FIX-320 (Day 4): auditLog gains an optional tenantId parameter for tenant-
+// scoped admin actions. Backward-compatible — existing callers (5 args, no
+// tenantId) generate the same INSERT as before. New tenant-scoped callers
+// pass tenantId as the 6th arg, which adds tenant_id to the INSERT column
+// list. The column only appears in the SQL when explicitly provided, so the
+// helper is safe to deploy before audit_logs.tenant_id migration runs.
+async function auditLog(pool, adminId, action, targetId, detail = '', tenantId = null) {
     try {
+        const cols   = [];
+        const vals   = [];
+        const params = [];
+        let   idx    = 1;
         if (adminId) {
-            await pool.query(
-                `INSERT INTO audit_logs (admin_id, action, target_id, detail, created_at)
-                 VALUES ($1, $2, $3, $4, NOW())
-                 ON CONFLICT DO NOTHING`,
-                [adminId, action, targetId, detail]
-            );
-        } else {
-            // System-generated action — omit admin_id to avoid FK violation
-            await pool.query(
-                `INSERT INTO audit_logs (action, target_id, detail, created_at)
-                 VALUES ($1, $2, $3, NOW())
-                 ON CONFLICT DO NOTHING`,
-                [action, targetId, detail]
-            );
+            cols.push('admin_id'); vals.push(`$${idx++}`); params.push(adminId);
         }
+        cols.push('action');     vals.push(`$${idx++}`); params.push(action);
+        cols.push('target_id');  vals.push(`$${idx++}`); params.push(targetId);
+        cols.push('detail');     vals.push(`$${idx++}`); params.push(detail);
+        cols.push('created_at'); vals.push('NOW()');
+        if (tenantId !== null && tenantId !== undefined) {
+            cols.push('tenant_id'); vals.push(`$${idx++}`); params.push(tenantId);
+        }
+        await pool.query(
+            `INSERT INTO audit_logs (${cols.join(', ')}) VALUES (${vals.join(', ')}) ON CONFLICT DO NOTHING`,
+            params
+        );
     } catch (e) {
         console.warn('audit_log insert failed (non-critical):', e.message);
     }
@@ -2598,6 +2748,556 @@ const requireSuperAdmin = (req, res, next) => {
     next();
 };
 
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-318 — ROW Day 2: Tenant-aware authorization middleware
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Three middlewares for tenant-scoped routes. All assume:
+//   - authenticateToken has run (req.user populated)
+//   - FIX-317 tenant resolver has run (req.tenant populated — mount path is
+//     /api/t/:tenant_short_id/* so this is automatic)
+//
+// Superadmin bypass (per Q2=a): users.role === 'superadmin' satisfies ALL
+// tenant role checks. Mitchell sees every tenant without being a row in
+// player_tenants. This keeps the existing global admin flag authoritative.
+//
+// Tenant role hierarchy (stored in player_tenants.role):
+//   'player'        — base, can read tenant-public surface
+//   'organiser'     — can run assigned games, see player ratings (per A.68)
+//   'tenant_admin'  — full admin within the tenant
+//
+// requireTenantAccess  — any active player_tenants row (player or above)
+// requireTenantOrganiser — organiser OR tenant_admin (for game-management routes)
+// requireTenantAdmin   — tenant_admin only (panel-level config, payouts, etc.)
+//
+// All three return 403 if the user has no qualifying row. 401 only if auth
+// itself failed (handled upstream by authenticateToken).
+async function _getTenantRole(playerId, tenantId) {
+    try {
+        const r = await pool.query(
+            `SELECT role FROM player_tenants
+              WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'
+              LIMIT 1`,
+            [playerId, tenantId]
+        );
+        return r.rows.length === 0 ? null : r.rows[0].role;
+    } catch (e) {
+        // 42P01 = table doesn't exist — pre-migration safety
+        if (e && e.code === '42P01') return null;
+        throw e;
+    }
+}
+
+const requireTenantAccess = async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Access denied' });
+    if (!req.tenant) return res.status(400).json({ error: 'Tenant context required' });
+    if (req.user.role === 'superadmin') {
+        req.tenantRole = 'superadmin';
+        return next();
+    }
+    try {
+        const role = await _getTenantRole(req.user.playerId, req.tenant.id);
+        if (!role) return res.status(403).json({ error: 'Not a member of this tenant' });
+        req.tenantRole = role;
+        next();
+    } catch (e) {
+        console.error('FIX-318 requireTenantAccess failed:', e.message);
+        return res.status(500).json({ error: 'Authorization error' });
+    }
+};
+
+const requireTenantOrganiser = async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Access denied' });
+    if (!req.tenant) return res.status(400).json({ error: 'Tenant context required' });
+    if (req.user.role === 'superadmin') {
+        req.tenantRole = 'superadmin';
+        return next();
+    }
+    try {
+        const role = await _getTenantRole(req.user.playerId, req.tenant.id);
+        if (role !== 'organiser' && role !== 'tenant_admin') {
+            return res.status(403).json({ error: 'Tenant organiser access required' });
+        }
+        req.tenantRole = role;
+        next();
+    } catch (e) {
+        console.error('FIX-318 requireTenantOrganiser failed:', e.message);
+        return res.status(500).json({ error: 'Authorization error' });
+    }
+};
+
+const requireTenantAdmin = async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Access denied' });
+    if (!req.tenant) return res.status(400).json({ error: 'Tenant context required' });
+    if (req.user.role === 'superadmin') {
+        req.tenantRole = 'superadmin';
+        return next();
+    }
+    try {
+        const role = await _getTenantRole(req.user.playerId, req.tenant.id);
+        if (role !== 'tenant_admin') {
+            return res.status(403).json({ error: 'Tenant admin access required' });
+        }
+        req.tenantRole = role;
+        next();
+    } catch (e) {
+        console.error('FIX-318 requireTenantAdmin failed:', e.message);
+        return res.status(500).json({ error: 'Authorization error' });
+    }
+};
+// ════════════════════════════════════════════════════════════════════════════
+// END FIX-318 middleware
+// ════════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-319 — ROW Day 3: Discovery firewall helper + Add Tenant flow
+// ════════════════════════════════════════════════════════════════════════════
+//
+// getVisibleTenantContext(playerId, currentTenantId = null)
+//
+// Single source of truth for "what tenant data can this player see?". Returns:
+//   {
+//     tenantIds:    UUID[]   — tenants this player can see games from
+//     includeTfRoot: boolean — should games with tenant_id IS NULL be visible?
+//     includeAllPublicTenants: boolean — should games from ANY active tenant be
+//                              visible (cross-tenant discovery)? When TRUE,
+//                              callers should NOT use tenantIds as a hard filter
+//                              and instead allow rows from any tenant whose
+//                              status='active'.
+//     currentTenantInList: boolean — convenience flag for query builders
+//   }
+//
+// Composition rules:
+//   - includeTfRoot ← players.show_tf_root_games (default TRUE for existing
+//     players → zero regression; tenant-origin signups override to FALSE).
+//   - includeAllPublicTenants ← players.show_cross_tenant_games (default FALSE
+//     → privacy-first silo; FIX-335 Phase 4.1 toggle opt-in for discovery).
+//   - tenantIds always includes currentTenantId (if provided — i.e. the URL
+//     prefix's tenant is always visible from inside that tenant).
+//   - tenantIds also includes every tenant where the player has an active
+//     player_tenants row with show_in_dashboard = TRUE (A.78 per-tenant
+//     visibility opt-in, refined per Mitchell's spec amendment).
+//
+// Game-listing endpoints use this in their WHERE clause:
+//   WHERE (g.tenant_id IS NULL AND <includeTfRoot>)
+//      OR  g.tenant_id = ANY($N::uuid[])
+//      OR  (<includeAllPublicTenants> AND g.tenant_id IS NOT NULL)   /* FIX-335 Phase 4.1 */
+//
+// Pre-migration safety: if player_tenants table does not exist (42P01),
+// returns the legacy-equivalent scope (TF-root only) so the helper is safe
+// to deploy before the migration runs.
+async function getVisibleTenantContext(playerId, currentTenantId = null) {
+    try {
+        // FIX-335 Phase 4.1: read show_cross_tenant_games alongside
+        // show_tf_root_games. Tolerant of pre-migration absence — the new
+        // column was added in FIX-334 BLOCK 6; if missing, the SELECT
+        // still succeeds because column reference fails outside the row
+        // accessor, so try the new shape first and fall back on 42703.
+        let showTfRoot = true;
+        let showCrossTenant = false;
+        let pRes;
+        try {
+            pRes = await pool.query(
+                'SELECT show_tf_root_games, show_cross_tenant_games FROM players WHERE id = $1',
+                [playerId]
+            );
+            if (pRes.rows.length > 0) {
+                showTfRoot      = pRes.rows[0].show_tf_root_games !== false;
+                showCrossTenant = pRes.rows[0].show_cross_tenant_games === true;
+            }
+        } catch (e) {
+            if (e && e.code === '42703') {
+                // show_cross_tenant_games column not yet provisioned —
+                // fall back to legacy SELECT, leave showCrossTenant FALSE.
+                pRes = await pool.query(
+                    'SELECT show_tf_root_games FROM players WHERE id = $1',
+                    [playerId]
+                );
+                if (pRes.rows.length > 0) {
+                    showTfRoot = pRes.rows[0].show_tf_root_games !== false;
+                }
+            } else { throw e; }
+        }
+
+        const ptRes = await pool.query(
+            `SELECT tenant_id, show_in_dashboard
+               FROM player_tenants
+              WHERE player_id = $1 AND status = 'active'`,
+            [playerId]
+        );
+
+        const tenantIds = new Set();
+        if (currentTenantId) tenantIds.add(currentTenantId);
+        for (const row of ptRes.rows) {
+            if (row.show_in_dashboard) tenantIds.add(row.tenant_id);
+        }
+        return {
+            tenantIds: Array.from(tenantIds),
+            includeTfRoot: showTfRoot,
+            includeAllPublicTenants: showCrossTenant,  // FIX-335 Phase 4.1
+            currentTenantInList: !!currentTenantId
+        };
+    } catch (e) {
+        // 42P01 = undefined_table — either players.show_tf_root_games or
+        // player_tenants doesn't exist yet. Fall back to legacy TF-root scope.
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return {
+                tenantIds: currentTenantId ? [currentTenantId] : [],
+                includeTfRoot: true,
+                includeAllPublicTenants: false,
+                currentTenantInList: !!currentTenantId
+            };
+        }
+        throw e;
+    }
+}
+// ════════════════════════════════════════════════════════════════════════════
+// END FIX-319 helper
+// ════════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-329 — ROW Day 15: Organiser allowance dial helpers (A.70)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Three helpers for the comp-eligibility decision when an organiser registers
+// for a game. Existing TF Coventry behaviour preserved when tenant has
+// default values (-1 / 6 / 100) or the master toggle is OFF.
+
+// Resolve effective allowance dials for a game. Returns a struct with:
+//   { enabled, per_game, pct_discount, games_per_week, tenant_id }
+// For TF root games (tenant_id IS NULL): uses TF hardcoded defaults
+// (matches existing comp behaviour exactly).
+//
+// FIX-329 audit-fix: accept optional `dbClient` arg (pg Client from BEGIN tx).
+// Without this, the register endpoint's BEGIN transaction would read tenant
+// dial values from a separate pool connection — fine for slowly-changing
+// settings, but the weekly comp count below MUST use the same transaction
+// to see the FOR UPDATE row lock and concurrent registrations correctly.
+// All call sites pass `client` when inside a transaction; profile/detail
+// reads pass nothing (use pool).
+async function _fix329GetAllowance(gameTenantId, dbClient = null) {
+    const q = dbClient || pool;
+    if (!gameTenantId) {
+        return {
+            enabled: true,             // TF root: always on (existing behaviour)
+            per_game: 6,               // matches existing < 6 cap
+            pct_discount: 100,         // existing full comp
+            games_per_week: -1,        // unlimited (existing behaviour)
+            tenant_id: null,
+        };
+    }
+    try {
+        const r = await q.query(
+            `SELECT organiser_allowance_enabled,
+                    organiser_allowance_per_game,
+                    organiser_allowance_pct_discount,
+                    organiser_allowance_games_per_week
+               FROM tenants WHERE id = $1 LIMIT 1`,
+            [gameTenantId]
+        );
+        const row = r.rows[0] || {};
+        return {
+            enabled:        row.organiser_allowance_enabled !== false,
+            per_game:       parseInt(row.organiser_allowance_per_game || 6, 10),
+            pct_discount:   parseInt(row.organiser_allowance_pct_discount || 100, 10),
+            games_per_week: parseInt(row.organiser_allowance_games_per_week || -1, 10),
+            tenant_id:      gameTenantId,
+        };
+    } catch (e) {
+        // Pre-migration safety
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return { enabled: true, per_game: 6, pct_discount: 100, games_per_week: -1, tenant_id: gameTenantId };
+        }
+        throw e;
+    }
+}
+
+// Count comped registrations this organiser has THIS WEEK (Mon 00:00 → Sun 23:59
+// in Europe/London) within the given tenant scope (or TF root if tenantId null).
+// Used to enforce games_per_week cap. Returns integer.
+//
+// FIX-329 audit-fix: same dbClient pattern. When called from inside the
+// /register transaction, MUST run on the same connection or it will miss
+// any registration the current transaction has already inserted.
+async function _fix329CountWeeklyComps(playerId, tenantId, dbClient = null) {
+    const q = dbClient || pool;
+    try {
+        const tenantClause = tenantId ? 'AND g.tenant_id = $2' : 'AND g.tenant_id IS NULL';
+        const params = tenantId ? [playerId, tenantId] : [playerId];
+        const r = await q.query(
+            `SELECT COUNT(*) AS cnt
+               FROM registrations r
+               JOIN games g ON g.id = r.game_id
+              WHERE r.player_id = $1
+                AND r.is_comped = TRUE
+                AND r.status = 'confirmed'
+                AND g.game_date >= DATE_TRUNC('week', NOW() AT TIME ZONE 'Europe/London')
+                AND g.game_date <  DATE_TRUNC('week', NOW() AT TIME ZONE 'Europe/London') + INTERVAL '7 days'
+                ${tenantClause}`,
+            params
+        );
+        return parseInt(r.rows[0]?.cnt || 0, 10);
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return 0;
+        throw e;
+    }
+}
+
+// One-shot eligibility decision for an organiser registering for a game.
+// Returns { comped, discount_pct, reason }. discount_pct = 0 means NO comp
+// (player pays full price); discount_pct = 100 means full free; 1-99 partial.
+// Caller still needs to compute actual amount_paid from cost_per_player.
+//
+// FIX-329 audit-fix: dbClient parameter propagated to inner helpers.
+async function _fix329ResolveOrganiserComp(playerId, game, currentCompCountInGame, dbClient = null) {
+    const allowance = await _fix329GetAllowance(game.tenant_id, dbClient);
+
+    if (!allowance.enabled) {
+        return { comped: false, discount_pct: 0, reason: 'allowance_disabled' };
+    }
+    if (currentCompCountInGame >= allowance.per_game) {
+        return { comped: false, discount_pct: 0, reason: 'per_game_cap_reached' };
+    }
+    if (allowance.games_per_week !== -1) {
+        const weekly = await _fix329CountWeeklyComps(playerId, game.tenant_id, dbClient);
+        if (weekly >= allowance.games_per_week) {
+            return { comped: false, discount_pct: 0, reason: 'weekly_cap_reached' };
+        }
+    }
+    return { comped: true, discount_pct: allowance.pct_discount, reason: 'eligible' };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-330 — ROW Day 16: Invoicing helpers
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Invoice number format: INV-YYYYMM-{tenant_short_id}-{seq}, where seq is a
+// 2-digit zero-padded ordinal in case a tenant gets re-invoiced (e.g. a void
+// triggers a new draft). Unique by (tenant_id, period_start, period_end) on
+// the table — re-running the helper for the same period returns the existing
+// invoice rather than creating a duplicate (idempotent).
+//
+// Aggregation method: confirmed registrations in tenant's games where the
+// game_date falls in [period_start, period_end]. amount_pence per line item =
+// quantity × tenant.platform_fee_pence (frozen at invoice-generation time so
+// later tweaks to the dial don't retroactively change issued invoices).
+
+async function _fix330NextInvoiceNumber(tenantShortId, periodStart, dbClient = null) {
+    const q = dbClient || pool;
+    const yyyymm = periodStart.slice(0, 7).replace('-', ''); // 'YYYY-MM-...' → 'YYYYMM'
+    const prefix = `INV-${yyyymm}-${tenantShortId}-`;
+    // Count existing matches to pick the next seq (handles re-invoice after void)
+    const r = await q.query(
+        `SELECT COUNT(*) AS cnt FROM invoices WHERE invoice_number LIKE $1`,
+        [prefix + '%']
+    );
+    const seq = (parseInt(r.rows[0]?.cnt || 0, 10) + 1).toString().padStart(2, '0');
+    return prefix + seq;
+}
+
+// Build (or fetch existing) draft invoice for one tenant + period.
+// Returns the invoice row. NEVER mutates an already-issued/paid invoice —
+// re-runs are safe.
+async function _fix330BuildTenantInvoice(tenant, periodStart, periodEnd) {
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // Check for existing invoice for this period
+        const existRes = await client.query(
+            `SELECT * FROM invoices
+              WHERE tenant_id = $1 AND period_start = $2 AND period_end = $3
+              LIMIT 1`,
+            [tenant.id, periodStart, periodEnd]
+        );
+        if (existRes.rows.length > 0) {
+            await client.query('ROLLBACK'); // nothing to commit
+            return { invoice: existRes.rows[0], created: false };
+        }
+
+        // Count confirmed registrations in this tenant's games for the period
+        const regCountRes = await client.query(
+            `SELECT COUNT(*) AS cnt
+               FROM registrations r
+               JOIN games g ON g.id = r.game_id
+              WHERE g.tenant_id = $1
+                AND r.status = 'confirmed'
+                AND g.game_date >= $2::date
+                AND g.game_date <  ($3::date + INTERVAL '1 day')`,
+            [tenant.id, periodStart, periodEnd]
+        );
+        const regCount = parseInt(regCountRes.rows[0]?.cnt || 0, 10);
+
+        // Snapshot platform_fee_pence at this moment (frozen for this invoice)
+        const platformFee = parseInt(tenant.platform_fee_pence || 12, 10);
+        const subtotal = regCount * platformFee;
+
+        // FIX-332 Day 18: VAT — 20% (2000 basis points) default if registered.
+        // Snapshot at generation time so later rate changes don't affect issued.
+        const vatRegistered = tenant.vat_registered === true;
+        const vatRateBp     = parseInt(tenant.vat_rate_basis_points || 2000, 10);
+        const tax = vatRegistered ? Math.round(subtotal * vatRateBp / 10000) : 0;
+
+        // FIX-332 Day 18: consume tenant credit balance up to current total.
+        //
+        // FIX-333 audit-fix (Day 19): re-read credit_balance WITHIN the
+        // transaction with FOR UPDATE — was reading from the outer fetch
+        // (passed via `tenant` arg), which could be stale if another invoice
+        // generation for a DIFFERENT period was running concurrently. Without
+        // this lock: two builds could both compute creditApplied = 100, both
+        // decrement → balance goes negative → CHECK constraint fails → one
+        // build silently rolls back. Now: row-locked, sequential consumption.
+        let startingBalance = 0;
+        try {
+            const balRes = await client.query(
+                `SELECT credit_balance_pence FROM tenants WHERE id = $1 FOR UPDATE`,
+                [tenant.id]
+            );
+            startingBalance = parseInt(balRes.rows[0]?.credit_balance_pence || 0, 10);
+        } catch (e) {
+            // Pre-FIX-332 schema: column doesn't exist → no credit balance available
+            if (e && e.code !== '42703') throw e;
+        }
+        const grossTotal      = subtotal + tax;
+        const creditApplied   = Math.min(startingBalance, grossTotal);
+        const total           = grossTotal - creditApplied;
+
+        // Generate next number
+        const invoiceNumber = await _fix330NextInvoiceNumber(tenant.short_id, periodStart, client);
+
+        // Insert invoice header
+        const invRes = await client.query(
+            `INSERT INTO invoices
+                (tenant_id, invoice_number, period_start, period_end,
+                 subtotal_pence, tax_pence, total_pence, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft')
+             RETURNING *`,
+            [tenant.id, invoiceNumber, periodStart, periodEnd, subtotal, tax, total]
+        );
+        const invoice = invRes.rows[0];
+
+        // Insert main line item if any registrations occurred
+        if (regCount > 0) {
+            await client.query(
+                `INSERT INTO invoice_line_items
+                    (invoice_id, line_type, description, quantity, unit_price_pence, amount_pence, metadata)
+                 VALUES ($1, 'platform_fee_per_registration', $2, $3, $4, $5, $6::jsonb)`,
+                [
+                    invoice.id,
+                    `Platform fee — ${regCount} confirmed registration${regCount === 1 ? '' : 's'} (${periodStart} to ${periodEnd})`,
+                    regCount,
+                    platformFee,
+                    subtotal,
+                    JSON.stringify({ period_start: periodStart, period_end: periodEnd, platform_fee_pence: platformFee }),
+                ]
+            );
+        }
+
+        // FIX-332 Day 18: VAT line item if applicable
+        if (tax > 0) {
+            await client.query(
+                `INSERT INTO invoice_line_items
+                    (invoice_id, line_type, description, quantity, unit_price_pence, amount_pence, metadata)
+                 VALUES ($1, 'tax', $2, 1, $3, $3, $4::jsonb)`,
+                [
+                    invoice.id,
+                    `VAT @ ${(vatRateBp / 100).toFixed(2)}%`,
+                    tax,
+                    JSON.stringify({ vat_rate_basis_points: vatRateBp, base_pence: subtotal }),
+                ]
+            );
+        }
+
+        // FIX-332 Day 18: credit-applied line item + decrement tenant balance
+        if (creditApplied > 0) {
+            await client.query(
+                `INSERT INTO invoice_line_items
+                    (invoice_id, line_type, description, quantity, unit_price_pence, amount_pence, metadata)
+                 VALUES ($1, 'manual_credit', $2, 1, $3, $3, $4::jsonb)`,
+                [
+                    invoice.id,
+                    `Credit applied from previous balance`,
+                    -creditApplied,
+                    JSON.stringify({ source: 'carry_forward', starting_balance_pence: startingBalance }),
+                ]
+            );
+            await client.query(
+                `UPDATE tenants SET credit_balance_pence = credit_balance_pence - $1
+                  WHERE id = $2`,
+                [creditApplied, tenant.id]
+            );
+        }
+
+        await client.query('COMMIT');
+        return { invoice, created: true };
+    } catch (e) {
+        if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+        // 42P01 = table missing (pre-migration); 23505 = unique race (someone else just inserted)
+        if (e && e.code === '23505') {
+            // Race: re-fetch the row that beat us
+            const r = await pool.query(
+                `SELECT * FROM invoices WHERE tenant_id = $1 AND period_start = $2 AND period_end = $3 LIMIT 1`,
+                [tenant.id, periodStart, periodEnd]
+            );
+            return { invoice: r.rows[0] || null, created: false };
+        }
+        throw e;
+    } finally {
+        if (client) client.release();
+    }
+}
+
+// Generate draft invoices for ALL active tenants for a given period.
+// Idempotent: skips tenants that already have an invoice for the period.
+// Returns array of { tenant_id, invoice, created }.
+async function _fix330GenerateInvoicesForPeriod(periodStart, periodEnd) {
+    try {
+        // FIX-332 Day 18: also fetch VAT settings + credit balance so build
+        // helper can apply them. Tolerant of pre-FIX-332 schema via try/catch.
+        let tRes;
+        try {
+            tRes = await pool.query(
+                `SELECT id, short_id, name, platform_fee_pence,
+                        vat_registered, vat_rate_basis_points, credit_balance_pence
+                   FROM tenants
+                  WHERE status = 'active'
+                  ORDER BY name`
+            );
+        } catch (e) {
+            if (e && e.code === '42703') {
+                // Pre-FIX-332 migration: fall back to legacy SELECT
+                tRes = await pool.query(
+                    `SELECT id, short_id, name, platform_fee_pence
+                       FROM tenants
+                      WHERE status = 'active'
+                      ORDER BY name`
+                );
+            } else { throw e; }
+        }
+        const results = [];
+        for (const tenant of tRes.rows) {
+            try {
+                const r = await _fix330BuildTenantInvoice(tenant, periodStart, periodEnd);
+                results.push({ tenant_id: tenant.id, tenant_name: tenant.name, ...r });
+            } catch (e) {
+                console.error(`FIX-330 invoice generation failed for tenant ${tenant.name}:`, e.message);
+                results.push({ tenant_id: tenant.id, tenant_name: tenant.name, error: e.message });
+            }
+        }
+        return results;
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return [];
+        throw e;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+
+
+// ════════════════════════════════════════════════════════════════════════════
+
+
 // CLM Admin: is_clm_admin flag, only operates on CLM-exclusive games
 const requireCLMAdmin = async (req, res, next) => {
     try {
@@ -3356,6 +4056,13 @@ const FIX275_FOLLOWUP_WINDOW_GAMES = 5;
 //   20-30% → 0.85 (mild self-cooling)
 //   30-50% → 0.70 (the system is too hot — slow down)
 //   ≥50%   → 0.50 (emergency brake; admin should investigate)
+//
+// FIX-321 (ROW Day 5) — Damping stays GLOBAL per spec A.56. The 90-day
+// overcorrection rate is computed across every player on the platform
+// regardless of tenant. Per-tenant damping was explicitly rejected because
+// (a) early-stage tenants have too little data to support a stable rate,
+// and (b) cross-tenant calibration (A.51) requires a single shared signal.
+// Do NOT scope this calculation by tenant_id.
 function _fix275DampingForRate(rate) {
     if (rate < 0.20) return 1.00;
     if (rate < 0.30) return 0.85;
@@ -4285,6 +4992,29 @@ app.post('/api/auth/register', async (req, res) => {
         // here and writes a row in landing_attributions linking the new player to
         // the originating ad campaign. Snake_case for web payload consistency.
         const landingHitId = req.body.landing_hit_id || req.body.landingHitId || null;
+
+        // FIX-334 (ROW Day 21): Signup-with-tenant. When a new player arrives via
+        // a tenant invite link (e.g. /87432/signup), the frontend includes the
+        // tenant_short_id in the registration body. We validate, look up the
+        // tenant, and attach the player to it after the players row is created.
+        //
+        // Accept both snake_case (web) and camelCase (mobile) per existing
+        // conventions in this endpoint.
+        //
+        // Per Q1=C: a tenant-attached signup gets:
+        //   - player_tenants row (role='player', status='active', show_in_dashboard=TRUE)
+        //   - players.show_tf_root_games = FALSE     (don't show TF root)
+        //   - players.show_cross_tenant_games = FALSE (don't show other tenants either)
+        //   → purist silo: they see ONLY their tenant's games until they opt out.
+        //
+        // Invalid tenant_short_id (wrong format, doesn't exist, paused/exited):
+        // silently ignored — player still registers, just isn't attached. We
+        // never block signup on a bad invite link.
+        const _tenantShortIdRaw = req.body.tenant_short_id || req.body.tenantShortId || null;
+        let tenantShortId = null;
+        if (typeof _tenantShortIdRaw === 'string' && /^\d{5}$/.test(_tenantShortIdRaw.trim())) {
+            tenantShortId = _tenantShortIdRaw.trim();
+        }
         // FIX-243: When a cold visitor clicked a specific game tile on
         // games.html, that tile's game_url was stashed in sessionStorage and
         // is passed here. Surface it in the admin signup email so GAFFA sees
@@ -4524,6 +5254,176 @@ app.post('/api/auth/register', async (req, res) => {
 
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
+
+        // FIX-334 (ROW Day 21): Tenant attachment for tenant-invite signups.
+        //
+        // If tenantShortId was supplied AND resolves to an active tenant:
+        //   1. Insert player_tenants row (role='player', status='active', show_in_dashboard=TRUE)
+        //   2. Set players.show_tf_root_games=FALSE + show_cross_tenant_games=FALSE (Q1=C purist silo)
+        //   3. Allocate tenant_player_id sequence value (per spec A.76 — 6-digit IDs for
+        //      players whose first signup originates via a tenant route)
+        //   4. Capture T&Cs acceptance for both player and organiser (if applicable)
+        //   5. Audit log the attachment
+        //
+        // If tenantShortId not supplied OR invalid OR tenant inactive: do nothing.
+        // The player is registered as a standalone TotalFooty player (TF Coventry default).
+        //
+        // Pre-migration safe: silently skips entirely if player_tenants table or
+        // tenant_player_id column doesn't exist (42P01 / 42703).
+        let tenantAttachResult = null;
+        if (tenantShortId) {
+            try {
+                // Look up tenant; must be active to attach
+                const tRes = await pool.query(
+                    `SELECT id, name, short_id, status, accepted_tenant_tcs_version
+                       FROM tenants WHERE short_id = $1 LIMIT 1`,
+                    [tenantShortId]
+                );
+                if (tRes.rows.length > 0 && tRes.rows[0].status === 'active') {
+                    const _tenant = tRes.rows[0];
+                    // Skip if this is TF Coventry — every player gets the row via
+                    // the migration backfill (Block 3); duplicating here causes
+                    // a 23505 unique violation on the PK (player_id, tenant_id).
+                    // The migration already set show_in_dashboard=TRUE for TF.
+                    if (_tenant.id !== TF_COVENTRY_TENANT_ID) {
+                        // 1. Allocate tenant_player_id sequence (per A.76)
+                        //    Only for first-tenant-origin signup (per A.77 immutability)
+                        try {
+                            await pool.query(
+                                `UPDATE players
+                                    SET tenant_player_id = nextval('tenant_player_id_seq')
+                                  WHERE id = $1 AND tenant_player_id IS NULL`,
+                                [playerId]
+                            );
+                        } catch (e) {
+                            // Sequence may not exist pre-migration — skip silently
+                            if (e && e.code !== '42P01' && e.code !== '42703' && e.code !== '42704') throw e;
+                        }
+
+                        // 2. Insert player_tenants row
+                        await pool.query(
+                            `INSERT INTO player_tenants
+                                (player_id, tenant_id, role, status, joined_at,
+                                 show_in_dashboard, allow_tenant_contact,
+                                 accepted_organiser_tcs_version, accepted_organiser_tcs_at)
+                             VALUES ($1, $2, 'player', 'active', NOW(), TRUE, TRUE, NULL, NULL)
+                             ON CONFLICT (player_id, tenant_id) DO UPDATE
+                                SET status = 'active', joined_at = NOW(),
+                                    show_in_dashboard = TRUE`,
+                            [playerId, _tenant.id]
+                        );
+
+                        // 3. Set purist-silo prefs (Q1=C)
+                        //    show_tf_root_games column may not exist yet pre-migration
+                        try {
+                            await pool.query(
+                                `UPDATE players
+                                    SET show_tf_root_games = FALSE,
+                                        show_cross_tenant_games = FALSE
+                                  WHERE id = $1`,
+                                [playerId]
+                            );
+                        } catch (e) {
+                            if (e && e.code !== '42703') throw e;
+                        }
+
+                        tenantAttachResult = {
+                            attached: true,
+                            tenant_id: _tenant.id,
+                            tenant_name: _tenant.name,
+                            tenant_short_id: _tenant.short_id,
+                        };
+
+                        // 4. Capture T&Cs acceptance at register time (Q9)
+                        //    Player T&Cs always; Organiser T&Cs N/A (role='player' here)
+                        //    Use the constant — if hardcoded, every version bump
+                        //    would immediately hit fresh signups with the blocking
+                        //    modal asking them to re-accept what they just accepted.
+                        try {
+                            await pool.query(
+                                `UPDATE players
+                                    SET accepted_player_tcs_version = $2,
+                                        accepted_player_tcs_at      = NOW()
+                                  WHERE id = $1`,
+                                [playerId, CURRENT_PLAYER_TCS_VERSION]
+                            );
+                        } catch (e) {
+                            if (e && e.code !== '42703') throw e;
+                        }
+
+                        // 5. Audit log
+                        try {
+                            await auditLog(pool, playerId, 'player_signup_with_tenant', _tenant.id,
+                                `New player signup attached to ${_tenant.name} (${_tenant.short_id}) via tenant invite link`,
+                                _tenant.id);
+                        } catch (_) { /* audit_logs missing — fall through */ }
+                    }
+                }
+            } catch (e) {
+                // Tenants table missing entirely (pre-FIX-317) — log + continue
+                if (e && (e.code === '42P01' || e.code === '42703')) {
+                    console.warn('[FIX-334 signup-with-tenant] tenants table missing — skipping attachment');
+                } else {
+                    // Any other DB error during attachment: don't block signup,
+                    // just log so Mitchell can investigate.
+                    console.error('[FIX-334 signup-with-tenant] attachment failed:', e.message);
+                }
+            }
+        }
+
+        // FIX-334 audit-fix (Day 30 Pass 8 EDGE 1): every signup ALSO becomes a
+        // TF Coventry member by default. Without this, new tenant-attached
+        // signups (purist silo) AND new no-tenant signups would have no TF
+        // membership row; the post-migration SQL filter requires tenant_id in
+        // the player's tenantIds list, so they'd see ZERO TF games.
+        //
+        // For tenant-attached signups (Q1=C purist silo): show_in_dashboard
+        // for TF Coventry is FALSE (they don't want TF games until they opt in).
+        // For free-floating signups (no tenant_short_id): show_in_dashboard=TRUE.
+        try {
+            const tfShowInDashboard = !tenantShortId;  // only TRUE for no-tenant signups
+            await pool.query(
+                `INSERT INTO player_tenants
+                    (player_id, tenant_id, role, status, joined_at,
+                     show_in_dashboard, allow_tenant_contact)
+                 VALUES ($1, $2, 'player', 'active', NOW(), $3, TRUE)
+                 ON CONFLICT (player_id, tenant_id) DO NOTHING`,
+                [playerId, TF_COVENTRY_TENANT_ID, tfShowInDashboard]
+            );
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703' || e.code === '23503')) {
+                // player_tenants table missing (pre-FIX-317), or tenants table
+                // missing (TF Coventry tenant row doesn't exist yet).
+                // Pre-migration deploys can't have this protection — accept it.
+            } else {
+                console.error('[FIX-334 TF Coventry default attachment] failed:', e.message);
+            }
+        }
+
+        // FIX-335 audit-fix (round 6 #33): Capture player T&Cs version on EVERY
+        // signup path. The Wave 2 tenant-attach block above only set this for
+        // external-tenant signups (and skipped TF Coventry + plain signups),
+        // which meant the most common signup paths (plain + TF Coventry) saw
+        // the blocking T&Cs modal pop the instant they reached the dashboard.
+        // The wizard's "Create Account" button itself is the acceptance ceremony
+        // for the published-version T&Cs; record it server-side here so the
+        // modal doesn't fire on the first dashboard load.
+        try {
+            await pool.query(
+                `UPDATE players
+                    SET accepted_player_tcs_version = $2,
+                        accepted_player_tcs_at      = NOW()
+                  WHERE id = $1
+                    AND accepted_player_tcs_version IS DISTINCT FROM $2`,
+                [playerId, CURRENT_PLAYER_TCS_VERSION]
+            );
+        } catch (e) {
+            // Column missing pre-FIX-334 — silent skip. The modal will pop
+            // post-migration as expected for any pre-existing rows.
+            if (e && e.code !== '42703') {
+                console.error('[FIX-335 signup TCS capture] failed:', e.message);
+            }
+        }
 
         // ── LANDING ATTRIBUTION ─────────────────────────────────────────────
         // Link this new player to the landing_hit that brought them here, if
@@ -4789,7 +5689,11 @@ app.post('/api/auth/register', async (req, res) => {
         res.status(201).json({ 
             message: 'Account created successfully', 
             userId,
-            playerId 
+            playerId,
+            // FIX-334 (ROW Day 21): expose tenant attach result so frontend can
+            // route to the tenant's dashboard immediately (or show success
+            // toast: "You're now in [Tenant Name]"). null = no attachment.
+            tenant_attached: tenantAttachResult
         });
 
         // Non-critical: send welcome email after response
@@ -4823,8 +5727,12 @@ app.post('/api/auth/register', async (req, res) => {
             let referredByRow = '';
             if (ref) {
                 try {
+                    // FIX-317 audit-fix: extend referrer SELECT to all cascade fields
+                    // so formatPlayerDisplayId can render 6-digit tenant IDs correctly.
                     const refRow = await pool.query(
-                        `SELECT pref.alias, pref.full_name, pref.squad_number
+                        `SELECT pref.alias, pref.full_name,
+                                pref.squad_number, pref.player_number_text,
+                                pref.tenant_player_id, pref.player_number
                          FROM players p
                          JOIN players pref ON pref.id = p.referred_by
                          WHERE p.id = $1`,
@@ -4833,10 +5741,10 @@ app.post('/api/auth/register', async (req, res) => {
                     if (refRow.rows.length > 0) {
                         const r = refRow.rows[0];
                         const displayName = r.alias || r.full_name || 'Unknown';
-                        const squadRef    = (r.squad_number != null) ? `TF-${r.squad_number}` : '';
+                        const squadRef    = formatPlayerDisplayId(r);
                         referredByRow = `<tr><td style="padding:6px 0;color:#888;">Referred by</td>` +
                             `<td style="font-weight:900;">${htmlEncode(displayName)}` +
-                            `${squadRef ? ' · ' + htmlEncode(squadRef) : ''}</td></tr>`;
+                            `${squadRef && squadRef !== '—' ? ' · ' + htmlEncode(squadRef) : ''}</td></tr>`;
                     } else {
                         // ref provided but didn't resolve to a player (legacy markers / invalid code)
                         referredByRow = `<tr><td style="padding:6px 0;color:#888;">Referral</td>` +
@@ -6339,23 +7247,55 @@ const _PREFS_ALLOWED_LOCATIONS = new Set(['Birmingham','Coventry','Manchester','
 // GET /api/player/preferences — returns all prefs for current player
 app.get('/api/player/preferences', authenticateToken, async (req, res) => {
     try {
-        const result = await pool.query(
-            `SELECT preferred_locations,
-                    default_positions_11aside,
-                    default_position_areas,
-                    coachable,
-                    region_code
-             FROM players WHERE id = $1`,
-            [req.user.playerId]
-        );
+        // FIX-319 audit-fix: try with show_tf_root_games column; gracefully
+        // fall back to legacy SELECT if column doesn't exist (pre-migration).
+        // FIX-328: phone_public_for_organising also tolerant of pre-migration.
+        // FIX-335 Phase 4.1: show_cross_tenant_games added to SELECT — same
+        // 42703 fallback handles its absence pre-migration.
+        let result;
+        try {
+            result = await pool.query(
+                `SELECT preferred_locations,
+                        default_positions_11aside,
+                        default_position_areas,
+                        coachable,
+                        region_code,
+                        show_tf_root_games,
+                        show_cross_tenant_games,
+                        phone_public_for_organising
+                 FROM players WHERE id = $1`,
+                [req.user.playerId]
+            );
+        } catch (e) {
+            if (e && e.code === '42703') {
+                // One or more new columns don't exist yet — legacy SELECT
+                result = await pool.query(
+                    `SELECT preferred_locations,
+                            default_positions_11aside,
+                            default_position_areas,
+                            coachable,
+                            region_code
+                     FROM players WHERE id = $1`,
+                    [req.user.playerId]
+                );
+            } else { throw e; }
+        }
         if (result.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
         const r = result.rows[0];
         res.json({
-            preferred_locations:       r.preferred_locations || '',
-            default_positions_11aside: r.default_positions_11aside || '',
-            default_position_areas:    r.default_position_areas || '',
-            coachable:                 !!r.coachable,
-            region_code:               r.region_code || null,
+            preferred_locations:         r.preferred_locations || '',
+            default_positions_11aside:   r.default_positions_11aside || '',
+            default_position_areas:      r.default_position_areas || '',
+            coachable:                   !!r.coachable,
+            region_code:                 r.region_code || null,
+            // FIX-319: default to TRUE if column doesn't exist or row says null
+            show_tf_root_games:          r.show_tf_root_games !== false,
+            // FIX-335 Phase 4.1: default FALSE — players see only their own
+            // tenants' games unless they explicitly opt in. Matches the
+            // schema default in FIX-334 migration BLOCK 6.
+            show_cross_tenant_games:     r.show_cross_tenant_games === true,
+            // FIX-328: default FALSE if column doesn't exist
+            phone_public_for_organising: r.phone_public_for_organising === true,
         });
     } catch (error) {
         console.error('Get preferences error:', error);
@@ -6403,6 +7343,38 @@ app.patch('/api/player/preferences', authenticateToken, async (req, res) => {
         if (body.coachable !== undefined) {
             updates.push(`coachable = $${idx++}`);
             values.push(!!body.coachable);
+        }
+
+        // FIX-319 audit-fix: allow player to toggle their TF root visibility.
+        // Default TRUE on signup (existing players keep TF visibility). Setting
+        // this FALSE hides g.tenant_id IS NULL games from /api/games and
+        // /api/games/completed (see getVisibleTenantContext). Pre-migration
+        // safety: if column doesn't exist, the UPDATE will simply 42703-fail
+        // and the rest of the prefs save succeeds via the existing error
+        // handler. Tolerant by design.
+        if (body.show_tf_root_games !== undefined) {
+            updates.push(`show_tf_root_games = $${idx++}`);
+            values.push(!!body.show_tf_root_games);
+        }
+
+        // FIX-335 Phase 4.1: cross-tenant game visibility. When TRUE, the
+        // dashboard surfaces games from EVERY tenant the player belongs to
+        // (regardless of per-tenant show_in_dashboard flags), plus tenants
+        // they DON'T belong to (controlled discovery — A.55). Default FALSE
+        // (privacy-first; each tenant is silo'd by default). Pre-migration
+        // tolerant — column added in FIX-334 migration BLOCK 6; if missing
+        // here, the UPDATE 42703-fails and the rest of the PATCH succeeds.
+        if (body.show_cross_tenant_games !== undefined) {
+            updates.push(`show_cross_tenant_games = $${idx++}`);
+            values.push(!!body.show_cross_tenant_games);
+        }
+
+        // FIX-328 (Day 14): phone consent for organiser card display.
+        // When TRUE, the player's phone number appears on game.html organiser
+        // card so players can call them directly. Default FALSE → privacy-first.
+        if (body.phone_public_for_organising !== undefined) {
+            updates.push(`phone_public_for_organising = $${idx++}`);
+            values.push(!!body.phone_public_for_organising);
         }
 
         if (updates.length === 0) {
@@ -8888,7 +9860,15 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         if (tier === 'white' || tier === 'black') hoursAhead = 0; // banned - no games visible
         
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
-        
+
+        // FIX-319 (ROW Day 3): Coventry hard-wall / discovery firewall.
+        // Admins see every game regardless of tenant. Non-admins see only:
+        //   - TF root games (g.tenant_id IS NULL) IF their show_tf_root_games = TRUE
+        //   - Games from tenants where they've toggled show_in_dashboard = TRUE
+        // For existing TF players (no player_tenants rows, default TRUE) this
+        // resolves to "all games where tenant_id IS NULL" — identical to today.
+        const visScope = await getVisibleTenantContext(req.user.playerId);
+
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location,
                    v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
@@ -8936,8 +9916,9 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             ${!isAdmin && !hasAllStarBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'allstars')" : ''}
             ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
             ${!isAdmin && !hasMisfitsBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'misfits')" : ''}
+            AND ($2 = TRUE OR (g.tenant_id IS NULL AND $3 = TRUE) OR g.tenant_id = ANY($4::uuid[]) OR ($5 = TRUE AND g.tenant_id IS NOT NULL))
             ORDER BY g.game_date DESC
-        `, [req.user.playerId]);
+        `, [req.user.playerId, isAdmin, visScope.includeTfRoot, visScope.tenantIds, visScope.includeAllPublicTenants]);
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -9019,6 +10000,10 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
                 WHERE r2.game_id = g.id AND r2.player_id = $3 AND r2.status = 'confirmed'
               )`;
 
+        // FIX-319 (ROW Day 3): Coventry hard-wall / discovery firewall on completed games.
+        // Same semantics as /api/games — admins bypass, others scope by visible tenants.
+        const visScope = await getVisibleTenantContext(req.user.playerId);
+
         const result = await pool.query(`
             SELECT g.*, v.name as venue_name,
                    v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
@@ -9065,9 +10050,10 @@ app.get('/api/games/completed', authenticateToken, async (req, res) => {
             ) gc ON gc.game_id = g.id
             WHERE g.game_status = 'completed'
               ${playerFilter}
+              AND ($4 = TRUE OR (g.tenant_id IS NULL AND $5 = TRUE) OR g.tenant_id = ANY($6::uuid[]) OR ($7 = TRUE AND g.tenant_id IS NOT NULL))
             ORDER BY g.game_date DESC
             LIMIT $1 OFFSET $2
-        `, [limit, offset, req.user.playerId]);
+        `, [limit, offset, req.user.playerId, isAdmin, visScope.includeTfRoot, visScope.tenantIds, visScope.includeAllPublicTenants]);
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -9126,6 +10112,9 @@ app.get('/api/games/needing-refs', authenticateToken, async (req, res) => {
             return res.status(403).json({ error: 'Referee badge required' });
         }
 
+        // FIX-319 (ROW Day 3): scope ref-eligible games to player's visible tenants.
+        const visScope = await getVisibleTenantContext(req.user.playerId);
+
         const result = await pool.query(`
             SELECT g.id, g.game_url, g.game_date, g.format, g.refs_required,
                    g.ref_pay, g.game_status,
@@ -9144,8 +10133,12 @@ app.get('/api/games/needing-refs', authenticateToken, async (req, res) => {
             WHERE g.refs_required > 0
               AND g.game_status IN ('available','confirmed')
               AND g.game_date >= NOW()
+              -- FIX-319 (ROW Day 3): refs only see games from their visible tenants.
+              -- FIX-335 Phase 4.1: cross-tenant discovery extends this to any
+              -- active tenant when the player opts in via show_cross_tenant_games.
+              AND ((g.tenant_id IS NULL AND $2 = TRUE) OR g.tenant_id = ANY($3::uuid[]) OR ($4 = TRUE AND g.tenant_id IS NOT NULL))
             ORDER BY g.game_date ASC
-        `, [req.user.playerId]);
+        `, [req.user.playerId, visScope.includeTfRoot, visScope.tenantIds, visScope.includeAllPublicTenants]);
 
         res.json(result.rows);
     } catch (error) {
@@ -9280,13 +10273,22 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         );
         const compCount = parseInt(compCountRow.rows[0].cnt) || 0;
         game.comp_count = compCount;
-        game.comp_cap = 6;
+        // FIX-329 (ROW Day 15): tenant-aware comp_cap (was hardcoded 6).
+        // For TF root (tenant_id NULL) helper returns 6 → identical behaviour.
+        const _fix329Allowance = await _fix329GetAllowance(game.tenant_id);
+        game.comp_cap = _fix329Allowance.per_game;
+        game.comp_discount_pct = _fix329Allowance.pct_discount;
         // Only compute eligibility for the calling user — avoids leaking organiser status
         const callerCheck = await pool.query(
             'SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]
         );
         const callerIsOrganiser = !!callerCheck.rows[0]?.is_organiser;
-        game.organiser_comp_available = callerIsOrganiser && compCount < 6;
+        // Eligibility: allowance enabled + per-game cap not reached.
+        // Weekly cap is NOT checked here (cheap GET); /register enforces it
+        // authoritatively at registration time.
+        game.organiser_comp_available = callerIsOrganiser
+            && _fix329Allowance.enabled
+            && compCount < _fix329Allowance.per_game;
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -10904,7 +11906,8 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
 
         const gameLock = await client.query(`
             SELECT id, max_players, game_status, game_date, player_editing_locked,
-                   team_selection_type, tournament_team_count, requires_organiser
+                   team_selection_type, tournament_team_count, requires_organiser,
+                   tenant_id
               FROM games
              WHERE id = $1
              FOR UPDATE
@@ -10914,6 +11917,26 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
             return res.status(404).json({ error: 'Game not found' });
         }
         const game = gameLock.rows[0];
+
+        // FIX-334 (ROW Day 23): tenant ban enforcement. If this is a tenant game
+        // (tenant_id NOT NULL and not TF Coventry — TF Coventry doesn't use bans)
+        // and the player is banned from this tenant, refuse.
+        if (game.tenant_id && game.tenant_id !== TF_COVENTRY_TENANT_ID) {
+            try {
+                const banCheck = await client.query(
+                    `SELECT status FROM player_tenants
+                      WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+                    [req.user.playerId, game.tenant_id]
+                );
+                if (banCheck.rows.length > 0 && banCheck.rows[0].status === 'banned') {
+                    await client.query('ROLLBACK');
+                    return res.status(403).json({ error: 'You are banned from this tenant and cannot register for its games' });
+                }
+            } catch (e) {
+                // Pre-FIX-317 — table missing. Skip check.
+                if (e && e.code !== '42P01' && e.code !== '42703') throw e;
+            }
+        }
 
         if (!['available', 'confirmed'].includes(game.game_status)) {
             await client.query('ROLLBACK');
@@ -11057,7 +12080,7 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
 
         const gameRow = await client.query(`
             SELECT id, cost_per_player, early_bird_price, super_early_bird_price, game_date,
-                   max_players, game_status, player_editing_locked
+                   max_players, game_status, player_editing_locked, tenant_id
               FROM games WHERE id = $1 FOR UPDATE`,
             [gameId]
         );
@@ -11097,6 +12120,12 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
         // comp slots for players who might bail. Mirrors /register's comp logic
         // exactly (L11944-11955). Without this re-check, organisers using the
         // RSVP→Pay flow were always charged, even under the 6-comp cap.
+        //
+        // FIX-333 audit-fix (Pass 4): now tenant-aware via _fix329ResolveOrganiserComp.
+        // Was using hardcoded < 6 cap; this caused tenant games with
+        // organiser_allowance_per_game ≠ 6 to silently use the wrong limit.
+        // Passes `client` so the cap count + weekly check use the locked
+        // transaction (matches /register pattern from Day 15 audit-fix).
         let isComped = !!reg.rows[0].is_comped; // honour any pre-existing flag (defensive)
         if (!isComped) {
             const _orgCheck = await client.query(
@@ -11108,9 +12137,13 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
                     "SELECT COUNT(*) AS cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
                     [gameId]
                 );
-                if (parseInt(_compCount.rows[0].cnt) < 6) {
-                    isComped = true;
-                }
+                const _compResult = await _fix329ResolveOrganiserComp(
+                    req.user.playerId,
+                    game,
+                    parseInt(_compCount.rows[0].cnt) || 0,
+                    client
+                );
+                isComped = _compResult.comped;
             }
         }
 
@@ -11811,7 +12844,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                    player_editing_locked, team_selection_type, position_type, tournament_team_count,
                    series_id, game_status, game_date, star_rating, min_rating_enabled,
                    is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                   requires_organiser,
+                   requires_organiser, tenant_id,
                    early_bird_price, super_early_bird_price
             FROM games
             WHERE id = $1
@@ -11824,6 +12857,24 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         }
         
         const game = gameLock.rows[0];
+
+        // FIX-334 (ROW Day 23): tenant ban enforcement. Refuse if player is
+        // banned from this game's tenant. Skips TF Coventry (no bans in TF).
+        if (game.tenant_id && game.tenant_id !== TF_COVENTRY_TENANT_ID) {
+            try {
+                const banCheck = await client.query(
+                    `SELECT status FROM player_tenants
+                      WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+                    [req.user.playerId, game.tenant_id]
+                );
+                if (banCheck.rows.length > 0 && banCheck.rows[0].status === 'banned') {
+                    await client.query('ROLLBACK');
+                    return res.status(403).json({ error: 'You are banned from this tenant and cannot register for its games' });
+                }
+            } catch (e) {
+                if (e && e.code !== '42P01' && e.code !== '42703') throw e;
+            }
+        }
 
         // Determine effective price based on early bird tiers
         const { price: effectiveCost, tier: pricingTier } = getEffectivePrice(game);
@@ -11988,7 +13039,11 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             }
         }
         
-        // COMP-001: Check if player is an organiser eligible for a free comp slot
+        // FIX-329 (ROW Day 15): tenant-aware comp eligibility via allowance dials.
+        // For TF root games (tenant_id IS NULL) the helper returns existing
+        // hardcoded defaults (cap=6, 100% discount, unlimited weekly) → zero
+        // behavioural change for TF Coventry. For tenant games the dials come
+        // from the tenant row (FIX-329 schema).
         const organiserCheck = await client.query(
             'SELECT is_organiser FROM players WHERE id = $1',
             [req.user.playerId]
@@ -11996,14 +13051,26 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         const isOrganiser = organiserCheck.rows[0]?.is_organiser || false;
 
         let isComped = false;
+        let compDiscountPct = 0;
         if (isOrganiser) {
             const compCount = await client.query(
                 "SELECT COUNT(*) as cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
                 [gameId]
             );
-            if (parseInt(compCount.rows[0].cnt) < 6) {
-                isComped = true;
-            }
+            const compResult = await _fix329ResolveOrganiserComp(
+                req.user.playerId,
+                game,
+                parseInt(compCount.rows[0].cnt) || 0,
+                client  // FIX-329 audit-fix: pass transaction client to avoid race
+            );
+            isComped = compResult.comped;
+            compDiscountPct = compResult.discount_pct;
+            // Note: partial-discount (< 100%) wiring into amount_paid is a Day
+            // 15 follow-up — current `is_comped=TRUE` always means full free.
+            // If tenant configures < 100% pct_discount, organiser still gets
+            // is_comped=TRUE but the partial-charge accounting requires
+            // additional payment-flow work. For ship: clamp pct_discount=100
+            // when is_comped flips TRUE (partial-comp deferred).
         }
 
         // Determine registration status
@@ -20257,6 +21324,103 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         // FIX-063: Single summary log replacing all step-by-step debug logs
         console.log(`Game ${gameId} completed. Winner: ${winningTeam}. MOTM nominees: ${nomineesInserted}`);
 
+        // FIX-334 (ROW Day 22): tenant payout calculation + CRM task.
+        //
+        // Every game completion generates a row in tenant_payouts_due for the
+        // tenant's payment run. Mitchell sees these in his admin panel and
+        // marks them paid manually after weekly bank transfers (per Q4).
+        //
+        // Calculation:
+        //   gross = sum(player_payments_for_this_game)
+        //   fee_mode = 'mixed' if cost_per_player = 0 else 'full'
+        //   platform_fee = mixed_listing_fee_pence if mixed else platform_fee_pence
+        //   total_fee = paid_player_count × platform_fee
+        //   payable = gross - total_fee
+        //
+        // Skip if:
+        //   - Game has no tenant_id (pre-FIX-334 untagged game)
+        //   - Game is TF Coventry tenant (Mitchell owns it — no payout owed to self)
+        //   - Game has 0 paid players (free game; no money to settle)
+        //   - tenant_payouts_due table missing (pre-FIX-334 migration)
+        setImmediate(async () => {
+            try {
+                const gRes = await pool.query(
+                    `SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.tenant_id,
+                            t.platform_fee_pence, t.mixed_listing_fee_pence
+                       FROM games g
+                       LEFT JOIN tenants t ON t.id = g.tenant_id
+                      WHERE g.id = $1`,
+                    [gameId]
+                );
+                if (gRes.rows.length === 0) return;
+                const g = gRes.rows[0];
+
+                // Skip TF Coventry (Mitchell owns it; no settlement to self)
+                if (!g.tenant_id || g.tenant_id === TF_COVENTRY_TENANT_ID) return;
+
+                // Mixed-listing detection (Q6): cost_per_player = 0 → mixed mode
+                const isMixedListing = parseInt(g.cost_per_player, 10) === 0;
+                const platformFee = isMixedListing
+                    ? parseInt(g.mixed_listing_fee_pence || 5, 10)
+                    : parseInt(g.platform_fee_pence || 12, 10);
+                const feeMode = isMixedListing ? 'mixed' : 'full';
+
+                // Sum gross + count paid players from registrations
+                // (amount_paid is in pence; backups who weren't promoted got
+                // refunded in the prior setImmediate handler, but their rows
+                // may or may not be flagged yet — to be safe we count only
+                // status='confirmed' rows with amount_paid > 0)
+                const pRes = await pool.query(
+                    `SELECT COUNT(*)::int AS n,
+                            COALESCE(SUM(amount_paid), 0)::bigint AS gross
+                       FROM registrations
+                      WHERE game_id = $1
+                        AND status = 'confirmed'
+                        AND amount_paid > 0`,
+                    [gameId]
+                );
+                const paidCount = pRes.rows[0].n;
+                const gross     = parseInt(pRes.rows[0].gross, 10);
+                if (paidCount === 0) return;  // free game, nothing to settle
+
+                const totalFee = paidCount * platformFee;
+                const payable  = Math.max(0, gross - totalFee);
+
+                await pool.query(
+                    `INSERT INTO tenant_payouts_due
+                        (tenant_id, game_id, game_url, game_date,
+                         gross_pence, paid_player_count,
+                         platform_fee_pence, fee_mode, total_fee_pence, payable_pence,
+                         status)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+                     ON CONFLICT (game_id) DO UPDATE
+                        SET gross_pence       = EXCLUDED.gross_pence,
+                            paid_player_count = EXCLUDED.paid_player_count,
+                            platform_fee_pence = EXCLUDED.platform_fee_pence,
+                            fee_mode          = EXCLUDED.fee_mode,
+                            total_fee_pence   = EXCLUDED.total_fee_pence,
+                            payable_pence     = EXCLUDED.payable_pence,
+                            updated_at        = NOW()
+                      WHERE tenant_payouts_due.status = 'pending'`,
+                    [g.tenant_id, g.id, g.game_url, g.game_date,
+                     gross, paidCount, platformFee, feeMode, totalFee, payable]
+                );
+
+                // Audit log for Mitchell's records
+                try {
+                    await auditLog(pool, null, 'tenant_payout_due_created', g.tenant_id,
+                        `Game ${g.game_url}: £${(payable / 100).toFixed(2)} owed to tenant (${paidCount} paid × ${feeMode} fee ${platformFee}p)`,
+                        g.tenant_id);
+                } catch (_) { /* audit table missing */ }
+            } catch (e) {
+                if (e && (e.code === '42P01' || e.code === '42703')) {
+                    // tenant_payouts_due table missing — pre-FIX-334 deploy. Skip silently.
+                    return;
+                }
+                console.error('[FIX-334 payout-due computation] failed for game ' + gameId + ':', e.message);
+            }
+        });
+
         // FIX-276: record calibration experiment post-commit. Non-fatal —
         // failure must not affect the completion response. The helper enforces
         // skip rules (draft_memory, vs_external, venue_clash, no team_setup).
@@ -23137,7 +24301,7 @@ async function closeAwards(gameId) {
         // Get game info
         const gameResult = await pool.query(
             `SELECT g.awards_open, g.awards_close_at, g.game_url, g.star_rating,
-                    g.team_selection_type,
+                    g.team_selection_type, g.tenant_id,
                     TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'Day') as day_name,
                     v.name as venue_name
              FROM games g LEFT JOIN venues v ON v.id = g.venue_id
@@ -23152,6 +24316,26 @@ async function closeAwards(gameId) {
         // S-class: vs_external and tournament games always get S regardless of star rating
         const starClass = (game.team_selection_type === 'vs_external' || game.team_selection_type === 'tournament')
             ? 'S' : starClassFromRating(game.star_rating);
+
+        // FIX-334 (ROW Day 26): per-award toggle. Tenants can disable specific
+        // awards via tenants.disabled_awards JSONB array of award_type strings.
+        // Pre-FIX-334 deploys: empty Set (all awards enabled). TF Coventry:
+        // empty by default (Mitchell wants all 17 awards).
+        let disabledAwards = new Set();
+        if (game.tenant_id) {
+            try {
+                const tRes = await pool.query(
+                    `SELECT disabled_awards FROM tenants WHERE id = $1 LIMIT 1`,
+                    [game.tenant_id]
+                );
+                if (tRes.rows.length > 0 && Array.isArray(tRes.rows[0].disabled_awards)) {
+                    disabledAwards = new Set(tRes.rows[0].disabled_awards);
+                }
+            } catch (e) {
+                // disabled_awards column missing pre-migration — treat as empty
+                if (e && e.code !== '42703') throw e;
+            }
+        }
 
         // FIX-148: awards_open=false moved to AFTER the loop. Was here previously,
         // which meant if the grant loop failed partway, awards_open was already false
@@ -23178,6 +24362,9 @@ async function closeAwards(gameId) {
         const confirmedWinners = [];
 
         for (const awardType of AWARD_TYPES) {
+            // FIX-334 (ROW Day 26): per-award toggle — skip if tenant disabled this award
+            if (disabledAwards.has(awardType)) continue;
+
             const nominees = (votesByAward[awardType] || []).sort((a, b) => b.votes - a.votes);
             if (nominees.length === 0) continue;
 
@@ -37230,25 +38417,82 @@ const MONTHLY_REGIONS = [
 // The SQL pattern mirrors calcSeriesLeaderboard but the scope filter changes
 // from `g.series_id = $1` to a year/month/region triple.
 //
+// FIX-321 (ROW Day 5): added optional tenantScope arg. When 'tf_root' (default),
+// the scope filter restricts to g.tenant_id IS NULL — prevents post-Day-6
+// tenant games from leaking into TF-root region trophies. When a UUID string
+// is passed, the filter restricts to g.tenant_id = <that UUID>, enabling
+// per-tenant 3-layer trophy generation (per A.55) when invoked from a
+// per-tenant cron pass.
+//
 // Returns array of: { player_id, player_name, appearances, primary_stat, supporting_stat }
-async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, minGames, minAwards = 0) {
+async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, minGames, minAwards = 0, tenantScope = 'tf_root') {
     const id = parseInt(metricId);
     const cfg = METRIC_CONFIG[id];
     if (!cfg) return [];
 
     // Build the scope filter — used in every CTE/subquery below.
     // Parameters:
-    //   $1 = year, $2 = month, $3 = region (only used when region !== 'ALL')
+    //   $1 = year, $2 = month
+    //   $3 = region (only when region !== 'ALL')
+    //   $4 = tenant uuid (only when tenantScope is a UUID string, i.e. per-tenant pass)
     const isAllRegions = (region === 'ALL');
     const regionJoin = isAllRegions
         ? 'JOIN venues v ON v.id = g.venue_id'
         : 'JOIN venues v ON v.id = g.venue_id AND v.region = $3';
+
+    // FIX-321: tenant scope clause — append after the date+status filter.
+    //
+    // FIX-334 (ROW Day 27): post-migration, 'tf_root' means TF Coventry tenant
+    // (UUID 11111111-...). Pre-migration: tenant_id IS NULL.
+    //   Mode 'tf_root'     → g.tenant_id = TF_COVENTRY_TENANT_ID
+    //                        (or IS NULL during transition — covered by OR clause)
+    //   Mode <uuid>        → g.tenant_id = <that uuid>      (per-tenant pass)
+    //   Mode 'universal'   → no tenant filter at all        (all-tenants global)
+    //   Mode 'venue:<vid>' → restrict by venue_id only      (per-venue pass)
+    let tenantClause;
+    if (tenantScope === 'tf_root' || tenantScope == null) {
+        // Backwards compatible: catches both NULL (pre-migration) and the
+        // explicit TF Coventry UUID (post-migration).
+        tenantClause = `AND (g.tenant_id IS NULL OR g.tenant_id = '${TF_COVENTRY_TENANT_ID}')`;
+    } else if (tenantScope === 'universal') {
+        // No tenant filter — counts games across ALL tenants. For the universal
+        // league trophy (A.55 third layer).
+        tenantClause = '';
+    } else if (typeof tenantScope === 'string' && tenantScope.startsWith('venue:')) {
+        // Per-venue pass — venue_id is in the regionJoin's `v.id = g.venue_id`,
+        // and we restrict further on v.id = <given venue uuid>. The venue is
+        // referenced via $4 (or $3 if region is ALL).
+        const venueUuid = tenantScope.slice('venue:'.length);
+        if (!isValidUuid(venueUuid)) {
+            console.warn('[FIX-334 trophy] invalid venue scope:', tenantScope);
+            return [];
+        }
+        tenantClause = isAllRegions ? 'AND v.id = $3' : 'AND v.id = $4';
+    } else {
+        // Per-tenant pass: bind as $4 (or $3 when region is ALL)
+        tenantClause = isAllRegions ? 'AND g.tenant_id = $3' : 'AND g.tenant_id = $4';
+    }
     const scopeFilter = `
         EXTRACT(YEAR FROM g.game_date) = $1
         AND EXTRACT(MONTH FROM g.game_date) = $2
         AND g.game_status = 'completed'
+        ${tenantClause}
     `;
-    const params = isAllRegions ? [year, month] : [year, month, region];
+
+    // Build params array in matching order
+    let params;
+    if (tenantScope === 'tf_root' || tenantScope == null) {
+        params = isAllRegions ? [year, month] : [year, month, region];
+    } else if (tenantScope === 'universal') {
+        // No extra binding — clause is empty.
+        params = isAllRegions ? [year, month] : [year, month, region];
+    } else if (typeof tenantScope === 'string' && tenantScope.startsWith('venue:')) {
+        const venueUuid = tenantScope.slice('venue:'.length);
+        params = isAllRegions ? [year, month, venueUuid] : [year, month, region, venueUuid];
+    } else {
+        // Per-tenant pass
+        params = isAllRegions ? [year, month, tenantScope] : [year, month, region, tenantScope];
+    }
 
     // Reusable appearances CTE (confirmed players in completed games for this month/region)
     const appearancesCte = `
@@ -37512,16 +38756,33 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
         let errorMsg = null;
 
         try {
+            // FIX-334 (ROW Day 27): three-layer trophy generation per spec A.55.
+            //
+            // Layer 1 — Per-tenant (each active tenant + TF Coventry)
+            //   region varies as before, tenantScope = tenant UUID
+            //   stored: monthly_trophies.tenant_id = <tenant uuid>, venue_id NULL
+            //
+            // Layer 2 — Per-venue (each venue, all tenants)
+            //   region = 'ALL' (venues already imply region), tenantScope = 'venue:<uuid>'
+            //   stored: monthly_trophies.tenant_id NULL, venue_id = <venue uuid>
+            //
+            // Layer 3 — Universal (cross-tenant, all venues, by region)
+            //   region varies, tenantScope = 'universal'
+            //   stored: monthly_trophies.tenant_id NULL, venue_id NULL
+            //   (existing behaviour — pre-FIX-334 trophies stay as universal layer)
+            //
+            // Privacy gate (per A.55 + A.78): a player only sees per-tenant or
+            // per-venue trophies they're eligible for via their memberships;
+            // the display layer (not this generator) enforces visibility.
+
+            // ── Layer 3: Universal (existing behaviour kept identical) ───────
             for (const region of MONTHLY_REGIONS) {
                 for (const m of MONTHLY_METRICS) {
                     const leaderboard = await calcMonthlyLeaderboard(
-                        year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards
+                        year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards,
+                        'tf_root'  // current behaviour: TF Coventry games only
                     );
-
-                    // Skip if zero qualifying players
                     if (!leaderboard || leaderboard.length === 0) continue;
-
-                    // Insert trophy definition
                     const trophyRow = await client.query(
                         `INSERT INTO monthly_trophies
                          (year, month, region, metric_id, calculation_type, eligibility_min_games, eligibility_min_awards)
@@ -37530,8 +38791,112 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
                         [year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards || 0]
                     );
                     const trophyId = trophyRow.rows[0].id;
+                    for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
+                        const row = leaderboard[i];
+                        await client.query(
+                            `INSERT INTO monthly_trophy_results
+                             (trophy_id, player_id, rank, primary_stat, supporting_stat, games_played)
+                             VALUES ($1, $2, $3, $4, $5, $6)`,
+                            [trophyId, row.player_id, i + 1, row.primary_stat, row.supporting_stat, row.appearances]
+                        );
+                    }
+                    trophiesCreated++;
+                }
+            }
 
-                    // Insert top 3 results
+            // ── Layer 1: Per-tenant trophies ─────────────────────────────────
+            // Only for tenants that opted into per-tenant trophy generation
+            // (status='active' AND has at least one game this month). Skips TF
+            // Coventry — Layer 3 above already handles it.
+            //
+            // Pre-FIX-334 deploy: tenants table missing entirely → catch 42P01.
+            let activeTenants = [];
+            try {
+                const tRes = await client.query(
+                    `SELECT t.id, t.short_id, t.name
+                       FROM tenants t
+                      WHERE t.status = 'active'
+                        AND t.id != $1
+                        AND EXISTS (
+                            SELECT 1 FROM games g
+                             WHERE g.tenant_id = t.id
+                               AND g.game_status = 'completed'
+                               AND EXTRACT(YEAR FROM g.game_date) = $2
+                               AND EXTRACT(MONTH FROM g.game_date) = $3
+                        )`,
+                    [TF_COVENTRY_TENANT_ID, year, month]
+                );
+                activeTenants = tRes.rows;
+            } catch (e) {
+                if (e && e.code !== '42P01' && e.code !== '42703') throw e;
+            }
+
+            for (const tenant of activeTenants) {
+                for (const region of MONTHLY_REGIONS) {
+                    for (const m of MONTHLY_METRICS) {
+                        const leaderboard = await calcMonthlyLeaderboard(
+                            year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards,
+                            tenant.id  // per-tenant pass
+                        );
+                        if (!leaderboard || leaderboard.length === 0) continue;
+                        const trophyRow = await client.query(
+                            `INSERT INTO monthly_trophies
+                             (year, month, region, metric_id, calculation_type,
+                              eligibility_min_games, eligibility_min_awards, tenant_id)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                             RETURNING id`,
+                            [year, month, region, m.metric_id, m.calc_type,
+                             m.min_games, m.min_awards || 0, tenant.id]
+                        );
+                        const trophyId = trophyRow.rows[0].id;
+                        for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
+                            const row = leaderboard[i];
+                            await client.query(
+                                `INSERT INTO monthly_trophy_results
+                                 (trophy_id, player_id, rank, primary_stat, supporting_stat, games_played)
+                                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                                [trophyId, row.player_id, i + 1, row.primary_stat, row.supporting_stat, row.appearances]
+                            );
+                        }
+                        trophiesCreated++;
+                    }
+                }
+            }
+
+            // ── Layer 2: Per-venue trophies ──────────────────────────────────
+            // Active venues with completed games this month, all tenants.
+            // Region scope = 'ALL' since the venue itself implies geography.
+            let activeVenues = [];
+            try {
+                const vRes = await client.query(
+                    `SELECT DISTINCT v.id, v.name
+                       FROM venues v
+                       JOIN games g ON g.venue_id = v.id
+                      WHERE g.game_status = 'completed'
+                        AND EXTRACT(YEAR FROM g.game_date) = $1
+                        AND EXTRACT(MONTH FROM g.game_date) = $2`,
+                    [year, month]
+                );
+                activeVenues = vRes.rows;
+            } catch (_) { /* venues table issue — skip */ }
+
+            for (const venue of activeVenues) {
+                for (const m of MONTHLY_METRICS) {
+                    const leaderboard = await calcMonthlyLeaderboard(
+                        year, month, 'ALL', m.metric_id, m.calc_type, m.min_games, m.min_awards,
+                        `venue:${venue.id}`
+                    );
+                    if (!leaderboard || leaderboard.length === 0) continue;
+                    const trophyRow = await client.query(
+                        `INSERT INTO monthly_trophies
+                         (year, month, region, metric_id, calculation_type,
+                          eligibility_min_games, eligibility_min_awards, venue_id)
+                         VALUES ($1, $2, 'ALL', $3, $4, $5, $6, $7)
+                         RETURNING id`,
+                        [year, month, m.metric_id, m.calc_type,
+                         m.min_games, m.min_awards || 0, venue.id]
+                    );
+                    const trophyId = trophyRow.rows[0].id;
                     for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
                         const row = leaderboard[i];
                         await client.query(
@@ -38263,25 +39628,124 @@ app.get('/api/monthly-trophies/:year/:month', async (req, res) => {
 
 // GET /api/players/:playerId/monthly-trophies
 // Player profile history view. Returns every trophy this player has placed in.
-app.get('/api/players/:playerId/monthly-trophies', async (req, res) => {
+//
+// FIX-335 Phase 4.2: response extended with tenant_id, tenant_name, venue_id,
+// venue_name so the frontend can split trophies into 3 layers (universal /
+// per-tenant / per-venue). Pre-migration tolerant: if monthly_trophies.tenant_id
+// or .venue_id columns don't exist yet, falls back to the legacy SELECT (all
+// trophies returned as universal layer).
+//
+// Privacy gate (A.55 + A.78): if the caller is authenticated, per-tenant
+// trophies are filtered to tenants they belong to (player_tenants row,
+// status='active'). Per-venue trophies are filtered to venues they've
+// played at (registrations.status='confirmed'). Universal trophies are
+// always returned. Unauthenticated callers (the profile page is public
+// for guests too) see ONLY universal trophies — consistent with the
+// privacy model on the rest of the public profile surface.
+app.get('/api/players/:playerId/monthly-trophies', optionalAuth, async (req, res) => {
     try {
         const playerId = req.params.playerId;
         if (!playerId) return res.status(400).json({ error: 'Missing playerId' });
 
-        const r = await pool.query(`
-            SELECT mtr.rank, mtr.primary_stat, mtr.supporting_stat, mtr.games_played,
-                   mt.id AS trophy_id, mt.year, mt.month, mt.region, mt.metric_id,
-                   mt.calculation_type, mt.finalized_at
-            FROM monthly_trophy_results mtr
-            JOIN monthly_trophies mt ON mt.id = mtr.trophy_id
-            WHERE mtr.player_id = $1
-            ORDER BY mt.year DESC, mt.month DESC, mt.region, mt.metric_id`,
-            [playerId]
-        );
+        // Resolve viewer's tenant memberships + venue history for the gate.
+        // optionalAuth attaches req.user when a valid cookie (tf_token, web) OR
+        // Authorization: Bearer (mobile) is present, otherwise leaves it
+        // undefined. Guests fall through with just universal trophies.
+        let viewerTenantIds = [];
+        let viewerVenueIds  = [];
+        let isOwnProfile    = false;
+        if (req.user && req.user.playerId) {
+            isOwnProfile = (req.user.playerId === playerId);
+            try {
+                const [tRes, vRes] = await Promise.all([
+                    pool.query(
+                        `SELECT tenant_id FROM player_tenants
+                          WHERE player_id = $1 AND status = 'active'`,
+                        [req.user.playerId]
+                    ).catch(e => (e && (e.code === '42P01' || e.code === '42703')) ? { rows: [] } : Promise.reject(e)),
+                    pool.query(
+                        `SELECT DISTINCT g.venue_id
+                           FROM registrations r
+                           JOIN games g ON g.id = r.game_id
+                          WHERE r.player_id = $1
+                            AND r.status = 'confirmed'
+                            AND g.venue_id IS NOT NULL`,
+                        [req.user.playerId]
+                    ).catch(() => ({ rows: [] }))
+                ]);
+                viewerTenantIds = tRes.rows.map(r => r.tenant_id);
+                viewerVenueIds  = vRes.rows.map(r => r.venue_id);
+            } catch (e) {
+                // Membership/venue lookup failed — fall through with empty
+                // gate sets. isOwnProfile still set so the user sees their
+                // own historic trophies regardless. Log so a transient DB
+                // issue here doesn't silently degrade other viewers' results.
+                console.warn('[FIX-335 Phase 4.2] viewer-context query failed:', e.message);
+            }
+        }
 
-        const out = r.rows.map(row => {
+        // Owner of the profile sees ALL their trophies regardless of current
+        // membership (matches A.78: trophies are historic records of their
+        // performance, not advertising for the tenant). Other viewers see
+        // universal + intersected per-tenant / per-venue layers only.
+        const ownerOverride = isOwnProfile;
+
+        let r;
+        try {
+            r = await pool.query(`
+                SELECT mtr.rank, mtr.primary_stat, mtr.supporting_stat, mtr.games_played,
+                       mt.id AS trophy_id, mt.year, mt.month, mt.region, mt.metric_id,
+                       mt.calculation_type, mt.finalized_at,
+                       mt.tenant_id, mt.venue_id,
+                       t.name AS tenant_name,
+                       v.name AS venue_name
+                FROM monthly_trophy_results mtr
+                JOIN monthly_trophies mt ON mt.id = mtr.trophy_id
+           LEFT JOIN tenants t ON t.id = mt.tenant_id
+           LEFT JOIN venues  v ON v.id = mt.venue_id
+                WHERE mtr.player_id = $1
+                ORDER BY mt.year DESC, mt.month DESC, mt.region, mt.metric_id`,
+                [playerId]
+            );
+        } catch (e) {
+            // 42703 = column missing (pre-FIX-335 Phase 4.2 migration).
+            // 42P01 = table missing (pre Wave 2 migration — tenants/venues absent).
+            // Fall back to the legacy SELECT and tag every row as universal.
+            if (e && (e.code === '42703' || e.code === '42P01')) {
+                r = await pool.query(`
+                    SELECT mtr.rank, mtr.primary_stat, mtr.supporting_stat, mtr.games_played,
+                           mt.id AS trophy_id, mt.year, mt.month, mt.region, mt.metric_id,
+                           mt.calculation_type, mt.finalized_at,
+                           NULL::uuid AS tenant_id, NULL::uuid AS venue_id,
+                           NULL::text AS tenant_name, NULL::text AS venue_name
+                    FROM monthly_trophy_results mtr
+                    JOIN monthly_trophies mt ON mt.id = mtr.trophy_id
+                    WHERE mtr.player_id = $1
+                    ORDER BY mt.year DESC, mt.month DESC, mt.region, mt.metric_id`,
+                    [playerId]
+                );
+            } else { throw e; }
+        }
+
+        const tenantIdSet = new Set(viewerTenantIds);
+        const venueIdSet  = new Set(viewerVenueIds);
+
+        // Compute the layer for each trophy and apply the visibility gate.
+        // Layer values match the 3 tabs in the frontend: 'universal' (always
+        // shown), 'tenant' (gated), 'venue' (gated).
+        const out = r.rows.flatMap(row => {
             const cfg = METRIC_CONFIG[parseInt(row.metric_id)];
-            return {
+            let layer = 'universal';
+            if (row.tenant_id) layer = 'tenant';
+            else if (row.venue_id) layer = 'venue';
+
+            // Apply gate. Owner of profile bypasses; other viewers filter.
+            if (!ownerOverride) {
+                if (layer === 'tenant' && !tenantIdSet.has(row.tenant_id)) return [];
+                if (layer === 'venue'  && !venueIdSet.has(row.venue_id))   return [];
+            }
+
+            return [{
                 trophy_id: row.trophy_id,
                 year: row.year,
                 month: row.month,
@@ -38297,7 +39761,13 @@ app.get('/api/players/:playerId/monthly-trophies', async (req, res) => {
                 supporting_stat: row.supporting_stat !== null ? parseFloat(row.supporting_stat) : null,
                 games_played: row.games_played,
                 finalized_at: row.finalized_at,
-            };
+                // FIX-335 Phase 4.2 scope fields
+                layer,
+                tenant_id:   row.tenant_id,
+                tenant_name: row.tenant_name,
+                venue_id:    row.venue_id,
+                venue_name:  row.venue_name,
+            }];
         });
 
         res.json({ player_id: playerId, trophies: out });
@@ -38658,23 +40128,19 @@ async function wonderfulRequest(method, path, body = null, timeoutMs = 15000) {
 // non-critical — uses the same notifyAdmin helper as RAF activations / guest adds.
 async function notifyAdminWonderfulPayment(playerId, pounds, ref, balAfter, gameId = null) {
     try {
+        // FIX-317: include tenant_player_id so formatPlayerDisplayId() can render
+        // 6-digit tenant IDs for tenant-origin players (existing TF players have
+        // tenant_player_id = NULL and render identically to pre-Day-1 behaviour).
         const pRow = await pool.query(
-            `SELECT p.alias, p.full_name, u.email, p.squad_number, p.player_number, p.player_number_text
+            `SELECT p.alias, p.full_name, u.email,
+                    p.squad_number, p.player_number, p.player_number_text, p.tenant_player_id
              FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
             [playerId]
         );
         const p = pRow.rows[0] || {};
         const name  = p.alias || p.full_name || `Player ${playerId}`;
-        // Squad # field — fallback chain:
-        //   1. squad_number assigned (1-999, or 0 → 'TF-00')
-        //   2. player_number_text (region-prefixed: Birmingham 'B1234', Manchester 'M1234')
-        //   3. player_number (non-prefixed 4-digit ID, 1000+)
-        //   4. '—' only if none of the above
-        const squad = (p.squad_number !== null && p.squad_number !== undefined)
-            ? `TF-${p.squad_number === 0 ? '00' : p.squad_number}`
-            : (p.player_number_text
-                ? `TF-${p.player_number_text}`
-                : (p.player_number ? `TF-${p.player_number}` : '—'));
+        // FIX-317: canonical player ID cascade — see formatPlayerDisplayId() defn.
+        const squad = formatPlayerDisplayId(p);
         const rows = [
             ['Player',      name],
             ['Squad #',     squad],
@@ -44991,6 +46457,4949 @@ app.get('/api/admin/players/feedback-diagnostic', authenticateToken, requireSupe
 
 
 
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-318 — ROW Day 2: Tenant-scoped proof-of-concept routes
+// ═══════════════════════════════════════════════════════════════════════
+//
+// These two routes prove the FIX-317 path resolver + FIX-318 role middleware
+// work end-to-end. Additional tenant admin endpoints get added in later days
+// as features land (game CRUD, audit log scoping, feedback panel, etc.).
+
+// GET /api/t/:short_id/whoami
+// Returns the resolved tenant + the caller's role within it. Used by the
+// frontend after login to determine which UI surface to render.
+// Access: any active member of the tenant (or superadmin).
+app.get('/api/t/:tenant_short_id/whoami', authenticateToken, requireTenantAccess, async (req, res) => {
+    return res.json({
+        tenant: {
+            id:             req.tenant.id,
+            short_id:       req.tenant.short_id,
+            slug:           req.tenant.slug,
+            name:           req.tenant.name,
+            logo_url:       req.tenant.logo_url,
+            primary_color:  req.tenant.primary_color,
+            status:         req.tenant.status
+        },
+        role: req.tenantRole
+    });
+});
+
+// GET /api/t/:short_id/admin/games
+// Lists games belonging to this tenant. Tenant-scoped equivalent of the
+// existing TF admin game-list surface. Returns only games where
+// games.tenant_id = req.tenant.id — never leaks across tenants.
+// Access: tenant organisers and tenant admins (plus superadmin).
+//
+// Day 2 surface: read-only list, last 50 games by date. CRUD operations
+// (create/edit/delete) land in later days alongside the per-feature work.
+app.get('/api/t/:tenant_short_id/admin/games', authenticateToken, requireTenantOrganiser, async (req, res) => {
+    try {
+        // FIX-318 audit-fix: real column names are cost_per_player + max_players.
+        // Earlier draft used non-existent player_cost / expected_players which
+        // would have thrown ECOLUMN at first call after Day 6 onboarding.
+        const r = await pool.query(
+            `SELECT g.id, g.game_date, g.game_status, g.format,
+                    g.cost_per_player, g.max_players, g.early_bird_price,
+                    v.name AS venue_name,
+                    gs.series_name
+               FROM games g
+          LEFT JOIN venues v       ON v.id  = g.venue_id
+          LEFT JOIN game_series gs ON gs.id = g.series_id
+              WHERE g.tenant_id = $1
+              ORDER BY g.game_date DESC
+              LIMIT 50`,
+            [req.tenant.id]
+        );
+        res.json({ games: r.rows });
+    } catch (e) {
+        console.error('FIX-318 /admin/games failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch tenant games' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-318 routes
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-319 — ROW Day 3: Player tenant membership endpoints + Add Tenant flow
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The four endpoints below let a player manage their own tenant memberships:
+//   GET    /api/players/me/tenants               — list memberships
+//   POST   /api/players/me/tenants               — Add Tenant by short_id (A.50)
+//   PATCH  /api/players/me/tenants/:tenant_id    — toggle prefs for one tenant
+//   DELETE /api/players/me/tenants/:tenant_id    — leave tenant (soft, status='left')
+//
+// Audit log entries are fire-and-forget on join/leave (per Q6 — keep history
+// in audit_log, status in player_tenants is the live state).
+//
+// All :tenant_id route params are validated via the existing isValidUuid()
+// helper (defined at the top of this file alongside auditLog).
+
+// GET /api/players/me/tenants — list this player's tenant memberships
+// Returns every row in player_tenants (active + left + banned) so the
+// frontend can render "leave" / "rejoin" state correctly.
+app.get('/api/players/me/tenants', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT pt.tenant_id, pt.role, pt.status, pt.joined_at,
+                    pt.show_in_dashboard, pt.allow_tenant_contact,
+                    t.short_id, t.name, t.slug, t.logo_url, t.primary_color,
+                    t.status AS tenant_status
+               FROM player_tenants pt
+               JOIN tenants t ON t.id = pt.tenant_id
+              WHERE pt.player_id = $1
+              ORDER BY t.name ASC`,
+            [req.user.playerId]
+        );
+        res.json({ tenants: r.rows });
+    } catch (e) {
+        // Pre-migration safety
+        if (e && (e.code === '42P01' || e.code === '42703')) return res.json({ tenants: [] });
+        console.error('FIX-319 GET /me/tenants failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch tenants' });
+    }
+});
+
+// POST /api/players/me/tenants — Add Tenant flow (A.50)
+// Body: { tenant_short_id: '87432' }
+//
+// Rejoin behaviour (per Q6): if the row exists with status='left', flip to
+// 'active' and reset joined_at. If status='banned', refuse. Otherwise insert.
+app.post('/api/players/me/tenants', authenticateToken, async (req, res) => {
+    const shortId = String(req.body?.tenant_short_id || '').trim();
+    if (!/^\d{5}$/.test(shortId)) {
+        return res.status(400).json({ error: 'tenant_short_id must be exactly 5 digits' });
+    }
+
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        const tRes = await client.query(
+            `SELECT id, short_id, name, status FROM tenants WHERE short_id = $1 LIMIT 1`,
+            [shortId]
+        );
+        if (tRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        const t = tRes.rows[0];
+        if (t.status !== 'active') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: `Tenant is ${t.status}` });
+        }
+
+        // Pre-check ban status so we can return a 403 rather than silently doing nothing
+        const existing = await client.query(
+            `SELECT status FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+            [req.user.playerId, t.id]
+        );
+        if (existing.rows.length > 0 && existing.rows[0].status === 'banned') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'You are banned from this tenant' });
+        }
+
+        const wasRejoin = existing.rows.length > 0 && existing.rows[0].status === 'left';
+
+        const ins = await client.query(
+            `INSERT INTO player_tenants (player_id, tenant_id, status, joined_at)
+             VALUES ($1, $2, 'active', NOW())
+             ON CONFLICT (player_id, tenant_id) DO UPDATE
+                SET status    = 'active',
+                    joined_at = NOW()
+              WHERE player_tenants.status = 'left'
+              RETURNING role, status, joined_at, show_in_dashboard, allow_tenant_contact`,
+            [req.user.playerId, t.id]
+        );
+
+        // FIX-333 audit-fix (Day 19): assign tenant_player_id from sequence on
+        // first-ever tenant join, if player doesn't already have one (NULL).
+        // Existing TF players keep their squad_number/region_code display;
+        // brand-new tenant-only players get a 6-digit ID per A.76 spec.
+        // Idempotent: WHERE clause prevents re-assignment on rejoin.
+        try {
+            await client.query(
+                `UPDATE players
+                    SET tenant_player_id = nextval('tenant_player_id_seq')
+                  WHERE id = $1 AND tenant_player_id IS NULL`,
+                [req.user.playerId]
+            );
+        } catch (e) {
+            // Pre-migration safety: sequence/column might not exist yet
+            if (e && e.code !== '42P01' && e.code !== '42703') throw e;
+        }
+
+        await client.query('COMMIT');
+
+        const action = wasRejoin ? 'tenant_rejoined' : 'tenant_joined';
+        // FIX-319 audit-fix: pass tenant_id as 6th arg (FIX-320 extended auditLog).
+        // Without this the audit row had tenant_id=NULL and was invisible in the
+        // tenant-scoped audit view.
+        setImmediate(() => auditLog(pool, req.user.playerId, action, req.user.playerId,
+            `${wasRejoin ? 'rejoined' : 'joined'} tenant ${t.name} (${t.short_id})`,
+            t.id));
+
+        return res.json({
+            tenant: {
+                id: t.id, short_id: t.short_id, name: t.name, status: t.status
+            },
+            membership: ins.rows[0] || existing.rows[0],
+            rejoined: wasRejoin
+        });
+    } catch (e) {
+        if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Tenants feature not yet provisioned' });
+        }
+        console.error('FIX-319 POST /me/tenants failed:', e.message);
+        res.status(500).json({ error: 'Failed to join tenant' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// PATCH /api/players/me/tenants/:tenant_id — update per-tenant preferences
+// Body: { show_in_dashboard?: boolean, allow_tenant_contact?: boolean }
+//
+// Only updates rows where status='active'. Returns 404 for missing/inactive.
+app.patch('/api/players/me/tenants/:tenant_id', authenticateToken, async (req, res) => {
+    const tenantId = String(req.params.tenant_id || '').trim();
+    if (!isValidUuid(tenantId)) {
+        return res.status(400).json({ error: 'Invalid tenant_id' });
+    }
+
+    const body = req.body || {};
+    const updates = [];
+    const values  = [];
+    let idx = 1;
+
+    if (body.show_in_dashboard !== undefined) {
+        updates.push(`show_in_dashboard = $${idx++}`);
+        values.push(!!body.show_in_dashboard);
+    }
+    if (body.allow_tenant_contact !== undefined) {
+        updates.push(`allow_tenant_contact = $${idx++}`);
+        values.push(!!body.allow_tenant_contact);
+    }
+    if (updates.length === 0) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    values.push(req.user.playerId, tenantId);
+
+    try {
+        const r = await pool.query(
+            `UPDATE player_tenants SET ${updates.join(', ')}
+              WHERE player_id = $${idx++} AND tenant_id = $${idx++} AND status = 'active'
+              RETURNING tenant_id, role, status, show_in_dashboard, allow_tenant_contact`,
+            values
+        );
+        if (r.rows.length === 0) {
+            return res.status(404).json({ error: 'Not an active member of this tenant' });
+        }
+        res.json({ membership: r.rows[0] });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Tenants feature not yet provisioned' });
+        }
+        console.error('FIX-319 PATCH /me/tenants failed:', e.message);
+        res.status(500).json({ error: 'Failed to update preferences' });
+    }
+});
+
+// DELETE /api/players/me/tenants/:tenant_id — leave tenant (soft delete)
+// Sets status='left'. Row retained for audit + future rejoin (per Q6).
+app.delete('/api/players/me/tenants/:tenant_id', authenticateToken, async (req, res) => {
+    const tenantId = String(req.params.tenant_id || '').trim();
+    if (!isValidUuid(tenantId)) {
+        return res.status(400).json({ error: 'Invalid tenant_id' });
+    }
+    try {
+        const r = await pool.query(
+            `UPDATE player_tenants SET status = 'left'
+              WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'
+              RETURNING tenant_id`,
+            [req.user.playerId, tenantId]
+        );
+        if (r.rows.length === 0) {
+            return res.status(404).json({ error: 'Not an active member of this tenant' });
+        }
+
+        // Audit log with tenant name where possible (best-effort)
+        let detail = `left tenant ${tenantId}`;
+        try {
+            const tRes = await pool.query('SELECT short_id, name FROM tenants WHERE id = $1', [tenantId]);
+            if (tRes.rows[0]) detail = `left tenant ${tRes.rows[0].name} (${tRes.rows[0].short_id})`;
+        } catch (_) { /* best-effort, ignore */ }
+        // FIX-319 audit-fix: pass tenant_id as 6th arg so the entry appears in
+        // the tenant-scoped audit panel.
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_left', req.user.playerId, detail, tenantId));
+
+        res.json({ left: true });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Tenants feature not yet provisioned' });
+        }
+        console.error('FIX-319 DELETE /me/tenants failed:', e.message);
+        res.status(500).json({ error: 'Failed to leave tenant' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-319 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-320 — ROW Day 4: Table scoping + tenant-scoped audit log endpoint
+// ═══════════════════════════════════════════════════════════════════════
+//
+// New tenant_id columns added (in cumulative migration SQL):
+//   - audit_logs.tenant_id    — NULL for global/TF actions
+//   - notifications.tenant_id — NULL for TF root notifications
+//
+// auditLog() helper extended (see definition near top of file) to accept an
+// optional 6th tenantId argument. Existing TF callers pass nothing → same
+// behaviour. Tenant-scoped admin endpoints introduced later (Day 6+) will
+// pass req.tenant.id to scope the audit entry properly.
+
+// GET /api/t/:short_id/admin/audit
+// Tenant-scoped audit log view for the Tenant Admin Panel (Bucket 1 #15).
+// Returns rows where tenant_id = req.tenant.id, paginated by created_at DESC.
+//
+// Access: tenant_admin only (superadmin bypass per Q2=a).
+// Query params:
+//   limit   (default 50, max 200)
+//   before  (optional ISO timestamp for cursor pagination)
+app.get('/api/t/:tenant_short_id/admin/audit', authenticateToken, requireTenantAdmin, async (req, res) => {
+    let limit = parseInt(req.query.limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 50;
+    if (limit > 200) limit = 200;
+
+    const before = req.query.before ? new Date(req.query.before) : null;
+    if (before && isNaN(before.getTime())) {
+        return res.status(400).json({ error: 'before must be a valid ISO timestamp' });
+    }
+
+    try {
+        const params = [req.tenant.id];
+        let where = `WHERE tenant_id = $1`;
+        if (before) {
+            params.push(before.toISOString());
+            where += ` AND created_at < $${params.length}`;
+        }
+        params.push(limit);
+
+        const r = await pool.query(
+            `SELECT admin_id, action, target_id, detail, tenant_id, created_at
+               FROM audit_logs
+               ${where}
+              ORDER BY created_at DESC
+              LIMIT $${params.length}`,
+            params
+        );
+        res.json({ entries: r.rows, count: r.rows.length });
+    } catch (e) {
+        // 42703 = column doesn't exist (pre-migration safety) — return empty
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.json({ entries: [], count: 0 });
+        }
+        console.error('FIX-320 /admin/audit failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch audit log' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-320 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-322 — ROW Day 6: Tenant Management Panel (superadmin)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Seven endpoints for Mitchell-level tenant CRUD + admin role management:
+//   POST   /api/admin/tenants                          — create new tenant
+//   GET    /api/admin/tenants                          — list all
+//   GET    /api/admin/tenants/:id                      — full config
+//   PATCH  /api/admin/tenants/:id                      — update config
+//   GET    /api/admin/tenants/:id/admins               — list tenant admins
+//   POST   /api/admin/tenants/:id/admins               — grant tenant_admin
+//   DELETE /api/admin/tenants/:id/admins/:player_id    — revoke tenant_admin
+//
+// All gated by requireSuperAdmin — only Mitchell can manage tenants.
+// Every operation logs to audit_log with tenant_id scoping (FIX-320 helper).
+
+// All editable boolean toggle field names (whitelist for PATCH /:id).
+// Adding a new toggle = append here + add the schema column in FIX-322.
+const _FIX322_BOOL_FIELDS = [
+    'awards_enabled', 'raf_enabled', 'organiser_allowance_enabled',
+    'referee_management_enabled', 'shop_enabled', 'coaching_enabled',
+    'mass_messaging_enabled', 'dsar_export_enabled',
+    'team_algo_creation_enabled', 'team_algo_cross_view_enabled',
+    'notify_signup_email', 'notify_signup_push',
+    'notify_game_confirmed_email', 'notify_game_confirmed_push',
+    'notify_rsvp_reminder_email', 'notify_rsvp_reminder_push',
+    'notify_dropout_email', 'notify_dropout_push',
+    'notify_motm_voting_email', 'notify_motm_voting_push',
+    'notify_awards_published_email', 'notify_awards_published_push',
+    // FIX-332 (Day 18): VAT registration toggle
+    'vat_registered'
+];
+const _FIX322_INT_FIELDS = [
+    'platform_fee_pence', 'refund_cutoff_hours',
+    'raf_signup_bonus_pence', 'raf_per_game_bonus_pence',
+    'raf_max_games_paid', 'raf_max_days_window',
+    'team_algo_id',
+    // FIX-329 audit-fix (Day 15): dial values must be tunable by superadmin
+    // via /api/admin/tenants/:id PATCH. Tenant admin has its own endpoint
+    // (PATCH /api/t/:short_id/admin/allowance) but superadmin needs full
+    // surface access from the Tenant Management Panel.
+    'organiser_allowance_per_game',
+    'organiser_allowance_pct_discount',
+    'organiser_allowance_games_per_week',
+    // FIX-332 (Day 18): VAT rate. credit_balance_pence is NOT in this list
+    // — it's adjusted via dedicated endpoint /api/admin/tenants/:id/credit
+    // (audit trail mandatory for cash movements).
+    'vat_rate_basis_points',
+];
+const _FIX322_TEXT_FIELDS = [
+    'name', 'slug', 'logo_url', 'primary_color',
+    'reply_to_email', 'cancellation_policy_text', 'status',
+    // FIX-332 (Day 18): VAT registration number
+    'vat_number',
+    // FIX-334 audit-fix (Day 30 SEC 4): bank details — superadmin can edit
+    'bank_account_holder_name', 'bank_account_number', 'bank_sort_code',
+];
+
+// Slug helper: deterministic, URL-safe, capped at 60 chars.
+function _fix322Slugify(name) {
+    if (!name) return '';
+    return String(name).toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60);
+}
+
+// Ensure slug is unique by appending -2, -3, ... if needed.
+async function _fix322UniqueSlug(baseSlug, excludeTenantId = null) {
+    let slug = baseSlug || `tenant-${Date.now()}`;
+    for (let i = 1; i <= 50; i++) {
+        const candidate = i === 1 ? slug : `${slug}-${i}`;
+        const params = excludeTenantId ? [candidate, excludeTenantId] : [candidate];
+        const q = excludeTenantId
+            ? 'SELECT 1 FROM tenants WHERE slug = $1 AND id != $2 LIMIT 1'
+            : 'SELECT 1 FROM tenants WHERE slug = $1 LIMIT 1';
+        const r = await pool.query(q, params);
+        if (r.rows.length === 0) return candidate;
+    }
+    return `${slug}-${Date.now()}`;
+}
+
+// POST /api/admin/tenants — create new tenant. Generates short_id with
+// collision retry (per Q2 acceptance — up to 5 attempts).
+app.post('/api/admin/tenants', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const body = req.body || {};
+    const name = String(body.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    if (name.length > 200) return res.status(400).json({ error: 'name too long (max 200)' });
+
+    const baseSlug = _fix322Slugify(body.slug || name);
+    if (!baseSlug) return res.status(400).json({ error: 'unable to derive slug from name' });
+    const slug = await _fix322UniqueSlug(baseSlug);
+
+    // Optional fields (caller can pre-configure on creation; otherwise defaults apply)
+    //
+    // FIX-333 audit-fix (Pass 5): validate primary_color + logo_url at CREATE
+    // time (PATCH already validates them). Prevents superadmin typos/paste-errors
+    // from storing javascript: URIs or invalid color strings that later confuse
+    // the frontend renderer. logo_url here accepts ONLY https:// URLs (caller
+    // can use POST /api/admin/tenants/:id/logo for base64 uploads after create).
+    const logoUrlRaw      = body.logo_url       ? String(body.logo_url).trim()       : null;
+    const primaryColorRaw = body.primary_color  ? String(body.primary_color).trim()  : null;
+    const replyToEmailRaw = body.reply_to_email ? String(body.reply_to_email).trim() : null;
+
+    if (primaryColorRaw && !/^#[0-9a-fA-F]{3,8}$/.test(primaryColorRaw)) {
+        return res.status(400).json({ error: 'primary_color must be a hex code like #ff0066' });
+    }
+    if (logoUrlRaw) {
+        // Accept https URLs (Cloudflare CDN, etc.) OR base64 data URLs (passed
+        // through _fix323ValidateImageBase64 — same as upload endpoint).
+        if (logoUrlRaw.startsWith('data:')) {
+            const check = _fix323ValidateImageBase64(logoUrlRaw);
+            if (!check.ok) return res.status(400).json({ error: 'logo_url: ' + check.error });
+        } else if (!logoUrlRaw.startsWith('https://')) {
+            return res.status(400).json({ error: 'logo_url must be a https URL or base64 data: URI' });
+        }
+    }
+    if (replyToEmailRaw && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(replyToEmailRaw)) {
+        return res.status(400).json({ error: 'reply_to_email must be a valid email address' });
+    }
+
+    const logoUrl       = logoUrlRaw;
+    const primaryColor  = primaryColorRaw;
+    const replyToEmail  = replyToEmailRaw;
+
+    // short_id collision retry — up to 5 attempts
+    //
+    // FIX-333 audit-fix (Pass 4): differentiate short_id vs slug collision.
+    // Two concurrent tenant creations with the same desired slug could BOTH
+    // pass _fix322UniqueSlug (TOCTOU) — the DB unique index catches the
+    // second one with 23505 referencing idx_tenants_slug, not idx_tenants_short_id.
+    // Without this differentiation, the retry loop spends all 5 attempts
+    // trying the same slug. With it: bump slug on slug-collision, bump
+    // short_id on short_id-collision.
+    let inserted = null;
+    let workingSlug = slug;
+    for (let attempt = 0; attempt < 5; attempt++) {
+        const shortId = String(Math.floor(Math.random() * 90000) + 10000); // 10000-99999
+        try {
+            const r = await pool.query(
+                `INSERT INTO tenants (short_id, name, slug, logo_url, primary_color, reply_to_email, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'active')
+                 RETURNING *`,
+                [shortId, name, workingSlug, logoUrl, primaryColor, replyToEmail]
+            );
+            inserted = r.rows[0];
+            break;
+        } catch (e) {
+            // 23505 = unique_violation — could be short_id OR slug
+            if (e && e.code === '23505') {
+                // Detect which constraint via constraint name (PG-specific)
+                // e.constraint values: 'idx_tenants_short_id' or 'idx_tenants_slug'
+                if (e.constraint && e.constraint.includes('slug')) {
+                    // Slug collision — append timestamp suffix to break tie
+                    workingSlug = `${slug}-${Date.now().toString(36)}`;
+                }
+                // (short_id collision — next loop iteration generates new shortId)
+                continue;
+            }
+            console.error('FIX-322 tenant create failed:', e.message);
+            return res.status(500).json({ error: 'Failed to create tenant' });
+        }
+    }
+    if (!inserted) {
+        return res.status(503).json({ error: 'short_id collision after 5 retries; try again' });
+    }
+
+    setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_created', inserted.id,
+        `Created tenant ${inserted.name} (${inserted.short_id})`, inserted.id));
+
+    res.status(201).json({ tenant: inserted });
+});
+
+// GET /api/admin/tenants — list all tenants
+app.get('/api/admin/tenants', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT t.id, t.short_id, t.slug, t.name, t.logo_url, t.primary_color,
+                    t.status, t.reply_to_email, t.created_at, t.exited_at,
+                    (SELECT COUNT(*) FROM player_tenants pt
+                       WHERE pt.tenant_id = t.id AND pt.status = 'active') AS active_members,
+                    (SELECT COUNT(*) FROM player_tenants pt
+                       WHERE pt.tenant_id = t.id AND pt.role = 'tenant_admin' AND pt.status = 'active') AS admin_count
+               FROM tenants t
+              ORDER BY t.created_at DESC`
+        );
+        res.json({ tenants: r.rows });
+    } catch (e) {
+        console.error('FIX-322 list tenants failed:', e.message);
+        res.status(500).json({ error: 'Failed to list tenants' });
+    }
+});
+
+// GET /api/admin/tenants/:id — full tenant config (all 30+ fields)
+app.get('/api/admin/tenants/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid tenant id' });
+    try {
+        const r = await pool.query('SELECT * FROM tenants WHERE id = $1', [req.params.id]);
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        res.json({ tenant: r.rows[0] });
+    } catch (e) {
+        console.error('FIX-322 get tenant failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch tenant' });
+    }
+});
+
+// PATCH /api/admin/tenants/:id — update any subset of editable fields
+// Body: { field_name: value, ... }
+// Whitelisted via _FIX322_BOOL_FIELDS / _INT_FIELDS / _TEXT_FIELDS.
+app.patch('/api/admin/tenants/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid tenant id' });
+    const body = req.body || {};
+    const updates = [];
+    const values  = [];
+    let idx = 1;
+
+    for (const f of _FIX322_BOOL_FIELDS) {
+        if (body[f] !== undefined) {
+            updates.push(`${f} = $${idx++}`);
+            values.push(!!body[f]);
+        }
+    }
+    for (const f of _FIX322_INT_FIELDS) {
+        if (body[f] !== undefined) {
+            const n = body[f] === null ? null : parseInt(body[f], 10);
+            if (body[f] !== null && (!Number.isFinite(n) || n < 0)) {
+                return res.status(400).json({ error: `${f} must be a non-negative integer` });
+            }
+            updates.push(`${f} = $${idx++}`);
+            values.push(n);
+        }
+    }
+    for (const f of _FIX322_TEXT_FIELDS) {
+        if (body[f] !== undefined) {
+            let v = body[f] === null ? null : String(body[f]).trim();
+            // Slug needs uniqueness validation + sanitisation
+            if (f === 'slug' && v !== null) {
+                v = _fix322Slugify(v);
+                v = await _fix322UniqueSlug(v, req.params.id);
+            }
+            // Status whitelist
+            if (f === 'status' && v !== null && !['active','paused','exited'].includes(v)) {
+                return res.status(400).json({ error: 'status must be active/paused/exited' });
+            }
+            updates.push(`${f} = $${idx++}`);
+            values.push(v);
+        }
+    }
+
+    if (updates.length === 0) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    // If status flipped to exited, set exited_at automatically
+    if (body.status === 'exited') {
+        updates.push(`exited_at = NOW()`);
+    }
+
+    values.push(req.params.id);
+
+    try {
+        const r = await pool.query(
+            `UPDATE tenants SET ${updates.join(', ')} WHERE id = $${idx++} RETURNING *`,
+            values
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_updated', req.params.id,
+            `Updated tenant ${r.rows[0].name}: ${Object.keys(body).join(', ')}`, req.params.id));
+
+        res.json({ tenant: r.rows[0] });
+    } catch (e) {
+        // Re-throw range/check constraint violations as 400
+        if (e && e.code === '23514') {
+            return res.status(400).json({ error: 'Constraint violation: ' + (e.constraint || e.message) });
+        }
+        // FIX-333 audit-fix (Pass 8): handle 22003 numeric_value_out_of_range
+        // cleanly. parseInt allows values > INT32 max (2,147,483,647); PG INTEGER
+        // refuses them. Mitchell would otherwise see a generic 500.
+        if (e && e.code === '22003') {
+            return res.status(400).json({ error: 'Numeric value out of range (max 2,147,483,647 for integer fields)' });
+        }
+        console.error('FIX-322 update tenant failed:', e.message);
+        res.status(500).json({ error: 'Failed to update tenant' });
+    }
+});
+
+// GET /api/admin/tenants/:id/admins — list this tenant's admin row(s)
+app.get('/api/admin/tenants/:id/admins', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid tenant id' });
+    try {
+        const r = await pool.query(
+            `SELECT pt.player_id, pt.role, pt.status, pt.joined_at,
+                    p.full_name, p.alias, u.email
+               FROM player_tenants pt
+               JOIN players p ON p.id = pt.player_id
+               JOIN users   u ON u.id = p.user_id
+              WHERE pt.tenant_id = $1
+                AND pt.role IN ('tenant_admin', 'organiser')
+              ORDER BY pt.role DESC, pt.joined_at ASC`,
+            [req.params.id]
+        );
+        res.json({ admins: r.rows });
+    } catch (e) {
+        console.error('FIX-322 list admins failed:', e.message);
+        res.status(500).json({ error: 'Failed to list tenant admins' });
+    }
+});
+
+// POST /api/admin/tenants/:id/admins — grant tenant_admin (or organiser) role
+// Body: { player_id: UUID, role: 'tenant_admin' | 'organiser' }
+app.post('/api/admin/tenants/:id/admins', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid tenant id' });
+    const playerId = String(req.body?.player_id || '').trim();
+    const role     = String(req.body?.role || 'tenant_admin').trim();
+
+    if (!isValidUuid(playerId)) return res.status(400).json({ error: 'player_id must be a UUID' });
+    if (!['tenant_admin', 'organiser'].includes(role)) {
+        return res.status(400).json({ error: 'role must be tenant_admin or organiser' });
+    }
+
+    try {
+        // Confirm tenant exists + is active
+        const tRes = await pool.query('SELECT name, status FROM tenants WHERE id = $1', [req.params.id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        if (tRes.rows[0].status !== 'active') {
+            return res.status(409).json({ error: `Tenant is ${tRes.rows[0].status}` });
+        }
+        // Confirm player exists
+        const pRes = await pool.query('SELECT id, full_name, alias FROM players WHERE id = $1', [playerId]);
+        if (pRes.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+        // FIX-326 Day 10 hardening: refuse to grant admin to a player who's
+        // currently banned from this tenant. Without this check, the existing
+        // ON CONFLICT clause would silently flip status from 'banned' to
+        // 'active' and grant them the admin role — privilege escalation by
+        // back-channel. To grant admin to a previously-banned player, an
+        // explicit unban step is required (revoke first, then grant).
+        const existing = await pool.query(
+            `SELECT status FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+            [playerId, req.params.id]
+        );
+        if (existing.rows.length > 0 && existing.rows[0].status === 'banned') {
+            return res.status(409).json({
+                error: 'Player is banned from this tenant — unban them first before granting admin role'
+            });
+        }
+
+        const ins = await pool.query(
+            `INSERT INTO player_tenants (player_id, tenant_id, role, status, joined_at)
+             VALUES ($1, $2, $3, 'active', NOW())
+             ON CONFLICT (player_id, tenant_id) DO UPDATE
+                SET role   = EXCLUDED.role,
+                    status = 'active'
+              RETURNING *`,
+            [playerId, req.params.id, role]
+        );
+
+        // FIX-333 audit-fix (Day 19): also assign tenant_player_id if missing,
+        // for consistency with Day 3/9 join paths. Idempotent — won't change
+        // existing TF player display.
+        try {
+            await pool.query(
+                `UPDATE players SET tenant_player_id = nextval('tenant_player_id_seq')
+                  WHERE id = $1 AND tenant_player_id IS NULL`,
+                [playerId]
+            );
+        } catch (e) {
+            if (e && e.code !== '42P01' && e.code !== '42703') throw e;
+        }
+
+        const displayName = pRes.rows[0].alias || pRes.rows[0].full_name || playerId;
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_admin_granted', playerId,
+            `Granted ${role} to ${displayName} for tenant ${tRes.rows[0].name}`, req.params.id));
+
+        res.status(201).json({ membership: ins.rows[0] });
+    } catch (e) {
+        console.error('FIX-322 grant admin failed:', e.message);
+        res.status(500).json({ error: 'Failed to grant admin role' });
+    }
+});
+
+// DELETE /api/admin/tenants/:id/admins/:player_id — revoke admin role
+// Demotes to 'player' (keeps row so player can still see tenant) unless ?leave=true,
+// in which case sets status='left'.
+app.delete('/api/admin/tenants/:id/admins/:player_id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id))        return res.status(400).json({ error: 'Invalid tenant id' });
+    if (!isValidUuid(req.params.player_id)) return res.status(400).json({ error: 'Invalid player_id' });
+
+    const fullLeave = req.query.leave === 'true';
+
+    try {
+        const sql = fullLeave
+            ? `UPDATE player_tenants SET status = 'left', role = 'player'
+                WHERE tenant_id = $1 AND player_id = $2 RETURNING *`
+            : `UPDATE player_tenants SET role = 'player'
+                WHERE tenant_id = $1 AND player_id = $2 RETURNING *`;
+        const r = await pool.query(sql, [req.params.id, req.params.player_id]);
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Membership not found' });
+
+        setImmediate(() => auditLog(pool, req.user.playerId,
+            fullLeave ? 'tenant_admin_removed' : 'tenant_admin_demoted',
+            req.params.player_id,
+            fullLeave ? `Removed from tenant ${req.params.id}` : `Demoted to player in tenant ${req.params.id}`,
+            req.params.id));
+
+        res.json({ membership: r.rows[0], leave: fullLeave });
+    } catch (e) {
+        console.error('FIX-322 revoke admin failed:', e.message);
+        res.status(500).json({ error: 'Failed to revoke admin role' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-322 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-323 — ROW Day 7: Branding upload + reply-to customisation
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Three new endpoints:
+//   POST  /api/admin/tenants/:id/logo          superadmin logo upload
+//   POST  /api/t/:short_id/admin/logo          tenant_admin logo upload (own tenant)
+//   PATCH /api/t/:short_id/admin/branding      tenant_admin branding fields (own tenant)
+//
+// Plus: _fix323TenantMailOptions(tenantId, baseOptions) — call before sendMail
+// to inject the tenant's reply_to_email as the Reply-To header. Existing
+// 26 sendMail() callsites are unchanged today; tenant-aware paths added as
+// we wire features in later days (Days 8+ when DSAR / onboarding emails ship).
+
+// Image validation shared with player photo upload (FIX-046 / SEC-027).
+// Extracted as a helper here so logo upload reuses the exact same checks.
+function _fix323ValidateImageBase64(photoData) {
+    if (!photoData) return { ok: false, error: 'No image data provided' };
+    if (photoData.length > 2_000_000) return { ok: false, error: 'Image too large. Max ~1.5MB.' };
+    const VALID_PREFIXES = {
+        'data:image/jpeg;base64,': { magic: [0xFF, 0xD8, 0xFF],         label: 'JPEG' },
+        'data:image/png;base64,':  { magic: [0x89, 0x50, 0x4E, 0x47],   label: 'PNG'  },
+        'data:image/webp;base64,': { magic: [0x52, 0x49, 0x46, 0x46],   label: 'WebP' },
+    };
+    const matchedPrefix = Object.keys(VALID_PREFIXES).find(p => photoData.startsWith(p));
+    if (!matchedPrefix) return { ok: false, error: 'Invalid image format. Only JPEG, PNG, and WebP allowed.' };
+    const b64Data = photoData.slice(matchedPrefix.length);
+    const rawBytes = Buffer.from(b64Data, 'base64');
+    const expectedMagic = VALID_PREFIXES[matchedPrefix].magic;
+    const actualBytes = [...rawBytes.slice(0, expectedMagic.length)];
+    const magicOk = expectedMagic.every((byte, i) => actualBytes[i] === byte);
+    if (!magicOk) return { ok: false, error: 'File contents do not match declared image type.' };
+    return { ok: true };
+}
+
+// _fix323TenantMailOptions(tenantId, baseOptions) — call this before
+// emailTransporter.sendMail() when sending email on behalf of a tenant.
+// Adds Reply-To header pointing at tenants.reply_to_email if set, otherwise
+// returns baseOptions unchanged. Safe to call for tenantId=null (TF root).
+//
+// USE PATTERN:
+//   const mail = await _fix323TenantMailOptions(game.tenant_id, {
+//       from: '"TotalFooty" <totalfooty19@gmail.com>',
+//       to: player.email,
+//       subject: '...',
+//       html: '...'
+//   });
+//   await emailTransporter.sendMail(mail);
+//
+// Wiring existing 26 sendMail callsites is later-day work (Days 8+ as each
+// feature lands). Until then, all email goes out with the TF default reply-to,
+// which is correct for TF root and harmless for tenant-scoped (replies just
+// go to Mitchell's inbox until the tenant migration completes).
+async function _fix323TenantMailOptions(tenantId, baseOptions) {
+    if (!tenantId) return baseOptions;
+    try {
+        const r = await pool.query(
+            'SELECT name, reply_to_email FROM tenants WHERE id = $1 AND status = $2 LIMIT 1',
+            [tenantId, 'active']
+        );
+        const row = r.rows[0];
+        if (!row || !row.reply_to_email) return baseOptions;
+        // Optional subject prefix with tenant name for clarity
+        const subject = row.name && baseOptions.subject
+            ? `[${row.name}] ${baseOptions.subject}`
+            : baseOptions.subject;
+        return {
+            ...baseOptions,
+            subject,
+            replyTo: row.reply_to_email,
+        };
+    } catch (e) {
+        // 42P01 (no tenants table) or 42703 (no reply_to_email) — pre-migration safe
+        if (e && (e.code === '42P01' || e.code === '42703')) return baseOptions;
+        console.warn('FIX-323 tenant mail options failed (using defaults):', e.message);
+        return baseOptions;
+    }
+}
+
+// POST /api/admin/tenants/:id/logo — superadmin logo upload
+// Body: { logo: <base64 data URL> }
+// FIX-333 audit-fix (Day 19): need inline express.json({limit:'5mb'}) middleware
+// because the default body parser is 500kb (line 117), which would reject the
+// upload before our 2MB validation runs. Matches existing photo upload pattern
+// at line 8039.
+app.post('/api/admin/tenants/:id/logo',
+    authenticateToken, requireSuperAdmin,
+    express.json({ limit: '5mb' }),
+async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid tenant id' });
+
+    const check = _fix323ValidateImageBase64(req.body?.logo);
+    if (!check.ok) return res.status(400).json({ error: check.error });
+
+    try {
+        const r = await pool.query(
+            'UPDATE tenants SET logo_url = $1 WHERE id = $2 RETURNING id, name, logo_url',
+            [req.body.logo, req.params.id]
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_logo_updated', req.params.id,
+            `Updated logo for tenant ${r.rows[0].name}`, req.params.id));
+
+        res.json({ tenant: r.rows[0] });
+    } catch (e) {
+        console.error('FIX-323 admin logo upload failed:', e.message);
+        res.status(500).json({ error: 'Failed to upload logo' });
+    }
+});
+
+// POST /api/t/:tenant_short_id/admin/logo — tenant_admin logo upload (own tenant)
+// Same validation as above, but gated by requireTenantAdmin (own-tenant only).
+// FIX-333 audit-fix (Day 19): same 5mb body limit as superadmin variant above.
+app.post('/api/t/:tenant_short_id/admin/logo',
+    authenticateToken, requireTenantAdmin,
+    express.json({ limit: '5mb' }),
+async (req, res) => {
+    const check = _fix323ValidateImageBase64(req.body?.logo);
+    if (!check.ok) return res.status(400).json({ error: check.error });
+
+    try {
+        const r = await pool.query(
+            'UPDATE tenants SET logo_url = $1 WHERE id = $2 RETURNING id, name, logo_url',
+            [req.body.logo, req.tenant.id]
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_logo_updated', req.tenant.id,
+            `Tenant admin updated logo`, req.tenant.id));
+
+        res.json({ tenant: r.rows[0] });
+    } catch (e) {
+        console.error('FIX-323 tenant logo upload failed:', e.message);
+        res.status(500).json({ error: 'Failed to upload logo' });
+    }
+});
+
+// PATCH /api/t/:tenant_short_id/admin/branding — tenant_admin self-serve branding
+// Body: { primary_color?, reply_to_email?, cancellation_policy_text? }
+//
+// Tenant admins can edit BRANDING / POLICY fields for their own tenant —
+// distinct from the superadmin PATCH /api/admin/tenants/:id which can edit
+// every field (including feature toggles, RAF rates, platform fee).
+//
+// Sensitive fields (feature toggles, financial config) remain superadmin-only.
+const _FIX323_TENANT_BRANDING_FIELDS = ['primary_color', 'reply_to_email', 'cancellation_policy_text'];
+app.patch('/api/t/:tenant_short_id/admin/branding', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const body = req.body || {};
+    const updates = [];
+    const values  = [];
+    let idx = 1;
+
+    for (const f of _FIX323_TENANT_BRANDING_FIELDS) {
+        if (body[f] !== undefined) {
+            const v = body[f] === null ? null : String(body[f]).trim();
+            // Validate hex color shape (allow #RGB / #RRGGBB / empty)
+            if (f === 'primary_color' && v !== null && v !== '' && !/^#[0-9a-fA-F]{3,8}$/.test(v)) {
+                return res.status(400).json({ error: 'primary_color must be a hex code like #ff0066' });
+            }
+            // Loose email format check (don't be overly strict — real emails are weird)
+            if (f === 'reply_to_email' && v !== null && v !== '' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) {
+                return res.status(400).json({ error: 'reply_to_email must be a valid email address' });
+            }
+            updates.push(`${f} = $${idx++}`);
+            values.push(v === '' ? null : v);
+        }
+    }
+
+    if (updates.length === 0) return res.status(400).json({ error: 'No branding fields to update' });
+    values.push(req.tenant.id);
+
+    try {
+        const r = await pool.query(
+            `UPDATE tenants SET ${updates.join(', ')}
+              WHERE id = $${idx++}
+              RETURNING id, name, primary_color, reply_to_email, cancellation_policy_text`,
+            values
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_branding_updated', req.tenant.id,
+            `Branding updated: ${Object.keys(body).join(', ')}`, req.tenant.id));
+
+        res.json({ tenant: r.rows[0] });
+    } catch (e) {
+        console.error('FIX-323 tenant branding update failed:', e.message);
+        res.status(500).json({ error: 'Failed to update branding' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-334 audit-fix (Day 30 Pass 5 SEC 4): tenant_admin self-serve bank details
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Tenant_admin can set/read their own bank details (where Mitchell sends payouts).
+// Plain text per Q10 — trusts Postgres at-rest encryption.
+
+// GET /api/t/:tenant_short_id/admin/bank-details — tenant_admin reads their own
+app.get('/api/t/:tenant_short_id/admin/bank-details',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT bank_account_holder_name, bank_account_number, bank_sort_code
+                   FROM tenants WHERE id = $1 LIMIT 1`,
+                [req.tenant.id]
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+            res.json({
+                bank_account_holder_name: r.rows[0].bank_account_holder_name || null,
+                bank_account_number:      r.rows[0].bank_account_number      || null,
+                bank_sort_code:           r.rows[0].bank_sort_code           || null,
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Bank details feature not yet provisioned' });
+            }
+            console.error('FIX-334 get bank details failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch bank details' });
+        }
+    }
+);
+
+// PUT /api/t/:tenant_short_id/admin/bank-details — tenant_admin sets their own
+//
+// Body: {
+//   bank_account_holder_name: string (1-200 chars),
+//   bank_account_number: string (exactly 8 digits),
+//   bank_sort_code: string (exactly 6 digits — accept '12-34-56' or '123456'),
+// }
+app.put('/api/t/:tenant_short_id/admin/bank-details',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const body = req.body || {};
+        const holder = typeof body.bank_account_holder_name === 'string'
+            ? body.bank_account_holder_name.trim().slice(0, 200) : '';
+        if (!holder) return res.status(400).json({ error: 'bank_account_holder_name is required' });
+
+        const acctRaw = typeof body.bank_account_number === 'string'
+            ? body.bank_account_number.trim().replace(/\s+/g, '') : '';
+        if (!/^\d{8}$/.test(acctRaw)) {
+            return res.status(400).json({ error: 'bank_account_number must be exactly 8 digits' });
+        }
+
+        // Accept sort codes with hyphens or spaces — normalise to 6 digits
+        const sortRaw = typeof body.bank_sort_code === 'string'
+            ? body.bank_sort_code.trim().replace(/[\s-]+/g, '') : '';
+        if (!/^\d{6}$/.test(sortRaw)) {
+            return res.status(400).json({ error: 'bank_sort_code must be 6 digits (e.g. 123456 or 12-34-56)' });
+        }
+
+        try {
+            const r = await pool.query(
+                `UPDATE tenants
+                    SET bank_account_holder_name = $1,
+                        bank_account_number      = $2,
+                        bank_sort_code           = $3
+                  WHERE id = $4
+                  RETURNING bank_account_holder_name, bank_account_number, bank_sort_code`,
+                [holder, acctRaw, sortRaw, req.tenant.id]
+            );
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_bank_details_updated',
+                req.tenant.id, `Bank details set (holder: ${holder})`, req.tenant.id).catch(() => {}));
+            res.json({
+                bank_account_holder_name: r.rows[0].bank_account_holder_name,
+                bank_account_number:      r.rows[0].bank_account_number,
+                bank_sort_code:           r.rows[0].bank_sort_code,
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Bank details feature not yet provisioned' });
+            }
+            if (e && e.code === '23514') {
+                return res.status(400).json({ error: 'Bank details failed CHECK constraint (format)' });
+            }
+            console.error('FIX-334 update bank details failed:', e.message);
+            res.status(500).json({ error: 'Failed to update bank details' });
+        }
+    }
+);
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-323 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-324 — ROW Day 8: DSAR Export (A.52, GDPR Subject Access Request)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Two endpoints:
+//   GET /api/players/me/dsar-export           — player exports their own data
+//   GET /api/admin/players/:id/dsar-export    — superadmin exports any player's data
+//
+// Returns JSON containing every row held about the player across the
+// platform. Streamed as application/json with Content-Disposition: attachment.
+// Rate-limited to 1 request per player per hour (DSAR is heavy + legally
+// mandated, but no need for abusive volume).
+//
+// Tenant gating: when called via /api/t/:short_id/... in future iterations,
+// the tenant's dsar_export_enabled toggle is checked. Self-serve player DSAR
+// always allowed (statutory right, can't be turned off).
+
+// Tables to extract for a single player_id. Pre-flighted at boot: any table
+// that doesn't exist gets silently skipped (tolerant of schema drift across
+// regions / dev environments). The query column list is the FK column whose
+// value is the player_id.
+//
+// Some tables have TWO player FKs (beef as both player_id and target_player_id;
+// game_award_votes as voter and subject). We list each direction separately so
+// the DSAR captures both "things this player did" and "things done about this
+// player". Within one table that hits twice, we tag the section with the
+// direction (e.g. "beef_as_actor" vs "beef_as_target").
+const _FIX324_DSAR_TABLES = [
+    // Core identity
+    { table: 'players',                       fk: 'id',                  section: 'players' },
+    { table: 'player_tenants',                fk: 'player_id',           section: 'player_tenants' },
+    // Game activity
+    { table: 'registrations',                 fk: 'player_id',           section: 'registrations' },
+    { table: 'game_guests',                   fk: 'invited_by',          section: 'game_guests_invited_by_me' },
+    { table: 'game_referees',                 fk: 'player_id',           section: 'game_referees' },
+    // Awards / voting / ratings
+    { table: 'game_awards',                   fk: 'subject_player_id',   section: 'game_awards_received' },
+    { table: 'game_award_votes',              fk: 'voter_player_id',     section: 'game_award_votes_cast' },
+    { table: 'game_award_votes',              fk: 'subject_player_id',   section: 'game_award_votes_received' },
+    { table: 'motm_votes',                    fk: 'voter_player_id',     section: 'motm_votes_cast' },
+    { table: 'motm_votes',                    fk: 'subject_player_id',   section: 'motm_votes_received' },
+    { table: 'motm_nominees',                 fk: 'player_id',           section: 'motm_nominations' },
+    { table: 'rating_correction_links',       fk: 'subject_player_id',   section: 'rating_corrections' },
+    { table: 'rating_recalibration_history',  fk: 'player_id',           section: 'rating_history' },
+    { table: 'referee_reviews',               fk: 'referee_player_id',   section: 'referee_reviews_about_me' },
+    { table: 'referee_reviews',               fk: 'reviewer_player_id',  section: 'referee_reviews_i_wrote' },
+    // Relationships
+    { table: 'beef',                          fk: 'player_id',           section: 'beef_as_actor' },
+    { table: 'beef',                          fk: 'target_player_id',    section: 'beef_as_target' },
+    { table: 'avoids',                        fk: 'player_id',           section: 'avoids_as_actor' },
+    { table: 'avoids',                        fk: 'target_player_id',    section: 'avoids_as_target' },
+    { table: 'player_favourite_series',       fk: 'player_id',           section: 'favourite_series' },
+    { table: 'player_favourite_opponents',    fk: 'player_id',           section: 'favourite_opponents' },
+    // Payments / finance
+    { table: 'wonderful_payments',            fk: 'player_id',           section: 'wonderful_payments' },
+    { table: 'credits',                       fk: 'player_id',           section: 'credits' },
+    // Comms
+    { table: 'comms_recipients',              fk: 'player_id',           section: 'comms_recipients' },
+    { table: 'notifications',                 fk: 'player_id',           section: 'notifications' },
+    // Coaching
+    { table: 'coaching_registrations',        fk: 'player_id',           section: 'coaching_registrations' },
+    { table: 'coaching_feedback',             fk: 'player_id',           section: 'coaching_feedback' },
+    // Audit trail of admin actions ON this player
+    { table: 'audit_logs',                    fk: 'target_id',           section: 'audit_actions_on_me' },
+    { table: 'audit_logs',                    fk: 'admin_id',            section: 'audit_actions_by_me' },
+];
+
+// Build a single export bundle for one player_id. Returns a JSON-serialisable
+// object. Each table either succeeds with rows or is omitted with a soft error
+// note — so the export always returns SOMETHING even if a region's schema is
+// behind.
+//
+// FIX-326 Day 10 hardening: per-table row count cap of 10,000. Players with
+// >10k rows in any single table (extreme power users) get truncated with a
+// note in `omitted` so they know to email Mitchell for a full export. Prevents
+// OOM on Render's memory-constrained dynos.
+const _FIX324_PER_TABLE_LIMIT = 10000;
+
+async function _fix324BuildDsarExport(playerId) {
+    const bundle = {
+        generated_at:   new Date().toISOString(),
+        player_id:      playerId,
+        schema_version: 'ROW-Day8-v1',
+        sections:       {},
+        omitted:        [],
+        truncated:      [],
+    };
+
+    // Pull email + users row separately (joined via players.user_id)
+    try {
+        const u = await pool.query(
+            `SELECT u.id, u.email, u.role, u.created_at, u.last_login_at
+               FROM users u
+               JOIN players p ON p.user_id = u.id
+              WHERE p.id = $1`,
+            [playerId]
+        );
+        bundle.sections.users = u.rows;
+    } catch (e) {
+        bundle.omitted.push({ table: 'users', reason: e.message });
+    }
+
+    for (const { table, fk, section } of _FIX324_DSAR_TABLES) {
+        try {
+            // FIX-326 Day 10: LIMIT each table to 10k rows to prevent OOM
+            const r = await pool.query(
+                `SELECT * FROM ${table} WHERE ${fk} = $1 LIMIT ${_FIX324_PER_TABLE_LIMIT + 1}`,
+                [playerId]
+            );
+            if (r.rows.length > _FIX324_PER_TABLE_LIMIT) {
+                bundle.sections[section] = r.rows.slice(0, _FIX324_PER_TABLE_LIMIT);
+                bundle.truncated.push({
+                    section, table, fk, limit: _FIX324_PER_TABLE_LIMIT,
+                    note: 'Section truncated to first 10,000 rows. Email Mitchell for the full set.'
+                });
+            } else {
+                bundle.sections[section] = r.rows;
+            }
+        } catch (e) {
+            // 42P01 = table doesn't exist (some regions / old schema). 42703 = column.
+            // Silently omit — DSAR completeness over per-table failure.
+            bundle.omitted.push({ section, table, fk, reason: e.code === '42P01' ? 'table_not_found' : (e.code === '42703' ? 'column_not_found' : e.message) });
+        }
+    }
+
+    return bundle;
+}
+
+// In-memory rate limit cache: playerId → last_dsar_timestamp
+const _FIX324_DSAR_RATE_LIMIT_MS = 60 * 60 * 1000; // 1 hour
+const _fix324DsarLastFired = new Map();
+
+// FIX-333 audit-fix (Pass 9 future-proofing): lazy Map eviction. Without
+// pruning, the Map grows unbounded — every player who ever DSAR'd has a stale
+// entry forever (until process restart). At 100k players: 100k entries × 70 bytes
+// = 7MB (negligible) — but we still prune to defend against unexpected growth.
+// Triggered every 1000th call (amortised O(1)).
+let _fix324PruneCounter = 0;
+function _fix324PruneDsarMap() {
+    const now = Date.now();
+    const expired = [];
+    for (const [pid, ts] of _fix324DsarLastFired) {
+        if ((now - ts) >= _FIX324_DSAR_RATE_LIMIT_MS) expired.push(pid);
+    }
+    for (const pid of expired) _fix324DsarLastFired.delete(pid);
+}
+
+function _fix324CheckRateLimit(playerId) {
+    const now  = Date.now();
+    const prev = _fix324DsarLastFired.get(playerId);
+    if (prev && (now - prev) < _FIX324_DSAR_RATE_LIMIT_MS) {
+        const remainingMs = _FIX324_DSAR_RATE_LIMIT_MS - (now - prev);
+        return { allowed: false, retryAfterSeconds: Math.ceil(remainingMs / 1000) };
+    }
+    _fix324DsarLastFired.set(playerId, now);
+    // Periodic prune — amortised cheap
+    if (++_fix324PruneCounter >= 1000) {
+        _fix324PruneCounter = 0;
+        _fix324PruneDsarMap();
+    }
+    return { allowed: true };
+}
+
+// GET /api/players/me/dsar-export — self-serve player export
+app.get('/api/players/me/dsar-export', authenticateToken, async (req, res) => {
+    const playerId = req.user.playerId;
+    const rate = _fix324CheckRateLimit(playerId);
+    if (!rate.allowed) {
+        res.setHeader('Retry-After', rate.retryAfterSeconds);
+        return res.status(429).json({ error: 'Rate limit: 1 DSAR per hour', retry_after_seconds: rate.retryAfterSeconds });
+    }
+    try {
+        const bundle = await _fix324BuildDsarExport(playerId);
+        setImmediate(() => auditLog(pool, playerId, 'dsar_export_self', playerId,
+            `Self-serve DSAR export: ${Object.keys(bundle.sections).length} sections`));
+
+        // Attachment with timestamp filename
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="totalfooty-dsar-${ts}.json"`);
+        res.status(200).end(JSON.stringify(bundle, null, 2));
+    } catch (e) {
+        console.error('FIX-324 self DSAR failed:', e.message);
+        res.status(500).json({ error: 'DSAR export failed' });
+    }
+});
+
+// GET /api/admin/players/:id/dsar-export — superadmin export on behalf of player
+// Triggered when a player emails Mitchell requesting their data (legal duty).
+// Audit log captures the admin who triggered it for accountability.
+app.get('/api/admin/players/:id/dsar-export', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid player id' });
+    try {
+        // Confirm player exists
+        const pRes = await pool.query('SELECT id, full_name, alias FROM players WHERE id = $1', [req.params.id]);
+        if (pRes.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+        const bundle = await _fix324BuildDsarExport(req.params.id);
+        const displayName = pRes.rows[0].alias || pRes.rows[0].full_name || req.params.id;
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'dsar_export_admin', req.params.id,
+            `Admin DSAR export for ${displayName}: ${Object.keys(bundle.sections).length} sections`));
+
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="totalfooty-dsar-${displayName.replace(/[^a-z0-9]+/gi, '-')}-${ts}.json"`);
+        res.status(200).end(JSON.stringify(bundle, null, 2));
+    } catch (e) {
+        console.error('FIX-324 admin DSAR failed:', e.message);
+        res.status(500).json({ error: 'DSAR export failed' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-324 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-325 — ROW Day 9: In-product onboarding scaffold (Bucket 7)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Backend for the tenant-invite onboarding flow. When a player clicks a
+// tenant invite link (e.g. shared by Saca: totalfooty.co.uk/join/87432),
+// the frontend POSTs to /api/onboarding/preview/:short_id to fetch the
+// tenant's public-facing card (name, logo, primary_color, member count),
+// then on confirm POSTs to /api/onboarding/join.
+//
+// Endpoints:
+//   GET  /api/onboarding/preview/:short_id    public — returns tenant card
+//   POST /api/onboarding/join                 authed — joins tenant
+//   GET  /api/players/me/onboarding-state     authed — wizard progress
+//   PATCH /api/players/me/onboarding-state    authed — wizard progress save
+//
+// Onboarding state lives in players.onboarding_state JSONB. Schema added
+// in FIX-325 migration. Default value = empty {} for new + existing players.
+
+// GET /api/onboarding/preview/:tenant_short_id — PUBLIC (no auth)
+// Returns minimal public-safe tenant info for invite-link landing pages.
+// Does NOT leak feature toggles, financial config, or admin emails.
+app.get('/api/onboarding/preview/:tenant_short_id', publicEndpointLimiter, async (req, res) => {
+    const shortId = req.params.tenant_short_id;
+    if (!/^\d{5}$/.test(shortId)) return res.status(404).json({ error: 'Tenant not found' });
+
+    try {
+        const r = await pool.query(
+            `SELECT t.id, t.short_id, t.slug, t.name, t.logo_url, t.primary_color,
+                    t.status, t.cancellation_policy_text,
+                    (SELECT COUNT(*) FROM player_tenants pt
+                       WHERE pt.tenant_id = t.id AND pt.status = 'active') AS member_count
+               FROM tenants t
+              WHERE t.short_id = $1
+              LIMIT 1`,
+            [shortId]
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const t = r.rows[0];
+        if (t.status !== 'active') return res.status(404).json({ error: 'Tenant not found' });
+
+        // Public-safe projection — explicit field list, NEVER res.json(row) to
+        // avoid leaking columns added in future migrations (master prompt rule).
+        res.json({
+            short_id:                 t.short_id,
+            slug:                     t.slug,
+            name:                     t.name,
+            logo_url:                 t.logo_url,
+            primary_color:            t.primary_color,
+            cancellation_policy:      t.cancellation_policy_text || '',
+            member_count:             parseInt(t.member_count, 10) || 0,
+        });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.status(404).json({ error: 'Tenant not found' });
+        console.error('FIX-325 preview failed:', e.message);
+        res.status(500).json({ error: 'Failed to load tenant preview' });
+    }
+});
+
+// POST /api/onboarding/check-email-for-attach — PUBLIC (rate-limited)
+//
+// FIX-336: when a guest is going through the tenant-attached signup wizard
+// and enters an email that ALREADY belongs to a TotalFooty account, we
+// don't want to make them create a duplicate. Instead the wizard should
+// pivot to "we recognise this email — log in and attach the tenant to
+// your existing account." This endpoint is the recognition probe.
+//
+// Body: { email, tenant_short_id }
+//
+// Privacy/enumeration mitigation: requires a valid tenant_short_id +
+// dedicated emailEnumLimiter (20/hour, counts ALL requests — unlike
+// authLimiter which exempts successful responses). The endpoint is gated
+// to require a tenant context — without a valid signup-link tenant, the
+// endpoint refuses. This matches the existing enumeration risk profile
+// of the signup flow itself (anyone with a signup link can already
+// attempt to register and observe the 409).
+//
+// Responses:
+//   200 { exists: false, tenant: {...} }
+//     → wizard continues as normal, will register a new account
+//   200 { exists: true, tenant: {...}, masked_alias: "Bob S",
+//         already_member: bool }
+//     → wizard pivots to "this email is registered, log in to attach"
+//   404 { error: 'Tenant not found' } — bad/missing tenant_short_id
+//   400 { error: ... } — malformed inputs
+//   429 — too many probes from this IP (via emailEnumLimiter)
+app.post('/api/onboarding/check-email-for-attach', emailEnumLimiter, async (req, res) => {
+    const email   = String((req.body && req.body.email) || '').trim().toLowerCase();
+    const shortId = String((req.body && req.body.tenant_short_id) || '').trim();
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'email is required' });
+    }
+    if (!/^\d{5}$/.test(shortId)) {
+        return res.status(400).json({ error: 'tenant_short_id must be 5 digits' });
+    }
+
+    try {
+        // 1. Resolve tenant. Refuse for inactive/missing tenants so this
+        //    endpoint can't be used as an enumeration oracle outside the
+        //    signup-link flow.
+        const tRes = await pool.query(
+            `SELECT id, short_id, slug, name, logo_url, primary_color, status
+               FROM tenants WHERE short_id = $1 LIMIT 1`,
+            [shortId]
+        );
+        if (tRes.rows.length === 0 || tRes.rows[0].status !== 'active') {
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        const tenant = tRes.rows[0];
+
+        // 2. Look up the user by email — single query joining players so we
+        //    can also mask the alias for the wizard confirmation copy.
+        const uRes = await pool.query(
+            `SELECT u.id AS user_id, p.id AS player_id, p.alias, p.full_name
+               FROM users u
+          LEFT JOIN players p ON p.user_id = u.id
+              WHERE u.email = $1
+              LIMIT 1`,
+            [email]
+        );
+
+        const tenantPayload = {
+            // tenant.id deliberately omitted — matches /api/onboarding/preview
+            // public-safe projection. Frontend uses tenant_short_id for the
+            // attach POST and doesn't need the UUID at this stage.
+            short_id:      tenant.short_id,
+            slug:          tenant.slug,
+            name:          tenant.name,
+            logo_url:      tenant.logo_url,
+            primary_color: tenant.primary_color,
+        };
+
+        if (uRes.rows.length === 0) {
+            // No account yet → wizard continues normally.
+            return res.json({ exists: false, tenant: tenantPayload });
+        }
+
+        const u = uRes.rows[0];
+
+        // 3. Already-member check. If they're an active member of this tenant
+        //    there's nothing for the wizard to do — just tell them to log in.
+        //    'left' or 'banned' rows: still surface "log in to attach" — the
+        //    POST /api/players/me/tenants endpoint will handle the actual
+        //    rejoin/reject logic on attempted attach.
+        let alreadyMember = false;
+        if (u.player_id) {
+            try {
+                const mRes = await pool.query(
+                    `SELECT status FROM player_tenants
+                      WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+                    [u.player_id, tenant.id]
+                );
+                alreadyMember = mRes.rows.length > 0 && mRes.rows[0].status === 'active';
+            } catch (e) {
+                // Pre-migration safety: player_tenants missing — assume
+                // not-member and let the attach step decide.
+                if (e && e.code !== '42P01' && e.code !== '42703') throw e;
+            }
+        }
+
+        // 4. Mask the alias for the wizard greeting. We deliberately do NOT
+        //    return any other identifying info (full_name, phone, etc).
+        //    Mask: first name + last-initial. "Bob Smith" → "Bob S".
+        //    Fallback chain mirrors what the wizard would display anyway.
+        const _name = (u.alias && u.alias.trim()) || (u.full_name && u.full_name.trim()) || '';
+        let maskedAlias = '';
+        if (_name) {
+            const parts = _name.split(/\s+/);
+            maskedAlias = parts[0];
+            if (parts.length > 1 && parts[1].length > 0) {
+                maskedAlias += ' ' + parts[1][0];
+            }
+        }
+
+        return res.json({
+            exists:         true,
+            tenant:         tenantPayload,
+            masked_alias:   maskedAlias,
+            already_member: alreadyMember,
+        });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        console.error('FIX-336 check-email-for-attach failed:', e.message);
+        res.status(500).json({ error: 'Lookup failed' });
+    }
+});
+
+
+app.post('/api/onboarding/join', authenticateToken, async (req, res) => {
+    const shortId = String(req.body?.tenant_short_id || '').trim();
+    if (!/^\d{5}$/.test(shortId)) return res.status(400).json({ error: 'tenant_short_id must be 5 digits' });
+
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        const tRes = await client.query(
+            `SELECT id, name, short_id, status FROM tenants WHERE short_id = $1 LIMIT 1`, [shortId]
+        );
+        if (tRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Tenant not found' });
+        }
+        const t = tRes.rows[0];
+        if (t.status !== 'active') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: `Tenant is ${t.status}` });
+        }
+
+        const existing = await client.query(
+            `SELECT status FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+            [req.user.playerId, t.id]
+        );
+        if (existing.rows.length > 0 && existing.rows[0].status === 'banned') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'You are banned from this tenant' });
+        }
+
+        // For onboarding-driven joins, default show_in_dashboard to TRUE — the
+        // player just expressed interest by going through the flow.
+        // BUT: on rejoin or already-active, do NOT overwrite the player's
+        // existing show_in_dashboard preference. The flow only sets that
+        // default on first-time insert.
+        const showInDashboard = req.body?.show_in_dashboard !== false;
+        const wasRejoin = existing.rows.length > 0 && existing.rows[0].status === 'left';
+
+        const ins = await client.query(
+            `INSERT INTO player_tenants (player_id, tenant_id, status, joined_at, show_in_dashboard)
+             VALUES ($1, $2, 'active', NOW(), $3)
+             ON CONFLICT (player_id, tenant_id) DO UPDATE
+                SET status    = 'active',
+                    joined_at = NOW()
+              WHERE player_tenants.status = 'left'
+              RETURNING *`,
+            [req.user.playerId, t.id, showInDashboard]
+        );
+
+        // Mark onboarding state as joined for this tenant
+        await client.query(
+            `UPDATE players SET onboarding_state = COALESCE(onboarding_state, '{}'::jsonb)
+                                 || jsonb_build_object('joined_' || $1::text, NOW()::text)
+              WHERE id = $2`,
+            [t.short_id, req.user.playerId]
+        );
+
+        // FIX-333 audit-fix (Day 19): assign tenant_player_id from sequence
+        // on first-ever tenant join. Same logic as Day 3 endpoint — keeps the
+        // two join entry points symmetric. Idempotent.
+        try {
+            await client.query(
+                `UPDATE players
+                    SET tenant_player_id = nextval('tenant_player_id_seq')
+                  WHERE id = $1 AND tenant_player_id IS NULL`,
+                [req.user.playerId]
+            );
+        } catch (e) {
+            if (e && e.code !== '42P01' && e.code !== '42703') throw e;
+        }
+
+        await client.query('COMMIT');
+
+        const action = wasRejoin ? 'tenant_rejoined' : 'tenant_joined';
+        setImmediate(() => auditLog(pool, req.user.playerId, action, req.user.playerId,
+            `${wasRejoin ? 'rejoined' : 'joined'} tenant ${t.name} via onboarding`, t.id));
+
+        return res.json({
+            tenant: { id: t.id, short_id: t.short_id, name: t.name },
+            membership: ins.rows[0],
+            rejoined: wasRejoin,
+        });
+    } catch (e) {
+        if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Onboarding feature not yet provisioned' });
+        }
+        console.error('FIX-325 onboarding join failed:', e.message);
+        res.status(500).json({ error: 'Failed to join tenant' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// GET /api/players/me/onboarding-state — wizard progress (JSONB blob)
+app.get('/api/players/me/onboarding-state', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(
+            'SELECT onboarding_state FROM players WHERE id = $1', [req.user.playerId]
+        );
+        const state = r.rows[0]?.onboarding_state || {};
+        res.json({ state });
+    } catch (e) {
+        if (e && e.code === '42703') return res.json({ state: {} });
+        console.error('FIX-325 onboarding state read failed:', e.message);
+        res.status(500).json({ error: 'Failed to read onboarding state' });
+    }
+});
+
+// PATCH /api/players/me/onboarding-state — merge keys into wizard state
+// Body: { state: { step1_done: true, ... } } — shallow merge
+app.patch('/api/players/me/onboarding-state', authenticateToken, async (req, res) => {
+    const incoming = req.body?.state;
+    if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+        return res.status(400).json({ error: 'state must be a JSON object' });
+    }
+    // FIX-326 Day 10 hardening: bound the merged blob.
+    //   - Per-request payload ≤ 8KB serialised  (prevents single big spam)
+    //   - Total merged state ≤ 32KB serialised  (prevents drip-feed accumulation)
+    //   - Max 100 distinct keys total          (prevents key-count abuse)
+    const serialised = JSON.stringify(incoming);
+    if (serialised.length > 8 * 1024) {
+        return res.status(413).json({ error: 'state payload too large (max 8KB per request)' });
+    }
+    //
+    // FIX-333 audit-fix (Pass 4): caps enforced WITHIN a transaction with
+    // FOR UPDATE on the player row. Without this, two concurrent PATCH calls
+    // could both pre-flight against the same baseline state, both pass the
+    // 32KB / 100-key cap check, then both merge — defeating the cap.
+    //
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // Lock the player row; subsequent PATCH waits here
+        const cur = await client.query(
+            'SELECT onboarding_state FROM players WHERE id = $1 FOR UPDATE',
+            [req.user.playerId]
+        );
+        const currentState = cur.rows[0]?.onboarding_state || {};
+        const mergedKeys = new Set([...Object.keys(currentState), ...Object.keys(incoming)]);
+        if (mergedKeys.size > 100) {
+            await client.query('ROLLBACK');
+            return res.status(413).json({ error: 'onboarding state would exceed 100 keys' });
+        }
+        const mergedPreview = { ...currentState, ...incoming };
+        if (JSON.stringify(mergedPreview).length > 32 * 1024) {
+            await client.query('ROLLBACK');
+            return res.status(413).json({ error: 'onboarding state would exceed 32KB total' });
+        }
+
+        const r = await client.query(
+            `UPDATE players
+                SET onboarding_state = COALESCE(onboarding_state, '{}'::jsonb) || $1::jsonb
+              WHERE id = $2
+              RETURNING onboarding_state`,
+            [serialised, req.user.playerId]
+        );
+
+        await client.query('COMMIT');
+        res.json({ state: r.rows[0]?.onboarding_state || {} });
+    } catch (e) {
+        if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+        if (e && e.code === '42703') return res.status(503).json({ error: 'Onboarding feature not yet provisioned' });
+        console.error('FIX-325 onboarding state write failed:', e.message);
+        res.status(500).json({ error: 'Failed to save onboarding state' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-325 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-326 — ROW Day 10: Verification + edge-case hardening
+// ═══════════════════════════════════════════════════════════════════════
+//
+// No new endpoints. Day 10 is the "audit & harden" day per the build plan.
+// Issues found and fixed in-place across Days 6/8/9 code:
+//
+//   • Day 6 POST /admin/tenants/:id/admins — refused to grant admin to
+//     a player currently banned from the tenant (prevents privilege
+//     escalation via the ON CONFLICT clause silently un-banning them).
+//
+//   • Day 8 _fix324BuildDsarExport — added per-table 10,000 row cap
+//     with truncation notice in the bundle (prevents OOM on Render).
+//
+//   • Day 9 PATCH /players/me/onboarding-state — capped per-request
+//     payload at 8KB, total merged state at 32KB, max 100 keys
+//     (prevents JSONB bloat via drip-feed PATCHes).
+//
+// All fixes are inline in their respective day blocks above. This block
+// exists so the FIX-326 tag has a home in the cumulative ledger.
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-326 markers
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-327 — ROW Day 11-13: Public organiser profile + game.html card
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Backend for organiser profile pages (Day 11) and game.html organiser card
+// (Days 12-13). Frontend pages added in /mnt/user-data/outputs/organiser.html
+// (new scaffold) and via small JS injection on game.html.
+//
+// Endpoints (all PUBLIC — no auth, but rate-limited):
+//   GET /api/public/organiser/:player_id           profile + aggregate stats
+//   GET /api/public/organiser/:player_id/reviews   recent reviews (placeholder
+//                                                   for Day 14 feedback widget;
+//                                                   returns [] until then)
+//   GET /api/public/game/:game_url/organiser       organiser card data for game.html
+//
+// Stats include: games organised, games this month, average review rating
+// (once Day 14 reviews exist), tenant they organise for (name + logo).
+// All projections explicit — never SELECT *.
+
+// GET /api/public/organiser/:player_id — full profile page data
+app.get('/api/public/organiser/:player_id', publicEndpointLimiter, async (req, res) => {
+    const playerId = req.params.player_id;
+    if (!isValidUuid(playerId)) return res.status(400).json({ error: 'Invalid player id' });
+
+    try {
+        // Validate player is actually an organiser (is_organiser=true OR has
+        // organiser/tenant_admin role in any active tenant). Otherwise 404 to
+        // avoid leaking "this player exists but isn't an organiser".
+        const isOrgRes = await pool.query(
+            `SELECT p.id, p.full_name, p.alias, p.photo_url, p.is_organiser,
+                    p.region_code,
+                    (SELECT COUNT(*) FROM player_tenants pt
+                       WHERE pt.player_id = p.id
+                         AND pt.role IN ('organiser', 'tenant_admin')
+                         AND pt.status = 'active') AS tenant_roles
+               FROM players p
+              WHERE p.id = $1
+              LIMIT 1`,
+            [playerId]
+        );
+        if (isOrgRes.rows.length === 0) return res.status(404).json({ error: 'Organiser not found' });
+        const p = isOrgRes.rows[0];
+        // Treat is_organiser=TRUE OR has any tenant org role as eligible
+        const eligible = p.is_organiser || parseInt(p.tenant_roles, 10) > 0;
+        if (!eligible) return res.status(404).json({ error: 'Organiser not found' });
+
+        // Aggregate stats: total games organised, games this month, first
+        // game organised (joined-as-organiser date proxy).
+        const statsRes = await pool.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE g.game_status = 'completed')                                          AS games_organised_total,
+                COUNT(*) FILTER (WHERE g.game_status = 'completed'
+                                   AND g.game_date >= DATE_TRUNC('month', NOW()))                           AS games_this_month,
+                MIN(g.game_date) FILTER (WHERE g.game_status = 'completed')                                  AS first_game_date,
+                MAX(g.game_date) FILTER (WHERE g.game_status = 'completed')                                  AS most_recent_game_date
+               FROM games g
+              WHERE g.default_organiser_id = $1`,
+            [playerId]
+        );
+        const stats = statsRes.rows[0] || {};
+
+        // FIX-328: real review stats from organiser_reviews (Day 14). Pre-migration
+        // tolerant — falls back to zero/null if table doesn't exist yet.
+        let reviewCount = 0, avgRating = null;
+        try {
+            const rStats = await pool.query(
+                `SELECT COUNT(*) AS cnt, ROUND(AVG(rating)::numeric, 1) AS avg
+                   FROM organiser_reviews
+                  WHERE organiser_player_id = $1`,
+                [playerId]
+            );
+            reviewCount = parseInt(rStats.rows[0]?.cnt || 0, 10);
+            const avgRaw = rStats.rows[0]?.avg;
+            avgRating = avgRaw != null ? parseFloat(avgRaw) : null;
+        } catch (e) {
+            if (!e || e.code !== '42P01') throw e;
+        }
+
+        // Tenant context: which tenants does this organiser run games for?
+        // For TF root (tenant_id IS NULL), label as "TotalFooty".
+        // FIX-327 audit-fix: filter to active tenants only — paused/exited
+        // tenants should not surface in public profiles. TF root (NULL) always
+        // counts as eligible.
+        const tenantsRes = await pool.query(
+            `SELECT DISTINCT t.id, t.short_id, t.slug, t.name, t.logo_url, t.primary_color,
+                    g.tenant_id AS game_tenant_id
+               FROM games g
+          LEFT JOIN tenants t ON t.id = g.tenant_id
+              WHERE g.default_organiser_id = $1
+                AND g.game_status IN ('completed', 'confirmed', 'available')
+                AND (g.tenant_id IS NULL OR t.status = 'active')`,
+            [playerId]
+        );
+
+        // FIX-335 Phase 3.1: verified-organiser status for public profile.
+        // The function takes (playerId, tenantId). For the global profile
+        // page (which spans all of an organiser's tenants), we pass NULL —
+        // _fix334CheckVerifiedOrganiser then falls back to the global
+        // default thresholds (20 games, 4.0 rating). Manual override takes
+        // precedence regardless of tenant context.
+        let verifiedInfo = { verified: false, reason: 'not_checked' };
+        try {
+            verifiedInfo = await _fix334CheckVerifiedOrganiser(playerId, null);
+        } catch (e) {
+            // Pre-migration tolerant — log but don't fail the whole profile.
+            console.warn('[FIX-335 Phase 3.1] verified check failed for profile:', e.message);
+        }
+
+        // Explicit projection — never leak raw DB rows publicly.
+        res.json({
+            organiser: {
+                player_id:  p.id,
+                full_name:  p.full_name,
+                alias:      p.alias,
+                photo_url:  p.photo_url,
+                region:     p.region_code,
+                // FIX-335 Phase 3.1: verified badge fields
+                verified:        !!verifiedInfo.verified,
+                verified_reason: verifiedInfo.reason || null,
+            },
+            stats: {
+                games_organised_total: parseInt(stats.games_organised_total || 0, 10),
+                games_this_month:      parseInt(stats.games_this_month || 0, 10),
+                first_game_date:       stats.first_game_date,
+                most_recent_game_date: stats.most_recent_game_date,
+                // FIX-328 (Day 14): real review stats from organiser_reviews
+                review_count:          reviewCount,
+                average_rating:        avgRating,
+            },
+            tenants: tenantsRes.rows.map(t => t.id ? {
+                short_id:      t.short_id,
+                slug:          t.slug,
+                name:          t.name,
+                logo_url:      t.logo_url,
+                primary_color: t.primary_color,
+            } : {
+                short_id:      null,
+                slug:          'totalfooty',
+                name:          'TotalFooty',
+                logo_url:      null,
+                primary_color: null,
+            }),
+        });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            // Tenant column not yet provisioned — return profile without tenant context
+            return res.status(503).json({ error: 'Organiser profile not yet available' });
+        }
+        console.error('FIX-327 organiser profile failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch organiser profile' });
+    }
+});
+
+// GET /api/public/organiser/:player_id/reviews — paginated review list
+// Day 14 (feedback widget) populates this. Until then returns empty array
+// so the public profile page can render the "no reviews yet" UI cleanly.
+app.get('/api/public/organiser/:player_id/reviews', publicEndpointLimiter, async (req, res) => {
+    const playerId = req.params.player_id;
+    if (!isValidUuid(playerId)) return res.status(400).json({ error: 'Invalid player id' });
+
+    let limit = parseInt(req.query.limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 10;
+    if (limit > 50) limit = 50;
+
+    try {
+        // Future: SELECT FROM organiser_reviews WHERE organiser_player_id = $1.
+        // Table doesn't exist until Day 14. Wrap in try/catch and return empty
+        // on 42P01.
+        const r = await pool.query(
+            `SELECT id, rating, comment, created_at
+               FROM organiser_reviews
+              WHERE organiser_player_id = $1
+              ORDER BY created_at DESC
+              LIMIT $2`,
+            [playerId, limit]
+        );
+        res.json({ reviews: r.rows, count: r.rows.length });
+    } catch (e) {
+        if (e && e.code === '42P01') {
+            return res.json({ reviews: [], count: 0, note: 'Reviews launching soon' });
+        }
+        console.error('FIX-327 organiser reviews failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch reviews' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-334 — ROW Day 26: Verified Organiser badge (check-on-demand per Q12=B)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Per Q12=B: check on every render (no cron drift). Per spec A.73: badge earned
+// when player has 20+ games run as organiser AND 4.0+ stars avg across reviews.
+// Thresholds are tenant-configurable (verified_threshold_games / _rating);
+// fallback to global defaults from any tenant (since spec says these are global
+// defaults Mitchell tunes once — A.73 doesn't define per-tenant variance, but
+// the schema allows it).
+//
+// Manual override: players.verified_organiser_manual_override
+//   TRUE  → forced verified regardless of stats (e.g. Saca on Day 1)
+//   FALSE → forced not-verified (sanction)
+//   NULL  → use threshold check
+//
+// Returns: { verified: bool, reason: 'manual_override'|'threshold_met'|'threshold_not_met'|'no_thresholds_configured',
+//            games_count: int, rating_avg: float|null }
+async function _fix334CheckVerifiedOrganiser(playerId, tenantId) {
+    if (!playerId || !isValidUuid(playerId)) {
+        return { verified: false, reason: 'invalid_player_id', games_count: 0, rating_avg: null };
+    }
+    try {
+        // 1. Manual override check
+        const overRes = await pool.query(
+            `SELECT verified_organiser_manual_override FROM players WHERE id = $1 LIMIT 1`,
+            [playerId]
+        );
+        if (overRes.rows.length === 0) {
+            return { verified: false, reason: 'player_not_found', games_count: 0, rating_avg: null };
+        }
+        const override = overRes.rows[0].verified_organiser_manual_override;
+        if (override === true) {
+            return { verified: true, reason: 'manual_override', games_count: null, rating_avg: null };
+        }
+        if (override === false) {
+            return { verified: false, reason: 'manual_override', games_count: null, rating_avg: null };
+        }
+
+        // 2. Threshold check — read thresholds from this tenant (or fall back
+        //    to global defaults if no tenant)
+        let thresholdGames  = 20;
+        let thresholdRating = 4.0;
+        if (tenantId && isValidUuid(tenantId)) {
+            try {
+                const tRes = await pool.query(
+                    `SELECT verified_threshold_games, verified_threshold_rating
+                       FROM tenants WHERE id = $1 LIMIT 1`,
+                    [tenantId]
+                );
+                if (tRes.rows.length > 0) {
+                    thresholdGames  = parseInt(tRes.rows[0].verified_threshold_games, 10)  || 20;
+                    thresholdRating = parseFloat(tRes.rows[0].verified_threshold_rating)   || 4.0;
+                }
+            } catch (e) {
+                if (e && e.code !== '42703') throw e;
+            }
+        }
+
+        // 3. Games run as organiser (default_organiser_id match, status='completed')
+        const gRes = await pool.query(
+            `SELECT COUNT(*)::int AS n
+               FROM games
+              WHERE default_organiser_id = $1
+                AND game_status = 'completed'`,
+            [playerId]
+        );
+        const gamesCount = gRes.rows[0].n;
+
+        // 4. Average rating across organiser_reviews
+        const rRes = await pool.query(
+            `SELECT AVG(rating)::float AS avg_rating, COUNT(*)::int AS review_count
+               FROM organiser_reviews
+              WHERE organiser_player_id = $1`,
+            [playerId]
+        );
+        const ratingAvg = rRes.rows[0].avg_rating;
+        const reviewCount = rRes.rows[0].review_count;
+
+        const hasEnoughGames = gamesCount  >= thresholdGames;
+        const hasEnoughStars = ratingAvg !== null && ratingAvg >= thresholdRating;
+        const verified = hasEnoughGames && hasEnoughStars;
+
+        return {
+            verified,
+            reason: verified ? 'threshold_met' : 'threshold_not_met',
+            games_count:   gamesCount,
+            rating_avg:    ratingAvg,
+            review_count:  reviewCount,
+            thresholds:    { games: thresholdGames, rating: thresholdRating },
+        };
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            // organiser_reviews table missing — pre-FIX-327. Not verified.
+            return { verified: false, reason: 'reviews_not_provisioned', games_count: 0, rating_avg: null };
+        }
+        console.error('FIX-334 verified-organiser check failed:', e.message);
+        return { verified: false, reason: 'error', games_count: 0, rating_avg: null };
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-335 — Wave 3 Phase 1: Per-player verified-organiser status read
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The Wave 2 helper _fix334CheckVerifiedOrganiser above is only invoked from
+// /api/public/game/:url/organiser (game-scoped). The CRM verified-override
+// panel needs to show:
+//   - the player's current override value (TRUE / FALSE / NULL),
+//   - whether the threshold check would otherwise pass (games + rating),
+// so Mitchell can decide whether the override is even necessary.
+//
+// Returns the same shape as the helper, plus the player's basic identity and
+// the raw override column value. Read-only — POST /verified-override below
+// is what actually mutates.
+//
+// Query params:
+//   ?tenant_id=<uuid>  (optional — uses tenant-specific thresholds if provided;
+//                       otherwise the helper falls back to global defaults of
+//                       20 games / 4.0 stars)
+app.get('/api/admin/players/:id/verified-status',
+    authenticateToken, requireSuperAdmin, async (req, res) => {
+        const playerId = String(req.params.id || '').trim();
+        if (!isValidUuid(playerId)) return res.status(400).json({ error: 'Invalid player id' });
+        const tenantId = req.query.tenant_id;
+        if (tenantId && !isValidUuid(tenantId)) {
+            return res.status(400).json({ error: 'tenant_id must be a valid UUID' });
+        }
+
+        try {
+            const p = await pool.query(
+                `SELECT id, alias, full_name, verified_organiser_manual_override
+                   FROM players WHERE id = $1 LIMIT 1`,
+                [playerId]
+            );
+            if (p.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+            const player = p.rows[0];
+
+            // Run the canonical check — same logic the public game page uses,
+            // so what Mitchell sees here matches what end users see on game.html.
+            const status = await _fix334CheckVerifiedOrganiser(playerId, tenantId || null);
+
+            res.json({
+                player: {
+                    id:        player.id,
+                    alias:     player.alias,
+                    full_name: player.full_name,
+                },
+                override:         player.verified_organiser_manual_override,
+                current_verified: status.verified,
+                reason:           status.reason,
+                games_count:      status.games_count,
+                rating_avg:       status.rating_avg,
+                review_count:     status.review_count || 0,
+                thresholds:       status.thresholds   || null,
+            });
+        } catch (e) {
+            if (e && e.code === '42703') {
+                return res.status(503).json({ error: 'Verified-status feature not yet provisioned' });
+            }
+            console.error('FIX-335 verified-status failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch verified status' });
+        }
+    }
+);
+
+// POST /api/admin/players/:id/verified-override
+//
+// Body: { override: true|false|null, reason?: string }
+//
+// Superadmin manual override of verified-organiser status. Per A.73: "Mitchell
+// can override — manual badge grant/revoke per organiser (for edge cases —
+// proven operators on Day 1)". E.g. Saca gets badge immediately even though
+// he hasn't run 20 games on TF yet.
+app.post('/api/admin/players/:id/verified-override',
+    authenticateToken, requireSuperAdmin, async (req, res) => {
+        const playerId = String(req.params.id || '').trim();
+        if (!isValidUuid(playerId)) return res.status(400).json({ error: 'Invalid player id' });
+        const override = req.body && req.body.override;
+        if (override !== true && override !== false && override !== null) {
+            return res.status(400).json({ error: 'override must be true, false, or null' });
+        }
+        const reason = (req.body && typeof req.body.reason === 'string')
+            ? req.body.reason.trim().slice(0, 1000) : '';
+
+        try {
+            const r = await pool.query(
+                `UPDATE players SET verified_organiser_manual_override = $1
+                  WHERE id = $2
+                  RETURNING id, alias, full_name, verified_organiser_manual_override`,
+                [override, playerId]
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+            setImmediate(() => auditLog(pool, req.user.playerId, 'verified_organiser_override',
+                playerId, `Override set to ${override === null ? 'null (use thresholds)' : override}${reason ? `: ${reason}` : ''}`).catch(() => {}));
+            res.json({ player: r.rows[0] });
+        } catch (e) {
+            if (e && e.code === '42703') {
+                return res.status(503).json({ error: 'Verified-override feature not yet provisioned' });
+            }
+            console.error('FIX-334 verified override failed:', e.message);
+            res.status(500).json({ error: 'Failed to set override' });
+        }
+    }
+);
+
+// GET /api/t/:tenant_short_id/admin/disabled-awards
+//
+// Returns the tenant's current disabled-awards list (array of award_type strings).
+app.get('/api/t/:tenant_short_id/admin/disabled-awards',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT disabled_awards FROM tenants WHERE id = $1 LIMIT 1`,
+                [req.tenant.id]
+            );
+            res.json({ disabled_awards: r.rows[0]?.disabled_awards || [] });
+        } catch (e) {
+            if (e && e.code === '42703') return res.json({ disabled_awards: [] });
+            console.error('FIX-334 get disabled awards failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch disabled awards' });
+        }
+    }
+);
+
+// PUT /api/t/:tenant_short_id/admin/disabled-awards
+//
+// Body: { disabled: [award_type, ...] }
+//
+// Replaces the disabled-awards list. Award types must match the AWARD_TYPES
+// constant (existing 17-award list — validated here to reject typos).
+app.put('/api/t/:tenant_short_id/admin/disabled-awards',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const disabled = req.body && req.body.disabled;
+        if (!Array.isArray(disabled)) {
+            return res.status(400).json({ error: 'disabled must be an array of award_type strings' });
+        }
+        // Validate every entry matches a known award type
+        const validTypes = new Set(AWARD_TYPES);
+        const cleaned = [];
+        for (const t of disabled) {
+            if (typeof t !== 'string') {
+                return res.status(400).json({ error: 'each disabled entry must be a string' });
+            }
+            if (!validTypes.has(t)) {
+                return res.status(400).json({ error: `Unknown award_type: ${t}` });
+            }
+            if (!cleaned.includes(t)) cleaned.push(t);
+        }
+        // Refuse to disable 'motm' — too central to game UX. Mitchell can override
+        // via direct DB if absolutely needed.
+        if (cleaned.includes('motm')) {
+            return res.status(400).json({ error: 'motm cannot be disabled (core game flow)' });
+        }
+
+        try {
+            const r = await pool.query(
+                `UPDATE tenants SET disabled_awards = $1::jsonb WHERE id = $2
+                  RETURNING disabled_awards`,
+                [JSON.stringify(cleaned), req.tenant.id]
+            );
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_disabled_awards_updated',
+                req.tenant.id, `Disabled: ${cleaned.join(', ') || '(none)'}`, req.tenant.id).catch(() => {}));
+            res.json({ disabled_awards: r.rows[0].disabled_awards });
+        } catch (e) {
+            if (e && e.code === '42703') {
+                return res.status(503).json({ error: 'Per-award toggle not yet provisioned' });
+            }
+            console.error('FIX-334 set disabled awards failed:', e.message);
+            res.status(500).json({ error: 'Failed to save disabled awards' });
+        }
+    }
+);
+
+// GET /api/public/game/:game_url/organiser — compact card payload for game.html
+// Used by the new "Organised by X" card on game.html (Days 12-13).
+// Returns minimal info so game.html can render quickly without extra calls.
+app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (req, res) => {
+    const gameUrl = req.params.game_url;
+    if (!gameUrl || gameUrl.length > 100) return res.status(400).json({ error: 'Invalid game_url' });
+
+    try {
+        const r = await pool.query(
+            `SELECT g.id, g.default_organiser_id,
+                    p.full_name AS organiser_full_name,
+                    p.alias     AS organiser_alias,
+                    p.photo_url AS organiser_photo,
+                    p.phone     AS organiser_phone,
+                    p.phone_public_for_organising AS organiser_phone_consent,
+                    p.is_organiser,
+                    t.id AS tenant_id, t.short_id AS tenant_short_id,
+                    t.name AS tenant_name, t.logo_url AS tenant_logo,
+                    t.primary_color AS tenant_primary_color,
+                    t.status AS tenant_status
+               FROM games g
+          LEFT JOIN players p ON p.id = g.default_organiser_id
+          LEFT JOIN tenants t ON t.id = g.tenant_id
+              WHERE g.game_url = $1
+              LIMIT 1`,
+            [gameUrl]
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const row = r.rows[0];
+        // FIX-327 audit-fix: treat tenant as effectively-NULL if its status is
+        // not 'active' (paused/exited). Player still sees the card via the
+        // "TotalFooty" fallback; tenant name/logo doesn't leak.
+        const tenantActive = row.tenant_id && row.tenant_status === 'active';
+        if (!row.default_organiser_id) {
+            // Game has no assigned organiser — return a tenant-fallback card
+            return res.json({
+                organiser: null,
+                tenant: tenantActive ? {
+                    short_id: row.tenant_short_id, name: row.tenant_name,
+                    logo_url: row.tenant_logo, primary_color: row.tenant_primary_color,
+                } : { short_id: null, name: 'TotalFooty', logo_url: null, primary_color: null },
+            });
+        }
+        // FIX-328 (Day 14): phone now returned ONLY when organiser opted in
+        // via the phone_public_for_organising consent toggle. Default FALSE on
+        // schema migration → existing TF organisers stay opted-out until they
+        // explicitly opt in via /api/player/preferences PATCH.
+        const phoneOk = row.organiser_phone_consent && row.organiser_phone;
+
+        // FIX-334 (ROW Day 26): verified badge (check-on-demand per Q12=B)
+        const verifiedCheck = await _fix334CheckVerifiedOrganiser(
+            row.default_organiser_id, row.tenant_id
+        );
+
+        res.json({
+            organiser: {
+                player_id: row.default_organiser_id,
+                full_name: row.organiser_full_name,
+                alias:     row.organiser_alias,
+                photo_url: row.organiser_photo,
+                phone:     phoneOk ? row.organiser_phone : null,
+                is_organiser: !!row.is_organiser,
+                verified:    verifiedCheck.verified,
+                verified_reason: verifiedCheck.reason,
+            },
+            tenant: tenantActive ? {
+                short_id:      row.tenant_short_id,
+                name:          row.tenant_name,
+                logo_url:      row.tenant_logo,
+                primary_color: row.tenant_primary_color,
+            } : {
+                short_id: null, name: 'TotalFooty',
+                logo_url: null, primary_color: null,
+            },
+        });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Tenant feature not yet provisioned' });
+        }
+        console.error('FIX-327 organiser card failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch organiser card' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-327 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-328 — ROW Day 14: Organiser feedback widget + tenant admin review panel
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Endpoints:
+//   POST   /api/games/:gameUrl/organiser-review     submit/edit review
+//   GET    /api/games/:gameUrl/my-review            fetch own review for game
+//   GET    /api/t/:short_id/admin/organiser-reviews tenant admin list
+//
+// Phone consent: added to existing /api/player/preferences PATCH whitelist
+// (see FIX-328 audit-fix in preferences endpoint above).
+//
+// Days 11-13 endpoints automatically pick up real data via SQL once the
+// migration runs — see FIX-328 audit-fix patches on those endpoints.
+
+// POST /api/games/:gameUrl/organiser-review
+// Body: { rating: 1-5, comment?: string, allow_tenant_contact?: boolean }
+// Idempotent: upserts (one review per game per reviewer).
+//
+// Validation:
+//   - Game must be 'completed'
+//   - Reviewer must have a CONFIRMED registration in the game
+//   - Cannot review yourself
+//   - Comment ≤ 500 chars
+//   - Rating 1-5 integer
+//
+// Side effect (A.50): if allow_tenant_contact === false AND the game is tenant-
+// scoped, flip player_tenants.allow_tenant_contact for that (player, tenant).
+// This is the "easily turned off via organiser review on game.html" mechanism.
+app.post('/api/games/:gameUrl/organiser-review', authenticateToken, async (req, res) => {
+    const gameUrl = req.params.gameUrl;
+    if (!gameUrl || gameUrl.length > 100) return res.status(400).json({ error: 'Invalid gameUrl' });
+
+    const rating = parseInt(req.body?.rating, 10);
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+        return res.status(400).json({ error: 'rating must be an integer 1-5' });
+    }
+
+    const rawComment = req.body?.comment;
+    if (rawComment != null && typeof rawComment !== 'string') {
+        return res.status(400).json({ error: 'comment must be a string' });
+    }
+    const safeComment = (rawComment || '').trim().slice(0, 500);
+
+    // Optional allow_tenant_contact toggle — only effects tenant-scoped games
+    const allowContact = req.body?.allow_tenant_contact;
+    const allowContactSet = typeof allowContact === 'boolean';
+
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // Load game + organiser + tenant context
+        const gRes = await client.query(
+            `SELECT g.id, g.game_status, g.default_organiser_id, g.tenant_id
+               FROM games g
+              WHERE g.game_url = $1
+              LIMIT 1`,
+            [gameUrl]
+        );
+        if (gRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Game not found' });
+        }
+        const g = gRes.rows[0];
+        if (g.game_status !== 'completed') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Reviews can only be submitted after the game has completed' });
+        }
+        if (!g.default_organiser_id) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This game has no assigned organiser to review' });
+        }
+        if (g.default_organiser_id === req.user.playerId) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'You cannot review yourself' });
+        }
+
+        // Must have played in this game (confirmed registration)
+        const partRes = await client.query(
+            `SELECT 1 FROM registrations
+              WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
+              LIMIT 1`,
+            [g.id, req.user.playerId]
+        );
+        if (partRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'Only confirmed participants can review the organiser' });
+        }
+
+        // UPSERT review
+        const isEdit = await client.query(
+            'SELECT id FROM organiser_reviews WHERE game_id = $1 AND reviewer_player_id = $2 LIMIT 1',
+            [g.id, req.user.playerId]
+        );
+        const wasEdit = isEdit.rows.length > 0;
+
+        const insRes = await client.query(
+            `INSERT INTO organiser_reviews
+                (game_id, organiser_player_id, reviewer_player_id, tenant_id, rating, comment)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (game_id, reviewer_player_id)
+             DO UPDATE SET rating     = EXCLUDED.rating,
+                           comment    = EXCLUDED.comment,
+                           updated_at = NOW()
+             RETURNING id, rating, comment, created_at, updated_at`,
+            [g.id, g.default_organiser_id, req.user.playerId, g.tenant_id, rating, safeComment]
+        );
+
+        // A.50 side-effect: flip allow_tenant_contact if requested and game is tenant-scoped
+        if (allowContactSet && g.tenant_id) {
+            await client.query(
+                `UPDATE player_tenants
+                    SET allow_tenant_contact = $1
+                  WHERE player_id = $2 AND tenant_id = $3 AND status = 'active'`,
+                [allowContact, req.user.playerId, g.tenant_id]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        const action = wasEdit ? 'organiser_review_updated' : 'organiser_review_received';
+        setImmediate(() => auditLog(pool, req.user.playerId, action, g.default_organiser_id,
+            `Rated organiser ${rating}★${safeComment ? ' — ' + safeComment.slice(0, 80) : ''}`,
+            g.tenant_id));
+
+        res.json({
+            review: insRes.rows[0],
+            edited: wasEdit,
+            allow_tenant_contact_updated: allowContactSet && !!g.tenant_id,
+        });
+    } catch (e) {
+        if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Review feature not yet provisioned' });
+        }
+        console.error('FIX-328 review submit failed:', e.message);
+        res.status(500).json({ error: 'Failed to submit review' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// GET /api/games/:gameUrl/my-review — fetch caller's review for this game
+// Returns 200 with null review if not yet submitted; 200 with review if yes.
+// Used by the game.html widget to render the right state (submit vs edit).
+app.get('/api/games/:gameUrl/my-review', authenticateToken, async (req, res) => {
+    const gameUrl = req.params.gameUrl;
+    if (!gameUrl || gameUrl.length > 100) return res.status(400).json({ error: 'Invalid gameUrl' });
+    try {
+        const r = await pool.query(
+            `SELECT orv.id, orv.rating, orv.comment, orv.created_at, orv.updated_at
+               FROM organiser_reviews orv
+               JOIN games g ON g.id = orv.game_id
+              WHERE g.game_url = $1 AND orv.reviewer_player_id = $2
+              LIMIT 1`,
+            [gameUrl, req.user.playerId]
+        );
+        res.json({ review: r.rows[0] || null });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ review: null });
+        console.error('FIX-328 my-review failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch review' });
+    }
+});
+
+// GET /api/t/:tenant_short_id/admin/organiser-reviews — tenant admin panel
+// Lists recent reviews for organisers in this tenant.
+app.get('/api/t/:tenant_short_id/admin/organiser-reviews',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        let limit  = parseInt(req.query.limit, 10);
+        let offset = parseInt(req.query.offset, 10);
+        if (!Number.isFinite(limit)  || limit  <= 0) limit  = 50;
+        if (!Number.isFinite(offset) || offset < 0)  offset = 0;
+        if (limit > 200) limit = 200;
+
+        try {
+            const r = await pool.query(
+                `SELECT orv.id, orv.game_id, orv.organiser_player_id,
+                        orv.rating, orv.comment, orv.created_at, orv.updated_at,
+                        po.full_name AS organiser_full_name,
+                        po.alias     AS organiser_alias,
+                        pr.full_name AS reviewer_full_name,
+                        pr.alias     AS reviewer_alias,
+                        g.game_url, g.game_date
+                   FROM organiser_reviews orv
+                   JOIN players po ON po.id = orv.organiser_player_id
+                   JOIN players pr ON pr.id = orv.reviewer_player_id
+                   JOIN games   g  ON g.id  = orv.game_id
+                  WHERE orv.tenant_id = $1
+                  ORDER BY orv.created_at DESC
+                  LIMIT $2 OFFSET $3`,
+                [req.tenant.id, limit, offset]
+            );
+            res.json({ reviews: r.rows, count: r.rows.length });
+        } catch (e) {
+            if (e && e.code === '42P01') return res.json({ reviews: [], count: 0 });
+            console.error('FIX-328 tenant reviews list failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch reviews' });
+        }
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-328 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-329 — ROW Day 15: Tenant organiser management endpoints
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Tenant admin can:
+//   GET    /api/t/:short_id/admin/organisers        list active organisers
+//   POST   /api/t/:short_id/admin/organisers        grant organiser role
+//   DELETE /api/t/:short_id/admin/organisers/:pid   revoke organiser role
+//   GET    /api/t/:short_id/admin/allowance         read dial values
+//   PATCH  /api/t/:short_id/admin/allowance         update dial values
+//
+// The allowance MASTER toggle (organiser_allowance_enabled) is superadmin-
+// only via PATCH /api/admin/tenants/:id (FIX-322). Tenant admin tunes the
+// DIAL VALUES only — same model as Stripe Connect: platform owner controls
+// whether the feature exists, tenant owner controls how aggressively to use it.
+
+// GET /api/t/:tenant_short_id/admin/organisers — list this tenant's organisers
+app.get('/api/t/:tenant_short_id/admin/organisers',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT pt.player_id, pt.role, pt.joined_at,
+                        p.full_name, p.alias, u.email, p.phone, p.photo_url
+                   FROM player_tenants pt
+                   JOIN players p ON p.id = pt.player_id
+                   JOIN users   u ON u.id = p.user_id
+                  WHERE pt.tenant_id = $1
+                    AND pt.status = 'active'
+                    AND pt.role IN ('organiser', 'tenant_admin')
+                  ORDER BY pt.role DESC, p.full_name ASC`,
+                [req.tenant.id]
+            );
+            res.json({ organisers: r.rows });
+        } catch (e) {
+            console.error('FIX-329 list organisers failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch organisers' });
+        }
+    }
+);
+
+// POST /api/t/:tenant_short_id/admin/organisers — grant organiser role
+// Body: { player_id }
+// Sets role='organiser' on the junction (does NOT grant tenant_admin — that's
+// superadmin-only via /api/admin/tenants/:id/admins).
+//
+// FIX-329 audit-fix: tenant admin can ONLY grant organiser to players who are
+// already ACTIVE members of this tenant. Without this check, a tenant admin
+// could insert any stranger as organiser, granting them tenant-data access
+// via requireTenantOrganiser. Superadmin's grant-admin endpoint (Day 6) is
+// allowed to bootstrap from scratch because that IS the entry point; tenant
+// admins must work within their existing member pool.
+app.post('/api/t/:tenant_short_id/admin/organisers',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const playerId = String(req.body?.player_id || '').trim();
+        if (!isValidUuid(playerId)) return res.status(400).json({ error: 'player_id must be a UUID' });
+
+        try {
+            const pRes = await pool.query('SELECT id, full_name, alias FROM players WHERE id = $1', [playerId]);
+            if (pRes.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+            // FIX-329 audit-fix: player MUST already be an active member.
+            const existing = await pool.query(
+                `SELECT status, role FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+                [playerId, req.tenant.id]
+            );
+            if (existing.rows.length === 0) {
+                return res.status(404).json({ error: 'Player is not a member of this tenant — they must join first' });
+            }
+            if (existing.rows[0].status !== 'active') {
+                return res.status(409).json({ error: `Player membership is ${existing.rows[0].status} — cannot grant organiser role` });
+            }
+            // Refuse to demote a tenant_admin to organiser (would lose their admin rights)
+            if (existing.rows[0].role === 'tenant_admin') {
+                return res.status(409).json({ error: 'Player is already a tenant admin (higher privilege)' });
+            }
+
+            // Player is already in the junction — UPDATE rather than INSERT.
+            // (No ON CONFLICT needed; we know the row exists.)
+            const upd = await pool.query(
+                `UPDATE player_tenants SET role = 'organiser'
+                  WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'
+                  RETURNING *`,
+                [playerId, req.tenant.id]
+            );
+
+            const displayName = pRes.rows[0].alias || pRes.rows[0].full_name || playerId;
+            setImmediate(() => auditLog(pool, req.user.playerId, 'organiser_granted', playerId,
+                `Granted organiser role to ${displayName}`, req.tenant.id));
+
+            res.status(201).json({ membership: upd.rows[0] });
+        } catch (e) {
+            console.error('FIX-329 grant organiser failed:', e.message);
+            res.status(500).json({ error: 'Failed to grant organiser role' });
+        }
+    }
+);
+
+// DELETE /api/t/:tenant_short_id/admin/organisers/:player_id — revoke
+// Demotes to 'player'. Does NOT remove from tenant (use Day 6 admin remove for that).
+app.delete('/api/t/:tenant_short_id/admin/organisers/:player_id',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        if (!isValidUuid(req.params.player_id)) return res.status(400).json({ error: 'Invalid player_id' });
+
+        try {
+            // Refuse to demote a tenant_admin via this endpoint (use FIX-322 admin revoke)
+            const cur = await pool.query(
+                'SELECT role FROM player_tenants WHERE tenant_id = $1 AND player_id = $2',
+                [req.tenant.id, req.params.player_id]
+            );
+            if (cur.rows.length === 0) return res.status(404).json({ error: 'Membership not found' });
+            if (cur.rows[0].role === 'tenant_admin') {
+                return res.status(409).json({ error: 'Use admin removal endpoint to demote a tenant admin' });
+            }
+
+            const r = await pool.query(
+                `UPDATE player_tenants SET role = 'player'
+                  WHERE tenant_id = $1 AND player_id = $2 AND role = 'organiser'
+                  RETURNING *`,
+                [req.tenant.id, req.params.player_id]
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Not currently an organiser' });
+
+            setImmediate(() => auditLog(pool, req.user.playerId, 'organiser_revoked',
+                req.params.player_id, `Revoked organiser role`, req.tenant.id));
+
+            res.json({ membership: r.rows[0] });
+        } catch (e) {
+            console.error('FIX-329 revoke organiser failed:', e.message);
+            res.status(500).json({ error: 'Failed to revoke organiser role' });
+        }
+    }
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-334 — ROW Day 23: Tenant member ban + Manage Players view-only
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Q5: tenant ban = tenant-scoped only. Player can still play in other tenants.
+// No 3-strikes platform exclusion.
+//
+// Q from session Turn 113 + Turn 125:
+//   - Tenant admin can ban a player from their tenant (player_tenants.status='banned')
+//   - Tenant admin can view their members' stats (NO rating values per A.68)
+//   - Tenant admin can NOT edit player ratings, balance, or anything beyond their tenant
+
+// GET /api/t/:tenant_short_id/admin/members
+//
+// Query params:
+//   ?status=active|banned|left|all (default: active)
+//   ?limit, ?offset
+//   ?search=alias_or_name_fragment (case-insensitive LIKE)
+//
+// Returns stats but NO rating values (A.68: tenant admins see ratings, but the
+// FA-acquisition philosophy is that ratings are internal-only signal — we
+// expose only outcome-based stats here: wins, MOTM, attendance, awards).
+app.get('/api/t/:tenant_short_id/admin/members',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const allowedStatuses = ['active', 'banned', 'left', 'all'];
+            const status = allowedStatuses.includes(req.query.status) ? req.query.status : 'active';
+            const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+            const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+            const search = typeof req.query.search === 'string'
+                ? req.query.search.trim().toLowerCase().slice(0, 100) : '';
+
+            const where  = ['pt.tenant_id = $1'];
+            const params = [req.tenant.id];
+            let pi = 2;
+            if (status !== 'all') {
+                where.push(`pt.status = $${pi++}`);
+                params.push(status);
+            }
+            if (search) {
+                where.push(`(LOWER(p.alias) LIKE $${pi} OR LOWER(p.full_name) LIKE $${pi})`);
+                params.push(`%${search}%`);
+                pi++;
+            }
+            params.push(limit, offset);
+
+            const r = await pool.query(
+                `SELECT pt.player_id, pt.role, pt.status, pt.joined_at,
+                        pt.show_in_dashboard, pt.allow_tenant_contact,
+                        p.alias, p.full_name, p.squad_number, p.player_number_text,
+                        p.tenant_player_id, p.player_number, p.is_organiser,
+                        p.region_code,
+                        (SELECT COUNT(*) FROM registrations r
+                          JOIN games g ON g.id = r.game_id
+                         WHERE r.player_id = pt.player_id
+                           AND r.status = 'confirmed'
+                           AND g.game_status = 'completed'
+                           AND g.tenant_id = $1) AS appearances,
+                        (SELECT COUNT(*) FROM motm_votes mv
+                         WHERE mv.voted_for_player_id = pt.player_id
+                           AND mv.game_id IN (SELECT id FROM games WHERE tenant_id = $1)) AS motm_votes_received,
+                        (SELECT COUNT(*) FROM trophy_awards ta
+                         WHERE ta.player_id = pt.player_id) AS total_trophies
+                   FROM player_tenants pt
+                   JOIN players p ON p.id = pt.player_id
+                  WHERE ${where.join(' AND ')}
+                  ORDER BY pt.role DESC, pt.joined_at ASC
+                  LIMIT $${pi++} OFFSET $${pi}`,
+                params
+            );
+
+            res.json({
+                members: r.rows,
+                status_filter: status,
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.json({ members: [], status_filter: 'active' });
+            }
+            console.error('FIX-334 members list failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch members' });
+        }
+    }
+);
+
+// POST /api/t/:tenant_short_id/admin/members/:player_id/ban
+//
+// Body: { reason: string }  (required, 1-1000 chars)
+//
+// Transitions player_tenants.status: active → banned.
+// Banned players cannot register for the tenant's games (gated by status='active'
+// check in registration paths). They keep their account and can still play
+// games in OTHER tenants.
+//
+// Refuses if:
+//   - Player not in this tenant (404)
+//   - Already banned (409)
+//   - Player is a tenant_admin of this tenant (403 — must demote via /organisers first)
+app.post('/api/t/:tenant_short_id/admin/members/:player_id/ban',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const playerId = String(req.params.player_id || '').trim();
+        if (!isValidUuid(playerId)) {
+            return res.status(400).json({ error: 'Invalid player_id' });
+        }
+        const reason = (req.body && typeof req.body.reason === 'string')
+            ? req.body.reason.trim().slice(0, 1000) : '';
+        if (!reason) return res.status(400).json({ error: 'reason is required' });
+
+        try {
+            // Check current membership state
+            const cur = await pool.query(
+                `SELECT role, status FROM player_tenants
+                  WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+                [playerId, req.tenant.id]
+            );
+            if (cur.rows.length === 0) {
+                return res.status(404).json({ error: 'Player is not a member of this tenant' });
+            }
+            if (cur.rows[0].status === 'banned') {
+                return res.status(409).json({ error: 'Player is already banned' });
+            }
+            if (cur.rows[0].role === 'tenant_admin') {
+                return res.status(403).json({
+                    error: 'Cannot ban a tenant admin. Demote them via the organisers endpoint first.'
+                });
+            }
+
+            // Set status='banned'; clear show_in_dashboard so the tenant disappears
+            // from their UI (they shouldn't see games they can't register for)
+            //
+            // FIX-334 audit-fix (Day 30 Pass 3 SM 2): the pre-check above runs
+            // on a separate query from this UPDATE — race window for concurrent
+            // ban + role-change. Add WHERE-clause defense so the UPDATE refuses
+            // to flip a tenant_admin or re-ban a banned player.
+            const r = await pool.query(
+                `UPDATE player_tenants
+                    SET status = 'banned',
+                        show_in_dashboard = FALSE
+                  WHERE player_id = $1 AND tenant_id = $2
+                    AND status != 'banned'
+                    AND role != 'tenant_admin'
+                  RETURNING player_id, tenant_id, role, status`,
+                [playerId, req.tenant.id]
+            );
+            if (r.rows.length === 0) {
+                // Race lost — re-check current state for a precise error
+                const recheck = await pool.query(
+                    `SELECT role, status FROM player_tenants
+                      WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+                    [playerId, req.tenant.id]
+                );
+                if (recheck.rows.length === 0) {
+                    return res.status(404).json({ error: 'Player is not a member of this tenant' });
+                }
+                if (recheck.rows[0].status === 'banned') {
+                    return res.status(409).json({ error: 'Player is already banned (concurrent update)' });
+                }
+                if (recheck.rows[0].role === 'tenant_admin') {
+                    return res.status(403).json({ error: 'Cannot ban a tenant admin (concurrent role change)' });
+                }
+                return res.status(409).json({ error: 'Ban refused — membership state changed' });
+            }
+
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_member_banned', playerId,
+                `Banned from tenant: ${reason}`, req.tenant.id).catch(() => {}));
+
+            res.json({ membership: r.rows[0], reason });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Ban feature not yet provisioned (run FIX-334 migration)' });
+            }
+            console.error('FIX-334 ban-member failed:', e.message);
+            res.status(500).json({ error: 'Failed to ban member' });
+        }
+    }
+);
+
+// POST /api/t/:tenant_short_id/admin/members/:player_id/unban
+//
+// Body: { reason?: string }
+//
+// Transitions player_tenants.status: banned → active.
+// Re-enables `show_in_dashboard` so the player sees the tenant's games again.
+app.post('/api/t/:tenant_short_id/admin/members/:player_id/unban',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const playerId = String(req.params.player_id || '').trim();
+        if (!isValidUuid(playerId)) {
+            return res.status(400).json({ error: 'Invalid player_id' });
+        }
+        const reason = (req.body && typeof req.body.reason === 'string')
+            ? req.body.reason.trim().slice(0, 1000) : '';
+
+        try {
+            const r = await pool.query(
+                `UPDATE player_tenants
+                    SET status = 'active',
+                        show_in_dashboard = TRUE
+                  WHERE player_id = $1 AND tenant_id = $2 AND status = 'banned'
+                  RETURNING player_id, tenant_id, role, status`,
+                [playerId, req.tenant.id]
+            );
+            if (r.rows.length === 0) {
+                return res.status(404).json({ error: 'No banned membership found for this player in this tenant' });
+            }
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_member_unbanned', playerId,
+                reason || 'Unbanned', req.tenant.id).catch(() => {}));
+            res.json({ membership: r.rows[0] });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Ban feature not yet provisioned' });
+            }
+            console.error('FIX-334 unban-member failed:', e.message);
+            res.status(500).json({ error: 'Failed to unban member' });
+        }
+    }
+);
+
+// GET /api/t/:tenant_short_id/admin/allowance — read dial values
+app.get('/api/t/:tenant_short_id/admin/allowance',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT organiser_allowance_enabled,
+                        organiser_allowance_per_game,
+                        organiser_allowance_pct_discount,
+                        organiser_allowance_games_per_week
+                   FROM tenants WHERE id = $1 LIMIT 1`,
+                [req.tenant.id]
+            );
+            res.json({ allowance: r.rows[0] || null });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Allowance feature not yet provisioned' });
+            }
+            console.error('FIX-329 read allowance failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch allowance' });
+        }
+    }
+);
+
+// PATCH /api/t/:tenant_short_id/admin/allowance — update dials
+// Body: { per_game?, pct_discount?, games_per_week? }
+// Tenant admin canNOT toggle organiser_allowance_enabled (master toggle) —
+// that's superadmin-only via PATCH /api/admin/tenants/:id (FIX-322).
+app.patch('/api/t/:tenant_short_id/admin/allowance',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const body = req.body || {};
+        const updates = [];
+        const values  = [];
+        let idx = 1;
+
+        const dialMap = {
+            per_game:       { col: 'organiser_allowance_per_game',       min: 0,  max: 50  },
+            pct_discount:   { col: 'organiser_allowance_pct_discount',   min: 0,  max: 100 },
+            games_per_week: { col: 'organiser_allowance_games_per_week', min: -1, max: 99  },
+        };
+
+        for (const [key, def] of Object.entries(dialMap)) {
+            if (body[key] !== undefined) {
+                const n = parseInt(body[key], 10);
+                if (!Number.isFinite(n) || n < def.min || n > def.max) {
+                    return res.status(400).json({ error: `${key} must be integer in [${def.min}, ${def.max}]` });
+                }
+                updates.push(`${def.col} = $${idx++}`);
+                values.push(n);
+            }
+        }
+        if (updates.length === 0) return res.status(400).json({ error: 'No dial fields to update' });
+        values.push(req.tenant.id);
+
+        try {
+            const r = await pool.query(
+                `UPDATE tenants SET ${updates.join(', ')}
+                  WHERE id = $${idx++}
+                  RETURNING organiser_allowance_enabled,
+                            organiser_allowance_per_game,
+                            organiser_allowance_pct_discount,
+                            organiser_allowance_games_per_week`,
+                values
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+
+            setImmediate(() => auditLog(pool, req.user.playerId, 'organiser_allowance_updated',
+                req.tenant.id, `Allowance dials updated: ${Object.keys(body).join(', ')}`, req.tenant.id));
+
+            res.json({ allowance: r.rows[0] });
+        } catch (e) {
+            if (e && e.code === '23514') {
+                return res.status(400).json({ error: 'Constraint violation: ' + (e.constraint || e.message) });
+            }
+            console.error('FIX-329 update allowance failed:', e.message);
+            res.status(500).json({ error: 'Failed to update allowance' });
+        }
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-329 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-334 — ROW Day 25: Mixed-listing fee tier visibility
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Tenants need to see WHICH fee tier applies to a game before creating it,
+// and what they'll owe per game completion. Day 22 already does the detection
+// + calculation in tenant_payouts_due; Day 25 surfaces that to the UI.
+
+// GET /api/t/:tenant_short_id/admin/fee-preview
+//
+// Query params:
+//   ?cost_per_player=<pence>       required, 0 = mixed listing
+//   ?paid_player_count=<int>       optional (default 0 = no projection)
+//
+// Returns:
+//   {
+//     fee_mode:               'mixed' or 'full',
+//     fee_per_player_pence:   X,
+//     full_fee_pence:         tenant.platform_fee_pence,
+//     mixed_fee_pence:        tenant.mixed_listing_fee_pence,
+//     projected_fee_pence:    paid_player_count × fee_per_player_pence,
+//     projected_gross_pence:  paid_player_count × cost_per_player,
+//     projected_payable_pence: gross - fee,
+//     explanation:             human-readable string
+//   }
+//
+// Use case: organiser is about to create a game; UI shows the fee they'll be
+// charged before they hit Save.
+app.get('/api/t/:tenant_short_id/admin/fee-preview',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const costPerPlayer = parseInt(req.query.cost_per_player, 10);
+        if (!Number.isFinite(costPerPlayer) || costPerPlayer < 0) {
+            return res.status(400).json({ error: 'cost_per_player must be a non-negative integer (pence)' });
+        }
+        // FIX-334 audit-fix (Day 30 Pass 2): bound inputs to prevent JS integer
+        // overflow in projection math. £500/player and 100-player cap covers
+        // any realistic football game.
+        if (costPerPlayer > 50000) {
+            return res.status(400).json({ error: 'cost_per_player too large (max £500.00 per player)' });
+        }
+        const paidPlayerCount = Math.max(0, parseInt(req.query.paid_player_count, 10) || 0);
+        if (paidPlayerCount > 100) {
+            return res.status(400).json({ error: 'paid_player_count too large (max 100)' });
+        }
+
+        try {
+            const r = await pool.query(
+                `SELECT platform_fee_pence, mixed_listing_fee_pence
+                   FROM tenants WHERE id = $1 LIMIT 1`,
+                [req.tenant.id]
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+
+            const fullFee  = parseInt(r.rows[0].platform_fee_pence || 12, 10);
+            const mixedFee = parseInt(r.rows[0].mixed_listing_fee_pence || 5, 10);
+
+            const isMixed       = costPerPlayer === 0;
+            const feePerPlayer  = isMixed ? mixedFee : fullFee;
+            const feeMode       = isMixed ? 'mixed' : 'full';
+
+            const projectedFee     = paidPlayerCount * feePerPlayer;
+            const projectedGross   = paidPlayerCount * costPerPlayer;
+            const projectedPayable = Math.max(0, projectedGross - projectedFee);
+
+            res.json({
+                fee_mode:                feeMode,
+                fee_per_player_pence:    feePerPlayer,
+                full_fee_pence:          fullFee,
+                mixed_fee_pence:         mixedFee,
+                cost_per_player_pence:   costPerPlayer,
+                paid_player_count:       paidPlayerCount,
+                projected_fee_pence:     projectedFee,
+                projected_gross_pence:   projectedGross,
+                projected_payable_pence: projectedPayable,
+                explanation: isMixed
+                    ? `This game charges £0 per player — TotalFooty applies the mixed-listing rate of ${mixedFee}p per player who signs up.`
+                    : `TotalFooty applies the standard rate of ${fullFee}p per paid player. You keep £${(projectedPayable / 100).toFixed(2)} of £${(projectedGross / 100).toFixed(2)} gross.`,
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Mixed-listing fee not yet provisioned' });
+            }
+            console.error('FIX-334 fee-preview failed:', e.message);
+            res.status(500).json({ error: 'Failed to compute fee preview' });
+        }
+    }
+);
+
+// GET /api/t/:tenant_short_id/admin/fee-summary
+//
+// Aggregates payouts to date by fee_mode. Shows the tenant how much they've
+// been charged at each tier — useful for billing transparency and disputes.
+app.get('/api/t/:tenant_short_id/admin/fee-summary',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT fee_mode,
+                        COUNT(*)::int                            AS games_count,
+                        SUM(paid_player_count)::bigint           AS total_paid_players,
+                        SUM(total_fee_pence)::bigint             AS total_fees_pence,
+                        SUM(gross_pence)::bigint                 AS total_gross_pence,
+                        SUM(payable_pence)::bigint               AS total_payable_pence
+                   FROM tenant_payouts_due
+                  WHERE tenant_id = $1
+                  GROUP BY fee_mode
+                  ORDER BY fee_mode`,
+                [req.tenant.id]
+            );
+
+            const summary = {
+                full:  { games_count: 0, total_paid_players: 0, total_fees_pence: 0,
+                         total_gross_pence: 0, total_payable_pence: 0 },
+                mixed: { games_count: 0, total_paid_players: 0, total_fees_pence: 0,
+                         total_gross_pence: 0, total_payable_pence: 0 },
+            };
+            for (const row of r.rows) {
+                summary[row.fee_mode] = {
+                    games_count:         parseInt(row.games_count, 10),
+                    total_paid_players:  parseInt(row.total_paid_players, 10),
+                    total_fees_pence:    parseInt(row.total_fees_pence, 10),
+                    total_gross_pence:   parseInt(row.total_gross_pence, 10),
+                    total_payable_pence: parseInt(row.total_payable_pence, 10),
+                };
+            }
+
+            res.json({
+                summary,
+                total_fees_pence: summary.full.total_fees_pence + summary.mixed.total_fees_pence,
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.json({
+                    summary: { full: {games_count:0,total_fees_pence:0}, mixed: {games_count:0,total_fees_pence:0} },
+                    total_fees_pence: 0
+                });
+            }
+            console.error('FIX-334 fee-summary failed:', e.message);
+            res.status(500).json({ error: 'Failed to compute fee summary' });
+        }
+    }
+);
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-334 — ROW Day 28: Refund processing + withdraw request
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Two flows:
+//   1. POST /api/t/:short_id/admin/refund-player
+//      Tenant admin refunds a specific player. Credit added back to player's
+//      wallet (existing credits table). Tracked in audit_logs.
+//   2. POST /api/t/:short_id/admin/withdraw-request
+//      Tenant admin requests a withdrawal of their payable balance. Writes a
+//      special-kind row to tenant_payouts_due (or related queue) for Mitchell
+//      to process manually.
+
+// POST /api/t/:tenant_short_id/admin/refund-player
+//
+// Body: {
+//   player_id: uuid,         (required)
+//   amount_pence: int,       (required, > 0)
+//   reason: string,          (required, 1-1000 chars)
+//   reference: string?       (optional — e.g. "Game cancelled X" — for audit)
+// }
+//
+// Adds amount to player's wallet credit. Logs in credit_transactions + audit.
+// NOT linked to a specific game — tenant_admin can refund discretionally.
+//
+// Note: this does NOT touch tenant_payouts_due. The refund is funded from the
+// tenant's pending payout (settled outside this endpoint via Mitchell's weekly
+// payment run). Conceptually: the tenant says "give Bob £5 back" → Mitchell
+// adds £5 to Bob's wallet AND reduces what he owes the tenant by £5. This
+// endpoint handles the player-credit half; the tenant-balance accounting is
+// implicit in Mitchell's weekly settlement workflow.
+app.post('/api/t/:tenant_short_id/admin/refund-player',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const body = req.body || {};
+        const playerId = String(body.player_id || '').trim();
+        if (!isValidUuid(playerId)) {
+            return res.status(400).json({ error: 'player_id must be a valid UUID' });
+        }
+        const amountPence = parseInt(body.amount_pence, 10);
+        if (!Number.isFinite(amountPence) || amountPence <= 0) {
+            return res.status(400).json({ error: 'amount_pence must be a positive integer' });
+        }
+        if (amountPence > 100000) {  // £1000 cap per refund
+            return res.status(400).json({ error: 'amount_pence too large (max £1000 per refund — split into multiple if needed)' });
+        }
+        const reason = (typeof body.reason === 'string') ? body.reason.trim().slice(0, 1000) : '';
+        if (!reason) return res.status(400).json({ error: 'reason is required' });
+        const reference = (typeof body.reference === 'string')
+            ? body.reference.trim().slice(0, 200) : null;
+
+        let client;
+        try {
+            client = await pool.connect();
+            await client.query('BEGIN');
+
+            // Verify player is a member of this tenant (don't allow refunds to
+            // players outside the tenant's roster — prevents abuse of cross-tenant
+            // wallet-topup)
+            const memCheck = await client.query(
+                `SELECT status FROM player_tenants
+                  WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+                [playerId, req.tenant.id]
+            );
+            if (memCheck.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ error: 'Player is not a member of this tenant' });
+            }
+            // Allow refunds to left/banned members (refunding their final games is legit)
+
+            // Lock player credit row + apply refund
+            const amountPounds = (amountPence / 100).toFixed(2);
+            const upd = await client.query(
+                `UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP
+                  WHERE player_id = $2
+                  RETURNING balance`,
+                [amountPounds, playerId]
+            );
+            if (upd.rows.length === 0) {
+                // No credits row — create one
+                await client.query(
+                    `INSERT INTO credits (player_id, balance) VALUES ($1, $2)`,
+                    [playerId, amountPounds]
+                );
+            }
+
+            // Record transaction (existing helper expects pounds + a type)
+            await recordCreditTransaction(
+                client,
+                playerId,
+                parseFloat(amountPounds),
+                'tenant_refund',
+                `Refund from tenant ${req.tenant.name}: ${reason}` + (reference ? ` (ref: ${reference})` : ''),
+                req.user.userId
+            );
+
+            // Audit log
+            await auditLog(client, req.user.playerId, 'tenant_player_refund', playerId,
+                `£${amountPounds} refunded — ${reason}` + (reference ? ` (ref: ${reference})` : ''),
+                req.tenant.id);
+
+            await client.query('COMMIT');
+
+            res.json({
+                ok: true,
+                player_id: playerId,
+                amount_pence: amountPence,
+                new_balance: upd.rows[0]?.balance,
+            });
+        } catch (e) {
+            if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Refund feature not yet provisioned' });
+            }
+            console.error('FIX-334 refund-player failed:', e.message);
+            res.status(500).json({ error: 'Failed to process refund' });
+        } finally {
+            if (client) client.release();
+        }
+    }
+);
+
+// POST /api/t/:tenant_short_id/admin/withdraw-request
+//
+// Body: { amount_pence: int (required, > 0), notes?: string }
+//
+// Tenant requests a withdrawal of their payable balance. Mitchell processes
+// these manually as part of his weekly payment run.
+//
+// Implementation: writes a row to tenant_payouts_due with game_id=NULL
+// (sentinel), fee_mode='full' (irrelevant), status='pending'.
+//
+// Validation: amount cannot exceed current pending payable across all
+// payouts (i.e. tenant can't withdraw more than they're actually owed).
+app.post('/api/t/:tenant_short_id/admin/withdraw-request',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const body = req.body || {};
+        const amountPence = parseInt(body.amount_pence, 10);
+        if (!Number.isFinite(amountPence) || amountPence <= 0) {
+            return res.status(400).json({ error: 'amount_pence must be a positive integer' });
+        }
+        const notes = (typeof body.notes === 'string') ? body.notes.trim().slice(0, 1000) : '';
+
+        try {
+            // Compute current pending balance
+            const balanceRes = await pool.query(
+                `SELECT COALESCE(SUM(payable_pence), 0)::bigint AS pending
+                   FROM tenant_payouts_due
+                  WHERE tenant_id = $1 AND status = 'pending' AND game_id IS NOT NULL`,
+                [req.tenant.id]
+            );
+            const pendingPence = parseInt(balanceRes.rows[0].pending, 10);
+
+            // Compute already-requested withdrawals not yet paid
+            // (game_id IS NULL = withdraw request sentinel)
+            const wRes = await pool.query(
+                `SELECT COALESCE(SUM(payable_pence), 0)::bigint AS pending
+                   FROM tenant_payouts_due
+                  WHERE tenant_id = $1 AND status = 'pending' AND game_id IS NULL`,
+                [req.tenant.id]
+            );
+            const alreadyRequested = parseInt(wRes.rows[0].pending, 10);
+
+            const availableForWithdraw = pendingPence - alreadyRequested;
+            if (amountPence > availableForWithdraw) {
+                return res.status(409).json({
+                    error: 'Withdrawal exceeds available balance',
+                    requested_pence: amountPence,
+                    available_pence: availableForWithdraw,
+                    pending_total_pence: pendingPence,
+                    already_requested_pence: alreadyRequested,
+                });
+            }
+
+            // The schema requires game_id NOT NULL. We can't use the existing
+            // table for withdraw requests directly — instead we set a synthetic
+            // game-like row using a placeholder game_url='WITHDRAW-REQUEST-<ts>'.
+            //
+            // BUT: tenant_payouts_due.game_id NOT NULL constraint blocks this.
+            // Better approach: use audit_logs with a sentinel action; Mitchell
+            // sees these via /api/admin/audit filtered by action.
+            const ts = new Date().toISOString();
+            const audit = await pool.query(
+                `INSERT INTO audit_logs (player_id, action, target_id, details, tenant_id)
+                 VALUES ($1, 'tenant_withdraw_request', $2, $3, $4)
+                 RETURNING id, created_at`,
+                [req.user.playerId, req.tenant.id,
+                 `Withdraw request: £${(amountPence / 100).toFixed(2)}${notes ? ` — ${notes}` : ''}`,
+                 req.tenant.id]
+            );
+
+            res.json({
+                ok: true,
+                request_id: audit.rows[0].id,
+                requested_at: audit.rows[0].created_at,
+                amount_pence: amountPence,
+                available_balance_pence: availableForWithdraw - amountPence,
+                notes: notes || null,
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Withdraw feature not yet provisioned' });
+            }
+            console.error('FIX-334 withdraw-request failed:', e.message);
+            res.status(500).json({ error: 'Failed to submit withdraw request' });
+        }
+    }
+);
+
+// GET /api/admin/withdraw-requests — Mitchell's view of pending withdrawals
+//
+// Returns all 'tenant_withdraw_request' audit rows that haven't been resolved.
+// Mitchell processes manually + marks resolved via POST /:id/resolve.
+app.get('/api/admin/withdraw-requests', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT al.id, al.created_at, al.target_id AS tenant_id, al.player_id AS requested_by,
+                    al.details,
+                    t.name AS tenant_name, t.short_id AS tenant_short_id,
+                    t.bank_account_holder_name, t.bank_account_number, t.bank_sort_code,
+                    p.alias AS requested_by_alias, p.full_name AS requested_by_full_name
+               FROM audit_logs al
+               LEFT JOIN tenants t ON t.id = al.target_id
+               LEFT JOIN players p ON p.id = al.player_id
+              WHERE al.action = 'tenant_withdraw_request'
+                AND NOT EXISTS (
+                    SELECT 1 FROM audit_logs al2
+                     WHERE al2.action = 'tenant_withdraw_request_resolved'
+                       AND al2.target_id = al.id::text  -- target_id is text; cast
+                )
+              ORDER BY al.created_at ASC
+              LIMIT 200`
+        );
+        res.json({ requests: r.rows });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.json({ requests: [] });
+        }
+        console.error('FIX-334 withdraw list failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch withdraw requests' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-335 — Wave 3 Phase 1: Withdraw request resolve (closes the loop)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Mitchell's CRM withdraw queue (GET /api/admin/withdraw-requests above)
+// filters out any request that has a 'tenant_withdraw_request_resolved' row
+// in audit_logs targeting the original request's id. Wave 2 shipped only the
+// SELECT side — no write endpoint to CREATE such a row. This endpoint closes
+// the gap so the "Mark Processed" button has somewhere to call.
+//
+// Body: { notes?: string }  — optional free-text reason / bank ref / etc
+//
+// Idempotency: if the target request is already resolved, returns 409 with
+// the existing resolution row's id so the UI can refresh without a confusing
+// retry loop.
+app.post('/api/admin/withdraw-requests/:audit_id/resolve',
+    authenticateToken, requireSuperAdmin, async (req, res) => {
+        const auditId = String(req.params.audit_id || '').trim();
+        if (!auditId) return res.status(400).json({ error: 'audit_id required' });
+        const notes = (req.body && typeof req.body.notes === 'string')
+            ? req.body.notes.trim().slice(0, 1000) : '';
+
+        try {
+            // 1. Confirm the target row exists AND is a withdraw request.
+            //    Cast al.id::text mirrors the SELECT side at GET /admin/withdraw-requests
+            //    so the column-type discovery stays consistent.
+            const target = await pool.query(
+                `SELECT id, target_id AS tenant_id, action
+                   FROM audit_logs
+                  WHERE id::text = $1
+                    AND action = 'tenant_withdraw_request'
+                  LIMIT 1`,
+                [auditId]
+            );
+            if (target.rows.length === 0) {
+                return res.status(404).json({ error: 'Withdraw request not found' });
+            }
+            const tenantId = target.rows[0].tenant_id;
+
+            // 2. Idempotency / double-click guard. Read before write so we
+            //    return 409 cleanly instead of inserting a duplicate resolve row.
+            const existing = await pool.query(
+                `SELECT id, created_at FROM audit_logs
+                  WHERE action = 'tenant_withdraw_request_resolved'
+                    AND target_id = $1
+                  LIMIT 1`,
+                [auditId]
+            );
+            if (existing.rows.length > 0) {
+                return res.status(409).json({
+                    error: 'Withdraw request already resolved',
+                    resolved_at: existing.rows[0].created_at,
+                });
+            }
+
+            // 3. Write the resolution row via the canonical auditLog helper.
+            //    target_id is the audit_id of the ORIGINAL request (as text), so
+            //    the GET /admin/withdraw-requests NOT EXISTS subquery picks it up
+            //    on the next refresh and hides the resolved request.
+            await auditLog(pool, req.user.playerId, 'tenant_withdraw_request_resolved',
+                auditId,
+                notes ? `Resolved: ${notes}` : 'Resolved',
+                tenantId
+            );
+
+            res.json({ ok: true, audit_id: auditId, resolved_at: new Date().toISOString() });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Withdraw feature not yet provisioned' });
+            }
+            // 22P02 = invalid_text_representation — caller passed a malformed id
+            // that failed Postgres's text-cast comparison.
+            if (e && e.code === '22P02') {
+                return res.status(400).json({ error: 'Invalid audit_id format' });
+            }
+            console.error('FIX-335 withdraw-resolve failed:', e.message);
+            res.status(500).json({ error: 'Failed to resolve withdraw request' });
+        }
+    }
+);
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-334 — ROW Day 24: Comms templates + signup link generator + share link
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Three deliverables (per Q8 + Bucket 1 #12 + #13):
+//   1. GET  /api/t/:short_id/admin/signup-link    return canonical tenant signup URL
+//   2. GET  /api/t/:short_id/admin/comms-templates list 3 default + tenant-overridden
+//   3. PUT  /api/t/:short_id/admin/comms-templates/:kind save a tenant-specific template
+//   4. GET  /api/games/:id/share-link             return per-game share URL (tracked)
+//
+// All template messages support placeholders rendered server-side:
+//   {tenant_name}     →  tenant.name
+//   {short_id}        →  tenant.short_id (5-digit)
+//   {organiser_name}  →  alias or full_name of organiser
+//   {game_url}        →  full https://totalfooty.co.uk/game.html?url=... URL
+//   {game_date}       →  formatted date string
+//
+// The "tracking" requirement (Q8 — yes, tracking enabled) is satisfied via
+// the landing_attributions table extension (Block 12 of FIX-334 migration):
+// when a player clicks a comms-template link, the per-player ref token in the
+// URL ("?via=<template_id>&from=<inviter_player_id>") is captured into
+// landing_attributions on signup, so Mitchell can see attribution.
+
+// Helper: substitute template placeholders
+function _fix334RenderCommsTemplate(body, vars) {
+    return String(body || '')
+        .replace(/\{tenant_name\}/g,    vars.tenant_name    || '')
+        .replace(/\{short_id\}/g,        vars.short_id        || '')
+        .replace(/\{organiser_name\}/g, vars.organiser_name || '')
+        .replace(/\{game_url\}/g,        vars.game_url        || '')
+        .replace(/\{game_date\}/g,       vars.game_date       || '');
+}
+
+// GET /api/t/:tenant_short_id/admin/signup-link
+//
+// Returns the canonical tenant signup link. Optionally accepts ?inviter=<player_id>
+// to attribute clicks to a specific inviter (e.g. when Mitchell invites Saca
+// or a tenant_admin shares the link with a specific player).
+app.get('/api/t/:tenant_short_id/admin/signup-link',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const baseUrl  = 'https://totalfooty.co.uk';
+        const shortId  = req.tenant.short_id;
+        const inviter  = req.query.inviter && isValidUuid(req.query.inviter)
+            ? req.query.inviter : null;
+
+        // Per spec A.47: URL = /{tenant_short_id}/signup
+        // Frontend route to be added in index.html; backend captures via tenant_short_id in body
+        const url = inviter
+            ? `${baseUrl}/${shortId}/signup?via=${inviter}`
+            : `${baseUrl}/${shortId}/signup`;
+
+        res.json({
+            url,
+            short_id: shortId,
+            tenant_name: req.tenant.name,
+            qr_code_url: `https://chart.googleapis.com/chart?cht=qr&chs=300x300&chl=${encodeURIComponent(url)}`,
+            // Note: chart.googleapis.com is sunset — frontend should use a JS QR lib instead.
+            // This URL is documentary only; safe to leave for now.
+        });
+    }
+);
+
+// GET /api/t/:tenant_short_id/admin/comms-templates
+//
+// Returns the 3 templates for this tenant. Falls back to defaults (tenant_id=NULL
+// seeded rows) if the tenant has not customised them.
+app.get('/api/t/:tenant_short_id/admin/comms-templates',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT
+                    kind,
+                    COALESCE(custom.body_text, def.body_text) AS body_text,
+                    custom.id IS NOT NULL AS is_customised,
+                    custom.updated_at
+                  FROM (
+                    SELECT 'new_signup_invite' AS kind UNION ALL
+                    SELECT 'existing_player_game_invite' UNION ALL
+                    SELECT 'unfilled_reminder'
+                  ) kinds
+                  LEFT JOIN tenant_signup_comms_templates def    ON def.tenant_id    IS NULL AND def.template_kind = kinds.kind
+                  LEFT JOIN tenant_signup_comms_templates custom ON custom.tenant_id = $1     AND custom.template_kind = kinds.kind
+                  ORDER BY kind`,
+                [req.tenant.id]
+            );
+            res.json({ templates: r.rows });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.json({ templates: [] });
+            }
+            console.error('FIX-334 comms templates list failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch templates' });
+        }
+    }
+);
+
+// PUT /api/t/:tenant_short_id/admin/comms-templates/:kind
+//
+// Body: { body_text: string (1-2000 chars) }
+//
+// Upserts a tenant-specific override for the given template kind.
+app.put('/api/t/:tenant_short_id/admin/comms-templates/:kind',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const kind = String(req.params.kind || '').trim();
+        const allowedKinds = ['new_signup_invite', 'existing_player_game_invite', 'unfilled_reminder'];
+        if (!allowedKinds.includes(kind)) {
+            return res.status(400).json({ error: 'Invalid template kind' });
+        }
+        const bodyText = (req.body && typeof req.body.body_text === 'string')
+            ? req.body.body_text.trim() : '';
+        if (!bodyText)       return res.status(400).json({ error: 'body_text is required' });
+        if (bodyText.length > 2000) {
+            return res.status(400).json({ error: 'body_text too long (max 2000 chars)' });
+        }
+
+        try {
+            const r = await pool.query(
+                `INSERT INTO tenant_signup_comms_templates
+                    (tenant_id, template_kind, body_text, is_default, updated_at)
+                 VALUES ($1, $2, $3, FALSE, NOW())
+                 ON CONFLICT (tenant_id, template_kind) DO UPDATE
+                    SET body_text  = EXCLUDED.body_text,
+                        updated_at = NOW()
+                 RETURNING *`,
+                [req.tenant.id, kind, bodyText]
+            );
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_comms_template_updated',
+                req.tenant.id, `Template '${kind}' customised`, req.tenant.id).catch(() => {}));
+            res.json({ template: r.rows[0] });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Comms templates not yet provisioned' });
+            }
+            console.error('FIX-334 update comms template failed:', e.message);
+            res.status(500).json({ error: 'Failed to save template' });
+        }
+    }
+);
+
+// POST /api/t/:tenant_short_id/admin/comms-templates/:kind/render
+//
+// Body: { game_id?: uuid }
+//
+// Returns the template body with placeholders substituted. Useful for "preview"
+// in the admin UI and for the copy-to-clipboard button. If game_id is supplied,
+// pulls game-specific variables (date, URL).
+app.post('/api/t/:tenant_short_id/admin/comms-templates/:kind/render',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const kind = String(req.params.kind || '').trim();
+        const allowedKinds = ['new_signup_invite', 'existing_player_game_invite', 'unfilled_reminder'];
+        if (!allowedKinds.includes(kind)) {
+            return res.status(400).json({ error: 'Invalid template kind' });
+        }
+        const gameId = req.body && req.body.game_id;
+        if (gameId && !isValidUuid(gameId)) {
+            return res.status(400).json({ error: 'Invalid game_id' });
+        }
+
+        try {
+            // Resolve template
+            const tRes = await pool.query(
+                `SELECT COALESCE(custom.body_text, def.body_text) AS body_text
+                   FROM (VALUES ($1::text)) AS k(kind)
+                   LEFT JOIN tenant_signup_comms_templates def    ON def.tenant_id    IS NULL AND def.template_kind = k.kind
+                   LEFT JOIN tenant_signup_comms_templates custom ON custom.tenant_id = $2     AND custom.template_kind = k.kind`,
+                [kind, req.tenant.id]
+            );
+            const template = tRes.rows[0]?.body_text || '';
+            if (!template) return res.status(404).json({ error: 'Template not configured' });
+
+            // Resolve organiser name
+            const orgRes = await pool.query(
+                `SELECT alias, full_name FROM players WHERE id = $1`,
+                [req.user.playerId]
+            );
+            const organiserName = orgRes.rows[0]?.alias || orgRes.rows[0]?.full_name || 'Organiser';
+
+            // Game variables (if a game_id was given)
+            let gameUrl  = '';
+            let gameDate = '';
+            if (gameId) {
+                const gRes = await pool.query(
+                    `SELECT game_url, game_date FROM games WHERE id = $1 AND tenant_id = $2`,
+                    [gameId, req.tenant.id]
+                );
+                if (gRes.rows.length === 0) {
+                    return res.status(404).json({ error: 'Game not found in this tenant' });
+                }
+                const g = gRes.rows[0];
+                gameUrl  = `https://totalfooty.co.uk/game.html?url=${g.game_url}`;
+                gameDate = new Date(g.game_date).toLocaleDateString('en-GB', {
+                    weekday: 'short', day: 'numeric', month: 'short'
+                });
+            }
+
+            const rendered = _fix334RenderCommsTemplate(template, {
+                tenant_name:    req.tenant.name,
+                short_id:       req.tenant.short_id,
+                organiser_name: organiserName,
+                game_url:       gameUrl,
+                game_date:      gameDate,
+            });
+
+            res.json({
+                kind,
+                rendered_text: rendered,
+                vars_used: { tenant_name: req.tenant.name, short_id: req.tenant.short_id,
+                             organiser_name: organiserName, game_url: gameUrl, game_date: gameDate }
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Comms templates not yet provisioned' });
+            }
+            console.error('FIX-334 render comms template failed:', e.message);
+            res.status(500).json({ error: 'Failed to render template' });
+        }
+    }
+);
+
+// GET /api/games/:id/share-link
+//
+// Returns the canonical game.html share URL plus a tracked variant carrying
+// the inviter's player_id (per A.59 + B.1#13). Caller must be an organiser
+// of the game or a tenant_admin of its tenant.
+app.get('/api/games/:id/share-link', authenticateToken, async (req, res) => {
+    const gameId = String(req.params.id || '').trim();
+    if (!isValidUuid(gameId)) return res.status(400).json({ error: 'Invalid game id' });
+
+    try {
+        // Fetch game + verify caller is authorised (organiser or tenant admin)
+        const gRes = await pool.query(
+            `SELECT g.id, g.game_url, g.tenant_id, g.organiser_id
+               FROM games g WHERE g.id = $1`,
+            [gameId]
+        );
+        if (gRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const game = gRes.rows[0];
+
+        // Authorisation: superadmin, organiser_id match, OR tenant_admin of game's tenant
+        const isSuperadmin = req.user.role === 'superadmin' || req.user.role === 'admin';
+        const isGameOrganiser = game.organiser_id === req.user.playerId;
+        let isTenantAdmin = false;
+        if (!isSuperadmin && !isGameOrganiser && game.tenant_id) {
+            try {
+                const role = await _getTenantRole(req.user.playerId, game.tenant_id);
+                isTenantAdmin = (role === 'tenant_admin');
+            } catch (_) { /* no membership */ }
+        }
+        if (!isSuperadmin && !isGameOrganiser && !isTenantAdmin) {
+            return res.status(403).json({ error: 'Not authorised to share this game' });
+        }
+
+        const baseUrl   = 'https://totalfooty.co.uk';
+        const canonical = `${baseUrl}/game.html?url=${game.game_url}`;
+        const tracked   = `${canonical}&from=${req.user.playerId}`;
+
+        res.json({
+            canonical_url: canonical,
+            tracked_url:   tracked,
+            game_url:      game.game_url,
+        });
+    } catch (e) {
+        console.error('FIX-334 share-link failed:', e.message);
+        res.status(500).json({ error: 'Failed to generate share link' });
+    }
+});
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-334 — ROW Day 29: T&Cs version tracking + acceptance flow
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Three documents (per A.27):
+//   1. Player T&Cs       — every signed-up player must accept
+//   2. Tenant T&Cs       — each tenant must accept (their admin signs)
+//   3. Organiser T&Cs    — each organiser-role player_tenants row needs acceptance
+//
+// Frontend flow:
+//   1. Login completes → frontend calls GET /api/players/me/tcs-status
+//   2. If must_accept_* fields are TRUE → show modal blocking further use
+//   3. Player clicks accept → frontend POSTs /accept-*
+//   4. Status recomputes, modal dismisses
+//
+// We don't BLOCK other endpoints — the frontend modal is the gate. Backend
+// just exposes status + accepts updates.
+
+// GET /api/players/me/tcs-status
+//
+// Returns:
+//   {
+//     current_versions: { player: 'v1.0-draft', tenant: '...', organiser: '...' },
+//     player: {
+//       accepted_version: 'v1.0-draft' | null,
+//       accepted_at: '2026-...' | null,
+//       must_accept: bool,
+//     },
+//     tenants: [
+//       {
+//         tenant_id: '...',
+//         short_id: '...',
+//         name: '...',
+//         role: 'player' | 'organiser' | 'tenant_admin',
+//         organiser_accepted_version: 'v1.0-draft' | null,
+//         tenant_accepted_version: 'v1.0-draft' | null,    // (only relevant if role=tenant_admin)
+//         must_accept_organiser: bool,
+//         must_accept_tenant: bool,
+//       }, ...
+//     ]
+//   }
+app.get('/api/players/me/tcs-status', authenticateToken, async (req, res) => {
+    try {
+        // Player T&Cs status
+        const pRes = await pool.query(
+            `SELECT accepted_player_tcs_version, accepted_player_tcs_at
+               FROM players WHERE id = $1`,
+            [req.user.playerId]
+        ).catch(e => {
+            if (e && e.code === '42703') return { rows: [{ accepted_player_tcs_version: null, accepted_player_tcs_at: null }] };
+            throw e;
+        });
+
+        const playerAccepted = pRes.rows[0]?.accepted_player_tcs_version || null;
+
+        // Tenant memberships + per-tenant T&Cs status
+        let tenants = [];
+        try {
+            const ptRes = await pool.query(
+                `SELECT pt.tenant_id, pt.role,
+                        pt.accepted_organiser_tcs_version,
+                        pt.accepted_organiser_tcs_at,
+                        t.short_id, t.name,
+                        t.accepted_tenant_tcs_version,
+                        t.accepted_tenant_tcs_at
+                   FROM player_tenants pt
+                   JOIN tenants t ON t.id = pt.tenant_id
+                  WHERE pt.player_id = $1 AND pt.status = 'active'
+                  ORDER BY t.name`,
+                [req.user.playerId]
+            );
+            tenants = ptRes.rows.map(row => ({
+                tenant_id: row.tenant_id,
+                short_id: row.short_id,
+                name: row.name,
+                role: row.role,
+                organiser_accepted_version: row.accepted_organiser_tcs_version || null,
+                organiser_accepted_at:      row.accepted_organiser_tcs_at || null,
+                tenant_accepted_version: row.accepted_tenant_tcs_version || null,
+                tenant_accepted_at:      row.accepted_tenant_tcs_at || null,
+                must_accept_organiser:
+                    (row.role === 'organiser' || row.role === 'tenant_admin') &&
+                    row.accepted_organiser_tcs_version !== CURRENT_ORGANISER_TCS_VERSION,
+                must_accept_tenant:
+                    row.role === 'tenant_admin' &&
+                    row.accepted_tenant_tcs_version !== CURRENT_TENANT_TCS_VERSION,
+            }));
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                // Tables/columns missing — pre-migration. Return empty.
+                tenants = [];
+            } else {
+                throw e;
+            }
+        }
+
+        res.json({
+            current_versions: {
+                player:    CURRENT_PLAYER_TCS_VERSION,
+                tenant:    CURRENT_TENANT_TCS_VERSION,
+                organiser: CURRENT_ORGANISER_TCS_VERSION,
+            },
+            player: {
+                accepted_version: playerAccepted,
+                accepted_at:      pRes.rows[0]?.accepted_player_tcs_at || null,
+                must_accept:      playerAccepted !== CURRENT_PLAYER_TCS_VERSION,
+            },
+            tenants,
+        });
+    } catch (e) {
+        console.error('FIX-334 tcs-status failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch T&Cs status' });
+    }
+});
+
+// POST /api/players/me/accept-player-tcs
+//
+// Body: { version: 'v1.0-draft' }  (must match CURRENT_PLAYER_TCS_VERSION)
+//
+// Records acceptance of the CURRENT player T&Cs version.
+app.post('/api/players/me/accept-player-tcs', authenticateToken, async (req, res) => {
+    const version = String((req.body && req.body.version) || '').trim();
+    if (version !== CURRENT_PLAYER_TCS_VERSION) {
+        return res.status(400).json({
+            error: 'version mismatch',
+            expected: CURRENT_PLAYER_TCS_VERSION,
+            received: version,
+        });
+    }
+
+    try {
+        const r = await pool.query(
+            `UPDATE players
+                SET accepted_player_tcs_version = $1,
+                    accepted_player_tcs_at      = NOW()
+              WHERE id = $2
+              RETURNING accepted_player_tcs_version, accepted_player_tcs_at`,
+            [version, req.user.playerId]
+        );
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'player_tcs_accepted',
+            req.user.playerId, `Accepted player T&Cs ${version}`).catch(() => {}));
+
+        res.json({
+            accepted_version: r.rows[0].accepted_player_tcs_version,
+            accepted_at:      r.rows[0].accepted_player_tcs_at,
+        });
+    } catch (e) {
+        if (e && e.code === '42703') {
+            return res.status(503).json({ error: 'T&Cs tracking not yet provisioned' });
+        }
+        console.error('FIX-334 accept-player-tcs failed:', e.message);
+        res.status(500).json({ error: 'Failed to record acceptance' });
+    }
+});
+
+// POST /api/players/me/tenants/:tenant_id/accept-organiser-tcs
+//
+// Body: { version: 'v1.0-draft' }
+//
+// Records acceptance of the CURRENT Organiser T&Cs for this specific membership.
+// Required only when role IN ('organiser', 'tenant_admin').
+app.post('/api/players/me/tenants/:tenant_id/accept-organiser-tcs',
+    authenticateToken, async (req, res) => {
+        const tenantId = String(req.params.tenant_id || '').trim();
+        if (!isValidUuid(tenantId)) return res.status(400).json({ error: 'Invalid tenant_id' });
+        const version = String((req.body && req.body.version) || '').trim();
+        if (version !== CURRENT_ORGANISER_TCS_VERSION) {
+            return res.status(400).json({
+                error: 'version mismatch',
+                expected: CURRENT_ORGANISER_TCS_VERSION,
+                received: version,
+            });
+        }
+
+        try {
+            const r = await pool.query(
+                `UPDATE player_tenants
+                    SET accepted_organiser_tcs_version = $1,
+                        accepted_organiser_tcs_at      = NOW()
+                  WHERE player_id = $2 AND tenant_id = $3
+                    AND role IN ('organiser', 'tenant_admin')
+                  RETURNING role, accepted_organiser_tcs_version, accepted_organiser_tcs_at`,
+                [version, req.user.playerId, tenantId]
+            );
+            if (r.rows.length === 0) {
+                return res.status(404).json({
+                    error: 'No organiser/admin membership found for this player in this tenant'
+                });
+            }
+
+            setImmediate(() => auditLog(pool, req.user.playerId, 'organiser_tcs_accepted',
+                tenantId, `Accepted Organiser T&Cs ${version}`, tenantId).catch(() => {}));
+
+            res.json({
+                role: r.rows[0].role,
+                accepted_version: r.rows[0].accepted_organiser_tcs_version,
+                accepted_at:      r.rows[0].accepted_organiser_tcs_at,
+            });
+        } catch (e) {
+            if (e && e.code === '42703') {
+                return res.status(503).json({ error: 'T&Cs tracking not yet provisioned' });
+            }
+            console.error('FIX-334 accept-organiser-tcs failed:', e.message);
+            res.status(500).json({ error: 'Failed to record acceptance' });
+        }
+    }
+);
+
+// POST /api/t/:tenant_short_id/admin/accept-tenant-tcs
+//
+// Body: { version: 'v1.0-draft' }
+//
+// Tenant_admin (and only tenant_admin) records acceptance of the CURRENT
+// Tenant T&Cs on behalf of the tenant. Stored on tenants table.
+app.post('/api/t/:tenant_short_id/admin/accept-tenant-tcs',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const version = String((req.body && req.body.version) || '').trim();
+        if (version !== CURRENT_TENANT_TCS_VERSION) {
+            return res.status(400).json({
+                error: 'version mismatch',
+                expected: CURRENT_TENANT_TCS_VERSION,
+                received: version,
+            });
+        }
+
+        try {
+            const r = await pool.query(
+                `UPDATE tenants
+                    SET accepted_tenant_tcs_version = $1,
+                        accepted_tenant_tcs_at      = NOW()
+                  WHERE id = $2
+                  RETURNING accepted_tenant_tcs_version, accepted_tenant_tcs_at`,
+                [version, req.tenant.id]
+            );
+
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_tcs_accepted',
+                req.tenant.id, `Accepted Tenant T&Cs ${version}`, req.tenant.id).catch(() => {}));
+
+            res.json({
+                accepted_version: r.rows[0].accepted_tenant_tcs_version,
+                accepted_at:      r.rows[0].accepted_tenant_tcs_at,
+            });
+        } catch (e) {
+            if (e && e.code === '42703') {
+                return res.status(503).json({ error: 'T&Cs tracking not yet provisioned' });
+            }
+            console.error('FIX-334 accept-tenant-tcs failed:', e.message);
+            res.status(500).json({ error: 'Failed to record acceptance' });
+        }
+    }
+);
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-330 — ROW Day 16: Invoicing endpoints
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Superadmin:
+//   POST   /api/admin/invoices/generate          run period invoice batch
+//   GET    /api/admin/invoices                   list all (filterable)
+//   GET    /api/admin/invoices/:id               full detail incl. line items
+//   POST   /api/admin/invoices/:id/issue         draft → issued
+//   POST   /api/admin/invoices/:id/mark-paid     issued → paid
+//   POST   /api/admin/invoices/:id/void          any → void
+//   POST   /api/admin/invoices/:id/line-items    add manual adjustment
+//
+// Tenant admin:
+//   GET    /api/t/:short_id/admin/invoices       list own tenant's
+//   GET    /api/t/:short_id/admin/invoices/:id   detail (must belong to tenant)
+
+// POST /api/admin/invoices/generate
+// Body: { period_start: 'YYYY-MM-DD', period_end: 'YYYY-MM-DD' }
+// If body missing, defaults to the previous calendar month.
+app.post('/api/admin/invoices/generate', authenticateToken, requireSuperAdmin, async (req, res) => {
+    let { period_start, period_end } = req.body || {};
+
+    // Default: previous calendar month in Europe/London
+    if (!period_start || !period_end) {
+        const now = new Date();
+        const ukNow = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/London' }));
+        const firstOfThisMonth = new Date(ukNow.getFullYear(), ukNow.getMonth(), 1);
+        const lastOfPrev       = new Date(firstOfThisMonth.getTime() - 86400000);
+        const firstOfPrev      = new Date(lastOfPrev.getFullYear(), lastOfPrev.getMonth(), 1);
+        period_start = firstOfPrev.toISOString().slice(0, 10);
+        period_end   = lastOfPrev.toISOString().slice(0, 10);
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(period_start) || !/^\d{4}-\d{2}-\d{2}$/.test(period_end)) {
+        return res.status(400).json({ error: 'period_start and period_end must be YYYY-MM-DD' });
+    }
+    if (period_end < period_start) {
+        return res.status(400).json({ error: 'period_end must be on or after period_start' });
+    }
+
+    try {
+        const results = await _fix330GenerateInvoicesForPeriod(period_start, period_end);
+        const createdCount = results.filter(r => r.created).length;
+        const skippedCount = results.filter(r => r.invoice && !r.created).length;
+        const errorCount   = results.filter(r => r.error).length;
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'invoices_generated', req.user.playerId,
+            `Generated invoices for ${period_start}..${period_end}: ${createdCount} created, ${skippedCount} skipped, ${errorCount} errors`));
+
+        res.json({
+            period_start, period_end,
+            created: createdCount,
+            skipped: skippedCount,
+            errors:  errorCount,
+            results,
+        });
+    } catch (e) {
+        console.error('FIX-330 invoice generation failed:', e.message);
+        res.status(500).json({ error: 'Failed to generate invoices' });
+    }
+});
+
+// GET /api/admin/invoices — list (filter ?tenant_id, ?status, ?limit, ?offset)
+app.get('/api/admin/invoices', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const filters = [];
+    const params  = [];
+    let p = 1;
+    if (req.query.tenant_id) {
+        if (!isValidUuid(req.query.tenant_id)) return res.status(400).json({ error: 'Invalid tenant_id' });
+        filters.push(`tenant_id = $${p++}`); params.push(req.query.tenant_id);
+    }
+    if (req.query.status) {
+        if (!['draft','issued','paid','void'].includes(req.query.status)) {
+            return res.status(400).json({ error: 'Invalid status' });
+        }
+        filters.push(`status = $${p++}`); params.push(req.query.status);
+    }
+    let limit  = parseInt(req.query.limit, 10);
+    let offset = parseInt(req.query.offset, 10);
+    if (!Number.isFinite(limit)  || limit  <= 0) limit  = 50;
+    if (!Number.isFinite(offset) || offset < 0)  offset = 0;
+    if (limit > 200) limit = 200;
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    params.push(limit, offset);
+
+    try {
+        const r = await pool.query(
+            `SELECT i.id, i.tenant_id, i.invoice_number, i.period_start, i.period_end,
+                    i.subtotal_pence, i.tax_pence, i.total_pence, i.status,
+                    i.issued_at, i.paid_at, i.void_at, i.created_at,
+                    t.short_id AS tenant_short_id, t.name AS tenant_name
+               FROM invoices i
+               JOIN tenants t ON t.id = i.tenant_id
+              ${where}
+              ORDER BY i.created_at DESC
+              LIMIT $${p++} OFFSET $${p++}`,
+            params
+        );
+        res.json({ invoices: r.rows, count: r.rows.length });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ invoices: [], count: 0 });
+        console.error('FIX-330 list invoices failed:', e.message);
+        res.status(500).json({ error: 'Failed to list invoices' });
+    }
+});
+
+// GET /api/admin/invoices/:id — full detail with line items
+app.get('/api/admin/invoices/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid invoice id' });
+    try {
+        const invRes = await pool.query(
+            `SELECT i.*, t.short_id AS tenant_short_id, t.name AS tenant_name
+               FROM invoices i
+               JOIN tenants t ON t.id = i.tenant_id
+              WHERE i.id = $1`,
+            [req.params.id]
+        );
+        if (invRes.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
+        const lineRes = await pool.query(
+            `SELECT * FROM invoice_line_items WHERE invoice_id = $1 ORDER BY created_at ASC`,
+            [req.params.id]
+        );
+        res.json({ invoice: invRes.rows[0], line_items: lineRes.rows });
+    } catch (e) {
+        console.error('FIX-330 get invoice failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch invoice' });
+    }
+});
+
+// Shared state-transition helper. Returns { ok, error?, statusCode? }.
+async function _fix330TransitionInvoice(invoiceId, fromStates, toState, extraUpdates = '', extraValues = []) {
+    const fromList = fromStates.map((s, i) => `$${i + 2}`).join(', ');
+    const setParts = [`status = '${toState}'`, `updated_at = NOW()`];
+    if (toState === 'issued') setParts.push(`issued_at = COALESCE(issued_at, NOW())`);
+    if (toState === 'paid')   setParts.push(`paid_at   = COALESCE(paid_at,   NOW())`);
+    if (toState === 'void')   setParts.push(`void_at   = COALESCE(void_at,   NOW())`);
+    const setSql = setParts.join(', ') + (extraUpdates ? ', ' + extraUpdates : '');
+    const r = await pool.query(
+        `UPDATE invoices SET ${setSql}
+          WHERE id = $1 AND status IN (${fromList})
+          RETURNING *`,
+        [invoiceId, ...fromStates, ...extraValues]
+    );
+    return r.rows[0] || null;
+}
+
+// POST /api/admin/invoices/:id/issue — draft → issued
+app.post('/api/admin/invoices/:id/issue', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid invoice id' });
+    try {
+        const updated = await _fix330TransitionInvoice(req.params.id, ['draft'], 'issued');
+        if (!updated) return res.status(409).json({ error: 'Invoice not in draft state (or not found)' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'invoice_issued', updated.id,
+            `Issued invoice ${updated.invoice_number} (£${(updated.total_pence/100).toFixed(2)})`, updated.tenant_id));
+        res.json({ invoice: updated });
+    } catch (e) {
+        console.error('FIX-330 issue invoice failed:', e.message);
+        res.status(500).json({ error: 'Failed to issue invoice' });
+    }
+});
+
+// POST /api/admin/invoices/:id/mark-paid — issued → paid
+// FIX-333 audit-fix (Day 19): also sets paid_amount_pence = total_pence so
+// dashboards don't show "paid but £0 received". For partial payments or
+// payments with method tracking, use /record-payment instead.
+app.post('/api/admin/invoices/:id/mark-paid', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid invoice id' });
+    try {
+        const updated = await _fix330TransitionInvoice(
+            req.params.id, ['issued'], 'paid',
+            // Mirror total to paid_amount so reports don't show 0p.
+            // Tolerant of pre-FIX-331 schema: column may not exist yet, but the
+            // helper builds the SQL dynamically — if column missing, this just
+            // adds an UPDATE clause that PostgreSQL refuses with 42703. Outer
+            // try/catch handles. For safety, only add the clause if we can
+            // detect the column exists at startup. For now: rely on caller
+            // having run FIX-317-332 migration (Day 17 + Day 18 included).
+            `paid_amount_pence = total_pence`
+        );
+        if (!updated) return res.status(409).json({ error: 'Invoice not in issued state (or not found)' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'invoice_marked_paid', updated.id,
+            `Marked invoice ${updated.invoice_number} as paid (£${(updated.total_pence/100).toFixed(2)})`, updated.tenant_id));
+        res.json({ invoice: updated });
+    } catch (e) {
+        // Pre-FIX-331 fallback: paid_amount_pence column missing → retry without it
+        if (e && e.code === '42703') {
+            try {
+                const updated = await _fix330TransitionInvoice(req.params.id, ['issued'], 'paid');
+                if (!updated) return res.status(409).json({ error: 'Invoice not in issued state' });
+                setImmediate(() => auditLog(pool, req.user.playerId, 'invoice_marked_paid', updated.id,
+                    `Marked invoice ${updated.invoice_number} as paid (legacy schema, paid_amount not tracked)`,
+                    updated.tenant_id));
+                return res.json({ invoice: updated });
+            } catch (e2) {
+                console.error('FIX-330 mark-paid fallback failed:', e2.message);
+                return res.status(500).json({ error: 'Failed to mark invoice paid' });
+            }
+        }
+        console.error('FIX-330 mark-paid invoice failed:', e.message);
+        res.status(500).json({ error: 'Failed to mark invoice paid' });
+    }
+});
+
+// POST /api/admin/invoices/:id/void — any-but-void → void
+app.post('/api/admin/invoices/:id/void', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid invoice id' });
+    const reason = String(req.body?.reason || '').trim().slice(0, 500);
+    if (!reason) return res.status(400).json({ error: 'reason is required when voiding' });
+    try {
+        const updated = await _fix330TransitionInvoice(
+            req.params.id,
+            ['draft', 'issued', 'paid'],
+            'void',
+            `void_reason = $${3}`,
+            [reason]
+        );
+        if (!updated) return res.status(409).json({ error: 'Invoice already void (or not found)' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'invoice_voided', updated.id,
+            `Voided invoice ${updated.invoice_number}: ${reason}`, updated.tenant_id));
+        res.json({ invoice: updated });
+    } catch (e) {
+        console.error('FIX-330 void invoice failed:', e.message);
+        res.status(500).json({ error: 'Failed to void invoice' });
+    }
+});
+
+// POST /api/admin/invoices/:id/line-items — add manual adjustment / credit
+// Body: { line_type: 'manual_adjustment'|'manual_credit', description, amount_pence }
+// Only allowed on DRAFT invoices. Updates subtotal+total accordingly.
+app.post('/api/admin/invoices/:id/line-items', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid invoice id' });
+    const body = req.body || {};
+    const lineType = String(body.line_type || '').trim();
+    if (!['manual_adjustment', 'manual_credit'].includes(lineType)) {
+        return res.status(400).json({ error: 'line_type must be manual_adjustment or manual_credit' });
+    }
+    const description = String(body.description || '').trim();
+    if (!description) return res.status(400).json({ error: 'description is required' });
+    if (description.length > 500) return res.status(400).json({ error: 'description too long (max 500)' });
+    const amount = parseInt(body.amount_pence, 10);
+    if (!Number.isFinite(amount)) return res.status(400).json({ error: 'amount_pence must be an integer' });
+    // manual_credit stored as negative for clarity; manual_adjustment positive
+    const signedAmount = lineType === 'manual_credit' ? -Math.abs(amount) : Math.abs(amount);
+
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        const invRes = await client.query(`SELECT * FROM invoices WHERE id = $1 FOR UPDATE`, [req.params.id]);
+        if (invRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Invoice not found' });
+        }
+        const inv = invRes.rows[0];
+        if (inv.status !== 'draft') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: `Cannot add line items to ${inv.status} invoice — void and re-create instead` });
+        }
+
+        await client.query(
+            `INSERT INTO invoice_line_items
+                (invoice_id, line_type, description, quantity, unit_price_pence, amount_pence)
+             VALUES ($1, $2, $3, 1, $4, $4)`,
+            [inv.id, lineType, description, signedAmount]
+        );
+
+        const newSubtotal = parseInt(inv.subtotal_pence, 10) + signedAmount;
+        const newTotal    = newSubtotal + parseInt(inv.tax_pence, 10);
+        // FIX-332 Day 18: if manual_credit drives subtotal negative, push the
+        // overflow to tenants.credit_balance_pence (Mitchell owes the tenant).
+        // Next invoice generation will apply it as a credit. Clamp current
+        // invoice at 0 to satisfy the CHECK constraint.
+        let overflowToBalance = 0;
+        let clampedSubtotal   = newSubtotal;
+        if (newSubtotal < 0) {
+            overflowToBalance = -newSubtotal;
+            clampedSubtotal   = 0;
+            try {
+                await client.query(
+                    `UPDATE tenants SET credit_balance_pence = credit_balance_pence + $1
+                      WHERE id = $2`,
+                    [overflowToBalance, inv.tenant_id]
+                );
+            } catch (e) {
+                if (e && e.code === '42703') {
+                    // Pre-FIX-332 migration: balance column doesn't exist yet.
+                    // Fall back to old behaviour (just clamp, log warning).
+                    console.warn('FIX-332 credit_balance column missing — overflow lost:', overflowToBalance);
+                    overflowToBalance = 0;
+                } else { throw e; }
+            }
+        }
+        const clampedTotal = clampedSubtotal + parseInt(inv.tax_pence, 10);
+
+        const upd = await client.query(
+            `UPDATE invoices SET subtotal_pence = $1, total_pence = $2, updated_at = NOW()
+              WHERE id = $3 RETURNING *`,
+            [clampedSubtotal, clampedTotal, inv.id]
+        );
+
+        await client.query('COMMIT');
+
+        setImmediate(() => auditLog(pool, req.user.playerId, 'invoice_line_item_added', inv.id,
+            `${lineType} on ${inv.invoice_number}: ${description} (${signedAmount}p)${overflowToBalance ? ` [+£${(overflowToBalance/100).toFixed(2)} → tenant credit]` : ''}`,
+            inv.tenant_id));
+
+        res.status(201).json({
+            invoice: upd.rows[0],
+            overflow_to_credit_balance_pence: overflowToBalance,
+            warning: overflowToBalance > 0
+                ? `Credit exceeded subtotal by £${(overflowToBalance/100).toFixed(2)} — added to tenant credit balance (applied to next invoice).`
+                : null,
+        });
+    } catch (e) {
+        if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+        console.error('FIX-330 add line item failed:', e.message);
+        res.status(500).json({ error: 'Failed to add line item' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// GET /api/t/:tenant_short_id/admin/invoices — tenant admin's own list
+app.get('/api/t/:tenant_short_id/admin/invoices',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        let limit  = parseInt(req.query.limit, 10);
+        let offset = parseInt(req.query.offset, 10);
+        if (!Number.isFinite(limit)  || limit  <= 0) limit  = 50;
+        if (!Number.isFinite(offset) || offset < 0)  offset = 0;
+        if (limit > 200) limit = 200;
+
+        // Hide draft invoices from tenant — tenants only see issued/paid/void
+        try {
+            const r = await pool.query(
+                `SELECT id, invoice_number, period_start, period_end,
+                        subtotal_pence, tax_pence, total_pence, status,
+                        issued_at, paid_at, void_at, created_at
+                   FROM invoices
+                  WHERE tenant_id = $1
+                    AND status IN ('issued', 'paid', 'void')
+                  ORDER BY created_at DESC
+                  LIMIT $2 OFFSET $3`,
+                [req.tenant.id, limit, offset]
+            );
+            res.json({ invoices: r.rows, count: r.rows.length });
+        } catch (e) {
+            if (e && e.code === '42P01') return res.json({ invoices: [], count: 0 });
+            console.error('FIX-330 tenant list invoices failed:', e.message);
+            res.status(500).json({ error: 'Failed to list invoices' });
+        }
+    }
+);
+
+// GET /api/t/:tenant_short_id/admin/invoices/:id — own detail
+app.get('/api/t/:tenant_short_id/admin/invoices/:id',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid invoice id' });
+        try {
+            const invRes = await pool.query(
+                `SELECT id, tenant_id, invoice_number, period_start, period_end,
+                        subtotal_pence, tax_pence, total_pence, status,
+                        issued_at, paid_at, void_at, void_reason, notes, created_at
+                   FROM invoices
+                  WHERE id = $1 AND tenant_id = $2 AND status IN ('issued','paid','void')
+                  LIMIT 1`,
+                [req.params.id, req.tenant.id]
+            );
+            if (invRes.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
+            const lineRes = await pool.query(
+                `SELECT id, line_type, description, quantity, unit_price_pence, amount_pence, created_at
+                   FROM invoice_line_items
+                  WHERE invoice_id = $1
+                  ORDER BY created_at ASC`,
+                [req.params.id]
+            );
+            res.json({ invoice: invRes.rows[0], line_items: lineRes.rows });
+        } catch (e) {
+            console.error('FIX-330 tenant get invoice failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch invoice' });
+        }
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-330 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-331 — ROW Day 17: Payment recording + monthly auto-generation
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Manual payment recording flow (Day 17 — Wonderful auto-marking is Day 18).
+// Endpoint:
+//   POST /api/admin/invoices/:id/record-payment
+//   Body: { payment_method, payment_reference?, paid_amount_pence?, paid_at? }
+//
+// Replaces /mark-paid for cases where Mitchell needs to capture HOW the
+// invoice was paid. /mark-paid still works for quick-and-dirty marking but
+// leaves all method/reference fields NULL.
+
+// Allowed payment methods (mirror DB constraint)
+const _FIX331_PAYMENT_METHODS = [
+    'bank_transfer', 'direct_debit', 'cash', 'cheque', 'wonderful', 'card', 'other'
+];
+
+// POST /api/admin/invoices/:id/record-payment — issued → paid with method
+app.post('/api/admin/invoices/:id/record-payment',
+    authenticateToken, requireSuperAdmin, async (req, res) => {
+        if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid invoice id' });
+
+        const body = req.body || {};
+        const method = String(body.payment_method || '').trim();
+        if (!_FIX331_PAYMENT_METHODS.includes(method)) {
+            return res.status(400).json({
+                error: `payment_method must be one of: ${_FIX331_PAYMENT_METHODS.join(', ')}`
+            });
+        }
+        const reference = body.payment_reference != null ? String(body.payment_reference).trim().slice(0, 200) : null;
+
+        // paid_amount_pence: default to invoice total if not provided
+        let paidAmount = null;
+        if (body.paid_amount_pence !== undefined) {
+            paidAmount = parseInt(body.paid_amount_pence, 10);
+            if (!Number.isFinite(paidAmount) || paidAmount < 0) {
+                return res.status(400).json({ error: 'paid_amount_pence must be a non-negative integer' });
+            }
+        }
+
+        // paid_at: default to NOW; allow backdating with ISO string
+        let paidAt = null;
+        if (body.paid_at) {
+            const d = new Date(body.paid_at);
+            if (isNaN(d.getTime())) return res.status(400).json({ error: 'paid_at must be a valid ISO date' });
+            if (d.getTime() > Date.now() + 86400000) {
+                return res.status(400).json({ error: 'paid_at cannot be more than 24h in the future' });
+            }
+            paidAt = d.toISOString();
+        }
+
+        let client;
+        try {
+            client = await pool.connect();
+            await client.query('BEGIN');
+
+            const cur = await client.query(
+                `SELECT * FROM invoices WHERE id = $1 FOR UPDATE`, [req.params.id]
+            );
+            if (cur.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ error: 'Invoice not found' });
+            }
+            const inv = cur.rows[0];
+            if (!['issued', 'paid'].includes(inv.status)) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({
+                    error: `Cannot record payment on ${inv.status} invoice — must be issued or already-paid (for amendments)`
+                });
+            }
+
+            // If paid_amount not supplied, default to invoice total
+            if (paidAmount == null) paidAmount = parseInt(inv.total_pence, 10);
+
+            // Note: partial payments allowed (paidAmount < total). Status only
+            // flips to 'paid' if paidAmount >= total. Otherwise stays 'issued'
+            // with paid_amount_pence updated for Mitchell to track.
+            //
+            // FIX-333 audit-fix (Pass 3): State machine MUST be monotonic
+            // forward — never downgrade paid → issued. If current status is
+            // already 'paid', amendments (e.g., correcting a reference number
+            // with a partial amount) must NOT silently flip back to issued.
+            const fullyPaid = paidAmount >= parseInt(inv.total_pence, 10);
+            const currentlyPaid = inv.status === 'paid';
+            const newStatus = (fullyPaid || currentlyPaid) ? 'paid' : 'issued';
+            const newPaidAt = newStatus === 'paid'
+                ? (paidAt || inv.paid_at || new Date().toISOString())
+                : null;
+
+            const upd = await client.query(
+                `UPDATE invoices SET
+                    status                = $1,
+                    payment_method        = $2,
+                    payment_reference     = $3,
+                    paid_amount_pence     = $4,
+                    paid_at               = COALESCE($5::timestamptz, paid_at),
+                    recorded_by_player_id = $6,
+                    updated_at            = NOW()
+                  WHERE id = $7
+                  RETURNING *`,
+                [newStatus, method, reference, paidAmount, newPaidAt, req.user.playerId, inv.id]
+            );
+
+            await client.query('COMMIT');
+
+            setImmediate(() => auditLog(pool, req.user.playerId,
+                fullyPaid ? 'invoice_payment_recorded' : 'invoice_partial_payment_recorded',
+                inv.id,
+                `${method} payment of £${(paidAmount/100).toFixed(2)} for ${inv.invoice_number}${reference ? ` (ref: ${reference})` : ''}${fullyPaid ? '' : ' [partial]'}`,
+                inv.tenant_id));
+
+            res.json({
+                invoice:     upd.rows[0],
+                fully_paid:  fullyPaid,
+                outstanding_pence: Math.max(0, parseInt(inv.total_pence, 10) - paidAmount),
+            });
+        } catch (e) {
+            if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+            console.error('FIX-331 record-payment failed:', e.message);
+            res.status(500).json({ error: 'Failed to record payment' });
+        } finally {
+            if (client) client.release();
+        }
+    }
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-334 — ROW Day 22: Tenant payouts-due (Mitchell's CRM queue)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Each game completion (in non-TF tenants) generates a tenant_payouts_due row.
+// Mitchell's weekly payment-run workflow:
+//   1. GET /api/admin/payouts-due → list of pending rows (filterable by tenant)
+//   2. Make bank transfers via Mitchell's banking app
+//   3. POST /api/admin/payouts-due/:id/mark-paid with reference number
+//
+// Per Q4: weekly cadence, manual processing, one CRM task per game completion.
+//
+// FIX-334 audit-fix (Day 30 Pass 3): state machine has 4 values defined
+//   pending → paid       via /mark-paid (guarded WHERE status='pending')
+//   pending → disputed   via /dispute   (guarded WHERE status='pending')
+//   pending → cancelled  NO endpoint currently — TF has no game-cancel write
+//                        path either, so 'cancelled' state is reserved for
+//                        future use. If/when game cancellation lands, add a
+//                        /cancel endpoint here that mirrors /dispute's guard.
+
+// GET /api/admin/payouts-due — list payouts owed to tenants
+//
+// Query params:
+//   ?status=pending|paid|disputed|cancelled  (default: pending)
+//   ?tenant_id=<uuid>  (filter to one tenant)
+//   ?limit=N (default 100, max 500)
+//   ?offset=N (default 0)
+app.get('/api/admin/payouts-due', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const status = ['pending', 'paid', 'disputed', 'cancelled'].includes(req.query.status)
+            ? req.query.status : 'pending';
+        const tenantId = req.query.tenant_id;
+        if (tenantId && !isValidUuid(tenantId)) {
+            return res.status(400).json({ error: 'tenant_id must be a valid UUID' });
+        }
+        const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+        const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+        const where  = ['p.status = $1'];
+        const params = [status];
+        let pi = 2;
+        if (tenantId) {
+            where.push(`p.tenant_id = $${pi++}`);
+            params.push(tenantId);
+        }
+        params.push(limit, offset);
+
+        const r = await pool.query(
+            `SELECT p.id, p.tenant_id, p.game_id, p.game_url, p.game_date,
+                    p.gross_pence, p.paid_player_count,
+                    p.platform_fee_pence, p.fee_mode, p.total_fee_pence,
+                    p.payable_pence, p.status, p.paid_at, p.paid_reference,
+                    p.marked_paid_by, p.notes, p.created_at,
+                    t.name AS tenant_name, t.short_id AS tenant_short_id,
+                    t.bank_account_holder_name, t.bank_account_number, t.bank_sort_code,
+                    SUM(p.payable_pence) OVER (PARTITION BY p.tenant_id) AS tenant_total_owed
+               FROM tenant_payouts_due p
+               JOIN tenants t ON t.id = p.tenant_id
+              WHERE ${where.join(' AND ')}
+              ORDER BY p.created_at ASC
+              LIMIT $${pi++} OFFSET $${pi}`,
+            params
+        );
+
+        // Sum totals across all returned rows for Mitchell's summary header
+        const totals = await pool.query(
+            `SELECT COALESCE(SUM(payable_pence), 0)::bigint AS total_payable,
+                    COUNT(*)::int AS row_count
+               FROM tenant_payouts_due
+              WHERE status = $1
+                ${tenantId ? 'AND tenant_id = $2' : ''}`,
+            tenantId ? [status, tenantId] : [status]
+        );
+
+        res.json({
+            payouts: r.rows,
+            total_payable_pence: parseInt(totals.rows[0].total_payable, 10),
+            row_count: totals.rows[0].row_count,
+            status_filter: status,
+            tenant_filter: tenantId || null,
+        });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Payouts feature not yet provisioned (run FIX-334 migration)' });
+        }
+        console.error('FIX-334 payouts list failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch payouts' });
+    }
+});
+
+// POST /api/admin/payouts-due/:id/mark-paid — record a manual bank transfer
+//
+// Body: { paid_reference?: string, paid_at?: ISO string, notes?: string }
+//
+// Transitions row from 'pending' → 'paid'. State machine guards against
+// double-mark and against marking a 'disputed' or 'cancelled' row.
+app.post('/api/admin/payouts-due/:id/mark-paid', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid payout id' });
+
+    const body = req.body || {};
+    const paidRef   = typeof body.paid_reference === 'string'
+        ? body.paid_reference.trim().slice(0, 200) : null;
+    const notes     = typeof body.notes === 'string'
+        ? body.notes.trim().slice(0, 1000) : null;
+    let paidAt = body.paid_at || null;
+    if (paidAt) {
+        const d = new Date(paidAt);
+        if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid paid_at' });
+        // Reject far-future dates (>24h) to catch typos
+        if (d.getTime() > Date.now() + 24 * 60 * 60 * 1000) {
+            return res.status(400).json({ error: 'paid_at cannot be more than 24h in the future' });
+        }
+        paidAt = d.toISOString();
+    } else {
+        paidAt = new Date().toISOString();
+    }
+
+    try {
+        const r = await pool.query(
+            `UPDATE tenant_payouts_due
+                SET status         = 'paid',
+                    paid_at        = $1,
+                    paid_reference = COALESCE($2, paid_reference),
+                    notes          = COALESCE($3, notes),
+                    marked_paid_by = $4,
+                    updated_at     = NOW()
+              WHERE id = $5
+                AND status = 'pending'
+              RETURNING *`,
+            [paidAt, paidRef, notes, req.user.playerId, id]
+        );
+
+        if (r.rows.length === 0) {
+            // Either id doesn't exist, or status isn't 'pending' (already paid/disputed/cancelled)
+            const cur = await pool.query(
+                `SELECT status FROM tenant_payouts_due WHERE id = $1`,
+                [id]
+            );
+            if (cur.rows.length === 0) return res.status(404).json({ error: 'Payout not found' });
+            return res.status(409).json({
+                error: `Payout is currently '${cur.rows[0].status}'; only 'pending' payouts can be marked paid`,
+                current_status: cur.rows[0].status
+            });
+        }
+
+        const payout = r.rows[0];
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_payout_marked_paid', payout.id,
+            `Marked £${(payout.payable_pence / 100).toFixed(2)} paid to tenant ${payout.tenant_id}` +
+            (paidRef ? ` (ref: ${paidRef})` : ''),
+            payout.tenant_id).catch(() => {}));
+
+        res.json({ payout });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Payouts feature not yet provisioned' });
+        }
+        console.error('FIX-334 mark-paid failed:', e.message);
+        res.status(500).json({ error: 'Failed to mark payout paid' });
+    }
+});
+
+// POST /api/admin/payouts-due/:id/dispute — flag a payout for review
+//
+// Body: { reason: string }  (required)
+//
+// Use when something looks wrong (e.g. recorded gross doesn't match Mitchell's
+// records). Transitions pending → disputed. Mitchell investigates manually.
+app.post('/api/admin/payouts-due/:id/dispute', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid payout id' });
+
+    const reason = (req.body && typeof req.body.reason === 'string')
+        ? req.body.reason.trim().slice(0, 1000) : '';
+    if (!reason) return res.status(400).json({ error: 'reason is required' });
+
+    try {
+        const r = await pool.query(
+            `UPDATE tenant_payouts_due
+                SET status = 'disputed',
+                    notes  = $1,
+                    updated_at = NOW()
+              WHERE id = $2
+                AND status = 'pending'
+              RETURNING *`,
+            [reason, id]
+        );
+        if (r.rows.length === 0) {
+            return res.status(409).json({ error: 'Only pending payouts can be disputed' });
+        }
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_payout_disputed', r.rows[0].id,
+            `Disputed: ${reason}`, r.rows[0].tenant_id).catch(() => {}));
+        res.json({ payout: r.rows[0] });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Payouts feature not yet provisioned' });
+        }
+        console.error('FIX-334 dispute-payout failed:', e.message);
+        res.status(500).json({ error: 'Failed to dispute payout' });
+    }
+});
+
+// GET /api/t/:tenant_short_id/payouts — tenant_admin views their own pending settlements
+//
+// Returns only payouts for the requesting tenant. No bank details exposed here
+// (tenant_admin already controls their own). status filter same as superadmin.
+app.get('/api/t/:tenant_short_id/payouts', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const status = ['pending', 'paid', 'disputed', 'cancelled'].includes(req.query.status)
+            ? req.query.status : 'pending';
+        const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+        const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+        const r = await pool.query(
+            `SELECT id, game_id, game_url, game_date,
+                    gross_pence, paid_player_count,
+                    platform_fee_pence, fee_mode, total_fee_pence,
+                    payable_pence, status, paid_at, paid_reference,
+                    notes, created_at, updated_at
+               FROM tenant_payouts_due
+              WHERE tenant_id = $1
+                AND status = $2
+              ORDER BY created_at DESC
+              LIMIT $3 OFFSET $4`,
+            [req.tenant.id, status, limit, offset]
+        );
+
+        const totals = await pool.query(
+            `SELECT COALESCE(SUM(payable_pence), 0)::bigint AS total_owed,
+                    COUNT(*)::int AS row_count
+               FROM tenant_payouts_due
+              WHERE tenant_id = $1 AND status = $2`,
+            [req.tenant.id, status]
+        );
+
+        res.json({
+            payouts: r.rows,
+            total_owed_pence: parseInt(totals.rows[0].total_owed, 10),
+            row_count: totals.rows[0].row_count,
+            status_filter: status,
+        });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Payouts feature not yet provisioned' });
+        }
+        console.error('FIX-334 tenant payouts list failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch payouts' });
+    }
+});
+
+// ─── Monthly auto-generation cron ──────────────────────────────────────
+// Runs hourly via setInterval (matches codebase convention). On the 1st of
+// any month, generates draft invoices for the PREVIOUS month for all active
+// tenants. Idempotent: the UNIQUE constraint on (tenant_id, period_start,
+// period_end) prevents duplicates.
+//
+// Stays as DRAFT — Mitchell still issues manually. This is intentional: lets
+// Mitchell review + adjust before sending to tenants.
+async function _fix331TickInvoiceCron() {
+    try {
+        const now = new Date();
+        // Only fire on day 1 of any month
+        if (now.getUTCDate() !== 1) return;
+
+        // Previous calendar month (UTC reasoning is fine for billing periods —
+        // we use DATE not TIMESTAMPTZ so timezone drift is bounded to 1 day,
+        // acceptable for monthly cycles).
+        const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+        const firstOfTarget = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), 1));
+        const lastOfTarget  = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0));
+        const periodStart = firstOfTarget.toISOString().slice(0, 10);
+        const periodEnd   = lastOfTarget.toISOString().slice(0, 10);
+
+        // Quick pre-check: have we already run for this period today?
+        // (Hourly tick means we'd otherwise run 24 times on the 1st)
+        try {
+            const recentRun = await pool.query(
+                `SELECT 1 FROM audit_logs
+                  WHERE action = 'invoices_generated'
+                    AND created_at >= NOW() - INTERVAL '23 hours'
+                    AND detail LIKE $1
+                  LIMIT 1`,
+                [`%${periodStart}..${periodEnd}%`]
+            );
+            if (recentRun.rows.length > 0) return; // Already ran today
+        } catch (_) { /* audit_logs might not exist in some envs — fall through */ }
+
+        const results = await _fix330GenerateInvoicesForPeriod(periodStart, periodEnd);
+        const createdCount = results.filter(r => r.created).length;
+        const skippedCount = results.filter(r => r.invoice && !r.created).length;
+        const errorCount   = results.filter(r => r.error).length;
+
+        console.log(`💷 Auto-generated invoices for ${periodStart}..${periodEnd}: ${createdCount} created, ${skippedCount} skipped, ${errorCount} errors`);
+
+        // Audit log so the next-hour run sees this and skips
+        await auditLog(pool, null, 'invoices_generated', null,
+            `[CRON] Auto-generated invoices for ${periodStart}..${periodEnd}: ${createdCount} created, ${skippedCount} skipped, ${errorCount} errors`);
+    } catch (e) {
+        console.error('💷 Invoice cron error:', e.message);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-331 endpoints + cron
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-332 — ROW Day 18: Tenant credit balance management
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Two endpoints:
+//   GET   /api/admin/tenants/:id/credit-balance      view current balance
+//   POST  /api/admin/tenants/:id/credit-adjust       manual adjust (audited)
+//
+// The credit balance is auto-incremented when a manual_credit on a draft
+// invoice exceeds its subtotal (Day 16 line-items endpoint), and auto-
+// consumed when a new invoice is generated (Day 16 _fix330BuildTenantInvoice).
+// This endpoint exists for manual corrections (e.g. cash refund issued
+// out-of-band, tenant pre-paid for next month, etc.).
+
+// GET /api/admin/tenants/:id/credit-balance — read
+app.get('/api/admin/tenants/:id/credit-balance',
+    authenticateToken, requireSuperAdmin, async (req, res) => {
+        if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid tenant id' });
+        try {
+            const r = await pool.query(
+                `SELECT id, short_id, name, credit_balance_pence,
+                        vat_registered, vat_number, vat_rate_basis_points
+                   FROM tenants WHERE id = $1`,
+                [req.params.id]
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+            res.json({
+                tenant_id:               r.rows[0].id,
+                short_id:                r.rows[0].short_id,
+                name:                    r.rows[0].name,
+                credit_balance_pence:    parseInt(r.rows[0].credit_balance_pence || 0, 10),
+                credit_balance_display:  '£' + ((r.rows[0].credit_balance_pence || 0) / 100).toFixed(2),
+                vat_registered:          r.rows[0].vat_registered === true,
+                vat_number:              r.rows[0].vat_number || null,
+                vat_rate_basis_points:   parseInt(r.rows[0].vat_rate_basis_points || 2000, 10),
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Credit balance feature not yet provisioned' });
+            }
+            console.error('FIX-332 get credit balance failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch credit balance' });
+        }
+    }
+);
+
+// POST /api/admin/tenants/:id/credit-adjust — manual adjustment
+// Body: { delta_pence: integer (positive=credit_to_tenant, negative=debit), reason: string }
+// Always audited. Refuses if delta would push balance negative.
+app.post('/api/admin/tenants/:id/credit-adjust',
+    authenticateToken, requireSuperAdmin, async (req, res) => {
+        if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Invalid tenant id' });
+
+        const delta = parseInt(req.body?.delta_pence, 10);
+        if (!Number.isFinite(delta) || delta === 0) {
+            return res.status(400).json({ error: 'delta_pence must be a non-zero integer' });
+        }
+        if (Math.abs(delta) > 1000000) {
+            return res.status(400).json({ error: 'delta_pence too large (max ±£10,000 per adjustment)' });
+        }
+        const reason = String(req.body?.reason || '').trim().slice(0, 500);
+        if (!reason) return res.status(400).json({ error: 'reason is required for audit trail' });
+
+        let client;
+        try {
+            client = await pool.connect();
+            await client.query('BEGIN');
+
+            const cur = await client.query(
+                `SELECT id, name, credit_balance_pence FROM tenants WHERE id = $1 FOR UPDATE`,
+                [req.params.id]
+            );
+            if (cur.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ error: 'Tenant not found' });
+            }
+            const startingBalance = parseInt(cur.rows[0].credit_balance_pence || 0, 10);
+            const newBalance      = startingBalance + delta;
+            if (newBalance < 0) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({
+                    error: `Adjustment would push balance negative (current: ${startingBalance}p, delta: ${delta}p)`
+                });
+            }
+
+            const upd = await client.query(
+                `UPDATE tenants SET credit_balance_pence = $1 WHERE id = $2
+                  RETURNING credit_balance_pence`,
+                [newBalance, req.params.id]
+            );
+
+            await client.query('COMMIT');
+
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_credit_adjusted',
+                req.params.id,
+                `Adjusted ${cur.rows[0].name} credit balance by £${(delta/100).toFixed(2)} (${startingBalance}p → ${newBalance}p): ${reason}`,
+                req.params.id));
+
+            res.json({
+                starting_balance_pence: startingBalance,
+                delta_pence:            delta,
+                new_balance_pence:      parseInt(upd.rows[0].credit_balance_pence, 10),
+                new_balance_display:    '£' + (upd.rows[0].credit_balance_pence / 100).toFixed(2),
+            });
+        } catch (e) {
+            if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Credit balance feature not yet provisioned' });
+            }
+            console.error('FIX-332 credit-adjust failed:', e.message);
+            res.status(500).json({ error: 'Failed to adjust credit balance' });
+        } finally {
+            if (client) client.release();
+        }
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-332 endpoints
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIX-333 — ROW Day 19: Health/status endpoint + final polish
+// ═══════════════════════════════════════════════════════════════════════
+//
+// One diagnostic endpoint that introspects which ROW features are live based
+// on schema presence + endpoint registration. Used post-deploy to verify the
+// migration ran fully and the new endpoints are reachable.
+
+// GET /api/admin/row-status — diagnostic snapshot of ROW deployment state
+app.get('/api/admin/row-status', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const checks = [];
+
+    async function checkColumn(table, column, dayLabel) {
+        try {
+            const r = await pool.query(
+                `SELECT 1 FROM information_schema.columns
+                  WHERE table_name = $1 AND column_name = $2 LIMIT 1`,
+                [table, column]
+            );
+            checks.push({ day: dayLabel, check: `${table}.${column}`, ok: r.rows.length > 0 });
+        } catch (e) {
+            checks.push({ day: dayLabel, check: `${table}.${column}`, ok: false, error: e.message });
+        }
+    }
+    async function checkTable(table, dayLabel) {
+        try {
+            const r = await pool.query(
+                `SELECT 1 FROM information_schema.tables WHERE table_name = $1 LIMIT 1`,
+                [table]
+            );
+            checks.push({ day: dayLabel, check: `table:${table}`, ok: r.rows.length > 0 });
+        } catch (e) {
+            checks.push({ day: dayLabel, check: `table:${table}`, ok: false, error: e.message });
+        }
+    }
+
+    try {
+        // Day 1 — core ROW schema
+        await checkTable('tenants', 'Day 1');
+        await checkTable('player_tenants', 'Day 1');
+        await checkColumn('games', 'tenant_id', 'Day 1');
+        // Day 2 — role on junction
+        await checkColumn('player_tenants', 'role', 'Day 2');
+        // Day 3 — TF visibility toggle
+        await checkColumn('players', 'show_tf_root_games', 'Day 3');
+        // Day 4 — audit_logs tenant scope
+        await checkColumn('audit_logs', 'tenant_id', 'Day 4');
+        // Day 5 — trophies tenant scope
+        await checkColumn('monthly_trophies', 'tenant_id', 'Day 5');
+        // Day 6 — tenant management panel
+        await checkColumn('tenants', 'platform_fee_pence', 'Day 6');
+        await checkColumn('tenants', 'raf_enabled', 'Day 6');
+        // Day 7 — branding (no schema changes; helpers only)
+        // Day 8 — DSAR (no schema changes)
+        // Day 9 — onboarding
+        await checkColumn('players', 'onboarding_state', 'Day 9');
+        // Day 14 — reviews + phone consent
+        await checkTable('organiser_reviews', 'Day 14');
+        await checkColumn('players', 'phone_public_for_organising', 'Day 14');
+        // Day 15 — allowance dials
+        await checkColumn('tenants', 'organiser_allowance_per_game', 'Day 15');
+        // Day 16 — invoicing
+        await checkTable('invoices', 'Day 16');
+        await checkTable('invoice_line_items', 'Day 16');
+        // Day 17 — payment recording
+        await checkColumn('invoices', 'payment_method', 'Day 17');
+        // Day 18 — VAT + credit
+        await checkColumn('tenants', 'vat_registered', 'Day 18');
+        await checkColumn('tenants', 'credit_balance_pence', 'Day 18');
+
+        const passing = checks.filter(c => c.ok).length;
+        const failing = checks.filter(c => !c.ok);
+
+        // Tenant census — useful for Mitchell at-a-glance
+        let tenantCensus = { total: 0, active: 0, paused: 0, exited: 0 };
+        try {
+            const cen = await pool.query(
+                `SELECT status, COUNT(*) AS cnt FROM tenants GROUP BY status`
+            );
+            for (const row of cen.rows) {
+                tenantCensus.total += parseInt(row.cnt, 10);
+                tenantCensus[row.status] = parseInt(row.cnt, 10);
+            }
+        } catch (_) { /* tenants table missing — already reflected in checks */ }
+
+        // Outstanding draft invoices (Mitchell's TODO queue)
+        let draftInvoiceCount = 0;
+        try {
+            const r = await pool.query(`SELECT COUNT(*) AS cnt FROM invoices WHERE status = 'draft'`);
+            draftInvoiceCount = parseInt(r.rows[0]?.cnt || 0, 10);
+        } catch (_) { /* invoices missing — same */ }
+
+        // FIX-333 audit-fix (Pass 9 future-proofing): sequence health monitor.
+        // tenant_player_id_seq has 900k range (100k-999k). Surface current
+        // value + remaining capacity so Mitchell can extend the range before
+        // exhaustion (which would cause user 500s on tenant join).
+        let sequenceHealth = null;
+        try {
+            const r = await pool.query(
+                `SELECT last_value FROM tenant_player_id_seq`
+            );
+            const lastValue = parseInt(r.rows[0]?.last_value || 100000, 10);
+            const maxValue  = 999999;
+            const remaining = maxValue - lastValue;
+            const pctUsed   = ((lastValue - 100000) / (maxValue - 100000) * 100).toFixed(2);
+            sequenceHealth = {
+                sequence: 'tenant_player_id_seq',
+                last_value: lastValue,
+                max_value: maxValue,
+                remaining_capacity: remaining,
+                percent_used: parseFloat(pctUsed),
+                warning: remaining < 50000 ? 'Sequence below 50k remaining — extend range soon' : null,
+            };
+        } catch (_) { /* sequence missing — pre-migration, ok */ }
+
+        res.json({
+            row_status: failing.length === 0 ? 'fully_migrated' : 'partial_migration',
+            checks_passing: passing,
+            checks_total: checks.length,
+            failing_checks: failing,
+            tenant_census: tenantCensus,
+            draft_invoices: draftInvoiceCount,
+            sequence_health: sequenceHealth,
+            generated_at: new Date().toISOString(),
+        });
+    } catch (e) {
+        console.error('FIX-333 row-status failed:', e.message);
+        res.status(500).json({ error: 'Failed to compute ROW status' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// END FIX-333 endpoint
+// ═══════════════════════════════════════════════════════════════════════
+
+
 // FIX-043: Catch-all 404 — MUST be last, after ALL routes (including comms routes).
 // Previously this was placed before the comms routes, which caused all comms endpoints
 // to return 404 because Express matches routes in registration order. Moved to here —
@@ -45056,6 +51465,10 @@ app.listen(PORT, () => {
     // First tick runs 1 minute after boot to catch a 1st-of-month restart.
     setTimeout(tickMonthlyTrophyCron, 60 * 1000);
     setInterval(tickMonthlyTrophyCron, 60 * 60 * 1000); // every hour
+    // FIX-331 ROW Day 17: monthly invoice auto-generation. Same hourly tick,
+    // only fires on day 1 of month. Idempotent via UNIQUE constraint on
+    // invoices(tenant_id, period_start, period_end) + audit-log dedup.
+    setInterval(_fix331TickInvoiceCron, 60 * 60 * 1000); // every hour
 
     // ── Wonderful payment reconciler ────────────────────────────────────────
     // The webhook is the primary credit path but it can fail silently: Render
