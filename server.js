@@ -2457,6 +2457,18 @@ const NOTIF_TEMPLATES = {
     rsvp_warning:      d => ({ title: '⏰ 48h to pay',              body: `Your RSVP for ${d.day} at ${d.venue} needs paying soon — deadline ${d.deadline_short}.` }),
     rsvp_accelerated:  d => ({ title: '🔥 Deadline brought forward', body: `${d.venue} is full. Your RSVP deadline is now ${d.deadline_short}.` }),
     rsvp_bumped:       d => ({ title: '🚫 Lost your spot',          body: d.hasOpenSpots ? `Other RSVPs didn't pay either — race to reclaim ${d.day} at ${d.venue}.` : `Spots filled by backups. Pay to become a backup yourself if you still want in.` }),
+    // FIX-362 (Web66): Wonderful credit push — fires when a Wonderful payment
+    // is credited so the player gets confirmation on their lock screen even if
+    // their banking-app redirect didn't bounce them back to totalfooty.co.uk
+    // (Barclays mobile is known to close back to the bank's home screen).
+    // Title/body are deliberately generic (no bank name, no reference, no PII)
+    // because the notification is visible on a locked phone.
+    wonderful_credited: d => ({
+        title: '✅ Payment credited',
+        body:  d.hasGame
+            ? `£${(d.amount || 0).toFixed(2)} added — you're in for the game!`
+            : `£${(d.amount || 0).toFixed(2)} added to your TotalFooty balance.`
+    }),
 };
 
 // sendNotification: send an Expo push notification to a player's registered devices.
@@ -5152,7 +5164,29 @@ app.post('/api/auth/register', async (req, res) => {
         // Validate age range — required for insurance purposes
         // Validate region
         const VALID_REGIONS = ['Coventry', 'Birmingham', 'Leamington & Warwick', 'Nuneaton', 'Manchester']; // FIX-107
-        const validatedRegion = (region && VALID_REGIONS.includes(region)) ? region : null;
+
+        // FIX-366 (Web66): multi-region support. Frontend wizard sends
+        // `regions: [...]` array (one or more regions the player intends to
+        // play in). Validate each against VALID_REGIONS, dedupe, and stash
+        // for the post-INSERT region_codes UPDATE below. The PRIMARY region
+        // (stored in players.region_code) is the FIRST array element, so
+        // existing region-filtered read paths and notifications keep working
+        // without change. Legacy clients sending only the single `region`
+        // field are still supported via fallback.
+        const _regionsIn = Array.isArray(req.body.regions) ? req.body.regions : [];
+        const validatedRegionsArr = Array.from(new Set(
+            _regionsIn
+                .filter(r => typeof r === 'string')
+                .map(r => r.trim())
+                .filter(r => VALID_REGIONS.includes(r))
+        ));
+        const _singleRegion = (region && VALID_REGIONS.includes(region)) ? region : null;
+        if (validatedRegionsArr.length === 0 && _singleRegion) {
+            validatedRegionsArr.push(_singleRegion);
+        }
+        // validatedRegion is the PRIMARY — first array element, or legacy
+        // single field if no array sent. All downstream code uses this.
+        const validatedRegion = validatedRegionsArr[0] || _singleRegion;
 
         // Validate interests
         const VALID_INTERESTS = ['playing', 'reffing', 'coaching'];
@@ -5253,6 +5287,27 @@ app.post('/api/auth/register', async (req, res) => {
             }
         }
         const playerId = playerResult.rows[0].id;
+
+        // FIX-366 (Web66): persist the multi-region array. Column was created
+        // by fix366BootstrapMultiRegion at boot; pre-migration safe via 42703
+        // catch. The primary region is already in players.region_code via the
+        // INSERT above (validatedRegion = validatedRegionsArr[0]); this UPDATE
+        // adds the FULL array. Non-fatal on failure — the player still has
+        // a valid primary region from the INSERT.
+        if (validatedRegionsArr.length > 0) {
+            try {
+                await pool.query(
+                    `UPDATE players SET region_codes = $1::text[] WHERE id = $2`,
+                    [validatedRegionsArr, playerId]
+                );
+            } catch (e) {
+                if (e.code === '42703') {
+                    console.warn('[FIX-366] region_codes column not yet present — skipping multi-region store');
+                } else {
+                    console.error('[FIX-366] region_codes UPDATE failed (non-fatal):', e.message);
+                }
+            }
+        }
 
         // Create credits record
         await pool.query('INSERT INTO credits (player_id, balance) VALUES ($1, 0.00)', [playerId]);
@@ -5985,6 +6040,54 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 // ==========================================
 // PLAYERS - Get current user's player data
 // ==========================================
+
+// FIX-363 (Web66) — Recent Wonderful credits poll for cross-tab banner UX.
+// Powers the "✅ £10.00 credited" banner that appears in any open TF tab
+// when a Wonderful payment lands. Solves the case where the user's banking
+// app didn't redirect them back to totalfooty.co.uk — the next time they
+// flick back to a TF tab, the banner appears and balance refreshes.
+//
+// Cheap: 1 query, filtered, capped at LIMIT 5, defaults to 5-minute window.
+// Frontend should pass ?since=<ISO> with the last-seen-credit timestamp
+// (stored in localStorage) to avoid re-banner-ing credits already shown.
+app.get('/api/players/me/recent-wonderful-credits', authenticateToken, async (req, res) => {
+    try {
+        const sinceRaw = req.query.since;
+        let since;
+        if (sinceRaw) {
+            const parsed = new Date(sinceRaw);
+            if (!isNaN(parsed.getTime())) since = parsed;
+        }
+        if (!since) since = new Date(Date.now() - 5 * 60 * 1000);
+
+        const r = await pool.query(
+            `SELECT id, merchant_reference, amount_pence, credited_at, game_id, status
+               FROM wonderful_payments
+              WHERE player_id = $1
+                AND status IN ('credited', 'credited_manually')
+                AND credited_at IS NOT NULL
+                AND credited_at > $2
+              ORDER BY credited_at DESC
+              LIMIT 5`,
+            [req.user.playerId, since]
+        );
+
+        res.json({
+            credits: r.rows.map(row => ({
+                id: row.id,
+                ref: row.merchant_reference,
+                amount: (row.amount_pence || 0) / 100,
+                credited_at: row.credited_at,
+                game_id: row.game_id || null,
+                status: row.status
+            })),
+            server_time: new Date().toISOString()
+        });
+    } catch (e) {
+        console.error('[FIX-363] recent-wonderful-credits failed:', e.message);
+        res.json({ credits: [], server_time: new Date().toISOString() });
+    }
+});
 
 app.get('/api/players/me', authenticateToken, async (req, res) => {
     try {
@@ -40841,6 +40944,133 @@ function _pickBestWonderfulPayment(matches) {
     return sorted[0];
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-360 (Web66) — Paginated Wonderful list-search with defensive status filter
+// ──────────────────────────────────────────────────────────────────────────
+// Why this exists: Wonderful's /v2/payments?limit=50 returns the most-recent
+// 50 payment records globally across all our orders. On a busy day a paid
+// payment can fall off the back of page 1 within minutes, so the previous
+// single-page lookup would 404 and crediting would stall.
+//
+// Defensive behaviour:
+//   1. First page tries `?status=paid&limit=50` — narrows to just paid records
+//      so the match is far more likely to be in page 1 on busy days. If
+//      Wonderful rejects the `status` query param (400/422) OR returns an
+//      empty/non-array shape, we silently fall back to unfiltered.
+//   2. Pages 2..maxPages try `?page=N`. If page 2 returns the same records as
+//      page 1 (pagination not supported), we stop early — pagination is a
+//      no-op on this account.
+//   3. Stops as soon as a match is found.
+//   4. Hard cap at 5 pages (max 250 records inspected) so a wide search is
+//      bounded and Wonderful's API isn't hammered.
+//
+// Inputs:
+//   merchantRef    — the merchant_payment_reference we're trying to match
+//   preferStatusPaid — true: try `?status=paid` first. false: unfiltered only.
+//   maxPages       — defaults to 5
+//   wpIdForFallback — optional wpId to also match against id/order_id/payment_id
+//                     (used by the webhook handler when ref is null)
+//
+// Returns: { match, viaStatusFilter, pagesScanned } | { match: null, ... }
+async function _wonderfulPaginatedListSearch(opts) {
+    const {
+        merchantRef = null,
+        wpIdForFallback = null,
+        preferStatusPaid = true,
+        maxPages = 5
+    } = opts || {};
+    if (!merchantRef && !wpIdForFallback) return { match: null, viaStatusFilter: false, pagesScanned: 0 };
+
+    const _isMatch = (p) => {
+        if (!p || typeof p !== 'object') return false;
+        if (merchantRef && (
+            p.merchant_payment_reference === merchantRef ||
+            p.merchant_reference === merchantRef ||
+            p.reference === merchantRef
+        )) return true;
+        if (wpIdForFallback && (
+            p.id === wpIdForFallback || p.order_id === wpIdForFallback || p.payment_id === wpIdForFallback
+        )) return true;
+        return false;
+    };
+
+    // helper: GET one page with optional status filter + page param.
+    // Returns { arr, ok } — ok=false means the API call itself threw.
+    const _fetchPage = async (page, withStatusPaid) => {
+        const params = [];
+        if (withStatusPaid) params.push('status=paid');
+        params.push('limit=50');
+        if (page > 1) params.push('page=' + page);
+        const qs = '?' + params.join('&');
+        try {
+            const res = await wonderfulRequest('GET', '/v2/payments' + qs);
+            const payments = res.data?.payments || res.data?.data || res.data || [];
+            const arr = Array.isArray(payments) ? payments : [];
+            return { arr, ok: true };
+        } catch (e) {
+            console.warn('[WF paginated] page ' + page + (withStatusPaid ? ' (status=paid)' : '') + ' failed:', e.message);
+            return { arr: [], ok: false };
+        }
+    };
+
+    // Scan pages until either a) we find matches on a page (then stop and pick
+    // best of THIS page's matches — multi-attempt records always cluster on
+    // the same page because Wonderful sorts by updated_at), b) we exhaust
+    // maxPages, c) pagination appears unsupported (same first record returned
+    // on consecutive pages), or d) the API rejects the request.
+    //
+    // Critical: returns _pickBestWonderfulPayment of the matches found on the
+    // matching page — NOT first match. This preserves the multi-attempt fix
+    // (player retries → paid record must beat cancelled record). Without
+    // _pickBest, a 'cancelled' attempt could be returned even when a later
+    // 'paid' attempt exists for the same merchant_reference. (Jac's bug.)
+    const _scanPagesAndPickBest = async (withStatusPaid) => {
+        let prevFirstId = null;
+        let pagesScanned = 0;
+        for (let page = 1; page <= maxPages; page++) {
+            const { arr, ok } = await _fetchPage(page, withStatusPaid);
+            if (!ok) return { match: null, pagesScanned, apiOk: false };
+            pagesScanned++;
+            if (arr.length === 0) break;
+            if (page > 1 && arr[0]?.id && arr[0].id === prevFirstId) {
+                console.log('[WF paginated] pagination appears unsupported (page ' + page + ' == page ' + (page - 1) + ') — stopping' + (withStatusPaid ? ' (status=paid)' : ''));
+                break;
+            }
+            const pageMatches = arr.filter(_isMatch);
+            if (pageMatches.length > 0) {
+                // Found at least one match on this page. Apply _pickBest to
+                // resolve the multi-attempt case (paid > pending > others > cancelled).
+                const best = _pickBestWonderfulPayment(pageMatches);
+                return { match: best, pagesScanned, apiOk: true };
+            }
+            prevFirstId = arr[0]?.id || prevFirstId;
+            if (arr.length < 50) break;
+        }
+        return { match: null, pagesScanned, apiOk: true };
+    };
+
+    // ── PASS 1: status=paid filtered (if preferred) ───────────────────────
+    let viaStatusFilter = false;
+    let totalPages = 0;
+    if (preferStatusPaid) {
+        const r1 = await _scanPagesAndPickBest(true);
+        totalPages += r1.pagesScanned;
+        if (r1.apiOk && r1.match) {
+            viaStatusFilter = true;
+            return { match: r1.match, viaStatusFilter, pagesScanned: totalPages };
+        }
+        if (!r1.apiOk) {
+            // status=paid rejected by API — silently fall through to unfiltered
+            console.log('[WF paginated] status=paid filter not supported, falling back to unfiltered');
+        }
+    }
+
+    // ── PASS 2: unfiltered ────────────────────────────────────────────────
+    const r2 = await _scanPagesAndPickBest(false);
+    totalPages += r2.pagesScanned;
+    return { match: r2.match, viaStatusFilter, pagesScanned: totalPages };
+}
+
 async function _wonderfulVerifyStatus(pmt) {
     if (!WONDERFUL_API_KEY) return { verified: null, resolvedWpId: pmt.wonderful_payment_id || null };
 
@@ -40891,28 +41121,28 @@ async function _wonderfulVerifyStatus(pmt) {
         }
     }
 
-    // ── LIST-SEARCH FALLBACK (unfiltered, scans last 50) ──────────────────
+    // ── LIST-SEARCH FALLBACK (paginated, defensive status=paid first) ────
     // Wonderful's /v2/payments/{id} GET on a quick-pay ID can return the LINK's
     // status rather than the underlying payment's status — so a paid payment
     // can appear 'pending' forever via that path. The list endpoint returns the
     // actual payment records, matched by our merchant_reference (which we own).
     // This is why webhooks would fail and the reconciler would never credit:
     // direct-GET returned a non-terminal status → list-search was skipped.
+    //
+    // FIX-360 (Web66): now uses _wonderfulPaginatedListSearch helper. Tries
+    // ?status=paid first (most likely to find paid records on busy days),
+    // falls back to unfiltered, walks up to 5 pages, stops on first match.
     if (!verified && pmt.merchant_reference) {
         try {
-            const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
-            const payments = listRes.data?.payments || listRes.data?.data || listRes.data || [];
-            const arr = Array.isArray(payments) ? payments : [];
-            // Log shape ONCE per call so we can finally see why webhook lookups fail
-            const sample = arr[0] ? Object.keys(arr[0]).join(',') : '(empty)';
-            console.log('[WF verify] list-search shape: array len=' + arr.length + ' | sample keys:', sample);
-            // Pick best of all matching attempts (see filtered-lookup comment above).
-            const matches = arr.filter(p =>
-                p.merchant_payment_reference === pmt.merchant_reference ||
-                p.merchant_reference === pmt.merchant_reference ||
-                p.reference === pmt.merchant_reference
-            );
-            const found = _pickBestWonderfulPayment(matches);
+            const { match: found, viaStatusFilter, pagesScanned } = await _wonderfulPaginatedListSearch({
+                merchantRef: pmt.merchant_reference,
+                preferStatusPaid: true,
+                maxPages: 5
+            });
+            console.log('[WF verify] paginated list-search:',
+                found ? 'matched' : 'no-match',
+                '· filter:', viaStatusFilter ? 'status=paid' : 'unfiltered',
+                '· pages:', pagesScanned);
             if (found) {
                 verified = found.status || null;
                 const foundWpId = found.id || found.order_id || found.payment_id || null;
@@ -40925,7 +41155,7 @@ async function _wonderfulVerifyStatus(pmt) {
                 }
             }
         } catch (e) {
-            console.warn('[WF verify] list search failed:', e.message);
+            console.warn('[WF verify] paginated list search failed:', e.message);
         }
     }
 
@@ -41300,6 +41530,43 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
     // Fire superadmin notification for every Wonderful payment (parallel to player email).
     setImmediate(() => notifyAdminWonderfulPayment(freshPmt.player_id, pounds, freshPmt.merchant_reference, balAfter, freshPmt.game_id || null));
 
+    // FIX-362 (Web66): Push notification on credit. Covers the case where the
+    // user's banking-app redirect didn't return them to totalfooty.co.uk
+    // (Barclays mobile especially). Idempotent via wonderful_payments.notified_at
+    // — even if multiple credit paths (webhook + reconciler) race, the column
+    // guards against double-pushing. Best-effort: failures never block credit.
+    setImmediate(async () => {
+        try {
+            // Idempotency: claim the right to push by setting notified_at, only
+            // if it isn't already set. Atomic check + set in one UPDATE.
+            const claim = await pool.query(
+                `UPDATE wonderful_payments
+                    SET notified_at = NOW()
+                  WHERE id = $1
+                    AND notified_at IS NULL
+                  RETURNING id`,
+                [freshPmt.id]
+            );
+            if (claim.rows.length === 0) {
+                // Someone else (another webhook/reconciler hit) already pushed.
+                return;
+            }
+            await sendNotification('wonderful_credited', freshPmt.player_id, {
+                amount: pounds,
+                hasGame: !!freshPmt.game_id
+            });
+        } catch (e) {
+            console.warn('[FIX-362] wonderful_credited push failed (non-fatal):', e.message);
+            // Best-effort: roll back the notified_at claim so a later retry can try again.
+            try {
+                await pool.query(
+                    `UPDATE wonderful_payments SET notified_at = NULL WHERE id = $1`,
+                    [freshPmt.id]
+                );
+            } catch (_) {}
+        }
+    });
+
     // Auto-register if payment linked to a game — runs in ALL credit paths now
     // (bug fixed web47: previously only the webhook ran this, so recovery/reconcile
     // paths credited the player but left them unregistered for the game they paid to join).
@@ -41386,16 +41653,21 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         // records with order_id.
         if (!pmt && wpId) {
             try {
-                const listRes = await wonderfulRequest('GET', '/v2/payments?limit=50');
-                const payments = listRes.data?.payments || listRes.data?.data || listRes.data || [];
-                // Log the response shape ONCE per webhook so we can diagnose if the
-                // structure changes. Compact but reveals enough.
-                const sample = Array.isArray(payments) && payments[0] ? Object.keys(payments[0]).join(',') : '(empty)';
-                console.log('[WF webhook] list-search shape:', Array.isArray(payments) ? `array len=${payments.length}` : typeof payments, '| sample keys:', sample);
-
-                let found = (Array.isArray(payments) ? payments : []).find(p =>
-                    p.id === wpId || p.order_id === wpId || p.payment_id === wpId
-                );
+                // FIX-360 (Web66): paginated list-search via helper. The helper
+                // walks up to 5 pages with status=paid filter first (then falls
+                // back to unfiltered if Wonderful rejects). Matches by wpId
+                // against id/order_id/payment_id since the webhook gave us no
+                // merchant_reference to anchor on.
+                const { match: foundFromPaged, viaStatusFilter, pagesScanned } = await _wonderfulPaginatedListSearch({
+                    wpIdForFallback: wpId,
+                    preferStatusPaid: true,
+                    maxPages: 5
+                });
+                console.log('[WF webhook] paginated list-search:',
+                    foundFromPaged ? 'matched' : 'no-match',
+                    '· filter:', viaStatusFilter ? 'status=paid' : 'unfiltered',
+                    '· pages:', pagesScanned);
+                let found = foundFromPaged || null;
 
                 // FIX (wonderful-pagination): when list-search misses (Wonderful's
                 // /v2/payments returns ~25 records regardless of limit param, and a
@@ -41445,9 +41717,22 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                     // Cache "tried-and-failed" wpIds for 5 minutes so repeated
                     // webhooks short-circuit. Cache lives in process memory;
                     // restarts clear it (acceptable — reconciler covers any gap).
-                    if (_reverseLookupFailCache.has(wpId)) {
+                    if (_reverseLookupFailCache.has(wpId) && !((String(req.body?.status || req.body?.data?.status || '').toLowerCase() === 'paid') || (String(req.body?.status || req.body?.data?.status || '').toLowerCase() === 'accepted'))) {
+                        // FIX-359 (Web66): fail cache prevents reverse-lookup ONLY for
+                        // non-terminal webhooks. A 'paid'/'accepted' webhook is the one
+                        // that actually matters — it MUST bust through the cache even
+                        // if a prior 'created'/'pending' webhook failed lookup. Without
+                        // this, 7 retries fired by Wonderful all skip silently and the
+                        // paid event is lost (order 69227933 / 2026-05-25). Cache busts
+                        // automatically when we re-enter the lookup below.
                         console.log('[WF webhook] reverse-lookup skipped (recently failed for wpId)', wpId);
                     } else {
+                        const _wfWebhookStatusForCache = String(req.body?.status || req.body?.data?.status || '').toLowerCase();
+                        if (_reverseLookupFailCache.has(wpId) && (_wfWebhookStatusForCache === 'paid' || _wfWebhookStatusForCache === 'accepted')) {
+                            // FIX-359: bust the cache so this paid webhook gets its lookup
+                            console.log('[WF webhook] cache busted by', _wfWebhookStatusForCache, 'webhook — retrying reverse-lookup for wpId', wpId);
+                            _reverseLookupFailCache.delete(wpId);
+                        }
                         console.log('[WF webhook] list-search did not match wpId', wpId, '— trying reverse lookup against pending rows');
                         const pendingRows = await pool.query(
                             `SELECT * FROM wonderful_payments
@@ -41483,8 +41768,20 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                             }
                         }
                         if (!matched) {
-                            // Add to fail cache so subsequent webhooks short-circuit
-                            _reverseLookupFailCache.set(wpId, Date.now());
+                            // FIX-359 (Web66): only cache the fail when the webhook itself
+                            // signals a TERMINAL state. A 'created'/'pending' webhook is
+                            // expected to miss (our DB row may not even exist yet — race
+                            // window between init and the first webhook fire). Caching that
+                            // fail locks out the later 'paid' webhook for 5 minutes, which
+                            // is exactly how the 25-May bug manifested. Only terminal
+                            // status fails are real signals worth caching.
+                            const _wfWebhookStatusForFailCache = String(req.body?.status || req.body?.data?.status || '').toLowerCase();
+                            const _wfIsTerminalStatus = ['paid', 'accepted', 'failed', 'cancelled', 'expired'].includes(_wfWebhookStatusForFailCache);
+                            if (_wfIsTerminalStatus) {
+                                _reverseLookupFailCache.set(wpId, Date.now());
+                            } else {
+                                console.log('[WF webhook] not caching fail — non-terminal status:', _wfWebhookStatusForFailCache || '(none)', 'wpId:', wpId);
+                            }
                         }
                     }
                 }
@@ -41493,10 +41790,52 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
             }
         }
         if (!pmt) {
+            // FIX-364 (Web66): log this unmatched webhook for diagnostic recovery
+            const _wfStatus = String(req.body?.status || req.body?.data?.status || '').toLowerCase() || null;
+            _logWonderfulWebhookAttempt({
+                pmtRowId:      null,
+                orderId:       wpId,
+                merchantRef:   webhookRef,
+                webhookStatus: _wfStatus,
+                matched:       false,
+                resolvedVia:   null,
+                failReason:    'no matching payment record after all lookup paths',
+                rawPayload:    req.body || null
+            }).catch(() => {});
             return console.warn('[WF webhook] no matching payment record (reconciler will retry) — wpId:', wpId, 'ref:', webhookRef);
         }
         if (pmt.status === 'credited' || pmt.status === 'credited_manually') {
+            // FIX-364: log successful match even on already-credited path
+            const _wfStatus = String(req.body?.status || req.body?.data?.status || '').toLowerCase() || null;
+            _logWonderfulWebhookAttempt({
+                pmtRowId:      pmt.id,
+                orderId:       wpId,
+                merchantRef:   pmt.merchant_reference || webhookRef,
+                webhookStatus: _wfStatus,
+                matched:       true,
+                resolvedVia:   'already_credited',
+                failReason:    null,
+                rawPayload:    req.body || null
+            }).catch(() => {});
             return console.log('[WF webhook] already credited (' + pmt.status + '), skipping:', pmt.merchant_reference);
+        }
+
+        // FIX-364 (Web66): log the successful match into the audit table.
+        // Fires once per webhook that resolves to a row, regardless of what
+        // happens next (verify, credit, mirror state). Powers the CRM
+        // "Webhook log" diagnostic view per-payment.
+        {
+            const _wfStatus = String(req.body?.status || req.body?.data?.status || '').toLowerCase() || null;
+            _logWonderfulWebhookAttempt({
+                pmtRowId:      pmt.id,
+                orderId:       wpId,
+                merchantRef:   pmt.merchant_reference || webhookRef,
+                webhookStatus: _wfStatus,
+                matched:       true,
+                resolvedVia:   'webhook',
+                failReason:    null,
+                rawPayload:    req.body || null
+            }).catch(() => {});
         }
 
         // Verify with Wonderful API — never trust webhook payload alone
@@ -41709,6 +42048,212 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
     } catch (e) {
         console.error('Manual Wonderful credit error:', e.message);
         res.status(500).json({ error: 'Server error: ' + e.message });
+    }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-364 (Web66) — CRM diagnostic tooling for stuck Wonderful payments
+// ──────────────────────────────────────────────────────────────────────────
+// Four endpoints that give the CRM "Wonderful Payments" panel proper
+// recovery + diagnostic capability without admins having to SSH into the
+// box or jump between Wonderful's dashboard and our DB.
+
+// 1) Force re-verify — runs _wonderfulVerifyStatus on a payment row and
+//    returns the result WITHOUT crediting. Lets the admin see what Wonderful
+//    actually says about this payment right now.
+app.post('/api/admin/payments/wonderful/:id/force-verify', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`SELECT * FROM wonderful_payments WHERE id = $1`, [req.params.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Payment row not found' });
+        if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'WONDERFUL_API_KEY not set' });
+        const pmt = r.rows[0];
+        const { verified, resolvedWpId } = await _wonderfulVerifyStatus(pmt);
+        res.json({
+            ok: true,
+            row_id: pmt.id,
+            merchant_reference: pmt.merchant_reference,
+            db_status: pmt.status,
+            wonderful_status: verified,
+            wonderful_payment_id_was: pmt.wonderful_payment_id,
+            wonderful_payment_id_now: resolvedWpId,
+            creditable: (verified === 'paid' || verified === 'accepted')
+                        && pmt.status !== 'credited'
+                        && pmt.status !== 'credited_manually'
+        });
+    } catch (e) {
+        console.error('[FIX-364] force-verify failed:', e.message);
+        res.status(500).json({ error: 'force-verify failed: ' + e.message });
+    }
+});
+
+// 2) Resolve by order_id — admin pastes an order_id seen in Wonderful's
+//    dashboard. We try paginated list-search to find it, pull its
+//    merchant_reference, and link to the corresponding DB row. Solves the
+//    case where webhooks have all failed but the payment is sitting in
+//    Wonderful's UI and an admin can see it.
+app.post('/api/admin/payments/wonderful/resolve-by-order-id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const { order_id } = req.body || {};
+    if (!order_id) return res.status(400).json({ error: 'order_id required' });
+    if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'WONDERFUL_API_KEY not set' });
+    try {
+        // First, paginated list-search using wpIdForFallback (matches by id/order_id)
+        const { match, viaStatusFilter, pagesScanned } = await _wonderfulPaginatedListSearch({
+            wpIdForFallback: String(order_id),
+            preferStatusPaid: true,
+            maxPages: 5
+        });
+        if (!match) {
+            return res.status(404).json({
+                error: 'order_id not found in Wonderful list-search (scanned ' + pagesScanned + ' page(s))',
+                pages_scanned: pagesScanned
+            });
+        }
+        const ref = match.merchant_payment_reference || match.merchant_reference || match.reference || null;
+        if (!ref) {
+            return res.status(422).json({
+                error: 'Found in Wonderful but no merchant_reference on the record',
+                wonderful_payload: match
+            });
+        }
+        // Find our DB row by ref
+        const rowRes = await pool.query(
+            `SELECT * FROM wonderful_payments WHERE merchant_reference = $1`, [ref]
+        );
+        if (!rowRes.rows.length) {
+            return res.status(404).json({
+                error: 'Found in Wonderful (ref ' + ref + ') but no matching wonderful_payments row in DB',
+                merchant_reference: ref,
+                wonderful_payload: match
+            });
+        }
+        const pmt = rowRes.rows[0];
+        // Persist the order_id ↔ wonderful_payment_id mapping so subsequent
+        // webhooks for this payment hit directly.
+        const foundWpId = match.id || match.order_id || match.payment_id || null;
+        if (foundWpId && foundWpId !== pmt.wonderful_payment_id) {
+            await pool.query(
+                `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
+                [foundWpId, pmt.id]
+            );
+        }
+        // Also log this manual resolution to the webhook log for the audit trail
+        _logWonderfulWebhookAttempt({
+            pmtRowId:      pmt.id,
+            orderId:       String(order_id),
+            merchantRef:   ref,
+            webhookStatus: (match.status || '').toLowerCase() || null,
+            matched:       true,
+            resolvedVia:   'admin_resolve_by_order_id',
+            failReason:    null,
+            rawPayload:    match
+        }).catch(() => {});
+        await auditLog(pool, req.user.playerId, 'wonderful_resolve_by_order_id', String(pmt.id),
+            `Admin linked order_id=${order_id} → payment_row=${pmt.id} ref=${ref} (Wonderful status: ${match.status || 'unknown'})`);
+        res.json({
+            ok: true,
+            row_id: pmt.id,
+            merchant_reference: ref,
+            wonderful_payment_id: foundWpId,
+            wonderful_status: match.status || null,
+            db_status: pmt.status,
+            pages_scanned: pagesScanned,
+            via_status_filter: viaStatusFilter
+        });
+    } catch (e) {
+        console.error('[FIX-364] resolve-by-order-id failed:', e.message);
+        res.status(500).json({ error: 'resolve-by-order-id failed: ' + e.message });
+    }
+});
+
+// 3) Webhook log per payment — returns the last N entries from
+//    wonderful_webhook_log for this row. Lets admin see how many webhooks
+//    arrived, what status each carried, and why any of them failed to match.
+app.get('/api/admin/payments/wonderful/:id/webhook-log', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const pmtRow = await pool.query(
+            `SELECT id, merchant_reference, wonderful_payment_id FROM wonderful_payments WHERE id = $1`,
+            [req.params.id]
+        );
+        if (!pmtRow.rows.length) return res.status(404).json({ error: 'Payment row not found' });
+        const pmt = pmtRow.rows[0];
+        // Pull log entries by row_id OR by order_id (caught the unmatched-then-resolved case)
+        const logRes = await pool.query(
+            `SELECT id, wonderful_payment_row_id, order_id, merchant_reference, webhook_status,
+                    matched, resolved_via, fail_reason, raw_payload, created_at
+               FROM wonderful_webhook_log
+              WHERE wonderful_payment_row_id = $1
+                 OR (order_id IS NOT NULL AND order_id = $2)
+                 OR (merchant_reference IS NOT NULL AND merchant_reference = $3)
+              ORDER BY created_at DESC
+              LIMIT 50`,
+            [pmt.id, pmt.wonderful_payment_id, pmt.merchant_reference]
+        );
+        res.json({
+            ok: true,
+            row_id: pmt.id,
+            entries: logRes.rows
+        });
+    } catch (e) {
+        console.error('[FIX-364] webhook-log fetch failed:', e.message);
+        res.status(500).json({ error: 'webhook-log fetch failed: ' + e.message });
+    }
+});
+
+// 4) Inspect raw Wonderful payloads — calls /v2/payments/{id} AND filtered
+//    list-search by merchant_reference, returns both raw JSON responses.
+//    Saves admins jumping out to Wonderful's dashboard for diagnosis.
+app.get('/api/admin/payments/wonderful/:id/inspect', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const pmtRow = await pool.query(`SELECT * FROM wonderful_payments WHERE id = $1`, [req.params.id]);
+        if (!pmtRow.rows.length) return res.status(404).json({ error: 'Payment row not found' });
+        if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'WONDERFUL_API_KEY not set' });
+        const pmt = pmtRow.rows[0];
+
+        const inspection = {
+            row: {
+                id: pmt.id,
+                merchant_reference: pmt.merchant_reference,
+                wonderful_payment_id: pmt.wonderful_payment_id,
+                status: pmt.status,
+                amount_pence: pmt.amount_pence,
+                player_id: pmt.player_id,
+                game_id: pmt.game_id,
+                created_at: pmt.created_at,
+                credited_at: pmt.credited_at,
+                notified_at: pmt.notified_at || null
+            },
+            direct_get: null,
+            direct_get_error: null,
+            filtered_list: null,
+            filtered_list_error: null
+        };
+
+        // Direct GET (only if we have a wpId stored)
+        if (pmt.wonderful_payment_id) {
+            try {
+                const direct = await wonderfulRequest('GET', `/v2/payments/${pmt.wonderful_payment_id}`);
+                inspection.direct_get = direct.data || direct;
+            } catch (e) {
+                inspection.direct_get_error = e.message;
+            }
+        }
+
+        // Filtered list-search by merchant_reference
+        if (pmt.merchant_reference) {
+            try {
+                const filtered = await wonderfulRequest('GET',
+                    `/v2/payments?merchant_payment_reference=${encodeURIComponent(pmt.merchant_reference)}&limit=10`
+                );
+                inspection.filtered_list = filtered.data || filtered;
+            } catch (e) {
+                inspection.filtered_list_error = e.message;
+            }
+        }
+
+        res.json({ ok: true, inspection });
+    } catch (e) {
+        console.error('[FIX-364] inspect failed:', e.message);
+        res.status(500).json({ error: 'inspect failed: ' + e.message });
     }
 });
 
@@ -49075,6 +49620,35 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
             row.default_organiser_id, row.tenant_id
         );
 
+        // FIX-370 (Web66): include rating aggregates so the card UI can show
+        // stars + review count next to the verified badge. Failure-tolerant:
+        // if organiser_reviews table doesn't exist (pre-FIX-328 deploy) or
+        // any other query error, fall back to null/0 so the card still
+        // renders without the rating.
+        let ratingAvg = null;
+        let ratingCount = 0;
+        try {
+            const rr = await pool.query(
+                `SELECT
+                    ROUND(AVG(rating)::numeric, 1) AS avg_rating,
+                    COUNT(*)::int                  AS review_count
+                   FROM organiser_reviews
+                  WHERE organiser_player_id = $1`,
+                [row.default_organiser_id]
+            );
+            if (rr.rows[0]) {
+                const a = rr.rows[0].avg_rating;
+                ratingAvg = a !== null && a !== undefined ? parseFloat(a) : null;
+                ratingCount = parseInt(rr.rows[0].review_count, 10) || 0;
+            }
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                // Table or column missing — no rating yet, no error.
+            } else {
+                console.warn('[FIX-370] organiser rating fetch failed (non-fatal):', e.message);
+            }
+        }
+
         res.json({
             organiser: {
                 player_id: row.default_organiser_id,
@@ -49085,6 +49659,9 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
                 is_organiser: !!row.is_organiser,
                 verified:    verifiedCheck.verified,
                 verified_reason: verifiedCheck.reason,
+                // FIX-370: rating aggregates for the inline star display
+                avg_rating:   ratingAvg,
+                review_count: ratingCount,
             },
             tenant: tenantActive ? {
                 short_id:      row.tenant_short_id,
@@ -52829,6 +53406,113 @@ async function fix356BootstrapFaq() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// FIX-359..364 — Wonderful Payments hardening + observability bootstrap
+// ──────────────────────────────────────────────────────────────────────────
+// Adds two schema objects (idempotent, safe to run on every boot):
+//   1. wonderful_payments.notified_at  — push-notification idempotency guard
+//      so we don't double-push on webhook retries / reconciler hits.
+//   2. wonderful_webhook_log           — append-only audit table of every
+//      webhook attempt with raw payload + match outcome. Powers the CRM
+//      "Webhook log" diagnostic added in FIX-364. Separate table (not JSONB
+//      on wonderful_payments) so webhook acks stay fast and the main row
+//      doesn't bloat over time.
+async function fix359BootstrapWonderfulHardening() {
+    try {
+        await pool.query(`
+            ALTER TABLE wonderful_payments
+                ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS wonderful_webhook_log (
+                id                  BIGSERIAL PRIMARY KEY,
+                wonderful_payment_row_id UUID,
+                order_id            TEXT,
+                merchant_reference  TEXT,
+                webhook_status      TEXT,
+                matched             BOOLEAN NOT NULL DEFAULT FALSE,
+                resolved_via        TEXT,
+                fail_reason         TEXT,
+                raw_payload         JSONB,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_wf_webhook_log_pmtrow
+                ON wonderful_webhook_log (wonderful_payment_row_id, created_at DESC)
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_wf_webhook_log_orderid
+                ON wonderful_webhook_log (order_id, created_at DESC)
+        `);
+        console.log('✅ FIX-359 Wonderful hardening schema ready (notified_at + wonderful_webhook_log)');
+    } catch (e) {
+        console.error('❌ FIX-359 Wonderful hardening bootstrap failed:', e.message);
+        // Non-fatal — server still runs; push/log features degrade gracefully.
+    }
+}
+
+// Helper to append a webhook attempt row. Always non-blocking, never throws.
+// Called from the webhook handler at every match/no-match decision point.
+async function _logWonderfulWebhookAttempt(opts) {
+    try {
+        await pool.query(
+            `INSERT INTO wonderful_webhook_log
+               (wonderful_payment_row_id, order_id, merchant_reference, webhook_status,
+                matched, resolved_via, fail_reason, raw_payload)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [
+                opts.pmtRowId || null,
+                opts.orderId || null,
+                opts.merchantRef || null,
+                opts.webhookStatus || null,
+                !!opts.matched,
+                opts.resolvedVia || null,
+                opts.failReason || null,
+                opts.rawPayload ? JSON.stringify(opts.rawPayload) : null
+            ]
+        );
+    } catch (e) {
+        // Never let logging failure poison the webhook handler — it just acks anyway.
+        console.warn('[WF webhook] log insert failed (non-fatal):', e.message);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-366 (Web66) — Multi-region storage bootstrap (Path B)
+// ──────────────────────────────────────────────────────────────────────────
+// Adds players.region_codes TEXT[] so a player can be a member of multiple
+// regions (e.g. "Coventry" + "Nuneaton"). The existing players.region_code
+// column stays as the PRIMARY region (used by existing notifications,
+// region-filtered game lists, and analytics) — backfilled into region_codes[0].
+//
+// Why a new column instead of replacing region_code: dozens of read paths
+// reference players.region_code today (region-targeted comms, the regions
+// dashboard tile, FAQ filters). Backfilling the new column atomically and
+// keeping the existing column untouched means zero read-path regression.
+// Future cleanup can migrate readers to region_codes over time.
+async function fix366BootstrapMultiRegion() {
+    try {
+        await pool.query(`
+            ALTER TABLE players
+                ADD COLUMN IF NOT EXISTS region_codes TEXT[] NOT NULL DEFAULT '{}'
+        `);
+        // Backfill: copy existing region_code → region_codes[0] for rows that
+        // haven't been migrated. Idempotent — cardinality check skips already-set rows.
+        const bf = await pool.query(`
+            UPDATE players
+               SET region_codes = ARRAY[region_code]
+             WHERE region_code IS NOT NULL
+               AND region_code <> ''
+               AND (region_codes IS NULL OR cardinality(region_codes) = 0)
+        `);
+        console.log('✅ FIX-366 region_codes schema ready (backfilled ' + (bf.rowCount || 0) + ' rows)');
+    } catch (e) {
+        console.error('❌ FIX-366 region_codes bootstrap failed:', e.message);
+        // Non-fatal — server still runs; multi-region just degrades to single-region.
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // FIX-357 — Lock-preempt helpers
 // ──────────────────────────────────────────────────────────────────────────
 // When a player tries to sign up while admin holds the lock, we:
@@ -53258,6 +53942,12 @@ app.listen(PORT, () => {
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
 
+    // FIX-359..364: bootstrap Wonderful hardening schema (notified_at + webhook log)
+    fix359BootstrapWonderfulHardening().catch(e => console.error('FIX-359 bootstrap surfaced:', e.message));
+
+    // FIX-366: bootstrap multi-region column + backfill (non-blocking)
+    fix366BootstrapMultiRegion().catch(e => console.error('FIX-366 bootstrap surfaced:', e.message));
+
     // ── Email transport self-check ──────────────────────────────────────────
     // Verifies SMTP credentials on boot so silent email failures become loud.
     // Without this, an expired Gmail App Password would just cause every email
@@ -53325,11 +54015,20 @@ app.listen(PORT, () => {
     // re-verifies with Wonderful, crediting (+ auto-registering for the game,
     // if applicable) if paid. Runs on boot (catches webhooks missed during a
     // deploy or cold-start) and every 5 minutes thereafter.
-    let wonderfulReconcilerRunning = false;
-    async function reconcilePendingWonderfulPayments() {
-        if (wonderfulReconcilerRunning) return; // avoid overlap if previous run is slow
+    // FIX-361 (Web66): split into recent + broad sweeps with INDEPENDENT locks.
+    // Why: a slow broad sweep was blocking the urgent 'just paid in last 10 min'
+    // case for up to 5 minutes. A payment that takes 90s to clear (as the
+    // 25-May bug showed) crossed the 5-min boundary and stayed stuck longer
+    // than necessary. With two locks, the 90s recent sweep runs even when the
+    // broad sweep is busy — and vice-versa. The recent sweep is bounded by
+    // its narrow window (last 10 min, max 30 rows) so it's always quick.
+    let wonderfulReconcilerRecentRunning = false;
+    let wonderfulReconcilerBroadRunning = false;
+
+    async function _runWonderfulReconcilerSweep(scope) {
         if (!WONDERFUL_API_KEY) return;
-        wonderfulReconcilerRunning = true;
+        // scope.label - 'recent' or 'broad'
+        // scope.whereClause - SQL fragment (built below)
         try {
             // Only look back 72 hours — older stuck payments need manual admin
             // intervention anyway. LIMIT 30 per run so we don't hammer Wonderful.
@@ -53341,12 +54040,12 @@ app.listen(PORT, () => {
             const pending = await pool.query(
                 `SELECT * FROM wonderful_payments
                  WHERE status NOT IN ('credited', 'credited_manually', 'failed', 'cancelled', 'expired', 'init_failed')
-                   AND created_at BETWEEN NOW() - INTERVAL '72 hours' AND NOW() - INTERVAL '30 seconds'
+                   ${scope.whereClause}
                  ORDER BY created_at ASC
                  LIMIT 30`
             );
             if (pending.rows.length === 0) return;
-            console.log(`💳 [WF reconciler]: checking ${pending.rows.length} pending payment(s)…`);
+            console.log(`💳 [WF reconciler:${scope.label}]: checking ${pending.rows.length} pending payment(s)…`);
 
             let credited = 0, stillPending = 0, failed = 0;
             for (const pmt of pending.rows) {
@@ -53355,7 +54054,7 @@ app.listen(PORT, () => {
                     if (!verified) { failed++; continue; }
                     if (verified === 'paid' || verified === 'accepted') {
                         const result = await creditAndAutoRegisterWonderful(pmt, {
-                            contextLabel: 'reconciler',
+                            contextLabel: 'reconciler:' + scope.label,
                             verifyWpId: resolvedWpId
                         });
                         if (result.credited) {
@@ -53374,21 +54073,54 @@ app.listen(PORT, () => {
                     }
                 } catch (e) {
                     failed++;
-                    console.error(`  ✗ reconciler error for ref ${pmt.merchant_reference}:`, e.message);
+                    console.error(`  ✗ reconciler:${scope.label} error for ref ${pmt.merchant_reference}:`, e.message);
                 }
             }
             if (credited > 0 || failed > 0) {
-                console.log(`💳 Wonderful reconciler done: ${credited} credited, ${stillPending} still pending, ${failed} failed`);
+                console.log(`💳 Wonderful reconciler:${scope.label} done: ${credited} credited, ${stillPending} still pending, ${failed} failed`);
             }
         } catch (e) {
-            console.error('Wonderful reconciler sweep error:', e.message);
-        } finally {
-            wonderfulReconcilerRunning = false;
+            console.error(`Wonderful reconciler:${scope.label} sweep error:`, e.message);
         }
     }
-    // Fire on boot (after brief delay for DB pool) + every 5 min thereafter
-    setTimeout(reconcilePendingWonderfulPayments, 10_000);
-    setInterval(reconcilePendingWonderfulPayments, 5 * 60 * 1000);
+
+    async function reconcileRecentWonderfulPayments() {
+        // Recent sweep: payments created in the last 10 minutes (high-priority window).
+        // Runs every 90 seconds. Catches the "paid in 90s but missed first sweep" case
+        // that the original 5-min cadence couldn't handle.
+        if (wonderfulReconcilerRecentRunning) return;
+        wonderfulReconcilerRecentRunning = true;
+        try {
+            await _runWonderfulReconcilerSweep({
+                label: 'recent',
+                whereClause: `AND created_at BETWEEN NOW() - INTERVAL '10 minutes' AND NOW() - INTERVAL '30 seconds'`
+            });
+        } finally {
+            wonderfulReconcilerRecentRunning = false;
+        }
+    }
+
+    async function reconcileBroadWonderfulPayments() {
+        // Broad sweep: payments older than 10 minutes, up to 72 hours. Runs every
+        // 5 minutes. Catches longer-stuck rows the recent sweep has aged out of.
+        if (wonderfulReconcilerBroadRunning) return;
+        wonderfulReconcilerBroadRunning = true;
+        try {
+            await _runWonderfulReconcilerSweep({
+                label: 'broad',
+                whereClause: `AND created_at BETWEEN NOW() - INTERVAL '72 hours' AND NOW() - INTERVAL '10 minutes'`
+            });
+        } finally {
+            wonderfulReconcilerBroadRunning = false;
+        }
+    }
+
+    // Boot kicker: broad sweep on boot (catches anything missed during deploy/cold-start).
+    // Recent and broad then run on their own cadences.
+    setTimeout(reconcileBroadWonderfulPayments, 10_000);
+    setTimeout(reconcileRecentWonderfulPayments, 20_000);
+    setInterval(reconcileRecentWonderfulPayments, 90 * 1000);
+    setInterval(reconcileBroadWonderfulPayments, 5 * 60 * 1000);
 
     // ── Multi-vote auto-close cron ──────────────────────────────────────────
     // FIX-220 R4-#1: voting_closes_at expires but no automatic closure runs.
