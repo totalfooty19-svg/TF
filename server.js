@@ -2377,6 +2377,8 @@ async function getGameDataForNotification(gameId) {
 
 // Push notification title/body templates per type
 const NOTIF_TEMPLATES = {
+    // FIX-357: Lock-preempt warning push to the admin holding a game lock.
+    lock_preempt:      d => ({ title: '⏳ Player waiting',       body: `${d.playerName || 'A player'} is trying to sign up — game will unlock in ${d.graceSeconds || 15}s.` }),
     game_registered:   d => ({ title: 'Signed Up! ⚽',          body: `You're in for ${d.day} at ${d.venue}. £${(d.cost||0).toFixed(2)} deducted.` }),
     backup_added:      d => ({ title: 'On the Backup List ⏳',  body: `You're on backup for ${d.day} at ${d.venue}.` }),
     dropout_confirmed: d => ({ title: 'Dropped Out ✅',          body: `You've been removed from ${d.day} at ${d.venue}.` }),
@@ -6290,18 +6292,23 @@ app.get('/api/admin/players/search', authenticateToken, requireAdmin, async (req
 
         // Two-branch query: numeric input also matches exact squad_number.
         // LIMIT 20 caps result size for the dropdown.
+        // FIX-353: email column now searched + returned. Existing callers
+        // (CRM tenant_admin assign, CRM player messaging, index.html organiser
+        // search) ignore unknown fields, so adding `email` is non-breaking.
         const sql = isNumeric
-            ? `SELECT id, alias, full_name, squad_number
+            ? `SELECT id, alias, full_name, squad_number, email
                  FROM players
                 WHERE LOWER(alias)     LIKE $1
                    OR LOWER(full_name) LIKE $1
+                   OR LOWER(email)     LIKE $1
                    OR squad_number = $2
                 ORDER BY (squad_number = $2) DESC, alias NULLS LAST, full_name
                 LIMIT 20`
-            : `SELECT id, alias, full_name, squad_number
+            : `SELECT id, alias, full_name, squad_number, email
                  FROM players
                 WHERE LOWER(alias)     LIKE $1
                    OR LOWER(full_name) LIKE $1
+                   OR LOWER(email)     LIKE $1
                 ORDER BY alias NULLS LAST, full_name
                 LIMIT 20`;
         const params = isNumeric ? [like, squadNum] : [like];
@@ -10992,8 +10999,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             refs_required, ref_pay, requires_organiser,
                             early_bird_price, super_early_bird_price, opponent_id,
                             pitch_cost,
-                            default_organiser_id
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+                            default_organiser_id,
+                            tenant_id /* FIX-340 */
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) /* FIX-340: $30 = tenant_id */
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -11013,7 +11021,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             parsedSuperEarlyBird,
                             resolvedOpponentId,
                             parsedPitchCost,   // P2.1
-                            parsedOrganiserId  // P3
+                            parsedOrganiserId, // P3
+                            TF_COVENTRY_TENANT_ID /* FIX-340 */
                         ]
                     ).catch(async (err) => {
                         // P3 — Pre-migration safety: default_organiser_id column missing? Re-run without it.
@@ -11028,8 +11037,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                                     refs_required, ref_pay, requires_organiser,
                                     early_bird_price, super_early_bird_price, opponent_id,
-                                    pitch_cost
-                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+                                    pitch_cost,
+                                    tenant_id /* FIX-340 */
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29) /* FIX-340: $29 = tenant_id */
                                 RETURNING id`,
                                 [
                                     venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly',
@@ -11048,7 +11058,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                                     parsedEarlyBird,
                                     parsedSuperEarlyBird,
                                     resolvedOpponentId,
-                                    parsedPitchCost
+                                    parsedPitchCost,
+                                    TF_COVENTRY_TENANT_ID /* FIX-340 */
                                 ]
                             );
                         }
@@ -11111,8 +11122,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     refs_required, ref_pay, requires_organiser,
                     early_bird_price, super_early_bird_price, opponent_id,
                     pitch_cost,
-                    default_organiser_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+                    default_organiser_id,
+                    tenant_id /* FIX-340 */
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) /* FIX-340: $30 = tenant_id */
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -11132,7 +11144,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                     parsedSuperEarlyBird,
                     resolvedOpponentId,
                     parsedPitchCost,   // P2.1
-                    parsedOrganiserId  // P3
+                    parsedOrganiserId, // P3
+                    TF_COVENTRY_TENANT_ID /* FIX-340 */
                 ]
             ).catch(async (err) => {
                 // Pre-migration safety: default_organiser_id column missing? Re-run without it.
@@ -11146,8 +11159,9 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                             refs_required, ref_pay, requires_organiser,
                             early_bird_price, super_early_bird_price, opponent_id,
-                            pitch_cost
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+                            pitch_cost,
+                            tenant_id /* FIX-340 */
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29) /* FIX-340: $29 = tenant_id */
                         RETURNING id`,
                         [
                             venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -11166,7 +11180,8 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                             parsedEarlyBird,
                             parsedSuperEarlyBird,
                             resolvedOpponentId,
-                            parsedPitchCost
+                            parsedPitchCost,
+                            TF_COVENTRY_TENANT_ID /* FIX-340 */
                         ]
                     );
                 }
@@ -11319,8 +11334,9 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
                     refs_required, ref_pay, requires_organiser,
                     early_bird_price, super_early_bird_price, opponent_id,
                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
-                    tournament_team_count, tournament_name, external_opponent
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+                    tournament_team_count, tournament_name, external_opponent,
+                    tenant_id /* FIX-340 */
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28) /* FIX-340: $28 = tenant_id */
                 RETURNING id, game_url
             `, [
                 game_template.venue_id, gameDate.toISOString(),
@@ -11352,6 +11368,7 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
                 game_template.tournament_team_count || null,
                 game_template.tournament_name || null,
                 game_template.external_opponent || null,
+                TF_COVENTRY_TENANT_ID /* FIX-340 */
             ]);
             createdGames.push(inserted.rows[0]);
         }
@@ -11944,7 +11961,24 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
         }
         if (game.player_editing_locked) {
             await client.query('ROLLBACK');
-            return res.status(423).json({ error: 'Game is currently being edited by an admin. Please try again in a few minutes.' });
+            // FIX-357: preempt — record intent, schedule lock release, notify admin
+            const _preempt = await _recordSignupIntent(req.params.id, req.user.playerId, 'rsvp');
+            return res.status(423).json(_preempt);
+        }
+
+        // FIX-341: RSVPs close 24h before kickoff. Inside that window, players
+        // must use the direct-pay flow. Admin-on-behalf endpoint at FIX-342
+        // bypasses this — admins can RSVP players any time.
+        {
+            const _gameDate341 = new Date(game.game_date);
+            const _hoursUntil341 = (_gameDate341.getTime() - Date.now()) / 3600000;
+            if (_hoursUntil341 < 24) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    error: 'RSVPs close 24 hours before kickoff. Please sign up directly.',
+                    code: 'RSVP_TOO_LATE'
+                });
+            }
         }
 
         // Block White/Black tier — same as /register
@@ -12072,6 +12106,123 @@ app.delete('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async 
 // POST /api/games/:id/rsvp/pay — convert an RSVP into a confirmed registration.
 // Charges credits at the CURRENT effective price (per spec — pay at conversion
 // time, not at RSVP time). Mirrors /claim-spot's payment path.
+// FIX-342 — POST /api/admin/games/:gameId/rsvp-on-behalf
+//
+// Lets a game manager (admin / superadmin / organiser) RSVP a player onto a
+// game without that player needing to log in. Bypasses tier check, tenant ban
+// check, and the 24h cutoff (FIX-341). Still honours capacity (places on
+// backup if full) and prevents duplicate registrations.
+//
+// Body: { player_id: uuid, position?: 'OUT'|'GK'|..., position_areas?: string }
+// Returns: { ok: true, registration_id, status: 'rsvp'|'backup' }
+app.post('/api/admin/games/:gameId/rsvp-on-behalf',
+    authenticateToken, requireGameManager, async (req, res) => {
+        const client = await pool.connect();
+        try {
+            const gameId = req.params.gameId;
+            const targetPlayerId = req.body && req.body.player_id;
+            if (!targetPlayerId || !isValidUuid(targetPlayerId)) {
+                return res.status(400).json({ error: 'player_id is required (uuid)' });
+            }
+
+            // Resolve position via shared helper, but use the target player's
+            // saved defaults rather than the admin's.
+            const _pos = await _resolvePositionForSignup(pool, targetPlayerId, req.body);
+            if (_pos.error) return res.status(400).json({ error: _pos.error, code: 'POSITION_REQUIRED' });
+            const positionValue          = _pos.positionValue;
+            const sanitisedPositionAreas = _pos.positionAreas;
+
+            await client.query('BEGIN');
+
+            const gameLock = await client.query(`
+                SELECT id, max_players, game_status, game_date, player_editing_locked, tenant_id
+                  FROM games
+                 WHERE id = $1
+                 FOR UPDATE
+            `, [gameId]);
+            if (gameLock.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ error: 'Game not found' });
+            }
+            const game = gameLock.rows[0];
+
+            if (!['available', 'confirmed'].includes(game.game_status)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'This game is no longer accepting registrations' });
+            }
+            // (Skip player_editing_locked, tier, ban, 24h cutoff — admin override.)
+
+            // Verify target player exists
+            const playerRes = await client.query('SELECT id, alias, full_name FROM players WHERE id = $1', [targetPlayerId]);
+            if (playerRes.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ error: 'Target player not found' });
+            }
+            const targetPlayer = playerRes.rows[0];
+
+            // Existing registration check — same rules as player-facing endpoint
+            const existing = await client.query(
+                'SELECT id, status FROM registrations WHERE game_id = $1 AND player_id = $2',
+                [gameId, targetPlayerId]
+            );
+            if (existing.rows.length > 0) {
+                await client.query('ROLLBACK');
+                const exStatus = existing.rows[0].status;
+                return res.status(409).json({
+                    error: `Player is already involved with this game (status: ${exStatus})`,
+                    existing_status: exStatus,
+                });
+            }
+
+            // Capacity check — if full, place on backup instead of refusing.
+            const countRes = await client.query(
+                "SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS current_players",
+                [gameId]
+            );
+            const currentPlayers = parseInt(countRes.rows[0].current_players, 10);
+            const isFull = currentPlayers >= parseInt(game.max_players, 10);
+
+            // Compute deadline same way as player-facing endpoint
+            const gameDate = new Date(game.game_date);
+            const defaultDeadline = new Date(gameDate.getTime() - RSVP_DEADLINE_HOURS * 3600 * 1000);
+            const minDeadline     = new Date(Date.now() + 60 * 1000);
+            const rsvpDeadline    = defaultDeadline > minDeadline ? defaultDeadline : minDeadline;
+
+            const targetStatus = isFull ? 'backup' : 'rsvp';
+            const insertRes = await client.query(
+                `INSERT INTO registrations
+                    (game_id, player_id, status, position_preference, amount_paid, amount_paid_free,
+                     is_comped, position_areas, rsvp_deadline, backup_type)
+                 VALUES ($1, $2, $3, $4, 0, 0, false, $5, $6, $7)
+                 RETURNING id`,
+                [gameId, targetPlayerId, targetStatus, positionValue, sanitisedPositionAreas,
+                 targetStatus === 'rsvp' ? rsvpDeadline : null,
+                 targetStatus === 'backup' ? 'rsvp_overflow' : null]
+            );
+
+            await client.query('COMMIT');
+
+            setImmediate(() => auditLog(pool, req.user.playerId, 'admin_rsvp_on_behalf', targetPlayerId,
+                `Admin-RSVP'd ${targetPlayer.alias || targetPlayer.full_name} onto game ${gameId} as ${targetStatus}`,
+                game.tenant_id || null).catch(() => {}));
+
+            res.json({
+                ok: true,
+                registration_id: insertRes.rows[0].id,
+                status: targetStatus,
+                placed_on_backup: targetStatus === 'backup',
+                target_player: { id: targetPlayer.id, alias: targetPlayer.alias, full_name: targetPlayer.full_name },
+            });
+        } catch (e) {
+            try { await client.query('ROLLBACK'); } catch (_) {}
+            console.error('FIX-342 admin rsvp-on-behalf failed:', e.message);
+            res.status(500).json({ error: 'Failed to RSVP player on behalf' });
+        } finally {
+            client.release();
+        }
+    }
+);
+
 app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -12269,6 +12420,178 @@ app.get('/api/admin/rsvp-pulse/games', authenticateToken, requireAdmin, async (r
     } catch (err) {
         console.error('[FIX-315] rsvp-pulse/games error:', err);
         return res.status(500).json({ error: 'Failed to load Pulse games' });
+    }
+});
+
+// FIX-344 — GET /api/games/:gameId/suggest-next
+//
+// Suggests the next upcoming game in the same series for the post-game CTA
+// banner. Returns null if:
+//   - no next game found
+//   - calling player is already registered/RSVP'd for the next game
+//
+// Used by game.html "Enjoyed the game?" banner (Item 3 of RSVP fixes brief).
+app.get('/api/games/:gameId/suggest-next', authenticateToken, async (req, res) => {
+    try {
+        const gameId = req.params.gameId;
+        const playerId = req.user.playerId;
+
+        // Get the current game's series/venue/day-of-week for fallback matching
+        const curRes = await pool.query(
+            `SELECT id, series_id, venue_id, game_date, tenant_id
+               FROM games WHERE id = $1`,
+            [gameId]
+        );
+        if (curRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const cur = curRes.rows[0];
+
+        // Try same-series first
+        let nextRow = null;
+        if (cur.series_id) {
+            const r = await pool.query(`
+                SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.max_players,
+                       g.early_bird_price, g.super_early_bird_price,
+                       v.name AS venue_name,
+                       (SELECT COUNT(*) FROM registrations
+                         WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
+                         + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id) AS current_players
+                  FROM games g
+                  LEFT JOIN venues v ON v.id = g.venue_id
+                 WHERE g.series_id = $1
+                   AND g.game_date > NOW()
+                   AND g.game_status IN ('available', 'confirmed')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM registrations
+                        WHERE game_id = g.id AND player_id = $2
+                          AND status IN ('confirmed', 'rsvp', 'backup')
+                   )
+                 ORDER BY g.game_date ASC
+                 LIMIT 1
+            `, [cur.series_id, playerId]);
+            if (r.rows.length > 0) nextRow = r.rows[0];
+        }
+
+        // Fallback — same venue + same day-of-week (only if no series match)
+        if (!nextRow && cur.venue_id) {
+            const r = await pool.query(`
+                SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.max_players,
+                       g.early_bird_price, g.super_early_bird_price,
+                       v.name AS venue_name,
+                       (SELECT COUNT(*) FROM registrations
+                         WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
+                         + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id) AS current_players
+                  FROM games g
+                  LEFT JOIN venues v ON v.id = g.venue_id
+                 WHERE g.venue_id = $1
+                   AND EXTRACT(DOW FROM g.game_date) = EXTRACT(DOW FROM $2::timestamptz)
+                   AND g.game_date > NOW()
+                   AND g.game_status IN ('available', 'confirmed')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM registrations
+                        WHERE game_id = g.id AND player_id = $3
+                          AND status IN ('confirmed', 'rsvp', 'backup')
+                   )
+                 ORDER BY g.game_date ASC
+                 LIMIT 1
+            `, [cur.venue_id, cur.game_date, playerId]);
+            if (r.rows.length > 0) nextRow = r.rows[0];
+        }
+
+        if (!nextRow) return res.json({ next_game: null });
+
+        const maxP    = parseInt(nextRow.max_players, 10);
+        const curP    = parseInt(nextRow.current_players, 10);
+        const spacesLeft = Math.max(0, maxP - curP);
+
+        // Compute effective price using same tier logic as game.html
+        let effectivePrice = parseFloat(nextRow.cost_per_player);
+        if (nextRow.super_early_bird_price != null && spacesLeft >= Math.ceil(maxP * 0.75)) {
+            effectivePrice = parseFloat(nextRow.super_early_bird_price);
+        } else if (nextRow.early_bird_price != null && spacesLeft >= Math.ceil(maxP * 0.5)) {
+            effectivePrice = parseFloat(nextRow.early_bird_price);
+        }
+
+        res.json({
+            next_game: {
+                id: nextRow.id,
+                game_url: nextRow.game_url,
+                game_date: nextRow.game_date,
+                venue_name: nextRow.venue_name,
+                cost_per_player: parseFloat(nextRow.cost_per_player),
+                effective_price: effectivePrice,
+                max_players: maxP,
+                current_players: curP,
+                spaces_left: spacesLeft,
+                is_full: spacesLeft === 0,
+            },
+        });
+    } catch (e) {
+        console.error('FIX-344 suggest-next failed:', e.message);
+        res.status(500).json({ error: 'Failed to suggest next game' });
+    }
+});
+
+// FIX-343 — GET /api/games/:gameId/rsvps-full
+//
+// Returns the full RSVP list for a game with per-row details (alias, position,
+// deadline, payment attempts, last reminder). Accessible to:
+//   - admin / superadmin (any game)
+//   - tenant_admin of the game's tenant_id (own tenant only)
+//
+// Used by the admin-only expandable RSVP details panel on game.html (Item 2
+// of the RSVP fixes brief).
+app.get('/api/games/:gameId/rsvps-full', authenticateToken, async (req, res) => {
+    try {
+        const gameId = req.params.gameId;
+
+        // Fetch game's tenant_id for role gating
+        const gameRes = await pool.query('SELECT id, tenant_id FROM games WHERE id = $1', [gameId]);
+        if (gameRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const game = gameRes.rows[0];
+
+        // Auth gate — admin/superadmin OR tenant_admin of this game's tenant
+        const isAdmin = req.user && (req.user.role === 'admin' || req.user.role === 'superadmin');
+        let isTenantAdminOfGame = false;
+        if (!isAdmin && game.tenant_id) {
+            const ptRes = await pool.query(
+                `SELECT role FROM player_tenants
+                  WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'
+                  LIMIT 1`,
+                [req.user.playerId, game.tenant_id]
+            );
+            isTenantAdminOfGame = ptRes.rows.length > 0 && ptRes.rows[0].role === 'tenant_admin';
+        }
+        if (!isAdmin && !isTenantAdminOfGame) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const rsvpsRes = await pool.query(`
+            SELECT r.id, r.player_id, r.position_preference, r.position_areas,
+                   r.rsvp_deadline, r.rsvp_warned_at, r.registered_at,
+                   p.alias, p.full_name
+              FROM registrations r
+              JOIN players p ON p.id = r.player_id
+             WHERE r.game_id = $1 AND r.status = 'rsvp'
+             ORDER BY r.rsvp_deadline ASC NULLS LAST, r.registered_at ASC
+        `, [gameId]);
+
+        res.json({
+            rsvps: rsvpsRes.rows.map(r => ({
+                id: r.id,
+                player_id: r.player_id,
+                alias: r.alias,
+                full_name: r.full_name,
+                position: r.position_preference,
+                position_areas: r.position_areas,
+                rsvp_deadline: r.rsvp_deadline,
+                rsvp_warned_at: r.rsvp_warned_at,
+                registered_at: r.registered_at,
+            })),
+            count: rsvpsRes.rows.length,
+        });
+    } catch (e) {
+        console.error('FIX-343 rsvps-full failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch RSVPs' });
     }
 });
 
@@ -12900,9 +13223,9 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         // Check if game is locked for editing
         if (game.player_editing_locked) {
             await client.query('ROLLBACK');
-            return res.status(423).json({ 
-                error: 'Game is currently being edited by an admin. Please try again in a few minutes.'
-            });
+            // FIX-357: preempt
+            const _preempt = await _recordSignupIntent(req.params.id, req.user.playerId, 'register');
+            return res.status(423).json(_preempt);
         }
         
         // Check exclusivity restrictions
@@ -13720,7 +14043,9 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         if (game.player_editing_locked && !isAdminAddingGuest) {
             await client.query('ROLLBACK');
             client.release();
-            return res.status(423).json({ error: 'Game is currently being edited by an admin. Please try again shortly.' });
+            // FIX-357: preempt
+            const _preempt = await _recordSignupIntent(req.params.id, req.user.playerId, 'guest_add');
+            return res.status(423).json(_preempt);
         }
 
         // FIX-018: Block guest addition after teams have been generated.
@@ -14293,7 +14618,9 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
         const isAdminRemovingGuest = req.user.role === 'admin' || req.user.role === 'superadmin';
         if (gameCheck.rows[0]?.player_editing_locked && !isAdminRemovingGuest) {
             await client.query('ROLLBACK');
-            return res.status(423).json({ error: 'Game is currently being edited by an admin.' });
+            // FIX-357: preempt
+            const _preempt = await _recordSignupIntent(req.params.id, req.user.playerId, 'guest_remove');
+            return res.status(423).json(_preempt);
         }
         if (gameCheck.rows[0]?.teams_generated && gameCheck.rows[0]?.team_selection_type !== 'draft_memory') {
             await client.query('ROLLBACK');
@@ -14868,7 +15195,9 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
 
         if (game.player_editing_locked) {
             await client.query('ROLLBACK');
-            return res.status(423).json({ error: 'Game is currently being edited by an admin. Please try again in a few minutes.' });
+            // FIX-357: preempt
+            const _preempt = await _recordSignupIntent(req.params.id, req.user.playerId, 'register_friend');
+            return res.status(423).json(_preempt);
         }
 
         // Registering player must be confirmed in this game
@@ -15677,9 +16006,9 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         const isAdminDroppingOut = req.user.role === 'admin' || req.user.role === 'superadmin';
         if (gameCheck.rows[0]?.player_editing_locked && !isAdminDroppingOut) {
             await client.query('ROLLBACK');
-            return res.status(423).json({ 
-                error: 'Game is currently being edited by an admin. Please try again in a few minutes.'
-            });
+            // FIX-357: preempt
+            const _preempt = await _recordSignupIntent(req.params.id, req.user.playerId, 'drop_out');
+            return res.status(423).json(_preempt);
         }
         
         const cost = parseFloat(gameCheck.rows[0].cost_per_player);
@@ -23324,6 +23653,38 @@ setTimeout(() => {
 }, 5000);
 
 // Lock game for player editing
+// FIX-357 — GET /api/admin/games/:gameId/waiting-signups
+//
+// Returns count of unresolved signup intents for this game + when the
+// auto-unlock fires. Polled by the admin Edit Players modal (every 5s) so
+// the admin sees a banner when a player is waiting.
+app.get('/api/admin/games/:gameId/waiting-signups',
+    authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT COUNT(*)::int AS count,
+                   MIN(created_at) AS earliest_intent_at
+              FROM game_signup_intents
+             WHERE game_id = $1 AND resolved_at IS NULL
+        `, [req.params.gameId]);
+        const count = parseInt(r.rows[0]?.count || 0, 10);
+        if (count === 0) return res.json({ count: 0 });
+
+        const earliest = r.rows[0].earliest_intent_at;
+        const unlockAt = new Date(new Date(earliest).getTime() + LOCK_PREEMPT_GRACE_SECONDS * 1000);
+        res.json({
+            count,
+            unlock_at: unlockAt.toISOString(),
+            earliest_intent_at: earliest,
+            grace_seconds: LOCK_PREEMPT_GRACE_SECONDS,
+        });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ count: 0 });
+        console.error('[FIX-357] waiting-signups failed:', e.message);
+        res.status(500).json({ error: 'Failed' });
+    }
+});
+
 app.post('/api/admin/games/:gameId/lock', authenticateToken, requireCLMAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
@@ -23392,9 +23753,12 @@ app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireCLMAdmin, 
         const { gameId } = req.params;
 
         // FIX-040: Only the lock owner (or full admin/superadmin) can unlock
+        // FIX-357: Allow no-op unlock if lock is already gone (auto-released by preempt).
         const lockOwner = await pool.query('SELECT locked_by FROM games WHERE id = $1', [gameId]);
         const isFullAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
-        if (!isFullAdmin && lockOwner.rows[0]?.locked_by !== req.user.playerId) {
+        const lockedByOther = lockOwner.rows[0]?.locked_by != null
+                              && lockOwner.rows[0]?.locked_by !== req.user.playerId;
+        if (!isFullAdmin && lockedByOther) {
             return res.status(403).json({ error: 'You cannot unlock a game locked by another admin' });
         }
         
@@ -23406,7 +23770,16 @@ app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireCLMAdmin, 
              WHERE id = $1`,
             [gameId]
         );
-        
+
+        // FIX-357: cancel any pending auto-release timer + resolve waiting intents
+        _clearPendingLockRelease(gameId);
+        pool.query(
+            `UPDATE game_signup_intents
+                SET resolved_at = NOW()
+              WHERE game_id = $1 AND resolved_at IS NULL`,
+            [gameId]
+        ).catch(() => {});
+
         res.json({ message: 'Game unlocked' });
         setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_unlocked', 'Player editing unlocked'));
     } catch (error) {
@@ -45187,6 +45560,57 @@ async function _fix276InsertExperiment(gameId) {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-354b — POST /api/admin/queue/:id/reopen
+// Reverts a resolved (approved/rejected) admin_action_queue row back to
+// status='pending'. Clears resolved_at, resolved_by, resolution_note. Used by
+// CRM Completed panel "Reopen" button. Refund-bearing rows are NOT clawed
+// back — the original refund stays applied; only the task state is reset
+// (use this when a task was wrongly marked done, not to undo a refund).
+// ──────────────────────────────────────────────────────────────────────────
+app.post('/api/admin/queue/:id/reopen', authenticateToken, requireAdmin, async (req, res) => {
+    const queueId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(queueId) || queueId <= 0) {
+        return res.status(400).json({ error: 'Invalid queue id' });
+    }
+    try {
+        const cur = await pool.query(
+            `SELECT id, status, refund_amount FROM admin_action_queue WHERE id = $1`,
+            [queueId]
+        );
+        if (cur.rows.length === 0) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+        const row = cur.rows[0];
+        if (row.status === 'pending') {
+            return res.status(409).json({ error: 'Task is already pending' });
+        }
+
+        const upd = await pool.query(
+            `UPDATE admin_action_queue
+                SET status = 'pending',
+                    resolved_at = NULL,
+                    resolved_by = NULL,
+                    resolution_note = NULL
+              WHERE id = $1
+              RETURNING id, type, status`,
+            [queueId]
+        );
+
+        // Audit log — captures who reopened it and whether it had a refund.
+        const refundNote = (row.refund_amount && parseFloat(row.refund_amount) > 0)
+            ? ` (original refund of £${parseFloat(row.refund_amount).toFixed(2)} retained)`
+            : '';
+        setImmediate(() => auditLog(pool, req.user.playerId, 'queue_task_reopened',
+            String(queueId), `Reopened resolved task #${queueId}${refundNote}`).catch(() => {}));
+
+        res.json({ ok: true, task: upd.rows[0] });
+    } catch (e) {
+        console.error('FIX-354b reopen failed:', e.message);
+        res.status(500).json({ error: 'Failed to reopen task', detail: e.message });
+    }
+});
+
 // ── /api/admin/calibration/summary ─────────────────────────────────────────
 // Top-of-dashboard health card. Aggregates across the last 90 days by
 // default; ?days=N overrides. Excludes admin_marked_unfair when ?excludeUnfair=1.
@@ -49624,15 +50048,28 @@ app.post('/api/t/:tenant_short_id/admin/withdraw-request',
             );
             const pendingPence = parseInt(balanceRes.rows[0].pending, 10);
 
-            // Compute already-requested withdrawals not yet paid
-            // (game_id IS NULL = withdraw request sentinel)
+            // FIX-337: Compute already-requested withdrawals not yet paid.
+            // Withdraw requests live in audit_logs (action='tenant_withdraw_request')
+            // because tenant_payouts_due.game_id is NOT NULL. The amount is
+            // encoded in the details text as "Withdraw request: £NN.NN — ...".
+            // We parse it out with a Postgres regex. The doc comment on this
+            // handler is intentionally left stale to document the historical
+            // schema decision; the real source-of-truth is the INSERT below.
             const wRes = await pool.query(
-                `SELECT COALESCE(SUM(payable_pence), 0)::bigint AS pending
-                   FROM tenant_payouts_due
-                  WHERE tenant_id = $1 AND status = 'pending' AND game_id IS NULL`,
+                `SELECT COALESCE(SUM(
+                            ((substring(details FROM 'Withdraw request: £([0-9]+\\.?[0-9]*)'))::numeric * 100)::bigint
+                        ), 0)::bigint AS pending
+                   FROM audit_logs al
+                  WHERE al.action = 'tenant_withdraw_request'
+                    AND al.tenant_id = $1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM audit_logs r
+                         WHERE r.action = 'tenant_withdraw_request_resolved'
+                           AND r.target_id = al.id::text
+                    )`,
                 [req.tenant.id]
             );
-            const alreadyRequested = parseInt(wRes.rows[0].pending, 10);
+            const alreadyRequested = parseInt(wRes.rows[0].pending, 10) || 0;
 
             const availableForWithdraw = pendingPence - alreadyRequested;
             if (amountPence > availableForWithdraw) {
@@ -49676,6 +50113,65 @@ app.post('/api/t/:tenant_short_id/admin/withdraw-request',
             }
             console.error('FIX-334 withdraw-request failed:', e.message);
             res.status(500).json({ error: 'Failed to submit withdraw request' });
+        }
+    }
+);
+
+// FIX-338 — GET /api/t/:tenant_short_id/admin/withdraw-requests
+//
+// Returns this tenant's own pending (unresolved) withdraw requests so the
+// admin UI can show what's in flight. Amount is parsed out of the audit
+// details string; the same parse logic is used by the POST balance check
+// at FIX-337 — keep them in sync if the details format ever changes.
+app.get('/api/t/:tenant_short_id/admin/withdraw-requests',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT al.id, al.created_at, al.player_id AS requested_by,
+                        al.details,
+                        ((substring(al.details FROM 'Withdraw request: £([0-9]+\\.?[0-9]*)'))::numeric * 100)::bigint AS amount_pence,
+                        p.alias AS requested_by_alias,
+                        p.full_name AS requested_by_full_name
+                   FROM audit_logs al
+                   LEFT JOIN players p ON p.id = al.player_id
+                  WHERE al.action = 'tenant_withdraw_request'
+                    AND al.tenant_id = $1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM audit_logs r
+                         WHERE r.action = 'tenant_withdraw_request_resolved'
+                           AND r.target_id = al.id::text
+                    )
+                  ORDER BY al.created_at ASC
+                  LIMIT 100`,
+                [req.tenant.id]
+            );
+            // Extract notes (anything after " — " in details, if present).
+            const rows = r.rows.map(row => {
+                const details = row.details || '';
+                const idx = details.indexOf(' — ');
+                const notes = idx >= 0 ? details.slice(idx + 3) : null;
+                return {
+                    id: row.id,
+                    created_at: row.created_at,
+                    requested_by: row.requested_by,
+                    requested_by_alias: row.requested_by_alias,
+                    requested_by_full_name: row.requested_by_full_name,
+                    amount_pence: parseInt(row.amount_pence, 10) || 0,
+                    notes,
+                };
+            });
+            const totalPence = rows.reduce((acc, r) => acc + (r.amount_pence || 0), 0);
+            res.json({
+                requests: rows,
+                total_pending_pence: totalPence,
+                row_count: rows.length,
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Withdraw feature not yet provisioned' });
+            }
+            console.error('FIX-338 tenant withdraw-requests list failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch withdraw requests' });
         }
     }
 );
@@ -49931,6 +50427,41 @@ app.put('/api/t/:tenant_short_id/admin/comms-templates/:kind',
             }
             console.error('FIX-334 update comms template failed:', e.message);
             res.status(500).json({ error: 'Failed to save template' });
+        }
+    }
+);
+
+// FIX-339 — DELETE /api/t/:tenant_short_id/admin/comms-templates/:kind
+//
+// Removes the tenant-specific override for the given kind. The next GET
+// falls back to the system default. Idempotent — returns ok=true even if
+// nothing was deleted.
+app.delete('/api/t/:tenant_short_id/admin/comms-templates/:kind',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const kind = String(req.params.kind || '').trim();
+        const allowedKinds = ['new_signup_invite', 'existing_player_game_invite', 'unfilled_reminder'];
+        if (!allowedKinds.includes(kind)) {
+            return res.status(400).json({ error: 'Invalid template kind' });
+        }
+        try {
+            const r = await pool.query(
+                `DELETE FROM tenant_signup_comms_templates
+                  WHERE tenant_id = $1 AND template_kind = $2
+                 RETURNING id`,
+                [req.tenant.id, kind]
+            );
+            const removed = r.rowCount > 0;
+            if (removed) {
+                setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_comms_template_reset',
+                    req.tenant.id, `Template '${kind}' reset to default`, req.tenant.id).catch(() => {}));
+            }
+            res.json({ ok: true, removed });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Comms templates not yet provisioned' });
+            }
+            console.error('FIX-339 reset comms template failed:', e.message);
+            res.status(500).json({ error: 'Failed to reset template' });
         }
     }
 );
@@ -51407,8 +51938,1325 @@ app.get('/api/admin/row-status', authenticateToken, requireSuperAdmin, async (re
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-356 — Dynamic FAQ system bootstrap
+// ──────────────────────────────────────────────────────────────────────────
+// Creates faq_entries + faq_unanswered tables if missing, and seeds the
+// 43 baseline FAQs from faq.html if faq_entries is empty. Runs on every
+// startup; cheap when tables exist (no work done after the first run).
+// ──────────────────────────────────────────────────────────────────────────
+const FIX_356_FAQ_SEED = [
+                {
+                    "order": 1,
+                    "category": "Getting Started",
+                    "question": "How do I join Total Footy?",
+                    "answer": "<p>Create a free account at <a href=\"https://totalfooty.co.uk\">totalfooty.co.uk</a>. Once registered you can start browsing and signing up for games straight away.</p>",
+                    "keywords": [
+                        "add me",
+                        "book in",
+                        "sign up",
+                        "join",
+                        "total",
+                        "footy",
+                        "getting",
+                        "started"
+                    ]
+                },
+                {
+                    "order": 2,
+                    "category": "Getting Started",
+                    "question": "What do I need to play?",
+                    "answer": "<ul> <li>An active TF account</li> <li>Sufficient credit balance to cover the game cost</li> <li>Appropriate footwear for the surface (astro, grass or indoor — check each game listing)</li> <li>Shinpads are recommended but not required</li> </ul>",
+                    "keywords": [
+                        "need",
+                        "play",
+                        "getting",
+                        "started"
+                    ]
+                },
+                {
+                    "order": 3,
+                    "category": "Games & Registration",
+                    "question": "How do I sign up for a game?",
+                    "answer": "<p>Log in, navigate to the Games page, and click on a game to open it. Hit the register button to secure your spot. Payment is taken from your credit balance at that point.</p>",
+                    "keywords": [
+                        "add me",
+                        "book in",
+                        "sign up",
+                        "fee",
+                        "game",
+                        "join",
+                        "sign",
+                        "cost",
+                        "price",
+                        "games",
+                        "charge",
+                        "payment"
+                    ]
+                },
+                {
+                    "order": 4,
+                    "category": "Games & Registration",
+                    "question": "How do I top up my credit balance?",
+                    "answer": "<p>Go to your Profile and follow the top-up instructions. Credits are added to your account and used automatically when you register for games.</p>",
+                    "keywords": [
+                        "add me",
+                        "book in",
+                        "my page",
+                        "sign up",
+                        "personal info",
+                        "pot",
+                        "join",
+                        "money",
+                        "funds",
+                        "games",
+                        "photo",
+                        "credit"
+                    ]
+                },
+                {
+                    "order": 5,
+                    "category": "Games & Registration",
+                    "question": "When will I see available games?",
+                    "answer": "<div class=\"tier-table\"> <div class=\"tier-row gold\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">Gold</div><div class=\"tier-row-desc\">Games visible up to 28 days in advance.</div></div> <div class=\"tier-row silver\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">Silver</div><div class=\"tier-row-desc\">Games visible up to 3 days (72 hours) in advance.</div></div> <div class=\"tier-row bronze\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">Bronze</div><div class=\"tier-row-desc\">Games visible 24 hours before kick-off.</div></div> <div class=\"tier-row white\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">White</div><div class=\"tier-row-desc\">Account suspended — no games visible.</div></div> <div class=\"tier-row black\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">Black</div><div class=\"tier-row-desc\">Account suspended — no games visible.</div></div> </div>",
+                    "keywords": [
+                        "attendance rank",
+                        "level",
+                        "games",
+                        "ranking",
+                        "available",
+                        "consistency",
+                        "reliability",
+                        "registration"
+                    ]
+                },
+                {
+                    "order": 6,
+                    "category": "Games & Registration",
+                    "question": "What is a star rating on a game?",
+                    "answer": "<p>Star ratings (0★–5★, in half-star increments) indicate the expected level of play. They are a guide to help you choose games suited to your ability. 0★ marks a weak-squad game; 5★ is the highest tier. Ratings adjust dynamically based on who signs up.</p>",
+                    "keywords": [
+                        "attendance rank",
+                        "ovr",
+                        "game",
+                        "star",
+                        "stars",
+                        "level",
+                        "score",
+                        "skill",
+                        "games",
+                        "rating",
+                        "ranking",
+                        "overall"
+                    ]
+                },
+                {
+                    "order": 7,
+                    "category": "Games & Registration",
+                    "question": "Can I sign up a friend?",
+                    "answer": "<p>Yes. If you are confirmed in a game you can register another TF member as your +1, or bring a guest who does not have an account. Both options carry the same cost as your own spot, which comes from your credit balance.</p>",
+                    "keywords": [
+                        "add me",
+                        "book in",
+                        "sign up",
+                        "plus one",
+                        "bring someone",
+                        "+1",
+                        "join",
+                        "sign",
+                        "mate",
+                        "games",
+                        "friend",
+                        "register"
+                    ]
+                },
+                {
+                    "order": 8,
+                    "category": "Games & Registration",
+                    "question": "How do I drop out of a game?",
+                    "answer": "<p>Open the game on the Games page and hit the Drop Out button.</p> <p><strong>Drop-out refund policy:</strong></p> <p>You'll be refunded in full if you drop out <strong>more than 2 hours before kick-off AND before teams have been generated</strong>.</p> <p>You will <strong>not be refunded</strong> if you drop out:</p> <ul> <li>Within 2 hours of kick-off, OR</li> <li>After teams have been generated (except draft games which allow changes until they're confirmed).</li> </ul> <p>Discipline points and tier downgrades still apply for late drop-outs as described in the discipline policy. GAFFA is notified of every late drop-out and may waive points if the reason is genuinely fair.</p> <p>Do so as early as possible so your spot can be filled.</p>",
+                    "keywords": [
+                        "turning up late",
+                        "no show",
+                        "money back",
+                        "credit back",
+                        "arrived late",
+                        "attendance rank",
+                        "ban",
+                        "game",
+                        "side",
+                        "late",
+                        "drop",
+                        "squad"
+                    ]
+                },
+                {
+                    "order": 9,
+                    "category": "Games & Registration",
+                    "question": "What is the Backup list?",
+                    "answer": "<p>When a game is full you can join the backup list. If a confirmed player drops out, backup players are contacted in order. Confirmed backups have guaranteed entry if a spot opens.</p>",
+                    "keywords": [
+                        "get in touch",
+                        "email us",
+                        "reserve list",
+                        "message admin",
+                        "sub",
+                        "help",
+                        "list",
+                        "games",
+                        "backup",
+                        "standby",
+                        "support",
+                        "waitlist"
+                    ]
+                },
+                {
+                    "order": 10,
+                    "category": "Reliability Tiers",
+                    "question": "What are tiers?",
+                    "answer": "<p>Your tier reflects your reliability as a player based on your attendance record and discipline history. It affects how early you can see and register for games.</p>",
+                    "keywords": [
+                        "add me",
+                        "book in",
+                        "no show",
+                        "sign up",
+                        "attendance rank",
+                        "ban",
+                        "join",
+                        "late",
+                        "tiers",
+                        "level",
+                        "ranking",
+                        "penalty"
+                    ]
+                },
+                {
+                    "order": 11,
+                    "category": "Reliability Tiers",
+                    "question": "What are the tiers?",
+                    "answer": "<div class=\"tier-table\"> <div class=\"tier-row gold\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">Gold</div><div class=\"tier-row-desc\">Top tier. Best visibility window. Awarded to reliable, active players.</div></div> <div class=\"tier-row silver\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">Silver</div><div class=\"tier-row-desc\">Standard tier for most players.</div></div> <div class=\"tier-row bronze\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">Bronze</div><div class=\"tier-row-desc\">Reduced visibility. Typically a result of accumulated discipline points.</div></div> <div class=\"tier-row white\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">White</div><div class=\"tier-row-desc\">Suspended. Cannot register for games. Temporary.</div></div> <div class=\"tier-row black\"><div class=\"tier-pip\"></div><div class=\"tier-row-name\">Black</div><div class=\"tier-row-desc\">Banned. Account permanently suspended pending review.</div></div> </div>",
+                    "keywords": [
+                        "turning up late",
+                        "add me",
+                        "no show",
+                        "book in",
+                        "sign up",
+                        "turning up",
+                        "showing up",
+                        "arrived late",
+                        "attendance rank",
+                        "ban",
+                        "join",
+                        "late"
+                    ]
+                },
+                {
+                    "order": 12,
+                    "category": "Reliability Tiers",
+                    "question": "How is my tier calculated?",
+                    "answer": "<p>Your tier is calculated automatically based on a combination of your game attendance rate and your rolling discipline points, measured over your last 10 completed games.</p>",
+                    "keywords": [
+                        "turning up late",
+                        "no show",
+                        "arrived late",
+                        "attendance rank",
+                        "ban",
+                        "late",
+                        "tier",
+                        "tiers",
+                        "level",
+                        "ranking",
+                        "penalty",
+                        "punishment"
+                    ]
+                },
+                {
+                    "order": 13,
+                    "category": "Reliability Tiers",
+                    "question": "How do I move up a tier?",
+                    "answer": "<p>Maintain a strong attendance record, show up on time, and avoid discipline points. Tier recalculations happen automatically after each game is completed.</p>",
+                    "keywords": [
+                        "no show",
+                        "attendance rank",
+                        "ban",
+                        "late",
+                        "tier",
+                        "move",
+                        "tiers",
+                        "level",
+                        "ranking",
+                        "penalty",
+                        "punishment",
+                        "misconduct"
+                    ]
+                },
+                {
+                    "order": 14,
+                    "category": "Discipline",
+                    "question": "What are discipline points?",
+                    "answer": "<p>Discipline points are recorded when a player behaves in a way that negatively affects the group. Points accumulate and affect your tier. They are reviewed on a rolling basis across your last 10 completed games.</p>",
+                    "keywords": [
+                        "turning up late",
+                        "no show",
+                        "arrived late",
+                        "attendance rank",
+                        "ban",
+                        "late",
+                        "level",
+                        "points",
+                        "ranking",
+                        "penalty",
+                        "punishment",
+                        "misconduct"
+                    ]
+                },
+                {
+                    "order": 15,
+                    "category": "Discipline",
+                    "question": "What offences result in discipline points?",
+                    "answer": "<ul> <li><strong style=\"color: var(--tf-white);\">Not Ready (0–5 mins late)</strong> — Being unprepared or not on the pitch when the game starts.</li> <li><strong style=\"color: var(--tf-white);\">5–10 Minutes Late</strong> — Arriving noticeably late after kick-off.</li> <li><strong style=\"color: var(--tf-white);\">10+ Minutes Late</strong> — Arriving significantly late.</li> <li><strong style=\"color: var(--tf-white);\">Late Drop Out</strong> — Dropping out with less than 3 hours' notice.</li> <li><strong style=\"color: var(--tf-accent);\">No Show</strong> — Confirmed for a game and not turning up at all.</li> </ul>",
+                    "keywords": [
+                        "didn't turn up",
+                        "turning up late",
+                        "pulled out late",
+                        "no show",
+                        "missed game",
+                        "arrived late",
+                        "ban",
+                        "late",
+                        "absent",
+                        "points",
+                        "result",
+                        "penalty"
+                    ]
+                },
+                {
+                    "order": 16,
+                    "category": "Discipline",
+                    "question": "Will my points ever reset?",
+                    "answer": "<p>Points are assessed on a rolling window of your last 10 completed games, so older points naturally fall off as you play more.</p>",
+                    "keywords": [
+                        "ever",
+                        "reset",
+                        "points",
+                        "discipline"
+                    ]
+                },
+                {
+                    "order": 17,
+                    "category": "Discipline",
+                    "question": "Can I appeal a discipline point?",
+                    "answer": "<p>Yes. Contact an organiser or admin if you believe a point was recorded in error. All discipline entries are logged with the relevant game.</p>",
+                    "keywords": [
+                        "get in touch",
+                        "message a player",
+                        "no show",
+                        "email us",
+                        "message admin",
+                        "direct message",
+                        "private message",
+                        "pm",
+                        "ban",
+                        "host",
+                        "late",
+                        "help"
+                    ]
+                },
+                {
+                    "order": 18,
+                    "category": "MOTM",
+                    "question": "How does MOTM voting work?",
+                    "answer": "<p>After a game is completed, admins open a voting window. All confirmed players from that game receive a notification and can cast one vote each for their MOTM. Voting is open for 24 hours.</p>",
+                    "keywords": [
+                        "man of the match",
+                        "player of the match",
+                        "message a player",
+                        "top voter",
+                        "best player",
+                        "direct message",
+                        "private message",
+                        "pm",
+                        "mvp",
+                        "work",
+                        "rate",
+                        "motm"
+                    ]
+                },
+                {
+                    "order": 19,
+                    "category": "MOTM",
+                    "question": "Who can vote?",
+                    "answer": "<p>Only players who were confirmed for that specific game can vote. You get one vote per game and you cannot vote for yourself.</p>",
+                    "keywords": [
+                        "rate",
+                        "motm",
+                        "rank",
+                        "vote",
+                        "voting"
+                    ]
+                },
+                {
+                    "order": 20,
+                    "category": "MOTM",
+                    "question": "Who can I vote for?",
+                    "answer": "<p>By default the winning team's players are on the ballot. Admins can add players from the opposing team if warranted. For external games, all our players are eligible.</p>",
+                    "keywords": [
+                        "message a player",
+                        "direct message",
+                        "private message",
+                        "pm",
+                        "rate",
+                        "motm",
+                        "side",
+                        "rank",
+                        "vote",
+                        "inbox",
+                        "squad",
+                        "lineup"
+                    ]
+                },
+                {
+                    "order": 21,
+                    "category": "MOTM",
+                    "question": "What happens when voting closes?",
+                    "answer": "<p>The player with the most votes is crowned MOTM. The result is displayed on the completed game page and on their player profile.</p>",
+                    "keywords": [
+                        "man of the match",
+                        "player of the match",
+                        "my page",
+                        "top voter",
+                        "best player",
+                        "personal info",
+                        "mvp",
+                        "rate",
+                        "motm",
+                        "rank",
+                        "photo",
+                        "closes"
+                    ]
+                },
+                {
+                    "order": 22,
+                    "category": "Game Chat",
+                    "question": "What is game chat?",
+                    "answer": "<p>Every game has a live chat thread visible on its page. It is a place for match build-up, banter, and communication between players.</p>",
+                    "keywords": [
+                        "group chat",
+                        "pre-game chat",
+                        "game",
+                        "chat",
+                        "banter",
+                        "messages"
+                    ]
+                },
+                {
+                    "order": 23,
+                    "category": "Game Chat",
+                    "question": "Who can see and post in the public chat?",
+                    "answer": "<p>Anyone who can view the game URL — including non-registered visitors — can read the public chat. You do not need to be signed in to read it.</p> <p>Only confirmed registered players for that game can post messages.</p>",
+                    "keywords": [
+                        "add me",
+                        "book in",
+                        "sign up",
+                        "group chat",
+                        "pre-game chat",
+                        "game",
+                        "post",
+                        "join",
+                        "chat",
+                        "public",
+                        "banter",
+                        "messages"
+                    ]
+                },
+                {
+                    "order": 24,
+                    "category": "Game Chat",
+                    "question": "What is team chat?",
+                    "answer": "<p>Once teams have been set by an organiser, registered players gain access to a private team chat visible only to their own team. Switch between PUBLIC and your team tab at the top of the chat panel. Team chat is never visible to the opposing team, guests, or anyone not in your team.</p>",
+                    "keywords": [
+                        "add me",
+                        "book in",
+                        "sign up",
+                        "plus one",
+                        "group chat",
+                        "bring someone",
+                        "pre-game chat",
+                        "+1",
+                        "game",
+                        "team",
+                        "join",
+                        "side"
+                    ]
+                },
+                {
+                    "order": 25,
+                    "category": "Game Chat",
+                    "question": "Do messages persist?",
+                    "answer": "<p>Yes. Chat messages are saved and visible for the duration of the game lifecycle. Admins can moderate and remove messages where necessary.</p>",
+                    "keywords": [
+                        "message a player",
+                        "group chat",
+                        "pre-game chat",
+                        "direct message",
+                        "private message",
+                        "pm",
+                        "game",
+                        "chat",
+                        "inbox",
+                        "banter",
+                        "persist",
+                        "messages"
+                    ]
+                },
+                {
+                    "order": 26,
+                    "category": "Direct Messages",
+                    "question": "Can I message other players?",
+                    "answer": "<p>Yes. Every player profile has a Send Message button. Tap it to open a private direct message thread with that player. Your conversation is visible only to you and the recipient.</p>",
+                    "keywords": [
+                        "my page",
+                        "personal info",
+                        "other",
+                        "photo",
+                        "avatar",
+                        "direct",
+                        "account",
+                        "message",
+                        "players",
+                        "messages"
+                    ]
+                },
+                {
+                    "order": 27,
+                    "category": "Direct Messages",
+                    "question": "Where do I find my messages?",
+                    "answer": "<p>Navigate to Messages in the sidebar or bottom navigation. Your most recent conversations are listed here, sorted by latest message. Unread messages show a red indicator on the Messages icon.</p>",
+                    "keywords": [
+                        "turning up late",
+                        "no show",
+                        "arrived late",
+                        "find",
+                        "direct",
+                        "messages"
+                    ]
+                },
+                {
+                    "order": 28,
+                    "category": "Direct Messages",
+                    "question": "Can I start a new conversation?",
+                    "answer": "<p>Yes. On the Messages page, tap the + NEW button and search for any player by name or alias to start a thread.</p>",
+                    "keywords": [
+                        "start",
+                        "direct",
+                        "messages",
+                        "conversation"
+                    ]
+                },
+                {
+                    "order": 29,
+                    "category": "Stats & Leaderboards",
+                    "question": "Where can I see player stats?",
+                    "answer": "<p>Navigate to the Players section. You can view all players, their appearances, wins, win percentages, and MOTM counts. Sort and filter by different time periods.</p>",
+                    "keywords": [
+                        "man of the match",
+                        "player of the match",
+                        "top voter",
+                        "best player",
+                        "mvp",
+                        "stats",
+                        "player",
+                        "record",
+                        "history",
+                        "numbers",
+                        "statistics",
+                        "leaderboards"
+                    ]
+                },
+                {
+                    "order": 30,
+                    "category": "Stats & Leaderboards",
+                    "question": "What stats are tracked?",
+                    "answer": "<ul> <li>Total appearances</li> <li>Wins and win percentage</li> <li>MOTM wins and MOTM percentage</li> <li>Tournament wins</li> <li>External game wins</li> </ul>",
+                    "keywords": [
+                        "man of the match",
+                        "player of the match",
+                        "top voter",
+                        "best player",
+                        "mvp",
+                        "cup",
+                        "comp",
+                        "stats",
+                        "record",
+                        "history",
+                        "bracket",
+                        "tracked"
+                    ]
+                },
+                {
+                    "order": 31,
+                    "category": "Stats & Leaderboards",
+                    "question": "Are player stats public?",
+                    "answer": "<p>Appearance count, wins, win percentage, and MOTM stats are visible on a player's public profile. Your tier and badges are also visible to the community.</p>",
+                    "keywords": [
+                        "man of the match",
+                        "player of the match",
+                        "my page",
+                        "top voter",
+                        "best player",
+                        "personal info",
+                        "attendance rank",
+                        "mvp",
+                        "level",
+                        "stats",
+                        "photo",
+                        "player"
+                    ]
+                },
+                {
+                    "order": 32,
+                    "category": "Stats & Leaderboards",
+                    "question": "How does the Refer a Friend scheme work?",
+                    "answer": "<p>Every TF member has a unique referral link. Share it with a friend — when they sign up via your link, you're connected as referrer and referee.</p> <div id=\"rafRewardDetails\" style=\"display:none;margin-top:16px;padding:16px;background:#0a0a0a;border:1px solid #222;border-radius:8px;\"> <div style=\"font-size:13px;font-weight:900;color:#00cc66;margin-bottom:12px;\">💰 OUR NEW REFER A FRIEND SCHEME IS LIVE!</div> <p style=\"margin:0 0 10px;\">Earn real credits for every friend you bring to Total Footy:</p> <ul style=\"margin:0 0 10px;padding-left:20px;\"> <li style=\"margin-bottom:6px;\"><strong>£2 activation bonus</strong> — when your friend tops up their account for the first time</li> <li style=\"margin-bottom:6px;\"><strong>50p per game sign-up</strong> — every time they sign up to a game (confirmed spots only)</li> <li style=\"margin-bottom:6px;\"><strong>Maximum £12 in game credits</strong> — that's 24 sign-ups</li> <li><strong>£14 total maximum</strong> per friend you refer</li> </ul> <p style=\"margin:0;color:#888;font-size:13px;\">The 1-year window starts from the day your friend joins. Credits are added to your balance automatically — no action needed.</p> </div>",
+                    "keywords": [
+                        "refer a friend",
+                        "bring a friend",
+                        "add me",
+                        "book in",
+                        "pot",
+                        "raf",
+                        "join",
+                        "work",
+                        "money",
+                        "funds",
+                        "refer",
+                        "stats"
+                    ]
+                },
+                {
+                    "order": 33,
+                    "category": "Stats & Leaderboards",
+                    "question": "Where do I find my referral link?",
+                    "answer": "<p>Your referral link is in the <strong>Refer a Friend</strong> section of your Profile page. Copy it and share via WhatsApp, social media, or directly to a friend.</p>",
+                    "keywords": [
+                        "refer a friend",
+                        "bring a friend",
+                        "my page",
+                        "whats app",
+                        "personal info",
+                        "wa",
+                        "raf",
+                        "find",
+                        "link",
+                        "stats",
+                        "group",
+                        "photo"
+                    ]
+                },
+                {
+                    "order": 34,
+                    "category": "Stats & Leaderboards",
+                    "question": "How much can I earn from a referral?",
+                    "answer": "<p>Up to <strong>£14 per friend</strong>, broken down as:</p> <ul style=\"padding-left:20px;margin:10px 0;\"> <li style=\"margin-bottom:6px;\"><strong>£2 activation bonus</strong> — when your friend tops up their account for the first time</li> <li style=\"margin-bottom:6px;\"><strong>50p per game sign-up</strong> — every confirmed spot they take, up to 24 sign-ups</li> <li><strong>£12 maximum</strong> in game credits (24 × 50p)</li> </ul> <p style=\"margin:0;color:#888;font-size:13px;\">There's no cap on how many friends you refer — bring 10 friends who each play 24 games and you'd earn <strong style=\"color:#fff;\">£140</strong>. The game credit window is 1 year from when your friend joins.</p>",
+                    "keywords": [
+                        "refer a friend",
+                        "bring a friend",
+                        "pot",
+                        "raf",
+                        "much",
+                        "earn",
+                        "money",
+                        "funds",
+                        "stats",
+                        "invite",
+                        "wallet",
+                        "balance"
+                    ]
+                },
+                {
+                    "order": 35,
+                    "category": "Stats & Leaderboards",
+                    "question": "When do I get paid?",
+                    "answer": "<p>Credits are added to your balance <strong>automatically</strong> — you don't need to do anything.</p> <ul style=\"padding-left:20px;margin:10px 0 0;\"> <li style=\"margin-bottom:6px;\">Your <strong>£2 activation bonus</strong> lands as soon as your friend makes their first top-up</li> <li style=\"margin-bottom:6px;\">Your <strong>50p game credits</strong> land each time they sign up to a game</li> <li>You'll receive an <strong>email notification</strong> at key milestones (activation, 10 games, and when you've maxed out their referral)</li> </ul>",
+                    "keywords": [
+                        "refer a friend",
+                        "bring a friend",
+                        "add me",
+                        "book in",
+                        "pot",
+                        "raf",
+                        "join",
+                        "paid",
+                        "money",
+                        "funds",
+                        "stats",
+                        "invite"
+                    ]
+                },
+                {
+                    "order": 36,
+                    "category": "Stats & Leaderboards",
+                    "question": "Can I see how much I've earned from referrals?",
+                    "answer": "<p>Yes — your <strong>Profile page</strong> shows a full breakdown: each friend you've referred, whether their activation bonus has been paid, how many sign-ups they've made, and your total earned per person.</p>",
+                    "keywords": [
+                        "refer a friend",
+                        "bring a friend",
+                        "my page",
+                        "personal info",
+                        "raf",
+                        "much",
+                        "i've",
+                        "stats",
+                        "photo",
+                        "avatar",
+                        "earned",
+                        "invite"
+                    ]
+                },
+                {
+                    "order": 37,
+                    "category": "Badges",
+                    "question": "What are badges?",
+                    "answer": "<p>Badges are displayed on your profile and recognise milestones, loyalty, and achievement within the TF community.</p>",
+                    "keywords": [
+                        "my page",
+                        "personal info",
+                        "photo",
+                        "trophy",
+                        "avatar",
+                        "reward",
+                        "unlock",
+                        "badges",
+                        "account",
+                        "achievement"
+                    ]
+                },
+                {
+                    "order": 38,
+                    "category": "Badges",
+                    "question": "What badges are available?",
+                    "answer": "<ul> <li><strong style=\"color: var(--tf-white);\">TF All Star</strong> — Rewarded to our best players and gives access to external games.</li> <li><strong style=\"color: var(--tf-white);\">Appearance Badge</strong> — Awarded automatically when you reach significant appearance milestones.</li> <li><strong style=\"color: var(--tf-white);\">MOTM Badge</strong> — Awarded automatically when you reach significant MOTM milestones.</li> <li><strong style=\"color: var(--tf-white);\">New</strong> — Shows for your first 30 days as a member.</li> <li><strong style=\"color: var(--tf-white);\">MOTM Streak</strong> — Awarded for winning MOTM in consecutive games.</li> </ul>",
+                    "keywords": [
+                        "man of the match",
+                        "player of the match",
+                        "top voter",
+                        "best player",
+                        "mvp",
+                        "trophy",
+                        "reward",
+                        "unlock",
+                        "badges",
+                        "available",
+                        "achievement"
+                    ]
+                },
+                {
+                    "order": 39,
+                    "category": "Badges",
+                    "question": "How do I earn badges?",
+                    "answer": "<p>Appearance and MOTM badges are awarded automatically when you hit the relevant milestone. TF All Star is granted manually by admins only.</p>",
+                    "keywords": [
+                        "man of the match",
+                        "player of the match",
+                        "message a player",
+                        "top voter",
+                        "best player",
+                        "direct message",
+                        "private message",
+                        "pm",
+                        "mvp",
+                        "earn",
+                        "inbox",
+                        "trophy"
+                    ]
+                },
+                {
+                    "order": 40,
+                    "category": "Your Profile",
+                    "question": "What can I add to my profile?",
+                    "answer": "<ul> <li>Profile photo</li> <li>Alias / display name</li> <li>Squad number</li> <li>Social links (TikTok, Instagram, YouTube, Facebook)</li> </ul>",
+                    "keywords": [
+                        "my page",
+                        "profile pic",
+                        "personal info",
+                        "your",
+                        "image",
+                        "photo",
+                        "avatar",
+                        "picture",
+                        "account",
+                        "profile",
+                        "headshot"
+                    ]
+                },
+                {
+                    "order": 41,
+                    "category": "Your Profile",
+                    "question": "Can other players see my profile?",
+                    "answer": "<p>Yes. Other players can tap your name anywhere on the website to view your public profile — including your alias, tier, badges, appearances, and social links. Your phone number and email are never visible to other players.</p>",
+                    "keywords": [
+                        "my page",
+                        "personal info",
+                        "attendance rank",
+                        "your",
+                        "level",
+                        "other",
+                        "photo",
+                        "trophy",
+                        "avatar",
+                        "reward",
+                        "unlock",
+                        "ranking"
+                    ]
+                },
+                {
+                    "order": 42,
+                    "category": "Venues",
+                    "question": "Where does Total Footy play?",
+                    "answer": "<p>TF runs games at multiple venues across Coventry and Nuneaton. Each game listing shows the venue name and address. Venue pages include parking information, pitch type, boot requirements, and any special instructions.</p>",
+                    "keywords": [
+                        "play",
+                        "footy",
+                        "total",
+                        "where",
+                        "pitch",
+                        "venues",
+                        "ground",
+                        "address",
+                        "location"
+                    ]
+                },
+                {
+                    "order": 43,
+                    "category": "Contact",
+                    "question": "How do I get in touch?",
+                    "answer": "<ul> <li>Use the Contact Us button in the website sidebar</li> <li>Message an admin directly via the messaging system</li> <li>Join our WhatsApp community — <a href=\"https://chat.whatsapp.com/KUXx8hr0mTHLx2BXWEjSze\" target=\"_blank\" rel=\"noopener\" style=\"color: var(--tf-silver);\">tap here to join</a></li> <li>Reach us on Instagram — <strong style=\"color: var(--tf-silver);\">@total_footy_cv</strong></li> </ul>",
+                    "keywords": [
+                        "get in touch",
+                        "message a player",
+                        "email us",
+                        "whats app",
+                        "group chat",
+                        "pre-game chat",
+                        "message admin",
+                        "direct message",
+                        "private message",
+                        "pm",
+                        "wa",
+                        "help"
+                    ]
+                }
+            ];
+
+async function fix356BootstrapFaq() {
+    try {
+        // Schema (idempotent)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS faq_entries (
+                id              SERIAL PRIMARY KEY,
+                category        TEXT NOT NULL,
+                question        TEXT NOT NULL,
+                answer          TEXT NOT NULL,
+                keywords        TEXT[] NOT NULL DEFAULT '{}',
+                display_order   INT NOT NULL DEFAULT 0,
+                active          BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_by      UUID
+            )
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_faq_entries_active_order
+                ON faq_entries (active, display_order)
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS faq_unanswered (
+                id              SERIAL PRIMARY KEY,
+                query           TEXT NOT NULL,
+                user_comment    TEXT,
+                player_id       UUID,
+                status          TEXT NOT NULL DEFAULT 'pending'
+                                 CHECK (status IN ('pending', 'resolved', 'dismissed')),
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                resolved_at     TIMESTAMPTZ,
+                resolved_by     UUID,
+                resolved_to_faq_id INT REFERENCES faq_entries(id) ON DELETE SET NULL,
+                resolution_note TEXT
+            )
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_faq_unanswered_status
+                ON faq_unanswered (status, created_at DESC)
+        `);
+
+        // FIX-357: signup intent table — used by the lock-preempt system
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS game_signup_intents (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                game_id     UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+                player_id   UUID NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+                intent_type TEXT NOT NULL,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMPTZ,
+                UNIQUE (game_id, player_id, intent_type)
+            )
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_signup_intents_unresolved
+                ON game_signup_intents (game_id, created_at)
+                WHERE resolved_at IS NULL
+        `);
+
+        // Seed — only if table is empty
+        const cnt = await pool.query('SELECT COUNT(*)::int AS n FROM faq_entries');
+        if (cnt.rows[0].n === 0) {
+            console.log(`📚 FIX-356: seeding ${FIX_356_FAQ_SEED.length} baseline FAQs…`);
+            for (const f of FIX_356_FAQ_SEED) {
+                await pool.query(
+                    `INSERT INTO faq_entries (category, question, answer, keywords, display_order)
+                          VALUES ($1, $2, $3, $4, $5)`,
+                    [f.category, f.question, f.answer, f.keywords || [], f.order || 0]
+                );
+            }
+            console.log(`✅ FIX-356: FAQ seed complete`);
+        } else {
+            console.log(`📚 FIX-356: FAQ table already populated (${cnt.rows[0].n} rows), skipping seed`);
+        }
+    } catch (e) {
+        console.error('❌ FIX-356 FAQ bootstrap failed:', e.message);
+        // Non-fatal — server can run without FAQs, admins can re-trigger later
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-357 — Lock-preempt helpers
+// ──────────────────────────────────────────────────────────────────────────
+// When a player tries to sign up while admin holds the lock, we:
+//   1. Record their intent in game_signup_intents
+//   2. Schedule a 15s auto-release of the admin's lock (if not already pending)
+//   3. Notify the admin via push
+// The admin can call /unlock early to release sooner; the timer is then cancelled.
+
+const LOCK_PREEMPT_GRACE_SECONDS = 15;
+const _pendingLockReleases = new Map();   // gameId -> timer handle
+
+function _scheduleLockRelease(gameId, delaySeconds) {
+    if (_pendingLockReleases.has(gameId)) return;
+
+    const handle = setTimeout(async () => {
+        _pendingLockReleases.delete(gameId);
+        try {
+            const r = await pool.query(`
+                UPDATE games
+                   SET player_editing_locked = FALSE,
+                       locked_by = NULL,
+                       locked_at = NULL
+                 WHERE id = $1
+                   AND player_editing_locked = TRUE
+                 RETURNING locked_by
+            `, [gameId]);
+            if (r.rowCount > 0) {
+                console.log(`[FIX-357] auto-released lock on game ${gameId} after ${delaySeconds}s grace`);
+                setImmediate(() => gameAuditLog(pool, gameId, r.rows[0].locked_by,
+                    'game_unlocked',
+                    `Auto-released for waiting player after ${delaySeconds}s grace`
+                ).catch(() => {}));
+                pool.query(
+                    `UPDATE game_signup_intents
+                        SET resolved_at = NOW()
+                      WHERE game_id = $1 AND resolved_at IS NULL`,
+                    [gameId]
+                ).catch(() => {});
+            }
+        } catch (e) {
+            console.warn('[FIX-357] scheduled release failed:', e.message);
+        }
+    }, delaySeconds * 1000);
+
+    _pendingLockReleases.set(gameId, handle);
+}
+
+function _clearPendingLockRelease(gameId) {
+    const handle = _pendingLockReleases.get(gameId);
+    if (handle) {
+        clearTimeout(handle);
+        _pendingLockReleases.delete(gameId);
+    }
+}
+
+async function _recordSignupIntent(gameId, playerId, intentType) {
+    let isNewPreempt = false;
+    try {
+        const ins = await pool.query(
+            `INSERT INTO game_signup_intents (game_id, player_id, intent_type)
+                  VALUES ($1, $2, $3)
+             ON CONFLICT (game_id, player_id, intent_type)
+             DO UPDATE SET created_at = CASE
+                                  WHEN game_signup_intents.resolved_at IS NOT NULL
+                                       OR game_signup_intents.created_at < NOW() - INTERVAL '60 seconds'
+                                  THEN NOW()
+                                  ELSE game_signup_intents.created_at
+                               END,
+                           resolved_at = NULL
+             RETURNING (created_at >= NOW() - INTERVAL '2 seconds') AS just_inserted_or_refreshed`,
+            [gameId, playerId, intentType]
+        );
+        isNewPreempt = !!ins.rows[0]?.just_inserted_or_refreshed;
+    } catch (e) {
+        if (e && e.code === '42P01') {
+            console.warn('[FIX-357] game_signup_intents missing; preempt disabled until bootstrap runs');
+        } else {
+            console.warn('[FIX-357] intent insert failed:', e.message);
+        }
+    }
+
+    if (isNewPreempt) {
+        setImmediate(() => _scheduleLockRelease(gameId, LOCK_PREEMPT_GRACE_SECONDS));
+        setImmediate(() => _notifyAdminOfWaitingPlayer(gameId, playerId));
+    }
+
+    return {
+        code: 'GAME_LOCKED_RETRY_PENDING',
+        error: 'Admin is finishing up. Retrying in 15 seconds…',
+        retry_after_seconds: LOCK_PREEMPT_GRACE_SECONDS,
+    };
+}
+
+async function _notifyAdminOfWaitingPlayer(gameId, playerId) {
+    try {
+        const r = await pool.query(
+            `SELECT locked_by FROM games WHERE id = $1`,
+            [gameId]
+        );
+        const adminPlayerId = r.rows[0]?.locked_by;
+        if (!adminPlayerId) return;
+
+        const playerInfo = await pool.query(
+            'SELECT alias, full_name FROM players WHERE id = $1',
+            [playerId]
+        );
+        const playerName = playerInfo.rows[0]?.alias
+                         || playerInfo.rows[0]?.full_name
+                         || 'A player';
+
+        await sendNotification('lock_preempt', adminPlayerId, {
+            gameId, playerName,
+            graceSeconds: LOCK_PREEMPT_GRACE_SECONDS,
+        });
+    } catch (e) {
+        console.warn('[FIX-357] notify admin failed (non-critical):', e.message);
+    }
+}
+
+async function _resolveSignupIntentForPlayer(gameId, playerId) {
+    try {
+        const r = await pool.query(
+            `UPDATE game_signup_intents
+                SET resolved_at = NOW()
+              WHERE game_id = $1 AND player_id = $2 AND resolved_at IS NULL
+             RETURNING id`,
+            [gameId, playerId]
+        );
+        if (r.rowCount > 0) {
+            const rem = await pool.query(
+                `SELECT 1 FROM game_signup_intents
+                  WHERE game_id = $1 AND resolved_at IS NULL LIMIT 1`,
+                [gameId]
+            );
+            if (rem.rows.length === 0) {
+                _clearPendingLockRelease(gameId);
+            }
+        }
+    } catch (e) {
+        if (!(e && e.code === '42P01')) {
+            console.warn('[FIX-357] resolve intent failed:', e.message);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-356 — FAQ endpoints
+// ──────────────────────────────────────────────────────────────────────────
+
+// GET /api/public/faqs — bulk fetch all active FAQs. Cached aggressively
+// at the edge; admins editing should purge cache or wait for TTL. Returns
+// flat array sorted by display_order, grouped client-side.
+app.get('/api/public/faqs', async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT id, category, question, answer, keywords, display_order
+              FROM faq_entries
+             WHERE active = TRUE
+             ORDER BY display_order ASC, id ASC
+        `);
+        // Browser cache: 5 minutes
+        res.set('Cache-Control', 'public, max-age=300');
+        res.json({ faqs: r.rows });
+    } catch (e) {
+        if (e && (e.code === '42P01')) {
+            return res.json({ faqs: [] });  // table missing — fresh deploy lag
+        }
+        console.error('FIX-356 public faqs failed:', e.message);
+        res.status(500).json({ error: 'Failed to load FAQs' });
+    }
+});
+
+// POST /api/public/faq-unanswered — log when a user search returns nothing.
+// Accepts guests (no auth required). Rate-limited to stop spam.
+// Body: { query: string, comment?: string }
+app.post('/api/public/faq-unanswered', async (req, res) => {
+    try {
+        const query = (req.body && req.body.query) ? String(req.body.query).trim().slice(0, 500) : '';
+        const comment = (req.body && req.body.comment) ? String(req.body.comment).trim().slice(0, 1000) : null;
+        if (!query) return res.status(400).json({ error: 'Query is required' });
+
+        // Try to resolve player_id from cookie token if present (non-blocking)
+        let playerId = null;
+        try {
+            const token = req.cookies && req.cookies.token;
+            if (token) {
+                const decoded = jwt.verify(token, JWT_SECRET);
+                playerId = decoded && decoded.playerId;
+            }
+        } catch (_) { /* not logged in — fine */ }
+
+        await pool.query(
+            `INSERT INTO faq_unanswered (query, user_comment, player_id, status)
+                  VALUES ($1, $2, $3, 'pending')`,
+            [query, comment, playerId]
+        );
+        res.json({ ok: true });
+    } catch (e) {
+        if (e && e.code === '42P01') {
+            return res.status(503).json({ error: 'FAQ system not yet provisioned' });
+        }
+        console.error('FIX-356 log unanswered failed:', e.message);
+        res.status(500).json({ error: 'Failed to log query' });
+    }
+});
+
+// GET /api/admin/faqs — full list including inactive (for CMS)
+app.get('/api/admin/faqs', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT id, category, question, answer, keywords, display_order, active,
+                   created_at, updated_at, updated_by
+              FROM faq_entries
+             ORDER BY active DESC, display_order ASC, id ASC
+        `);
+        res.json({ faqs: r.rows });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ faqs: [] });
+        console.error('FIX-356 admin faqs list failed:', e.message);
+        res.status(500).json({ error: 'Failed to load FAQs' });
+    }
+});
+
+// POST /api/admin/faqs — create new FAQ
+// Body: { category, question, answer, keywords[], display_order? }
+app.post('/api/admin/faqs', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const category = String(b.category || '').trim().slice(0, 100);
+        const question = String(b.question || '').trim().slice(0, 500);
+        const answer   = String(b.answer || '').trim().slice(0, 8000);
+        const keywords = Array.isArray(b.keywords)
+            ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)
+            : [];
+        const display_order = Number.isFinite(parseInt(b.display_order, 10)) ? parseInt(b.display_order, 10) : 9999;
+
+        if (!category) return res.status(400).json({ error: 'Category is required' });
+        if (!question) return res.status(400).json({ error: 'Question is required' });
+        if (!answer)   return res.status(400).json({ error: 'Answer is required' });
+
+        const r = await pool.query(
+            `INSERT INTO faq_entries (category, question, answer, keywords, display_order, updated_by)
+                  VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [category, question, answer, keywords, display_order, req.user.playerId]
+        );
+        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_created',
+            String(r.rows[0].id), `Created FAQ: ${question.slice(0, 80)}`).catch(() => {}));
+        res.json({ ok: true, faq: r.rows[0] });
+    } catch (e) {
+        console.error('FIX-356 admin faqs create failed:', e.message);
+        res.status(500).json({ error: 'Failed to create FAQ' });
+    }
+});
+
+// PUT /api/admin/faqs/:id — edit FAQ
+// Body: { category?, question?, answer?, keywords?, display_order?, active? }
+app.put('/api/admin/faqs/:id', authenticateToken, requireAdmin, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
+    try {
+        const b = req.body || {};
+        const fields = [];
+        const values = [];
+        let idx = 1;
+        if (typeof b.category === 'string')      { fields.push(`category = $${idx++}`);      values.push(b.category.trim().slice(0, 100)); }
+        if (typeof b.question === 'string')      { fields.push(`question = $${idx++}`);      values.push(b.question.trim().slice(0, 500)); }
+        if (typeof b.answer === 'string')        { fields.push(`answer = $${idx++}`);        values.push(b.answer.trim().slice(0, 8000)); }
+        if (Array.isArray(b.keywords))           { fields.push(`keywords = $${idx++}`);      values.push(b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)); }
+        if (Number.isFinite(parseInt(b.display_order, 10))) { fields.push(`display_order = $${idx++}`); values.push(parseInt(b.display_order, 10)); }
+        if (typeof b.active === 'boolean')       { fields.push(`active = $${idx++}`);        values.push(b.active); }
+        if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        fields.push(`updated_at = NOW()`);
+        fields.push(`updated_by = $${idx++}`); values.push(req.user.playerId);
+        values.push(id);
+
+        const r = await pool.query(
+            `UPDATE faq_entries SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+            values
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'FAQ not found' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_updated',
+            String(id), `Updated FAQ #${id}`).catch(() => {}));
+        res.json({ ok: true, faq: r.rows[0] });
+    } catch (e) {
+        console.error('FIX-356 admin faqs update failed:', e.message);
+        res.status(500).json({ error: 'Failed to update FAQ' });
+    }
+});
+
+// DELETE /api/admin/faqs/:id — soft delete (active=false). Set ?hard=1 to wipe.
+app.delete('/api/admin/faqs/:id', authenticateToken, requireAdmin, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
+    const hard = req.query.hard === '1' || req.query.hard === 'true';
+    try {
+        if (hard) {
+            await pool.query(`DELETE FROM faq_entries WHERE id = $1`, [id]);
+        } else {
+            await pool.query(`UPDATE faq_entries SET active = FALSE, updated_at = NOW(), updated_by = $2 WHERE id = $1`, [id, req.user.playerId]);
+        }
+        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_deleted',
+            String(id), `${hard ? 'Hard-deleted' : 'Soft-deleted'} FAQ #${id}`).catch(() => {}));
+        res.json({ ok: true, hard });
+    } catch (e) {
+        console.error('FIX-356 admin faqs delete failed:', e.message);
+        res.status(500).json({ error: 'Failed to delete FAQ' });
+    }
+});
+
+// GET /api/admin/faq-unanswered — review queue
+app.get('/api/admin/faq-unanswered', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const status = req.query.status || 'pending';
+        const r = await pool.query(`
+            SELECT u.id, u.query, u.user_comment, u.player_id, u.status,
+                   u.created_at, u.resolved_at, u.resolved_to_faq_id, u.resolution_note,
+                   COALESCE(p.alias, p.full_name) AS player_alias,
+                   COALESCE(rb.alias, rb.full_name) AS resolved_by_alias,
+                   f.question AS resolved_to_question
+              FROM faq_unanswered u
+              LEFT JOIN players p  ON p.id  = u.player_id
+              LEFT JOIN players rb ON rb.id = u.resolved_by
+              LEFT JOIN faq_entries f ON f.id = u.resolved_to_faq_id
+             WHERE u.status = $1
+             ORDER BY u.created_at DESC
+             LIMIT 200
+        `, [status]);
+        res.json({ items: r.rows, status });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ items: [], status: 'pending' });
+        console.error('FIX-356 unanswered list failed:', e.message);
+        res.status(500).json({ error: 'Failed to load unanswered queue' });
+    }
+});
+
+// POST /api/admin/faq-unanswered/:id/resolve
+// Body: {
+//   mode: 'attach_keywords' | 'create_new_faq' | 'dismiss',
+//   faq_id?: int           (required if mode='attach_keywords')
+//   keywords?: string[]    (required if mode='attach_keywords')
+//   category?, question?, answer?, keywords? (required if mode='create_new_faq')
+//   resolution_note?: string
+// }
+app.post('/api/admin/faq-unanswered/:id/resolve', authenticateToken, requireAdmin, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
+    const b = req.body || {};
+    const mode = b.mode;
+    const note = typeof b.resolution_note === 'string' ? b.resolution_note.trim().slice(0, 500) : null;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const cur = await client.query('SELECT id, status FROM faq_unanswered WHERE id = $1 FOR UPDATE', [id]);
+        if (cur.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Unanswered item not found' }); }
+        if (cur.rows[0].status !== 'pending') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Already resolved' }); }
+
+        let linkedFaqId = null;
+
+        if (mode === 'dismiss') {
+            // Just mark dismissed, no FAQ change.
+        } else if (mode === 'attach_keywords') {
+            const faqId = parseInt(b.faq_id, 10);
+            if (!Number.isInteger(faqId) || faqId <= 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'faq_id is required for attach_keywords' }); }
+            const newKeywords = Array.isArray(b.keywords)
+                ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean)
+                : [];
+            if (newKeywords.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'keywords required' }); }
+
+            // Merge with existing
+            const existing = await client.query('SELECT keywords FROM faq_entries WHERE id = $1 FOR UPDATE', [faqId]);
+            if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'FAQ not found' }); }
+            const merged = Array.from(new Set([...(existing.rows[0].keywords || []), ...newKeywords])).slice(0, 50);
+            await client.query(
+                `UPDATE faq_entries SET keywords = $1, updated_at = NOW(), updated_by = $2 WHERE id = $3`,
+                [merged, req.user.playerId, faqId]
+            );
+            linkedFaqId = faqId;
+        } else if (mode === 'create_new_faq') {
+            const category = String(b.category || '').trim().slice(0, 100);
+            const question = String(b.question || '').trim().slice(0, 500);
+            const answer   = String(b.answer || '').trim().slice(0, 8000);
+            const keywords = Array.isArray(b.keywords)
+                ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)
+                : [];
+            if (!category || !question || !answer) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'category, question, answer required' });
+            }
+            const ins = await client.query(
+                `INSERT INTO faq_entries (category, question, answer, keywords, display_order, updated_by)
+                      VALUES ($1, $2, $3, $4, 9999, $5) RETURNING id`,
+                [category, question, answer, keywords, req.user.playerId]
+            );
+            linkedFaqId = ins.rows[0].id;
+        } else {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'mode must be attach_keywords, create_new_faq, or dismiss' });
+        }
+
+        const newStatus = mode === 'dismiss' ? 'dismissed' : 'resolved';
+        await client.query(
+            `UPDATE faq_unanswered
+                SET status = $1, resolved_at = NOW(), resolved_by = $2,
+                    resolved_to_faq_id = $3, resolution_note = $4
+              WHERE id = $5`,
+            [newStatus, req.user.playerId, linkedFaqId, note, id]
+        );
+
+        await client.query('COMMIT');
+        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_unanswered_resolved',
+            String(id), `Unanswered #${id} resolved via ${mode}${linkedFaqId ? ` → FAQ #${linkedFaqId}` : ''}`).catch(() => {}));
+        res.json({ ok: true, status: newStatus, faq_id: linkedFaqId });
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        console.error('FIX-356 resolve unanswered failed:', e.message);
+        res.status(500).json({ error: 'Failed to resolve' });
+    } finally {
+        client.release();
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT} — build: web57`);
+
+    // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
+    fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
 
     // ── Email transport self-check ──────────────────────────────────────────
     // Verifies SMTP credentials on boot so silent email failures become loud.
