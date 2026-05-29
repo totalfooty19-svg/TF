@@ -48052,7 +48052,7 @@ app.post('/api/admin/queue/:id/reopen', authenticateToken, requireAdmin, async (
 // ── /api/admin/calibration/summary ─────────────────────────────────────────
 // Top-of-dashboard health card. Aggregates across the last 90 days by
 // default; ?days=N overrides. Excludes admin_marked_unfair when ?excludeUnfair=1.
-app.get('/api/admin/calibration/summary', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/calibration/summary', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 90));
         const excludeUnfair = req.query.excludeUnfair === '1' || req.query.excludeUnfair === 'true';
@@ -48101,7 +48101,7 @@ app.get('/api/admin/calibration/summary', authenticateToken, requireAdmin, async
 
 // ── /api/admin/calibration/experiments ─────────────────────────────────────
 // Paged experiment rows for the dashboard feed. Most recent first.
-app.get('/api/admin/calibration/experiments', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/calibration/experiments', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const days  = Math.min(365, Math.max(1, parseInt(req.query.days,  10) || 90));
         const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 50));
@@ -48134,7 +48134,7 @@ app.get('/api/admin/calibration/experiments', authenticateToken, requireAdmin, a
 // "Is the 14→15 gap the same as 12→13?" — bins games by the team-sum gap
 // (in OVR-points), reports avg actual |balance_score| per bin. If rungs are
 // evenly spaced, the avg slider value should grow linearly with bin.
-app.get('/api/admin/calibration/ovr-rung-spacing', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/calibration/ovr-rung-spacing', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 180));
         // Bins: 0-2, 2-4, 4-6, 6-8, 8-12, 12-20, 20+ OVR points of total-sum gap.
@@ -48180,7 +48180,7 @@ app.get('/api/admin/calibration/ovr-rung-spacing', authenticateToken, requireAdm
 // "Do 86+86 teams outperform 90+82 of same sum?" — for games where teams
 // had similar total OVR (|predicted_gap| < 3), bin by variance-difference
 // magnitude and report avg outcome.
-app.get('/api/admin/calibration/variance-vs-even', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/calibration/variance-vs-even', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 180));
         const r = await pool.query(`
@@ -48226,7 +48226,7 @@ app.get('/api/admin/calibration/variance-vs-even', authenticateToken, requireAdm
 // One-shot: pulls every completed system-generated game that doesn't yet
 // have an experiment row and inserts one. Idempotent via the recorder's
 // ON CONFLICT DO NOTHING. Body: { limit?: int (default 500, cap 5000) }.
-app.post('/api/admin/calibration/backfill', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/calibration/backfill', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const limit = Math.min(5000, Math.max(1, parseInt(req.body?.limit, 10) || 500));
         // Find candidates: completed games not yet in experiments, not skipped types.
@@ -55881,7 +55881,7 @@ app.post('/api/public/faq-unanswered', async (req, res) => {
 });
 
 // GET /api/admin/faqs — full list including inactive (for CMS)
-app.get('/api/admin/faqs', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/faqs', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const r = await pool.query(`
             SELECT id, category, question, answer, keywords, display_order, active,
@@ -55899,7 +55899,7 @@ app.get('/api/admin/faqs', authenticateToken, requireAdmin, async (req, res) => 
 
 // POST /api/admin/faqs — create new FAQ
 // Body: { category, question, answer, keywords[], display_order? }
-app.post('/api/admin/faqs', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/faqs', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const b = req.body || {};
         const category = String(b.category || '').trim().slice(0, 100);
@@ -55930,7 +55930,7 @@ app.post('/api/admin/faqs', authenticateToken, requireAdmin, async (req, res) =>
 
 // PUT /api/admin/faqs/:id — edit FAQ
 // Body: { category?, question?, answer?, keywords?, display_order?, active? }
-app.put('/api/admin/faqs/:id', authenticateToken, requireAdmin, async (req, res) => {
+app.put('/api/admin/faqs/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
     try {
@@ -55964,7 +55964,7 @@ app.put('/api/admin/faqs/:id', authenticateToken, requireAdmin, async (req, res)
 });
 
 // DELETE /api/admin/faqs/:id — soft delete (active=false). Set ?hard=1 to wipe.
-app.delete('/api/admin/faqs/:id', authenticateToken, requireAdmin, async (req, res) => {
+app.delete('/api/admin/faqs/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
     const hard = req.query.hard === '1' || req.query.hard === 'true';
@@ -55984,7 +55984,7 @@ app.delete('/api/admin/faqs/:id', authenticateToken, requireAdmin, async (req, r
 });
 
 // GET /api/admin/faq-unanswered — review queue
-app.get('/api/admin/faq-unanswered', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/faq-unanswered', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const status = req.query.status || 'pending';
         const r = await pool.query(`
@@ -56017,7 +56017,7 @@ app.get('/api/admin/faq-unanswered', authenticateToken, requireAdmin, async (req
 //   category?, question?, answer?, keywords? (required if mode='create_new_faq')
 //   resolution_note?: string
 // }
-app.post('/api/admin/faq-unanswered/:id/resolve', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/faq-unanswered/:id/resolve', authenticateToken, requireSuperAdmin, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
     const b = req.body || {};
