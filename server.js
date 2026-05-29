@@ -54434,6 +54434,284 @@ app.get('/api/admin/row-status', authenticateToken, requireSuperAdmin, async (re
 // Previously this was placed before the comms routes, which caused all comms endpoints
 // to return 404 because Express matches routes in registration order. Moved to here —
 // immediately before app.listen() — so every genuine route is registered first.
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-356 — FAQ endpoints
+// ──────────────────────────────────────────────────────────────────────────
+
+// GET /api/public/faqs — bulk fetch all active FAQs. Cached aggressively
+// at the edge; admins editing should purge cache or wait for TTL. Returns
+// flat array sorted by display_order, grouped client-side.
+app.get('/api/public/faqs', async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT id, category, question, answer, keywords, display_order
+              FROM faq_entries
+             WHERE active = TRUE
+             ORDER BY display_order ASC, id ASC
+        `);
+        // Browser cache: 5 minutes
+        res.set('Cache-Control', 'public, max-age=300');
+        res.json({ faqs: r.rows });
+    } catch (e) {
+        if (e && (e.code === '42P01')) {
+            return res.json({ faqs: [] });  // table missing — fresh deploy lag
+        }
+        console.error('FIX-356 public faqs failed:', e.message);
+        res.status(500).json({ error: 'Failed to load FAQs' });
+    }
+});
+
+// POST /api/public/faq-unanswered — log when a user search returns nothing.
+// Accepts guests (no auth required). Rate-limited to stop spam.
+// Body: { query: string, comment?: string }
+app.post('/api/public/faq-unanswered', async (req, res) => {
+    try {
+        const query = (req.body && req.body.query) ? String(req.body.query).trim().slice(0, 500) : '';
+        const comment = (req.body && req.body.comment) ? String(req.body.comment).trim().slice(0, 1000) : null;
+        if (!query) return res.status(400).json({ error: 'Query is required' });
+
+        // Try to resolve player_id from cookie token if present (non-blocking)
+        let playerId = null;
+        try {
+            const token = req.cookies && req.cookies.token;
+            if (token) {
+                const decoded = jwt.verify(token, JWT_SECRET);
+                playerId = decoded && decoded.playerId;
+            }
+        } catch (_) { /* not logged in — fine */ }
+
+        await pool.query(
+            `INSERT INTO faq_unanswered (query, user_comment, player_id, status)
+                  VALUES ($1, $2, $3, 'pending')`,
+            [query, comment, playerId]
+        );
+        res.json({ ok: true });
+    } catch (e) {
+        if (e && e.code === '42P01') {
+            return res.status(503).json({ error: 'FAQ system not yet provisioned' });
+        }
+        console.error('FIX-356 log unanswered failed:', e.message);
+        res.status(500).json({ error: 'Failed to log query' });
+    }
+});
+
+// GET /api/admin/faqs — full list including inactive (for CMS)
+app.get('/api/admin/faqs', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT id, category, question, answer, keywords, display_order, active,
+                   created_at, updated_at, updated_by
+              FROM faq_entries
+             ORDER BY active DESC, display_order ASC, id ASC
+        `);
+        res.json({ faqs: r.rows });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ faqs: [] });
+        console.error('FIX-356 admin faqs list failed:', e.message);
+        res.status(500).json({ error: 'Failed to load FAQs' });
+    }
+});
+
+// POST /api/admin/faqs — create new FAQ
+// Body: { category, question, answer, keywords[], display_order? }
+app.post('/api/admin/faqs', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const category = String(b.category || '').trim().slice(0, 100);
+        const question = String(b.question || '').trim().slice(0, 500);
+        const answer   = String(b.answer || '').trim().slice(0, 8000);
+        const keywords = Array.isArray(b.keywords)
+            ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)
+            : [];
+        const display_order = Number.isFinite(parseInt(b.display_order, 10)) ? parseInt(b.display_order, 10) : 9999;
+
+        if (!category) return res.status(400).json({ error: 'Category is required' });
+        if (!question) return res.status(400).json({ error: 'Question is required' });
+        if (!answer)   return res.status(400).json({ error: 'Answer is required' });
+
+        const r = await pool.query(
+            `INSERT INTO faq_entries (category, question, answer, keywords, display_order, updated_by)
+                  VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [category, question, answer, keywords, display_order, req.user.playerId]
+        );
+        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_created',
+            String(r.rows[0].id), `Created FAQ: ${question.slice(0, 80)}`).catch(() => {}));
+        res.json({ ok: true, faq: r.rows[0] });
+    } catch (e) {
+        console.error('FIX-356 admin faqs create failed:', e.message);
+        res.status(500).json({ error: 'Failed to create FAQ' });
+    }
+});
+
+// PUT /api/admin/faqs/:id — edit FAQ
+// Body: { category?, question?, answer?, keywords?, display_order?, active? }
+app.put('/api/admin/faqs/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
+    try {
+        const b = req.body || {};
+        const fields = [];
+        const values = [];
+        let idx = 1;
+        if (typeof b.category === 'string')      { fields.push(`category = $${idx++}`);      values.push(b.category.trim().slice(0, 100)); }
+        if (typeof b.question === 'string')      { fields.push(`question = $${idx++}`);      values.push(b.question.trim().slice(0, 500)); }
+        if (typeof b.answer === 'string')        { fields.push(`answer = $${idx++}`);        values.push(b.answer.trim().slice(0, 8000)); }
+        if (Array.isArray(b.keywords))           { fields.push(`keywords = $${idx++}`);      values.push(b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)); }
+        if (Number.isFinite(parseInt(b.display_order, 10))) { fields.push(`display_order = $${idx++}`); values.push(parseInt(b.display_order, 10)); }
+        if (typeof b.active === 'boolean')       { fields.push(`active = $${idx++}`);        values.push(b.active); }
+        if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        fields.push(`updated_at = NOW()`);
+        fields.push(`updated_by = $${idx++}`); values.push(req.user.playerId);
+        values.push(id);
+
+        const r = await pool.query(
+            `UPDATE faq_entries SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+            values
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'FAQ not found' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_updated',
+            String(id), `Updated FAQ #${id}`).catch(() => {}));
+        res.json({ ok: true, faq: r.rows[0] });
+    } catch (e) {
+        console.error('FIX-356 admin faqs update failed:', e.message);
+        res.status(500).json({ error: 'Failed to update FAQ' });
+    }
+});
+
+// DELETE /api/admin/faqs/:id — soft delete (active=false). Set ?hard=1 to wipe.
+app.delete('/api/admin/faqs/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
+    const hard = req.query.hard === '1' || req.query.hard === 'true';
+    try {
+        if (hard) {
+            await pool.query(`DELETE FROM faq_entries WHERE id = $1`, [id]);
+        } else {
+            await pool.query(`UPDATE faq_entries SET active = FALSE, updated_at = NOW(), updated_by = $2 WHERE id = $1`, [id, req.user.playerId]);
+        }
+        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_deleted',
+            String(id), `${hard ? 'Hard-deleted' : 'Soft-deleted'} FAQ #${id}`).catch(() => {}));
+        res.json({ ok: true, hard });
+    } catch (e) {
+        console.error('FIX-356 admin faqs delete failed:', e.message);
+        res.status(500).json({ error: 'Failed to delete FAQ' });
+    }
+});
+
+// GET /api/admin/faq-unanswered — review queue
+app.get('/api/admin/faq-unanswered', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const status = req.query.status || 'pending';
+        const r = await pool.query(`
+            SELECT u.id, u.query, u.user_comment, u.player_id, u.status,
+                   u.created_at, u.resolved_at, u.resolved_to_faq_id, u.resolution_note,
+                   COALESCE(p.alias, p.full_name) AS player_alias,
+                   COALESCE(rb.alias, rb.full_name) AS resolved_by_alias,
+                   f.question AS resolved_to_question
+              FROM faq_unanswered u
+              LEFT JOIN players p  ON p.id  = u.player_id
+              LEFT JOIN players rb ON rb.id = u.resolved_by
+              LEFT JOIN faq_entries f ON f.id = u.resolved_to_faq_id
+             WHERE u.status = $1
+             ORDER BY u.created_at DESC
+             LIMIT 200
+        `, [status]);
+        res.json({ items: r.rows, status });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ items: [], status: 'pending' });
+        console.error('FIX-356 unanswered list failed:', e.message);
+        res.status(500).json({ error: 'Failed to load unanswered queue' });
+    }
+});
+
+// POST /api/admin/faq-unanswered/:id/resolve
+// Body: {
+//   mode: 'attach_keywords' | 'create_new_faq' | 'dismiss',
+//   faq_id?: int           (required if mode='attach_keywords')
+//   keywords?: string[]    (required if mode='attach_keywords')
+//   category?, question?, answer?, keywords? (required if mode='create_new_faq')
+//   resolution_note?: string
+// }
+app.post('/api/admin/faq-unanswered/:id/resolve', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
+    const b = req.body || {};
+    const mode = b.mode;
+    const note = typeof b.resolution_note === 'string' ? b.resolution_note.trim().slice(0, 500) : null;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const cur = await client.query('SELECT id, status FROM faq_unanswered WHERE id = $1 FOR UPDATE', [id]);
+        if (cur.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Unanswered item not found' }); }
+        if (cur.rows[0].status !== 'pending') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Already resolved' }); }
+
+        let linkedFaqId = null;
+
+        if (mode === 'dismiss') {
+            // Just mark dismissed, no FAQ change.
+        } else if (mode === 'attach_keywords') {
+            const faqId = parseInt(b.faq_id, 10);
+            if (!Number.isInteger(faqId) || faqId <= 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'faq_id is required for attach_keywords' }); }
+            const newKeywords = Array.isArray(b.keywords)
+                ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean)
+                : [];
+            if (newKeywords.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'keywords required' }); }
+
+            // Merge with existing
+            const existing = await client.query('SELECT keywords FROM faq_entries WHERE id = $1 FOR UPDATE', [faqId]);
+            if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'FAQ not found' }); }
+            const merged = Array.from(new Set([...(existing.rows[0].keywords || []), ...newKeywords])).slice(0, 50);
+            await client.query(
+                `UPDATE faq_entries SET keywords = $1, updated_at = NOW(), updated_by = $2 WHERE id = $3`,
+                [merged, req.user.playerId, faqId]
+            );
+            linkedFaqId = faqId;
+        } else if (mode === 'create_new_faq') {
+            const category = String(b.category || '').trim().slice(0, 100);
+            const question = String(b.question || '').trim().slice(0, 500);
+            const answer   = String(b.answer || '').trim().slice(0, 8000);
+            const keywords = Array.isArray(b.keywords)
+                ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)
+                : [];
+            if (!category || !question || !answer) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'category, question, answer required' });
+            }
+            const ins = await client.query(
+                `INSERT INTO faq_entries (category, question, answer, keywords, display_order, updated_by)
+                      VALUES ($1, $2, $3, $4, 9999, $5) RETURNING id`,
+                [category, question, answer, keywords, req.user.playerId]
+            );
+            linkedFaqId = ins.rows[0].id;
+        } else {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'mode must be attach_keywords, create_new_faq, or dismiss' });
+        }
+
+        const newStatus = mode === 'dismiss' ? 'dismissed' : 'resolved';
+        await client.query(
+            `UPDATE faq_unanswered
+                SET status = $1, resolved_at = NOW(), resolved_by = $2,
+                    resolved_to_faq_id = $3, resolution_note = $4
+              WHERE id = $5`,
+            [newStatus, req.user.playerId, linkedFaqId, note, id]
+        );
+
+        await client.query('COMMIT');
+        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_unanswered_resolved',
+            String(id), `Unanswered #${id} resolved via ${mode}${linkedFaqId ? ` → FAQ #${linkedFaqId}` : ''}`).catch(() => {}));
+        res.json({ ok: true, status: newStatus, faq_id: linkedFaqId });
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        console.error('FIX-356 resolve unanswered failed:', e.message);
+        res.status(500).json({ error: 'Failed to resolve' });
+    } finally {
+        client.release();
+    }
+});
+
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 
@@ -55820,283 +56098,6 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// FIX-356 — FAQ endpoints
-// ──────────────────────────────────────────────────────────────────────────
-
-// GET /api/public/faqs — bulk fetch all active FAQs. Cached aggressively
-// at the edge; admins editing should purge cache or wait for TTL. Returns
-// flat array sorted by display_order, grouped client-side.
-app.get('/api/public/faqs', async (req, res) => {
-    try {
-        const r = await pool.query(`
-            SELECT id, category, question, answer, keywords, display_order
-              FROM faq_entries
-             WHERE active = TRUE
-             ORDER BY display_order ASC, id ASC
-        `);
-        // Browser cache: 5 minutes
-        res.set('Cache-Control', 'public, max-age=300');
-        res.json({ faqs: r.rows });
-    } catch (e) {
-        if (e && (e.code === '42P01')) {
-            return res.json({ faqs: [] });  // table missing — fresh deploy lag
-        }
-        console.error('FIX-356 public faqs failed:', e.message);
-        res.status(500).json({ error: 'Failed to load FAQs' });
-    }
-});
-
-// POST /api/public/faq-unanswered — log when a user search returns nothing.
-// Accepts guests (no auth required). Rate-limited to stop spam.
-// Body: { query: string, comment?: string }
-app.post('/api/public/faq-unanswered', async (req, res) => {
-    try {
-        const query = (req.body && req.body.query) ? String(req.body.query).trim().slice(0, 500) : '';
-        const comment = (req.body && req.body.comment) ? String(req.body.comment).trim().slice(0, 1000) : null;
-        if (!query) return res.status(400).json({ error: 'Query is required' });
-
-        // Try to resolve player_id from cookie token if present (non-blocking)
-        let playerId = null;
-        try {
-            const token = req.cookies && req.cookies.token;
-            if (token) {
-                const decoded = jwt.verify(token, JWT_SECRET);
-                playerId = decoded && decoded.playerId;
-            }
-        } catch (_) { /* not logged in — fine */ }
-
-        await pool.query(
-            `INSERT INTO faq_unanswered (query, user_comment, player_id, status)
-                  VALUES ($1, $2, $3, 'pending')`,
-            [query, comment, playerId]
-        );
-        res.json({ ok: true });
-    } catch (e) {
-        if (e && e.code === '42P01') {
-            return res.status(503).json({ error: 'FAQ system not yet provisioned' });
-        }
-        console.error('FIX-356 log unanswered failed:', e.message);
-        res.status(500).json({ error: 'Failed to log query' });
-    }
-});
-
-// GET /api/admin/faqs — full list including inactive (for CMS)
-app.get('/api/admin/faqs', authenticateToken, requireSuperAdmin, async (req, res) => {
-    try {
-        const r = await pool.query(`
-            SELECT id, category, question, answer, keywords, display_order, active,
-                   created_at, updated_at, updated_by
-              FROM faq_entries
-             ORDER BY active DESC, display_order ASC, id ASC
-        `);
-        res.json({ faqs: r.rows });
-    } catch (e) {
-        if (e && e.code === '42P01') return res.json({ faqs: [] });
-        console.error('FIX-356 admin faqs list failed:', e.message);
-        res.status(500).json({ error: 'Failed to load FAQs' });
-    }
-});
-
-// POST /api/admin/faqs — create new FAQ
-// Body: { category, question, answer, keywords[], display_order? }
-app.post('/api/admin/faqs', authenticateToken, requireSuperAdmin, async (req, res) => {
-    try {
-        const b = req.body || {};
-        const category = String(b.category || '').trim().slice(0, 100);
-        const question = String(b.question || '').trim().slice(0, 500);
-        const answer   = String(b.answer || '').trim().slice(0, 8000);
-        const keywords = Array.isArray(b.keywords)
-            ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)
-            : [];
-        const display_order = Number.isFinite(parseInt(b.display_order, 10)) ? parseInt(b.display_order, 10) : 9999;
-
-        if (!category) return res.status(400).json({ error: 'Category is required' });
-        if (!question) return res.status(400).json({ error: 'Question is required' });
-        if (!answer)   return res.status(400).json({ error: 'Answer is required' });
-
-        const r = await pool.query(
-            `INSERT INTO faq_entries (category, question, answer, keywords, display_order, updated_by)
-                  VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-            [category, question, answer, keywords, display_order, req.user.playerId]
-        );
-        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_created',
-            String(r.rows[0].id), `Created FAQ: ${question.slice(0, 80)}`).catch(() => {}));
-        res.json({ ok: true, faq: r.rows[0] });
-    } catch (e) {
-        console.error('FIX-356 admin faqs create failed:', e.message);
-        res.status(500).json({ error: 'Failed to create FAQ' });
-    }
-});
-
-// PUT /api/admin/faqs/:id — edit FAQ
-// Body: { category?, question?, answer?, keywords?, display_order?, active? }
-app.put('/api/admin/faqs/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
-    try {
-        const b = req.body || {};
-        const fields = [];
-        const values = [];
-        let idx = 1;
-        if (typeof b.category === 'string')      { fields.push(`category = $${idx++}`);      values.push(b.category.trim().slice(0, 100)); }
-        if (typeof b.question === 'string')      { fields.push(`question = $${idx++}`);      values.push(b.question.trim().slice(0, 500)); }
-        if (typeof b.answer === 'string')        { fields.push(`answer = $${idx++}`);        values.push(b.answer.trim().slice(0, 8000)); }
-        if (Array.isArray(b.keywords))           { fields.push(`keywords = $${idx++}`);      values.push(b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)); }
-        if (Number.isFinite(parseInt(b.display_order, 10))) { fields.push(`display_order = $${idx++}`); values.push(parseInt(b.display_order, 10)); }
-        if (typeof b.active === 'boolean')       { fields.push(`active = $${idx++}`);        values.push(b.active); }
-        if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
-        fields.push(`updated_at = NOW()`);
-        fields.push(`updated_by = $${idx++}`); values.push(req.user.playerId);
-        values.push(id);
-
-        const r = await pool.query(
-            `UPDATE faq_entries SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
-            values
-        );
-        if (r.rows.length === 0) return res.status(404).json({ error: 'FAQ not found' });
-        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_updated',
-            String(id), `Updated FAQ #${id}`).catch(() => {}));
-        res.json({ ok: true, faq: r.rows[0] });
-    } catch (e) {
-        console.error('FIX-356 admin faqs update failed:', e.message);
-        res.status(500).json({ error: 'Failed to update FAQ' });
-    }
-});
-
-// DELETE /api/admin/faqs/:id — soft delete (active=false). Set ?hard=1 to wipe.
-app.delete('/api/admin/faqs/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
-    const hard = req.query.hard === '1' || req.query.hard === 'true';
-    try {
-        if (hard) {
-            await pool.query(`DELETE FROM faq_entries WHERE id = $1`, [id]);
-        } else {
-            await pool.query(`UPDATE faq_entries SET active = FALSE, updated_at = NOW(), updated_by = $2 WHERE id = $1`, [id, req.user.playerId]);
-        }
-        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_deleted',
-            String(id), `${hard ? 'Hard-deleted' : 'Soft-deleted'} FAQ #${id}`).catch(() => {}));
-        res.json({ ok: true, hard });
-    } catch (e) {
-        console.error('FIX-356 admin faqs delete failed:', e.message);
-        res.status(500).json({ error: 'Failed to delete FAQ' });
-    }
-});
-
-// GET /api/admin/faq-unanswered — review queue
-app.get('/api/admin/faq-unanswered', authenticateToken, requireSuperAdmin, async (req, res) => {
-    try {
-        const status = req.query.status || 'pending';
-        const r = await pool.query(`
-            SELECT u.id, u.query, u.user_comment, u.player_id, u.status,
-                   u.created_at, u.resolved_at, u.resolved_to_faq_id, u.resolution_note,
-                   COALESCE(p.alias, p.full_name) AS player_alias,
-                   COALESCE(rb.alias, rb.full_name) AS resolved_by_alias,
-                   f.question AS resolved_to_question
-              FROM faq_unanswered u
-              LEFT JOIN players p  ON p.id  = u.player_id
-              LEFT JOIN players rb ON rb.id = u.resolved_by
-              LEFT JOIN faq_entries f ON f.id = u.resolved_to_faq_id
-             WHERE u.status = $1
-             ORDER BY u.created_at DESC
-             LIMIT 200
-        `, [status]);
-        res.json({ items: r.rows, status });
-    } catch (e) {
-        if (e && e.code === '42P01') return res.json({ items: [], status: 'pending' });
-        console.error('FIX-356 unanswered list failed:', e.message);
-        res.status(500).json({ error: 'Failed to load unanswered queue' });
-    }
-});
-
-// POST /api/admin/faq-unanswered/:id/resolve
-// Body: {
-//   mode: 'attach_keywords' | 'create_new_faq' | 'dismiss',
-//   faq_id?: int           (required if mode='attach_keywords')
-//   keywords?: string[]    (required if mode='attach_keywords')
-//   category?, question?, answer?, keywords? (required if mode='create_new_faq')
-//   resolution_note?: string
-// }
-app.post('/api/admin/faq-unanswered/:id/resolve', authenticateToken, requireSuperAdmin, async (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid id' });
-    const b = req.body || {};
-    const mode = b.mode;
-    const note = typeof b.resolution_note === 'string' ? b.resolution_note.trim().slice(0, 500) : null;
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const cur = await client.query('SELECT id, status FROM faq_unanswered WHERE id = $1 FOR UPDATE', [id]);
-        if (cur.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Unanswered item not found' }); }
-        if (cur.rows[0].status !== 'pending') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Already resolved' }); }
-
-        let linkedFaqId = null;
-
-        if (mode === 'dismiss') {
-            // Just mark dismissed, no FAQ change.
-        } else if (mode === 'attach_keywords') {
-            const faqId = parseInt(b.faq_id, 10);
-            if (!Number.isInteger(faqId) || faqId <= 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'faq_id is required for attach_keywords' }); }
-            const newKeywords = Array.isArray(b.keywords)
-                ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean)
-                : [];
-            if (newKeywords.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'keywords required' }); }
-
-            // Merge with existing
-            const existing = await client.query('SELECT keywords FROM faq_entries WHERE id = $1 FOR UPDATE', [faqId]);
-            if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'FAQ not found' }); }
-            const merged = Array.from(new Set([...(existing.rows[0].keywords || []), ...newKeywords])).slice(0, 50);
-            await client.query(
-                `UPDATE faq_entries SET keywords = $1, updated_at = NOW(), updated_by = $2 WHERE id = $3`,
-                [merged, req.user.playerId, faqId]
-            );
-            linkedFaqId = faqId;
-        } else if (mode === 'create_new_faq') {
-            const category = String(b.category || '').trim().slice(0, 100);
-            const question = String(b.question || '').trim().slice(0, 500);
-            const answer   = String(b.answer || '').trim().slice(0, 8000);
-            const keywords = Array.isArray(b.keywords)
-                ? b.keywords.map(k => String(k).trim().toLowerCase()).filter(Boolean).slice(0, 50)
-                : [];
-            if (!category || !question || !answer) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: 'category, question, answer required' });
-            }
-            const ins = await client.query(
-                `INSERT INTO faq_entries (category, question, answer, keywords, display_order, updated_by)
-                      VALUES ($1, $2, $3, $4, 9999, $5) RETURNING id`,
-                [category, question, answer, keywords, req.user.playerId]
-            );
-            linkedFaqId = ins.rows[0].id;
-        } else {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'mode must be attach_keywords, create_new_faq, or dismiss' });
-        }
-
-        const newStatus = mode === 'dismiss' ? 'dismissed' : 'resolved';
-        await client.query(
-            `UPDATE faq_unanswered
-                SET status = $1, resolved_at = NOW(), resolved_by = $2,
-                    resolved_to_faq_id = $3, resolution_note = $4
-              WHERE id = $5`,
-            [newStatus, req.user.playerId, linkedFaqId, note, id]
-        );
-
-        await client.query('COMMIT');
-        setImmediate(() => auditLog(pool, req.user.playerId, 'faq_unanswered_resolved',
-            String(id), `Unanswered #${id} resolved via ${mode}${linkedFaqId ? ` → FAQ #${linkedFaqId}` : ''}`).catch(() => {}));
-        res.json({ ok: true, status: newStatus, faq_id: linkedFaqId });
-    } catch (e) {
-        try { await client.query('ROLLBACK'); } catch (_) {}
-        console.error('FIX-356 resolve unanswered failed:', e.message);
-        res.status(500).json({ error: 'Failed to resolve' });
-    } finally {
-        client.release();
-    }
-});
 
 app.listen(PORT, () => {
     console.log(`🚀 Total Footy API running on port ${PORT} — build: web57`);
