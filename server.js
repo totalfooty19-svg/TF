@@ -465,6 +465,30 @@ Next game: {signup_link}
 
 — TotalFooty`,
     },
+    motm_rsvp: {
+        label: 'MOTM Live + RSVP Next Week',
+        subject_template: '🏆 MOTM is live — {venue_name}',
+        body_template:
+`🏆 MOTM voting is LIVE for {game_date_friendly}'s game at {venue_name}!
+
+Vote for your Man of the Match here: {view_teams_link}
+
+And lock in your spot for next week in one tap — RSVP here: {rsvp_link}
+
+— TotalFooty`,
+    },
+    teams_ready: {
+        label: 'Teams Are Ready',
+        subject_template: '📋 Teams are ready — {venue_name}',
+        body_template:
+`📋 Teams are ready for tonight's game at {venue_name}!
+
+View the line-ups here: {view_teams_link}
+
+Make sure you arrive on time — kick-off is {kickoff_time}. See you there! ⚽
+
+— TotalFooty`,
+    },
     custom: {
         label: 'Custom (blank)',
         subject_template: '',
@@ -488,6 +512,8 @@ function _resolvePlaceholders(text, player, game, extras) {
         } catch { return ''; }
     })();
     const signupLink = game?.game_url ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(game.game_url)}` : 'https://totalfooty.co.uk';
+    const rsvpLink   = game?.game_url ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(game.game_url)}&rsvp=1` : 'https://totalfooty.co.uk';
+    const viewLink   = signupLink;
     const spotsLeft  = (() => {
         const max = parseInt(game?.max_players || 0);
         const cur = parseInt(extras.current_players != null ? extras.current_players : game?.current_players || 0);
@@ -504,6 +530,8 @@ function _resolvePlaceholders(text, player, game, extras) {
         '{format}':             (game?.format || ''),
         '{price_credits}':      (game?.cost_per_player != null ? parseFloat(game.cost_per_player).toFixed(2) : ''),
         '{signup_link}':        signupLink,
+        '{rsvp_link}':          rsvpLink,
+        '{view_teams_link}':    viewLink,
         '{spots_left}':         spotsLeft,
         '{region}':             (game?.venue_region || ''),
         '{series_name}':        (game?.series_name || ''),
