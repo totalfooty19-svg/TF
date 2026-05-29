@@ -1721,6 +1721,31 @@ async function getRafEnabled() {
     } catch (e) { return false; }
 }
 
+// FIX-388 (Block D / Bug 3b): global RAF amounts, configurable via system_settings.
+// Defaults match the historical hardcoded scheme: £1 activation + 50p/game × 26
+// games = £14 max per referral. Reading is defensive — any missing/garbage value
+// falls back to its default, so the scheme never breaks on bad config.
+async function _getRafConfig() {
+    let signup = 100, perGame = 50, maxGames = 26;
+    try {
+        const [s, g, m] = await Promise.all([
+            _ratingSettingGet('raf_signup_bonus_pence'),
+            _ratingSettingGet('raf_per_game_bonus_pence'),
+            _ratingSettingGet('raf_max_games_paid'),
+        ]);
+        if (s != null && /^\d+$/.test(String(s).trim())) signup   = parseInt(s, 10);
+        if (g != null && /^\d+$/.test(String(g).trim())) perGame  = parseInt(g, 10);
+        if (m != null && /^\d+$/.test(String(m).trim()) && parseInt(m, 10) > 0) maxGames = parseInt(m, 10);
+    } catch (_) { /* keep defaults */ }
+    return {
+        signupPence: signup, perGamePence: perGame, maxGames,
+        signupPounds: signup / 100,
+        perGamePounds: perGame / 100,
+        maxGameCreditsPounds: (perGame * maxGames) / 100,
+        maxTotalPounds: (signup + perGame * maxGames) / 100,
+    };
+}
+
 // Trigger £1 activation bonus — called when admin tops up a referred player for the first time
 async function triggerRafActivation(referredPlayerId) {
     try {
@@ -1733,26 +1758,27 @@ async function triggerRafActivation(referredPlayerId) {
             [referredPlayerId]
         );
         if (!playerRow.rows[0]) return;
-        if (playerRow.rows[0].via_guest_invite) return;   // A2: skip RAF for guest-invite signups
+        // FIX-410i (audit v2): RAF suppression for guest-invite signups REMOVED — guest conversions now earn STANDARD RAF.
         if (!playerRow.rows[0].referred_by) return;
         const referrerId = playerRow.rows[0].referred_by;
+        const cfg = await _getRafConfig();   // FIX-388: configurable amounts
         await pool.query(
             'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
             [referrerId, referredPlayerId]
         );
         // BUG-02: Atomic activation — UPDATE only fires if activation_paid IS FALSE, preventing double-pay race condition
         const activationClaim = await pool.query(
-            `UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+1.00
+            `UPDATE raf_rewards SET activation_paid=TRUE, activation_paid_at=NOW(), total_paid=total_paid+$3
              WHERE referrer_id=$1 AND referred_id=$2 AND activation_paid=FALSE
              RETURNING referrer_id`,
-            [referrerId, referredPlayerId]
+            [referrerId, referredPlayerId, cfg.signupPounds]
         );
         if (activationClaim.rows.length === 0) return; // already paid — nothing to do
         await pool.query(
-            'UPDATE credits SET balance = balance + 1.00, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
-            [referrerId]
+            'UPDATE credits SET balance = balance + $2, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
+            [referrerId, cfg.signupPounds]
         );
-        await recordCreditTransaction(pool, referrerId, 1.00, 'raf_reward', `RAF activation bonus — referred player ${referredPlayerId} topped up`);
+        await recordCreditTransaction(pool, referrerId, cfg.signupPounds, 'raf_reward', `RAF activation bonus — referred player ${referredPlayerId} topped up`);
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -1764,15 +1790,15 @@ async function triggerRafActivation(referredPlayerId) {
             await emailTransporter.sendMail({
                 from: '"TotalFooty" <totalfooty19@gmail.com>',
                 to: referrerEmail,
-                subject: '💰 Refer a Friend — £1 Activation Bonus Earned!',
+                subject: `💰 Refer a Friend — £${cfg.signupPounds.toFixed(2)} Activation Bonus Earned!`,
                 html: wrapEmailHtml(`
-                    <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">YOU'VE EARNED £1! 💰</h2>
+                    <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">YOU'VE EARNED £${cfg.signupPounds.toFixed(2)}! 💰</h2>
                     <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> — your referral — has just topped up their TF account.</p>
-                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Your <strong style="color:#00cc66;">£1 activation bonus</strong> has been added to your balance. You'll also earn <strong style="color:#fff;">50p for every game they sign up to</strong>, capped at £13 in game credits (26 games) — so up to <strong style="color:#00cc66;">£14 total</strong> per referral!</p>
+                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Your <strong style="color:#00cc66;">£${cfg.signupPounds.toFixed(2)} activation bonus</strong> has been added to your balance. You'll also earn <strong style="color:#fff;">${cfg.perGamePence}p for every game they sign up to</strong>, capped at £${cfg.maxGameCreditsPounds.toFixed(2)} in game credits (${cfg.maxGames} games) — so up to <strong style="color:#00cc66;">£${cfg.maxTotalPounds.toFixed(2)} total</strong> per referral!</p>
                     <div style="background:#111;border:2px solid #333;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">MAXIMUM PER REFERRAL</div>
-                        <div style="font-size:30px;font-weight:900;color:#00cc66;">£14.00</div>
-                        <div style="font-size:12px;color:#666;">£1 activation + 26 × 50p game credits</div>
+                        <div style="font-size:30px;font-weight:900;color:#00cc66;">£${cfg.maxTotalPounds.toFixed(2)}</div>
+                        <div style="font-size:12px;color:#666;">£${cfg.signupPounds.toFixed(2)} activation + ${cfg.maxGames} × ${cfg.perGamePence}p game credits</div>
                     </div>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY PROFILE →</a>
                 `)
@@ -1780,7 +1806,7 @@ async function triggerRafActivation(referredPlayerId) {
         }
         await notifyAdmin(`💰 RAF Activation — ${referredName} topped up`, [
             ['Referrer', referrerName], ['Referred Player', referredName],
-            ['Amount Credited', '£1.00'], ['Type', 'Activation Bonus']
+            ['Amount Credited', `£${cfg.signupPounds.toFixed(2)}`], ['Type', 'Activation Bonus']
         ]);
     } catch (e) { console.error('triggerRafActivation error (non-critical):', e.message); }
 }
@@ -1797,36 +1823,38 @@ async function triggerRafGameCredit(referredPlayerId) {
             [referredPlayerId]
         );
         if (!ref.rows[0]?.referred_by) return;
-        if (ref.rows[0].via_guest_invite) return;   // A2: skip RAF for guest-invite signups
+        // FIX-410i (audit v2): RAF suppression for guest-invite signups REMOVED — guest conversions now earn STANDARD RAF.
         const referrerId = ref.rows[0].referred_by;
         const joinedAt   = ref.rows[0].created_at;
         const windowEnd  = new Date(joinedAt);
         windowEnd.setFullYear(windowEnd.getFullYear() + 1);
         if (new Date() > windowEnd) return; // 1-year window expired
+        const cfg = await _getRafConfig();   // FIX-388: configurable per-game amount + cap
         await pool.query(
             'INSERT INTO raf_rewards (referrer_id, referred_id) VALUES ($1,$2) ON CONFLICT (referrer_id, referred_id) DO NOTHING',
             [referrerId, referredPlayerId]
         );
         // BUG-02b: Atomic cap claim — increments counter only if not already capped, prevents race condition double-pay
+        // FIX-388: per-game amount ($3) and cap ($4) are now configurable.
         const creditClaim = await pool.query(`
             UPDATE raf_rewards
             SET game_credits_paid = game_credits_paid + 1,
-                game_credits_total = game_credits_total + 0.50,
-                total_paid         = total_paid + 0.50,
-                cap_reached        = (game_credits_paid + 1 >= 26),
-                cap_reached_at     = CASE WHEN (game_credits_paid + 1 >= 26) AND cap_reached_at IS NULL THEN NOW() ELSE cap_reached_at END
+                game_credits_total = game_credits_total + $3,
+                total_paid         = total_paid + $3,
+                cap_reached        = (game_credits_paid + 1 >= $4),
+                cap_reached_at     = CASE WHEN (game_credits_paid + 1 >= $4) AND cap_reached_at IS NULL THEN NOW() ELSE cap_reached_at END
             WHERE referrer_id=$1 AND referred_id=$2
-              AND cap_reached = FALSE AND game_credits_paid < 26
-            RETURNING game_credits_paid AS new_count, (game_credits_paid >= 26) AS cap_reached
-        `, [referrerId, referredPlayerId]);
+              AND cap_reached = FALSE AND game_credits_paid < $4
+            RETURNING game_credits_paid AS new_count, (game_credits_paid >= $4) AS cap_reached
+        `, [referrerId, referredPlayerId, cfg.perGamePounds, cfg.maxGames]);
         if (creditClaim.rows.length === 0) return; // cap already reached or row missing — nothing to do
         const newCount   = parseInt(creditClaim.rows[0].new_count);
         const capReached = creditClaim.rows[0].cap_reached;
         await pool.query(
-            'UPDATE credits SET balance = balance + 0.50, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
-            [referrerId]
+            'UPDATE credits SET balance = balance + $2, last_updated = CURRENT_TIMESTAMP WHERE player_id = $1',
+            [referrerId, cfg.perGamePounds]
         );
-        await recordCreditTransaction(pool, referrerId, 0.50, 'raf_reward', `RAF game credit (${newCount}/26) — referred player ${referredPlayerId}`);
+        await recordCreditTransaction(pool, referrerId, cfg.perGamePounds, 'raf_reward', `RAF game credit (${newCount}/${cfg.maxGames}) — referred player ${referredPlayerId}`);
         const [refRow, rfdRow] = await Promise.all([
             pool.query('SELECT p.full_name, p.alias, u.email FROM players p JOIN users u ON u.id=p.user_id WHERE p.id=$1', [referrerId]),
             pool.query('SELECT full_name, alias FROM players WHERE id=$1', [referredPlayerId])
@@ -1834,13 +1862,14 @@ async function triggerRafGameCredit(referredPlayerId) {
         const referrerName  = refRow.rows[0]?.alias  || refRow.rows[0]?.full_name  || 'Referrer';
         const referrerEmail = refRow.rows[0]?.email;
         const referredName  = rfdRow.rows[0]?.alias  || rfdRow.rows[0]?.full_name  || 'Your referral';
-        await notifyAdmin(`💰 RAF Game Credit — ${referredName} signed up (${newCount}/26)`, [
+        await notifyAdmin(`💰 RAF Game Credit — ${referredName} signed up (${newCount}/${cfg.maxGames})`, [
             ['Referrer', referrerName], ['Referred Player', referredName],
-            ['Amount Credited', '£0.50'], ['Sign-ups Counted', `${newCount} / 26`],
-            ['Cap Reached', capReached ? 'YES — £13 game credits fully earned (26 sign-ups)' : 'No']
+            ['Amount Credited', `£${cfg.perGamePounds.toFixed(2)}`], ['Sign-ups Counted', `${newCount} / ${cfg.maxGames}`],
+            ['Cap Reached', capReached ? `YES — £${cfg.maxGameCreditsPounds.toFixed(2)} game credits fully earned (${cfg.maxGames} sign-ups)` : 'No']
         ]);
-        if (referrerEmail && (newCount === 13 || capReached)) {
-            const gameCreditsSoFar = (newCount * 0.50).toFixed(2); // 50p per sign-up
+        const _midMilestone = Math.max(1, Math.floor(cfg.maxGames / 2));
+        if (referrerEmail && (newCount === _midMilestone || capReached)) {
+            const gameCreditsSoFar = (newCount * cfg.perGamePounds).toFixed(2);
             // Fetch actual total_paid (activation may not have been paid)
             const rrActual = await pool.query(
                 'SELECT total_paid, activation_paid FROM raf_rewards WHERE referrer_id=$1 AND referred_id=$2',
@@ -1853,24 +1882,24 @@ async function triggerRafGameCredit(referredPlayerId) {
                 to: referrerEmail,
                 subject: capReached
                     ? `🏆 Refer a Friend — Maximum Earned from ${referredName}!`
-                    : `🎉 Refer a Friend — ${referredName} has played 13 games!`,
+                    : `🎉 Refer a Friend — ${referredName} has played ${_midMilestone} games!`,
                 html: wrapEmailHtml(capReached ? `
                     <h2 style="color:#FFD700;font-size:22px;font-weight:900;margin:0 0 16px;">MAXIMUM EARNED! 🏆</h2>
-                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has played <strong style="color:#FFD700;">26 games</strong> — you've earned the full reward from this referral.</p>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has played <strong style="color:#FFD700;">${cfg.maxGames} games</strong> — you've earned the full reward from this referral.</p>
                     <div style="background:#111;border:2px solid #FFD700;border-radius:10px;padding:20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#888;font-weight:700;letter-spacing:1px;margin-bottom:6px;">TOTAL EARNED FROM ${htmlEncode(referredName.toUpperCase())}</div>
                         <div style="font-size:36px;font-weight:900;color:#FFD700;">£${actualTotal}</div>
-                        <div style="font-size:12px;color:#888;">${activationWasPaid ? '£1 activation + ' : ''}£13 game credits (26 × 50p)</div>
+                        <div style="font-size:12px;color:#888;">${activationWasPaid ? '£' + cfg.signupPounds.toFixed(2) + ' activation + ' : ''}£${cfg.maxGameCreditsPounds.toFixed(2)} game credits (${cfg.maxGames} × ${cfg.perGamePence}p)</div>
                     </div>
-                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Know anyone else? Keep referring — every friend earns you up to £14!</p>
+                    <p style="color:#ccc;font-size:14px;margin:0 0 24px;">Know anyone else? Keep referring — every friend earns you up to £${cfg.maxTotalPounds.toFixed(2)}!</p>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY REFERRALS →</a>
                 ` : `
                     <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">🎉 HALFWAY THERE!</h2>
-                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has now played <strong style="color:#fff;">13 games</strong>. You've earned <strong style="color:#00cc66;">£${gameCreditsSoFar}</strong> in game credits from their sign-ups so far.</p>
+                    <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(referredName)}</strong> has now played <strong style="color:#fff;">${_midMilestone} games</strong>. You've earned <strong style="color:#00cc66;">£${gameCreditsSoFar}</strong> in game credits from their sign-ups so far.</p>
                     <div style="background:#111;border:2px solid #333;border-radius:10px;padding:16px 20px;margin:0 0 24px;text-align:center;">
                         <div style="font-size:11px;color:#666;font-weight:700;letter-spacing:1px;margin-bottom:6px;">STILL TO EARN</div>
-                        <div style="font-size:28px;font-weight:900;color:#00cc66;">£${(13 - parseFloat(gameCreditsSoFar)).toFixed(2)}</div>
-                        <div style="font-size:12px;color:#666;">${26 - newCount} more sign-ups to go</div>
+                        <div style="font-size:28px;font-weight:900;color:#00cc66;">£${(cfg.maxGameCreditsPounds - parseFloat(gameCreditsSoFar)).toFixed(2)}</div>
+                        <div style="font-size:12px;color:#666;">${cfg.maxGames - newCount} more sign-ups to go</div>
                     </div>
                     <a href="https://totalfooty.co.uk/" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">VIEW MY PROFILE →</a>
                 `)
@@ -3066,15 +3095,25 @@ async function _fix329CountWeeklyComps(playerId, tenantId, dbClient = null) {
 async function _fix329ResolveOrganiserComp(playerId, game, currentCompCountInGame, dbClient = null) {
     const allowance = await _fix329GetAllowance(game.tenant_id, dbClient);
 
+    // DIAG-COMP: temporary instrumentation — logs the precise gate that denied
+    // comp to an is_organiser=TRUE player, so the reason shows up in Render logs
+    // without needing SQL access. Safe to remove once the live config is fixed.
+    const _diag = (reason, extra = '') => {
+        console.log(`[DIAG-COMP] denied player=${playerId} game=${game?.id} tenant=${game?.tenant_id || 'TF-root'} reason=${reason}${extra}`);
+    };
+
     if (!allowance.enabled) {
+        _diag('allowance_disabled', ` (tenant.organiser_allowance_enabled=false)`);
         return { comped: false, discount_pct: 0, reason: 'allowance_disabled' };
     }
     if (currentCompCountInGame >= allowance.per_game) {
+        _diag('per_game_cap_reached', ` (used=${currentCompCountInGame}/${allowance.per_game})`);
         return { comped: false, discount_pct: 0, reason: 'per_game_cap_reached' };
     }
     if (allowance.games_per_week !== -1) {
         const weekly = await _fix329CountWeeklyComps(playerId, game.tenant_id, dbClient);
         if (weekly >= allowance.games_per_week) {
+            _diag('weekly_cap_reached', ` (weekly=${weekly}/${allowance.games_per_week})`);
             return { comped: false, discount_pct: 0, reason: 'weekly_cap_reached' };
         }
     }
@@ -5520,18 +5559,26 @@ app.post('/api/auth/register', async (req, res) => {
         // (meaning we already confirmed token exists + unclaimed earlier).
         if (_signedUpViaGuestInvite && guestInviteToken) {
             try {
-                await pool.query(
+                // FIX-410i (audit v2): guest conversions now earn STANDARD RAF. Retire the
+                // £2 cashback path ('superseded_raf') and link the host as referrer so the
+                // RAF welcome + per-game bonuses fire under the tenant's RAF controls.
+                const _cl = await pool.query(
                     `UPDATE guest_invite_tokens
                         SET claimed_by_player_id = $1,
                             claimed_at = NOW(),
                             claim_was_new_user = TRUE,
                             cashback_status = CASE
                                 WHEN cashback_status = 'admin_invite' THEN 'admin_invite'
-                                ELSE 'new_user_pending'
+                                ELSE 'superseded_raf'
                             END
-                      WHERE token = $2 AND claimed_by_player_id IS NULL`,
+                      WHERE token = $2 AND claimed_by_player_id IS NULL
+                      RETURNING host_player_id`,
                     [playerId, guestInviteToken]
                 );
+                const _hostId = _cl.rows[0]?.host_player_id;
+                if (_hostId && String(_hostId) !== String(playerId)) {
+                    await pool.query(`UPDATE players SET referred_by = $1 WHERE id = $2 AND referred_by IS NULL`, [_hostId, playerId]);
+                }
             } catch (e) {
                 console.warn('[A2 signup auto-claim] failed (non-fatal):', e.message);
             }
@@ -5814,6 +5861,30 @@ app.post('/api/auth/register', async (req, res) => {
                 }
             }
 
+            // FIX-382 (Bug 1): surface tenant attachment in the signup email so GAFFA
+            // sees which tenant a new player/admin signed up under. Resolves
+            // _tenantShortIdRaw → tenant name; falls back to the raw code if unresolved.
+            let tenantRow = '';
+            if (tenantShortId) {
+                try {
+                    const tnRes = await pool.query(
+                        `SELECT name FROM tenants WHERE short_id = $1 LIMIT 1`,
+                        [tenantShortId]
+                    );
+                    const tName = tnRes.rows[0]?.name;
+                    tenantRow = `<tr><td style="padding:6px 0;color:#888;">Tenant</td>` +
+                        `<td style="font-weight:900;">${htmlEncode(tName || ('#' + tenantShortId))}` +
+                        `${tName ? ' · ' + htmlEncode(tenantShortId) : ''}</td></tr>`;
+                } catch (_e) {
+                    tenantRow = `<tr><td style="padding:6px 0;color:#888;">Tenant</td>` +
+                        `<td>${htmlEncode('#' + tenantShortId)}</td></tr>`;
+                }
+            } else if (_tenantShortIdRaw) {
+                // raw value supplied but failed 5-digit validation — surface it anyway
+                tenantRow = `<tr><td style="padding:6px 0;color:#888;">Tenant (raw)</td>` +
+                    `<td>${htmlEncode(String(_tenantShortIdRaw))}</td></tr>`;
+            }
+
             try {
                 const signupAdminTo = SUPERADMIN_EMAIL || 'totalfooty19@gmail.com';
                 const info = await emailTransporter.sendMail({
@@ -5829,6 +5900,7 @@ app.post('/api/auth/register', async (req, res) => {
                             <tr><td style="padding:6px 0;color:#888;">Mobile</td><td>${htmlEncode(phone.trim())}</td></tr>
                             <tr><td style="padding:6px 0;color:#888;">Age Range</td><td>${ageRange === '16_18' ? '16–18' : '18+'}</td></tr>
                             ${validatedRegion ? `<tr><td style="padding:6px 0;color:#888;">Region</td><td style="font-weight:900;">${htmlEncode(validatedRegion)}</td></tr>` : ''}
+                            ${tenantRow}
                             ${landingIntentGameUrl ? `<tr><td style="padding:6px 0;color:#888;">From game</td><td style="font-weight:900;"><a href="https://totalfooty.co.uk/game.html?url=${encodeURIComponent(landingIntentGameUrl)}" style="color:#00cc66;text-decoration:none;">${htmlEncode(landingIntentGameUrl)}</a></td></tr>` : ''}
                             ${validatedInterests.length > 0 ? `<tr><td style="padding:6px 0;color:#888;">Interests</td><td>${validatedInterests.map(i => i.charAt(0).toUpperCase()+i.slice(1)).join(', ')}</td></tr>` : ''}
                             ${referredByRow}
@@ -6066,6 +6138,7 @@ app.get('/api/players/me/recent-wonderful-credits', authenticateToken, async (re
               WHERE player_id = $1
                 AND status IN ('credited', 'credited_manually')
                 AND credited_at IS NOT NULL
+                AND league_split_id IS NULL -- FIX-410g: league shares don't credit the wallet, don't surface as balance top-ups
                 AND credited_at > $2
               ORDER BY credited_at DESC
               LIMIT 5`,
@@ -6118,6 +6191,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     COALESCE(p.position, 'outfield') AS position_preference,
                     p.referral_code,
                     p.region_code,
+                    p.region_codes, /* FIX-377 (App34): expose multi-region array so mobile can read FIX-366 signups */
                     p.coachable,
                     p.preferred_locations,
                     p.default_positions_11aside,
@@ -6268,7 +6342,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                     motm_winner_id AS player_id,
                     COUNT(*) FILTER (WHERE game_date >= NOW() - INTERVAL '3 months')     AS motm_3m,
                     COUNT(*) FILTER (WHERE game_date >= DATE_TRUNC('year', NOW()))        AS motm_year
-                FROM games WHERE motm_winner_id IS NOT NULL
+                FROM games WHERE motm_winner_id IS NOT NULL AND NOT stats_void
                 GROUP BY motm_winner_id
             ),
             win_stats AS (
@@ -6395,24 +6469,28 @@ app.get('/api/admin/players/search', authenticateToken, requireAdmin, async (req
 
         // Two-branch query: numeric input also matches exact squad_number.
         // LIMIT 20 caps result size for the dropdown.
-        // FIX-353: email column now searched + returned. Existing callers
-        // (CRM tenant_admin assign, CRM player messaging, index.html organiser
-        // search) ignore unknown fields, so adding `email` is non-breaking.
+        // FIX-353: email searched + returned. FIX-382: `email` lives on `users`,
+        // NOT `players` — the original FIX-353 query selected/filtered p.email which
+        // does not exist, 500-ing the endpoint (and the 4 features that call it).
+        // Rewritten to LEFT JOIN users (matches the grid query convention just below;
+        // LEFT so players without a user row still appear). Explicit columns, no SELECT *.
         const sql = isNumeric
-            ? `SELECT id, alias, full_name, squad_number, email
-                 FROM players
-                WHERE LOWER(alias)     LIKE $1
-                   OR LOWER(full_name) LIKE $1
-                   OR LOWER(email)     LIKE $1
-                   OR squad_number = $2
-                ORDER BY (squad_number = $2) DESC, alias NULLS LAST, full_name
+            ? `SELECT p.id, p.alias, p.full_name, p.squad_number, u.email
+                 FROM players p
+                 LEFT JOIN users u ON u.id = p.user_id
+                WHERE LOWER(p.alias)     LIKE $1
+                   OR LOWER(p.full_name) LIKE $1
+                   OR LOWER(u.email)     LIKE $1
+                   OR p.squad_number = $2
+                ORDER BY (p.squad_number = $2) DESC, p.alias NULLS LAST, p.full_name
                 LIMIT 20`
-            : `SELECT id, alias, full_name, squad_number, email
-                 FROM players
-                WHERE LOWER(alias)     LIKE $1
-                   OR LOWER(full_name) LIKE $1
-                   OR LOWER(email)     LIKE $1
-                ORDER BY alias NULLS LAST, full_name
+            : `SELECT p.id, p.alias, p.full_name, p.squad_number, u.email
+                 FROM players p
+                 LEFT JOIN users u ON u.id = p.user_id
+                WHERE LOWER(p.alias)     LIKE $1
+                   OR LOWER(p.full_name) LIKE $1
+                   OR LOWER(u.email)     LIKE $1
+                ORDER BY p.alias NULLS LAST, p.full_name
                 LIMIT 20`;
         const params = isNumeric ? [like, squadNum] : [like];
 
@@ -6453,7 +6531,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                  AND g.game_date >= NOW() - INTERVAL '3 months') as apps_3m,
 
                 (SELECT COUNT(*) FROM games g WHERE g.motm_winner_id = p.id
-                 AND g.game_status = 'completed'
+                 AND g.game_status = 'completed' AND NOT g.stats_void
                  AND g.game_date >= NOW() - INTERVAL '3 months') as motm_3m,
 
                 (SELECT COUNT(DISTINCT r.game_id)
@@ -6473,7 +6551,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                  AND g.game_date >= DATE_TRUNC('year', NOW())) as apps_year,
 
                 (SELECT COUNT(*) FROM games g WHERE g.motm_winner_id = p.id
-                 AND g.game_status = 'completed'
+                 AND g.game_status = 'completed' AND NOT g.stats_void
                  AND g.game_date >= DATE_TRUNC('year', NOW())) as motm_year,
 
                 (SELECT COUNT(DISTINCT r.game_id)
@@ -6790,7 +6868,7 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
 
         // Award counts — fetched for all viewers
         const awardsRes = await pool.query(
-            `SELECT award_type, COUNT(*) AS cnt FROM game_awards WHERE recipient_player_id = $1 GROUP BY award_type`,
+            `SELECT award_type, COUNT(*) AS cnt FROM game_awards WHERE recipient_player_id = $1 AND NOT removed_due_to_team_drop GROUP BY award_type`,
             [player.id]
         );
         const award_counts = {};
@@ -6955,7 +7033,7 @@ app.get('/api/players/me/pending-votes', authenticateToken, async (req, res) => 
                    g.game_date     AS game_date,
                    v.name          AS venue_name,
                    g.awards_close_at AS awards_close_at,
-                   (SELECT COUNT(*) FROM game_awards ga WHERE ga.game_id = g.id) AS award_count
+                   (SELECT COUNT(*) FROM game_awards ga WHERE ga.game_id = g.id AND NOT ga.removed_due_to_team_drop) AS award_count
             FROM games g
             JOIN registrations r ON r.game_id = g.id
             LEFT JOIN venues v ON v.id = g.venue_id
@@ -11082,8 +11160,14 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
                 );
                 let seriesUuid = seriesResult.rows[0].id;
             
-                // Create 26 weeks of games (6 months)
-                for (let week = 0; week < 26; week++) {
+                // FIX-389 (Block E): recurring length is now configurable (1–52),
+                // replacing the hardcoded 26. Defaults to 26 if absent/invalid.
+                let _recurringWeeks = parseInt(req.body.recurringWeeks, 10);
+                if (!Number.isFinite(_recurringWeeks)) _recurringWeeks = 26;
+                _recurringWeeks = Math.max(1, Math.min(52, _recurringWeeks));
+
+                // Create _recurringWeeks weeks of games (default 26 = 6 months, max 52)
+                for (let week = 0; week < _recurringWeeks; week++) {
                     // FIX-DST: Use London-timezone-aware date to preserve local clock time
                     // across DST boundaries (clocks change in March/October)
                     const weekDate = addWeeksLondon(gameDate, week);
@@ -11174,7 +11258,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
 
                 await wClient.query('COMMIT');
                 res.json({ 
-                    message: `Created 26 weekly games (series ${seriesIdValue})`,
+                    message: `Created ${_recurringWeeks} weekly games (series ${seriesIdValue})`,
                     seriesId: seriesIdValue,
                     games: createdGames 
                 });
@@ -13476,6 +13560,13 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         );
         const isOrganiser = organiserCheck.rows[0]?.is_organiser || false;
 
+        // DIAG-COMP: if a player who SHOULD be comped wasn't, the resolver
+        // logs the reason. Here we also log when is_organiser itself is FALSE —
+        // covers the "flag missing on the player record" case.
+        if (!isOrganiser) {
+            console.log(`[DIAG-COMP] is_organiser=FALSE for player=${req.user.playerId} game=${gameId} — comp skipped at caller. (If you expected a comp, set players.is_organiser=TRUE for this player.)`);
+        }
+
         let isComped = false;
         let compDiscountPct = 0;
         if (isOrganiser) {
@@ -14451,26 +14542,16 @@ async function _a2PayPendingCashbacks(gameId) {
                     await cbClient.query('ROLLBACK');
                     continue;
                 }
+                // FIX-410i (audit v2): £2 guest-conversion cashback REMOVED. Guest
+                // conversions now earn STANDARD RAF (host linked as referred_by at
+                // claim/signup; RAF suppression lifted). No payment here — just retire
+                // the token so it doesn't linger as 'new_user_pending'.
                 await cbClient.query(
-                    `INSERT INTO credits (player_id, balance, free_credit_balance, last_updated)
-                     VALUES ($2, 0, $1, NOW())
-                     ON CONFLICT (player_id) DO UPDATE
-                        SET free_credit_balance = COALESCE(credits.free_credit_balance, 0) + $1,
-                            last_updated = NOW()`,
-                    [A2_CASHBACK_AMOUNT, tok.host_player_id]
-                );
-                await recordCreditTransaction(cbClient, tok.host_player_id, A2_CASHBACK_AMOUNT, 'free_credit',
-                    `Guest invite cashback — ${tok.guest_name} signed up & played`);
-                await cbClient.query(
-                    `UPDATE guest_invite_tokens
-                        SET cashback_paid_at = NOW(),
-                            cashback_amount = $1,
-                            cashback_status = 'paid'
-                      WHERE token = $2`,
-                    [A2_CASHBACK_AMOUNT, tok.token]
+                    `UPDATE guest_invite_tokens SET cashback_status = 'superseded_raf' WHERE token = $1`,
+                    [tok.token]
                 );
                 await cbClient.query('COMMIT');
-                console.log(`✅ A2: Paid £${A2_CASHBACK_AMOUNT} cashback to host ${tok.host_player_id} (guest: ${tok.guest_name}, game: ${gameId})`);
+                console.log(`A2: guest-conversion cashback superseded by RAF for token ${tok.token.substring(0,8)}... (game ${gameId})`);
             } catch (e) {
                 await cbClient.query('ROLLBACK').catch(() => {});
                 console.error(`✗ A2: Cashback failed for token ${tok.token.substring(0,8)}... game ${gameId}:`, e.message);
@@ -14643,7 +14724,7 @@ app.post('/api/guest-invite/:token/claim', authenticateToken, async (req, res) =
         if (t.cashback_status === 'admin_invite') {
             newCashbackStatus = 'admin_invite';
         } else if (isNewUser) {
-            newCashbackStatus = 'new_user_pending';
+            newCashbackStatus = 'superseded_raf'; // FIX-410i: guest conversions now earn standard RAF
         } else {
             newCashbackStatus = 'existing_user';
         }
@@ -14657,6 +14738,12 @@ app.post('/api/guest-invite/:token/claim', authenticateToken, async (req, res) =
               WHERE token = $4`,
             [friendId, isNewUser, newCashbackStatus, token]
         );
+
+        // FIX-410i: link the host as referrer so the conversion earns STANDARD RAF
+        // (welcome + per-game per the tenant's RAF controls). New user, not self, not already referred.
+        if (isNewUser && String(t.host_player_id) !== String(friendId)) {
+            await client.query(`UPDATE players SET referred_by = $1 WHERE id = $2 AND referred_by IS NULL`, [t.host_player_id, friendId]);
+        }
 
         await client.query('COMMIT');
 
@@ -16100,7 +16187,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         const gameCheck = await client.query(
             `SELECT player_editing_locked, teams_generated, cost_per_player, team_selection_type,
                     tournament_team_count, requires_organiser,
-                    early_bird_price, super_early_bird_price, game_date, format
+                    early_bird_price, super_early_bird_price, game_date, format, tenant_id
              FROM games WHERE id = $1 FOR UPDATE`,
             [gameId]
         );
@@ -16127,6 +16214,30 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         const _gameStartTs = new Date(gameCheck.rows[0].game_date).getTime();
         const _hoursUntilKickoff = (_gameStartTs - Date.now()) / (1000 * 60 * 60);
         const _isLateWindow = isFinite(_gameStartTs) && _gameStartTs > 0 && _hoursUntilKickoff <= 2;
+
+        // FIX-386 (Block C): refund cutoff is tenant-configurable and DECOUPLED from the
+        // discipline window above (which stays a fixed 2h — a tenant's refund policy must
+        // not change who gets discipline points). For TF root games (tenant_id NULL) and
+        // any tenant without overrides, defaults are 2h + teams-on = previous behaviour.
+        let _refundCutoffHours = 2;
+        let _noRefundAfterTeams = true;
+        const _gameTenantId = gameCheck.rows[0].tenant_id;
+        if (_gameTenantId) {
+            try {
+                const _tp = await client.query(
+                    `SELECT refund_cutoff_hours, no_refund_after_teams FROM tenants WHERE id = $1`,
+                    [_gameTenantId]
+                );
+                if (_tp.rows.length) {
+                    if (_tp.rows[0].refund_cutoff_hours != null) _refundCutoffHours = parseInt(_tp.rows[0].refund_cutoff_hours, 10);
+                    if (_tp.rows[0].no_refund_after_teams != null) _noRefundAfterTeams = !!_tp.rows[0].no_refund_after_teams;
+                }
+            } catch (e) {
+                // Pre-migration (column/table absent) → keep defaults (2h + teams-on).
+                if (!(e && (e.code === '42P01' || e.code === '42703'))) throw e;
+            }
+        }
+        const _isLateForRefund = isFinite(_gameStartTs) && _gameStartTs > 0 && _hoursUntilKickoff <= _refundCutoffHours;
 
         // Compute the effective price at THIS moment — the total amount that was
         // actually debited at registration time (real balance + free credit combined).
@@ -16183,8 +16294,8 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
         // Either one keeps the money. Stacks with existing late-drop discipline points.
         // Admins-on-behalf-of bypass the penalty (they're typically processing legitimate drops).
         const _seriesType = gameCheck.rows[0].team_selection_type;
-        const _teamsLockedForDrop = teamsWereGenerated && _seriesType !== 'draft_memory';
-        const _inPenaltyWindow = (_isLateWindow || _teamsLockedForDrop) && wasConfirmed && !wasComped && !isAdminDroppingOut;
+        const _teamsLockedForDrop = _noRefundAfterTeams && teamsWereGenerated && _seriesType !== 'draft_memory';
+        const _inPenaltyWindow = (_isLateForRefund || _teamsLockedForDrop) && wasConfirmed && !wasComped && !isAdminDroppingOut;
         const _penaltyReason = _teamsLockedForDrop
             ? 'late_drop_teams_generated'
             : 'late_drop_2hr_window';
@@ -22735,6 +22846,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
                    g.requires_organiser, g.lineup_enabled,
                    g.early_bird_price, g.super_early_bird_price, g.opponent_id,
+                   g.league_id, /* FIX-405 Block N */
                    v.name as venue_name, v.address as venue_address, v.photo_url as venue_photo,
                    v.background_image_filename as venue_background_image,
                    v.pitch_location as venue_pitch_location, v.facilities as venue_facilities, v.notes as venue_notes,
@@ -22761,7 +22873,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'rsvp') as rsvp_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup' AND backup_type = 'confirmed_backup') as confirmed_backup_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'bumped') as bumped_count,
-                   g.accelerator_fired_at
+                   g.accelerator_fired_at,
+                   g.tenant_id
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN opponents opp_pub ON opp_pub.id = g.opponent_id
@@ -22773,6 +22886,29 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
         }
         
         const game = gameResult.rows[0];
+        
+        // FIX-386 (Block C): resolve the effective cancellation policy for display.
+        // Defensive separate lookup (not a JOIN) so a pre-migration missing column
+        // can never 500 this high-traffic public endpoint. Defaults = 2h + teams-on
+        // (matches TF root / un-migrated tenants and the dropout logic).
+        let _cancelPolicy = { refund_cutoff_hours: 2, no_refund_after_teams: true, text: '' };
+        if (game.tenant_id) {
+            try {
+                const _cp = await pool.query(
+                    `SELECT refund_cutoff_hours, no_refund_after_teams, cancellation_policy_text
+                       FROM tenants WHERE id = $1`,
+                    [game.tenant_id]
+                );
+                if (_cp.rows.length) {
+                    if (_cp.rows[0].refund_cutoff_hours != null) _cancelPolicy.refund_cutoff_hours = parseInt(_cp.rows[0].refund_cutoff_hours, 10);
+                    if (_cp.rows[0].no_refund_after_teams != null) _cancelPolicy.no_refund_after_teams = !!_cp.rows[0].no_refund_after_teams;
+                    if (_cp.rows[0].cancellation_policy_text) _cancelPolicy.text = String(_cp.rows[0].cancellation_policy_text);
+                }
+            } catch (e) {
+                if (!(e && (e.code === '42P01' || e.code === '42703'))) throw e;
+                // pre-migration → keep defaults
+            }
+        }
         
         // Map venue names to their photo URLs (override database)
         const venuePhotoMap = {
@@ -22815,9 +22951,55 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             } catch (e) { /* non-critical */ }
         }
         
+        // FIX-405 (Block N Phase 4b): league context for a league fixture's game.
+        // game.html uses this to skip the balancer and render fixed home/away rosters.
+        let _leagueBlock = null;
+        if (game.league_id) {
+            try {
+                const _lq = await pool.query(
+                    `SELECT l.id, l.short_id, l.name, l.status, l.primary_color,
+                            f.round_number, f.status AS fixture_status, f.home_score, f.away_score,
+                            h.id AS home_id, h.name AS home_name, h.bib_colour AS home_colour,
+                            a.id AS away_id, a.name AS away_name, a.bib_colour AS away_colour
+                       FROM leagues l
+                       JOIN league_fixtures f ON f.league_id = l.id AND f.game_id = $1
+                       JOIN league_teams h ON h.id = f.home_team_id
+                       JOIN league_teams a ON a.id = f.away_team_id
+                      WHERE l.id = $2 LIMIT 1`, [game.id, game.league_id]);
+                if (_lq.rows.length) {
+                    const lx = _lq.rows[0];
+                    _leagueBlock = {
+                        id: lx.id, short_id: lx.short_id, name: lx.name, status: lx.status, primary_color: lx.primary_color,
+                        round: lx.round_number, fixture_status: lx.fixture_status,
+                        home_score: lx.home_score, away_score: lx.away_score,
+                        home_team: { id: lx.home_id, name: lx.home_name, bib_colour: lx.home_colour },
+                        away_team: { id: lx.away_id, name: lx.away_name, bib_colour: lx.away_colour }
+                    };
+                    // FIX-407 (Block N Phase 4c): home/away squads + per-player availability
+                    // (availability = whether they've RSVP'd to this fixture's game).
+                    const _rq = await pool.query(
+                        `SELECT ltp.league_team_id, ltp.player_id, ltp.is_captain, p.alias,
+                                EXISTS(SELECT 1 FROM registrations r WHERE r.game_id=$1 AND r.player_id=ltp.player_id AND r.status IN ('confirmed','rsvp')) AS available
+                           FROM league_team_players ltp JOIN players p ON p.id = ltp.player_id
+                          WHERE ltp.league_team_id IN ($2,$3) AND ltp.status='active'
+                          ORDER BY ltp.is_captain DESC, p.alias ASC`,
+                        [game.id, lx.home_id, lx.away_id]);
+                    const _mapRoster = (teamId) => _rq.rows
+                        .filter(r => String(r.league_team_id) === String(teamId))
+                        .map(r => ({ player_id: r.player_id, alias: r.alias, is_captain: r.is_captain, available: r.available }));
+                    _leagueBlock.home_roster = _mapRoster(lx.home_id);
+                    _leagueBlock.away_roster = _mapRoster(lx.away_id);
+                }
+            } catch (e) { if (e.code !== '42P01') console.error('FIX-405 league block:', e.message); }
+        }
+
         res.json({
             id: game.id,
             game_url: game.game_url,
+            league: _leagueBlock, // FIX-405 Block N: null for normal games
+            // FIX-386 (Block C): effective cancellation policy for the Refunds section.
+            // Explicitly listed here per the "/details must list every field" rule.
+            cancellation_policy: _cancelPolicy,
             game_date: game.game_date,
             venue_id: game.venue_id,
             venue_name: game.venue_name,
@@ -23602,6 +23784,7 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
             pool.query(`
                 SELECT award_type, COUNT(*) AS cnt
                 FROM game_awards WHERE recipient_player_id = $1
+                  AND NOT removed_due_to_team_drop /* FIX-410k: exclude voided dropped-team awards from public profile totals */
                 GROUP BY award_type`, [player.id]),
             // External game wins — no team_players needed (all confirmed TF players win when winning_team=red)
             pool.query(`
@@ -25169,7 +25352,7 @@ async function regeneratePlayerBioForce(playerId, force = false) {
             const player = { ...playerRes.rows[0], total_appearances: Math.max(playerRes.rows[0].total_appearances || 0, 5) };
 
             const [awardsRes, formRes, streakRes, tfStatsRes] = await Promise.all([
-                pool.query(`SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1`, [playerId]),
+                pool.query(`SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1 AND NOT removed_due_to_team_drop /* FIX-410j: exclude dropped-team voided awards from AI bio */`, [playerId]),
                 pool.query(`SELECT g.winning_team, t.team_name FROM registrations r JOIN games g ON g.id = r.game_id LEFT JOIN team_players tp ON tp.player_id = r.player_id LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id WHERE r.player_id = $1 AND g.game_status = 'completed' AND g.team_selection_type != 'vs_external' ORDER BY g.game_date DESC LIMIT 5`, [playerId]),
                 pool.query(`SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]).catch(() => ({ rows: [] })),
                 pool.query(
@@ -25237,7 +25420,7 @@ async function regeneratePlayerBio(playerId) {
 
         const [awardsRes, formRes, streakRes, tfStatsRes] = await Promise.all([
             pool.query(
-                `SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1`,
+                `SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1 AND NOT removed_due_to_team_drop /* FIX-410j: exclude dropped-team voided awards from AI bio */`,
                 [playerId]
             ),
             pool.query(
@@ -25921,7 +26104,7 @@ app.get('/api/public/players/leaderboard/awards', async (req, res) => {
                 COALESCE(SUM(CASE WHEN ga.award_type = 'butterfingers'    THEN 1 ELSE 0 END), 0) as award_butterfingers,
                 COALESCE(COUNT(ga.id), 0) as total_awards
              FROM players p
-             LEFT JOIN game_awards ga ON ga.recipient_player_id = p.id
+             LEFT JOIN game_awards ga ON ga.recipient_player_id = p.id AND NOT ga.removed_due_to_team_drop /* FIX-410k: exclude voided dropped-team awards from public leaderboard */
              GROUP BY p.id, p.alias, p.full_name
              HAVING COALESCE(COUNT(ga.id), 0) > 0
              ORDER BY motm_total DESC, engine_count DESC`,
@@ -26236,12 +26419,18 @@ app.get('/api/admin/raf/status', authenticateToken, requireSuperAdmin, async (re
                 FROM raf_rewards
             `)
         ]);
+        const rafCfg = await _getRafConfig();   // FIX-388: expose configurable amounts
         res.json({
             enabled: setting.rows[0]?.value === 'true',
             totalPairs: parseInt(stats.rows[0].total_pairs || 0),
             activationsPaid: parseInt(stats.rows[0].activations_paid || 0),
             capsReached: parseInt(stats.rows[0].caps_reached || 0),
-            totalCredited: parseFloat(stats.rows[0].total_credited || 0).toFixed(2)
+            totalCredited: parseFloat(stats.rows[0].total_credited || 0).toFixed(2),
+            // FIX-388 amounts (pence in DB; pounds for display convenience)
+            signupBonusPence: rafCfg.signupPence,
+            perGameBonusPence: rafCfg.perGamePence,
+            maxGames: rafCfg.maxGames,
+            maxTotalPounds: rafCfg.maxTotalPounds.toFixed(2)
         });
     } catch (e) {
         console.error('RAF status error:', e.message);
@@ -26264,6 +26453,37 @@ app.put('/api/admin/raf/toggle', authenticateToken, requireSuperAdmin, async (re
     } catch (e) {
         console.error('RAF toggle error:', e.message);
         res.status(500).json({ error: 'Failed to update RAF setting' });
+    }
+});
+
+// PUT /api/admin/raf/config — set the global RAF amounts (FIX-388 / Bug 3a+3b).
+// Body: { signupBonusPence, perGameBonusPence, maxGames } — any subset.
+// Stored in system_settings; read by _getRafConfig() in the payout logic.
+app.put('/api/admin/raf/config', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const out = {};
+        const setIfValid = async (bodyKey, settingKey, { min, max }) => {
+            if (req.body[bodyKey] === undefined || req.body[bodyKey] === null || req.body[bodyKey] === '') return;
+            const n = parseInt(req.body[bodyKey], 10);
+            if (!Number.isFinite(n) || n < min || n > max) {
+                throw new Error(`${bodyKey} must be an integer between ${min} and ${max}`);
+            }
+            await _ratingSettingSet(settingKey, n);
+            out[bodyKey] = n;
+        };
+        // Bounds: bonuses 0–10000p (£0–£100), maxGames 1–500.
+        await setIfValid('signupBonusPence',  'raf_signup_bonus_pence',   { min: 0, max: 10000 });
+        await setIfValid('perGameBonusPence', 'raf_per_game_bonus_pence', { min: 0, max: 10000 });
+        await setIfValid('maxGames',          'raf_max_games_paid',       { min: 1, max: 500 });
+        if (Object.keys(out).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
+        await auditLog(pool, req.user.playerId, 'raf_config', null, `RAF amounts updated: ${JSON.stringify(out)}`);
+        const cfg = await _getRafConfig();
+        res.json({ message: 'RAF amounts updated', saved: out,
+            signupBonusPence: cfg.signupPence, perGameBonusPence: cfg.perGamePence,
+            maxGames: cfg.maxGames, maxTotalPounds: cfg.maxTotalPounds.toFixed(2) });
+    } catch (e) {
+        console.error('RAF config error:', e.message);
+        res.status(400).json({ error: e.message || 'Failed to update RAF amounts' });
     }
 });
 
@@ -39030,7 +39250,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
                 FROM game_awards ga
                 JOIN games g ON g.id = ga.game_id
                 ${regionJoin}
-                WHERE ga.award_type = 'motm' AND ${scopeFilter}
+                WHERE ga.award_type = 'motm' AND NOT ga.removed_due_to_team_drop AND ${scopeFilter}
                 GROUP BY ga.recipient_player_id
             )
             SELECT ac.player_id, ac.player_name, ac.appearances,
@@ -39109,7 +39329,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
                 FROM game_awards ga
                 JOIN games g ON g.id = ga.game_id
                 ${regionJoin}
-                WHERE ga.award_type = '${awardType}' AND ${scopeFilter}
+                WHERE ga.award_type = '${awardType}' AND NOT ga.removed_due_to_team_drop AND ${scopeFilter}
                 GROUP BY ga.recipient_player_id
             )
             SELECT ac.player_id, ac.player_name, ac.appearances,
@@ -39627,6 +39847,1617 @@ app.post('/api/games/:gameUrl/rating-feedback', authenticateToken, async (req, r
 // Allows a voter to request additional comparison pairs after exhausting the
 // initial batch. Capped at 3 click-through grants per (player, game) and
 // 30 pairs total per (player, game). Audit-logged each call.
+// FIX-400 (Block M1): overrated/underrated capture — a binary, per-subject signal
+// that runs ALONGSIDE the pairwise rating-feedback above. CAPTURE ONLY: it records
+// votes; it does NOT feed OVR yet (that's M2, gated on a deliberate weighting decision).
+// GET own votes for a game.
+app.get('/api/games/:gameUrl/overrated-vote/me', authenticateToken, async (req, res) => {
+    try {
+        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [req.params.gameUrl]);
+        if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
+        const gameId = gR.rows[0].id;
+        const r = await pool.query(
+            `SELECT subject_player_id, direction FROM player_overrated_votes
+              WHERE voter_player_id = $1 AND game_id = $2`,
+            [req.user.playerId, gameId]
+        );
+        const votes = {};
+        for (const row of r.rows) votes[row.subject_player_id] = row.direction;
+        res.json({ votes });
+    } catch (e) {
+        if (e && (e.code === '42P01')) return res.json({ votes: {} }); // pre-migration
+        console.error('FIX-400 overrated GET failed:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// POST a vote: { subjectPlayerId, direction } where direction is
+// 'overrated' | 'underrated' | null (null retracts). Voter & subject must both
+// have played (confirmed) the game; voter can't vote on themselves.
+app.post('/api/games/:gameUrl/overrated-vote', authenticateToken, fairnessLimiter, async (req, res) => {
+    try {
+        const voterId = req.user.playerId;
+        const { subjectPlayerId, direction } = req.body || {};
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!UUID_RE.test(subjectPlayerId || '')) return res.status(400).json({ error: 'invalid_subject_id' });
+        if (voterId === subjectPlayerId) return res.status(400).json({ error: 'cant_vote_self' });
+        if (direction !== null && direction !== 'overrated' && direction !== 'underrated') {
+            return res.status(400).json({ error: 'invalid_direction' });
+        }
+        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [req.params.gameUrl]);
+        if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
+        const gameId = gR.rows[0].id;
+        // Both voter and subject must have been confirmed in the game.
+        const part = await pool.query(
+            `SELECT player_id FROM registrations
+              WHERE game_id = $1 AND status = 'confirmed' AND player_id IN ($2, $3)`,
+            [gameId, voterId, subjectPlayerId]
+        );
+        const set = new Set(part.rows.map(r => r.player_id));
+        if (!set.has(voterId))         return res.status(403).json({ error: 'voter_not_in_game' });
+        if (!set.has(subjectPlayerId)) return res.status(400).json({ error: 'subject_not_in_game' });
+
+        if (direction === null) {
+            await pool.query(
+                `DELETE FROM player_overrated_votes
+                  WHERE voter_player_id = $1 AND subject_player_id = $2 AND game_id = $3`,
+                [voterId, subjectPlayerId, gameId]
+            );
+            return res.json({ ok: true, direction: null });
+        }
+        await pool.query(
+            `INSERT INTO player_overrated_votes (voter_player_id, subject_player_id, game_id, direction)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (voter_player_id, subject_player_id, game_id)
+             DO UPDATE SET direction = EXCLUDED.direction, updated_at = NOW()`,
+            [voterId, subjectPlayerId, gameId, direction]
+        );
+        res.json({ ok: true, direction });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.status(503).json({ error: 'not_ready' }); // pre-migration
+        console.error('FIX-400 overrated POST failed:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-402 (Block N Phase 1): LEAGUE CRUD + team shells + captain claim.
+// Admin endpoints are tenant-SCOPED (/api/t/:short/admin/leagues*) and gated by
+// requireTenantAdmin — which lets BOTH superadmin and the tenant's tenant_admin
+// through (the auth model chosen). req.tenant is set by the /api/t mount middleware.
+// Public/captain endpoints are global. Single-tenant leagues only (cross-tenant OOS).
+// ════════════════════════════════════════════════════════════════════════
+
+// League short_id: 'L-' + 5 unambiguous base32 chars, collision-retried.
+async function _genLeagueShortId() {
+    const alpha = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L ambiguity
+    for (let attempt = 0; attempt < 8; attempt++) {
+        let s = 'L-';
+        const bytes = crypto.randomBytes(5);
+        for (let k = 0; k < 5; k++) s += alpha[bytes[k] % alpha.length];
+        try {
+            const r = await pool.query('SELECT 1 FROM leagues WHERE short_id = $1', [s]);
+            if (r.rows.length === 0) return s;
+        } catch (e) { return s; } // table missing → caller handles
+    }
+    return 'L-' + crypto.randomBytes(6).toString('hex').toUpperCase();
+}
+// Claim slug: readable team-name stub + unguessable random suffix.
+function _genClaimSlug(name) {
+    let base = 'team';
+    try { base = (name ? _fix322Slugify(name) : 'team').slice(0, 24) || 'team'; } catch (_) {}
+    return base + '-' + crypto.randomBytes(9).toString('base64url'); // ~12-char suffix
+}
+
+// ─── ADMIN (scoped: superadmin OR tenant_admin) ──────────────────────────
+// List this tenant's leagues.
+app.get('/api/t/:tenant_short_id/admin/leagues', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, short_id, name, format, rounds, team_count, status, start_date, created_at,
+                    (SELECT COUNT(*)::int FROM league_teams lt WHERE lt.league_id = leagues.id) AS team_shells,
+                    (SELECT COUNT(*)::int FROM league_teams lt WHERE lt.league_id = leagues.id AND lt.claimed_at IS NOT NULL) AS claimed
+               FROM leagues WHERE tenant_id = $1 ORDER BY created_at DESC`,
+            [req.tenant.id]
+        );
+        res.json({ leagues: r.rows });
+    } catch (e) {
+        if (e.code === '42P01') return res.json({ leagues: [] });
+        console.error('FIX-402 list leagues:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Create a league.
+app.post('/api/t/:tenant_short_id/admin/leagues', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const name = String(b.name || '').trim();
+        if (!name) return res.status(400).json({ error: 'name required' });
+        const format = (b.format === 'random_evenly') ? 'random_evenly' : 'round_robin';
+        const rounds = Math.max(1, Math.min(10, parseInt(b.rounds, 10) || 1));
+        const teamCount = parseInt(b.team_count, 10);
+        if (!Number.isFinite(teamCount) || teamCount < 2 || teamCount > 32) {
+            return res.status(400).json({ error: 'team_count must be 2–32' });
+        }
+        const startDate = b.start_date ? new Date(b.start_date) : null;
+        if (!startDate || isNaN(startDate.getTime())) return res.status(400).json({ error: 'valid start_date required' });
+        const gamesPerTeam = (format === 'random_evenly') ? (parseInt(b.games_per_team, 10) || null) : null;
+        const cadence = Math.max(1, Math.min(60, parseInt(b.cadence_days, 10) || 7));
+        const pWin  = Number.isFinite(parseInt(b.points_for_win, 10))  ? parseInt(b.points_for_win, 10)  : 3;
+        const pDraw = Number.isFinite(parseInt(b.points_for_draw, 10)) ? parseInt(b.points_for_draw, 10) : 1;
+        const pLoss = Number.isFinite(parseInt(b.points_for_loss, 10)) ? parseInt(b.points_for_loss, 10) : 0;
+        // FIX-410h (audit v2): tie-break order. Whitelisted; default keeps the old
+        // behaviour (GD then GF, no head-to-head). Read-time sanitised in _orderLeagueStandings.
+        const _VALID_TB = ['goal_diff,goals_for', 'goal_diff,h2h,goals_for', 'h2h,goal_diff,goals_for'];
+        const tiebreak = _VALID_TB.includes(b.tiebreak_order) ? b.tiebreak_order : 'goal_diff,goals_for';
+        const shortId = await _genLeagueShortId();
+        const r = await pool.query(
+            `INSERT INTO leagues (short_id, tenant_id, name, description, format, rounds, games_per_team,
+                                  team_count, cadence_days, start_date, points_for_win, points_for_draw, points_for_loss, tiebreak_order, created_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             RETURNING id, short_id`,
+            [shortId, req.tenant.id, name, (b.description || null), format, rounds, gamesPerTeam, teamCount, cadence,
+             startDate.toISOString().slice(0, 10), pWin, pDraw, pLoss, tiebreak, req.user.playerId]
+        );
+        await auditLog(pool, req.user.playerId, 'league_created', null, `League "${name}" (${shortId})`, req.tenant.id);
+        res.status(201).json({ id: r.rows[0].id, short_id: r.rows[0].short_id });
+    } catch (e) {
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-402 create league:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// League details + its teams.
+app.get('/api/t/:tenant_short_id/admin/leagues/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const lid = req.params.id;
+        if (!isValidUuid(lid)) return res.status(400).json({ error: 'invalid_id' });
+        // FIX-410k (audit v3): explicit columns instead of SELECT * (burned-us rule --
+        // a future ALTER TABLE leagues would otherwise auto-surface in this admin response).
+        const lr = await pool.query(
+            `SELECT id, short_id, tenant_id, name, description, logo_url, primary_color,
+                    format, rounds, games_per_team, team_count, cadence_days, start_date,
+                    points_for_win, points_for_draw, points_for_loss, tiebreak_order,
+                    status, created_at, activated_at, completed_at, created_by
+               FROM leagues WHERE id = $1 AND tenant_id = $2`, [lid, req.tenant.id]);
+        if (lr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const tr = await pool.query(
+            `SELECT id, name, bib_colour, captain_player_id, claim_slug, claimed_at, status, created_at
+               FROM league_teams WHERE league_id = $1 ORDER BY created_at ASC`, [lid]);
+        res.json({ league: lr.rows[0], teams: tr.rows });
+    } catch (e) {
+        console.error('FIX-402 league details:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Edit league. Structural fields (rounds/games_per_team/cadence/team_count/start_date)
+// only while status='setup'; cosmetic + status transitions allowed anytime.
+app.patch('/api/t/:tenant_short_id/admin/leagues/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const lid = req.params.id;
+        if (!isValidUuid(lid)) return res.status(400).json({ error: 'invalid_id' });
+        const cur = await pool.query('SELECT status FROM leagues WHERE id=$1 AND tenant_id=$2', [lid, req.tenant.id]);
+        if (cur.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const inSetup = cur.rows[0].status === 'setup';
+        const b = req.body || {};
+        const updates = []; const vals = []; let i = 1;
+        for (const f of ['name', 'description', 'logo_url', 'primary_color', 'tiebreak_order']) {
+            if (b[f] === undefined) continue;
+            const val = (b[f] === null ? null : String(b[f]).trim());
+            // FIX-410k (audit v3): reject non-hex colours at the set-site. primary_color
+            // renders into an inline style="" on the public league page; esc() blocks
+            // attribute-breakout but NOT CSS-value injection, so validate the value here.
+            if (f === 'primary_color' && val && !/^#[0-9a-fA-F]{3,8}$/.test(val)) {
+                return res.status(400).json({ error: 'primary_color must be a hex code like #ff0066' });
+            }
+            updates.push(`${f}=$${i++}`); vals.push(val);
+        }
+        const structural = new Set(['rounds', 'games_per_team', 'cadence_days', 'team_count']);
+        for (const f of ['rounds', 'games_per_team', 'cadence_days', 'points_for_win', 'points_for_draw', 'points_for_loss', 'team_count']) {
+            if (b[f] === undefined) continue;
+            if (structural.has(f) && !inSetup) return res.status(409).json({ error: `${f} can only change while league is in setup` });
+            updates.push(`${f}=$${i++}`); vals.push(b[f] === null ? null : parseInt(b[f], 10));
+        }
+        if (b.start_date !== undefined) {
+            if (!inSetup) return res.status(409).json({ error: 'start_date can only change while league is in setup' });
+            const d = new Date(b.start_date); if (isNaN(d.getTime())) return res.status(400).json({ error: 'invalid start_date' });
+            updates.push(`start_date=$${i++}`); vals.push(d.toISOString().slice(0, 10));
+        }
+        if (b.status !== undefined) {
+            if (!['setup', 'active', 'paused', 'completed', 'cancelled'].includes(b.status)) return res.status(400).json({ error: 'invalid status' });
+            updates.push(`status=$${i++}`); vals.push(b.status);
+            if (b.status === 'active') updates.push(`activated_at=COALESCE(activated_at,NOW())`);
+            if (b.status === 'completed') updates.push(`completed_at=NOW()`);
+        }
+        if (!updates.length) return res.status(400).json({ error: 'no valid fields' });
+        vals.push(lid); vals.push(req.tenant.id);
+        await pool.query(`UPDATE leagues SET ${updates.join(', ')} WHERE id=$${i++} AND tenant_id=$${i++}`, vals);
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-402 patch league:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Create N team shells (each with a unique claim slug). Body: { count } or { names:[...] }.
+app.post('/api/t/:tenant_short_id/admin/leagues/:id/teams', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const lid = req.params.id;
+        if (!isValidUuid(lid)) return res.status(400).json({ error: 'invalid_id' });
+        const lr = await pool.query('SELECT short_id FROM leagues WHERE id=$1 AND tenant_id=$2', [lid, req.tenant.id]);
+        if (lr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const b = req.body || {};
+        let names = [];
+        if (Array.isArray(b.names) && b.names.length) {
+            names = b.names.map(n => String(n).trim()).filter(Boolean).slice(0, 32);
+        } else {
+            const count = Math.max(1, Math.min(32, parseInt(b.count, 10) || 0));
+            if (!count) return res.status(400).json({ error: 'provide names[] or count' });
+            const existing = await pool.query('SELECT COUNT(*)::int AS n FROM league_teams WHERE league_id=$1', [lid]);
+            const start = existing.rows[0].n;
+            for (let k = 0; k < count; k++) names.push(`Team ${start + k + 1}`);
+        }
+        const created = [];
+        for (const nm of names) {
+            const slug = _genClaimSlug(nm);
+            try {
+                const r = await pool.query(
+                    `INSERT INTO league_teams (league_id, name, claim_slug) VALUES ($1,$2,$3)
+                     RETURNING id, name, claim_slug`, [lid, nm, slug]);
+                created.push({
+                    id: r.rows[0].id, name: r.rows[0].name, claim_slug: r.rows[0].claim_slug,
+                    claim_url: `https://totalfooty.co.uk/claim-team.html?slug=${encodeURIComponent(r.rows[0].claim_slug)}`
+                });
+            } catch (ie) {
+                if (ie.code === '23505') continue; // duplicate name/slug — skip this one
+                throw ie;
+            }
+        }
+        await auditLog(pool, req.user.playerId, 'league_teams_created', null, `${created.length} team shells for league ${lr.rows[0].short_id}`, req.tenant.id);
+        res.status(201).json({ teams: created });
+    } catch (e) {
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-402 create teams:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// ─── PUBLIC / CAPTAIN (global) ───────────────────────────────────────────
+// Claim-page context (no auth — the page shows league + team, then prompts login).
+app.get('/api/leagues/teams/by-slug/:slug', async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT lt.id, lt.name, lt.bib_colour, lt.status, lt.claimed_at,
+                    l.id AS league_id, l.name AS league_name, l.short_id AS league_short_id,
+                    l.status AS league_status, l.start_date, l.format, l.team_count
+               FROM league_teams lt JOIN leagues l ON l.id = lt.league_id
+              WHERE lt.claim_slug = $1 LIMIT 1`, [req.params.slug]);
+        if (r.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const row = r.rows[0];
+        res.json({
+            team:   { id: row.id, name: row.name, bib_colour: row.bib_colour, status: row.status, claimed: !!row.claimed_at },
+            league: { id: row.league_id, name: row.league_name, short_id: row.league_short_id, status: row.league_status,
+                      start_date: row.start_date, format: row.format, team_count: row.team_count }
+        });
+    } catch (e) {
+        if (e.code === '42P01') return res.status(404).json({ error: 'not_found' });
+        console.error('FIX-402 by-slug:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Claim a team — the calling player becomes captain (atomic; one team per league).
+app.post('/api/leagues/teams/claim/:slug', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const tr = await client.query(
+            `SELECT id, league_id, claimed_at FROM league_teams WHERE claim_slug=$1 FOR UPDATE`, [req.params.slug]);
+        if (tr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        const team = tr.rows[0];
+        if (team.claimed_at) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'already_claimed' }); }
+        const dup = await client.query(
+            `SELECT 1 FROM league_teams WHERE league_id=$1 AND captain_player_id=$2 LIMIT 1`, [team.league_id, req.user.playerId]);
+        if (dup.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'already_captain_in_league' }); }
+        await client.query(
+            `UPDATE league_teams SET captain_player_id=$1, claimed_at=NOW(), status='active' WHERE id=$2`,
+            [req.user.playerId, team.id]);
+        await client.query(
+            `INSERT INTO league_team_players (league_team_id, player_id, is_captain) VALUES ($1,$2,TRUE)
+             ON CONFLICT (league_team_id, player_id) DO UPDATE SET is_captain=TRUE, status='active'`,
+            [team.id, req.user.playerId]);
+        await client.query('COMMIT');
+        res.json({ ok: true, team_id: team.id, league_id: team.league_id });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-402 claim:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// Edit a team's name + colour (captain OR superadmin OR the league tenant's tenant_admin).
+app.patch('/api/leagues/teams/:id', authenticateToken, async (req, res) => {
+    try {
+        const tid = req.params.id;
+        if (!isValidUuid(tid)) return res.status(400).json({ error: 'invalid_id' });
+        const tr = await pool.query(
+            `SELECT lt.id, lt.captain_player_id, l.tenant_id
+               FROM league_teams lt JOIN leagues l ON l.id = lt.league_id WHERE lt.id=$1`, [tid]);
+        if (tr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const team = tr.rows[0];
+        let allowed = (String(team.captain_player_id) === String(req.user.playerId)) || req.user.role === 'superadmin';
+        if (!allowed) {
+            const role = await _getTenantRole(req.user.playerId, team.tenant_id);
+            allowed = (role === 'tenant_admin');
+        }
+        if (!allowed) return res.status(403).json({ error: 'forbidden' });
+        const b = req.body || {};
+        const updates = []; const vals = []; let i = 1;
+        if (b.name !== undefined) {
+            const n = String(b.name).trim();
+            if (!n) return res.status(400).json({ error: 'name required' });
+            updates.push(`name=$${i++}`); vals.push(n);
+        }
+        if (b.bib_colour !== undefined) {
+            // FIX-410k (audit v3): validate hex -- bib_colour renders into inline style="".
+            const _bc = (b.bib_colour === null ? null : String(b.bib_colour).trim());
+            if (_bc && !/^#[0-9a-fA-F]{3,8}$/.test(_bc)) return res.status(400).json({ error: 'bib_colour must be a hex code like #ff0066' });
+            updates.push(`bib_colour=$${i++}`); vals.push(_bc);
+        }
+        if (!updates.length) return res.status(400).json({ error: 'no valid fields' });
+        vals.push(tid);
+        try {
+            await pool.query(`UPDATE league_teams SET ${updates.join(', ')} WHERE id=$${i++}`, vals);
+        } catch (ie) {
+            if (ie.code === '23505') return res.status(409).json({ error: 'name_taken' });
+            throw ie;
+        }
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-402 patch team:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-403 (Block N Phase 3): FIXTURE GENERATOR.
+// Generates league_fixtures rows (game_id NULL — games rows are wired in Phase 4).
+// round_robin → circle method (BYE for odd team counts; home/away swap on even
+// repeat-rounds). random_evenly → greedy even distribution with a rematch cap.
+// Scoped endpoint (superadmin OR tenant_admin via requireTenantAdmin).
+// ════════════════════════════════════════════════════════════════════════
+
+// Single round-robin via the circle method. Returns array of rounds; each round
+// is an array of [homeId, awayId] pairs. Odd N → a phantom BYE (that team rests).
+function _rrCircleRounds(teamIds) {
+    const teams = teamIds.slice();
+    if (teams.length % 2 !== 0) teams.push(null); // phantom BYE
+    const n = teams.length;
+    const arr = teams.slice();
+    const rounds = [];
+    for (let r = 0; r < n - 1; r++) {
+        const pairs = [];
+        for (let i = 0; i < n / 2; i++) {
+            const home = arr[i], away = arr[n - 1 - i];
+            if (home !== null && away !== null) pairs.push([home, away]);
+        }
+        rounds.push(pairs);
+        // rotate, keeping arr[0] fixed
+        const fixed = arr[0];
+        const rest = arr.slice(1);
+        rest.unshift(rest.pop());
+        arr.length = 0; arr.push(fixed, ...rest);
+    }
+    return rounds;
+}
+
+// Full round-robin honouring league.rounds (double/triple…). On even repeats,
+// swap home/away so each team gets a balanced split.
+function _roundRobinFixtures(teamIds, repeats) {
+    const out = []; // { home, away, round, seq }
+    let roundNo = 0;
+    for (let rep = 0; rep < repeats; rep++) {
+        const swap = (rep % 2 === 1);
+        const rounds = _rrCircleRounds(teamIds);
+        for (const round of rounds) {
+            roundNo++;
+            let seq = 0;
+            for (const [a, b] of round) {
+                seq++;
+                const home = swap ? b : a;
+                const away = swap ? a : b;
+                out.push({ home, away, round: roundNo, seq });
+            }
+        }
+    }
+    return out;
+}
+
+// Evenly-distributed random: each team plays gamesPerTeam games, no pair more
+// than ceil(G/(N-1))+1 times. Greedy with a guard; returns null if it can't
+// complete a valid even schedule (admin gets a clear error).
+function _evenlyRandomFixtures(teamIds, gamesPerTeam) {
+    const n = teamIds.length;
+    const G = gamesPerTeam;
+    if (n < 2 || G < 1) return null;
+    // FIX-410f (audit v2): an even per-team schedule is impossible when n*G is odd
+    // (handshake lemma). Refuse instead of silently returning a lopsided schedule
+    // where one team plays G-1 games.
+    if ((n * G) % 2 !== 0) return null;
+    const totalEdges = Math.floor((n * G) / 2);
+    if (totalEdges < 1) return null;
+    const remaining = {}; teamIds.forEach(t => { remaining[t] = G; });
+    const played = {}; // "a|b" -> count
+    const pkey = (a, b) => (a < b ? a + '|' + b : b + '|' + a);
+    const maxPair = Math.ceil(G / (n - 1)) + 1;
+    const fixtures = [];
+    let guard = totalEdges * 50;
+    while (fixtures.length < totalEdges && guard-- > 0) {
+        const withRem = teamIds.filter(t => remaining[t] > 0);
+        if (withRem.length < 2) break;
+        withRem.sort((x, y) => remaining[y] - remaining[x]);
+        const a = withRem[0];
+        const cands = withRem.filter(t => t !== a && (played[pkey(a, t)] || 0) < maxPair);
+        if (!cands.length) break;
+        cands.sort((x, y) => ((played[pkey(a, x)] || 0) - (played[pkey(a, y)] || 0)) || (Math.random() - 0.5));
+        const b = cands[0];
+        fixtures.push([a, b]);
+        remaining[a]--; remaining[b]--;
+        played[pkey(a, b)] = (played[pkey(a, b)] || 0) + 1;
+    }
+    if (fixtures.length < totalEdges) return null;
+    // Group into pseudo-rounds of floor(n/2) for date spacing.
+    const perRound = Math.max(1, Math.floor(n / 2));
+    return fixtures.map(([home, away], idx) => ({
+        home, away, round: Math.floor(idx / perRound) + 1, seq: (idx % perRound) + 1
+    }));
+}
+
+// FIX-405 (Block N Phase 4a): create the games row that backs a league fixture.
+// Replicates the known-good games INSERT with league values: regularity 'one-off'
+// (valid per line ~11080), team_selection_type 'league' (balancer skipped), no
+// venue/cost yet (editable per-fixture later), + league_id. Returns games.id.
+async function _createLeagueGameRow(client, leagueId, tenantId, scheduledAtISO) {
+    const gameUrl = crypto.randomBytes(8).toString('hex');
+    const r = await client.query(
+        `INSERT INTO games (
+            venue_id, game_date, max_players, cost_per_player, format, regularity,
+            exclusivity, position_type, game_url, series_id,
+            team_selection_type, tf_kit_color, opp_kit_color,
+            star_rating, star_rating_locked,
+            refs_required, ref_pay, requires_organiser,
+            early_bird_price, super_early_bird_price, opponent_id,
+            is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
+            tournament_team_count, tournament_name, external_opponent,
+            tenant_id, league_id
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)
+        RETURNING id`,
+        [
+            null, scheduledAtISO, 10, 0, '5-a-side', 'one-off',
+            'none', 'outfield_gk', gameUrl, null,
+            'league', null, null,
+            null, false,
+            0, 0, false,
+            null, null, null,
+            false, null, null,
+            null, null, null,
+            tenantId, leagueId
+        ]
+    );
+    return r.rows[0].id;
+}
+
+// POST generate fixtures (transactional). ?regenerate=true wipes existing
+// SCHEDULED fixtures first (refuses if any have been played).
+app.post('/api/t/:tenant_short_id/admin/leagues/:id/generate-fixtures', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const lid = req.params.id;
+        if (!isValidUuid(lid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const regenerate = String(req.query.regenerate || '') === 'true';
+        await client.query('BEGIN');
+
+        const lr = await client.query('SELECT id, format, rounds, games_per_team, status, start_date, cadence_days FROM leagues WHERE id=$1 AND tenant_id=$2 FOR UPDATE', [lid, req.tenant.id]);
+        if (lr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        const lg = lr.rows[0];
+        if (lg.status === 'completed' || lg.status === 'cancelled') {
+            await client.query('ROLLBACK'); return res.status(409).json({ error: 'league_' + lg.status });
+        }
+
+        // Existing fixtures?
+        const exist = await client.query('SELECT status FROM league_fixtures WHERE league_id=$1', [lid]);
+        if (exist.rows.length > 0) {
+            if (!regenerate) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'fixtures_exist', detail: 'Pass ?regenerate=true to rebuild.' }); }
+            const played = exist.rows.some(r => r.status !== 'scheduled');
+            if (played) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'fixtures_played', detail: 'Some fixtures already played — cannot regenerate.' }); }
+            // FIX-405: wipe the auto-created games rows (and any RSVPs) for the
+            // scheduled fixtures being rebuilt — otherwise we leak orphan games.
+            const wipe = await client.query(`SELECT game_id FROM league_fixtures WHERE league_id=$1 AND status='scheduled' AND game_id IS NOT NULL`, [lid]);
+            const wipeIds = wipe.rows.map(rw => rw.game_id);
+            await client.query('DELETE FROM league_fixtures WHERE league_id=$1 AND status=$2', [lid, 'scheduled']);
+            if (wipeIds.length) {
+                await client.query('DELETE FROM registrations WHERE game_id = ANY($1::uuid[])', [wipeIds]);
+                await client.query('DELETE FROM games WHERE id = ANY($1::uuid[])', [wipeIds]);
+            }
+        }
+
+        // Teams (non-dropped). Need ≥ 2.
+        const tr = await client.query(`SELECT id FROM league_teams WHERE league_id=$1 AND status NOT IN ('dropped','replaced') ORDER BY created_at ASC`, [lid]);
+        const teamIds = tr.rows.map(r => r.id);
+        if (teamIds.length < 2) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'need_two_teams' }); }
+
+        // Generate.
+        let plan;
+        if (lg.format === 'random_evenly') {
+            const G = parseInt(lg.games_per_team, 10);
+            if (!Number.isFinite(G) || G < 1) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'games_per_team_required' }); }
+            plan = _evenlyRandomFixtures(teamIds, G);
+            if (!plan) { await client.query('ROLLBACK'); return res.status(422).json({ error: 'cannot_distribute', detail: 'No valid even schedule for those settings — adjust games_per_team or team count.' }); }
+        } else {
+            const repeats = Math.max(1, Math.min(10, parseInt(lg.rounds, 10) || 1));
+            plan = _roundRobinFixtures(teamIds, repeats);
+        }
+
+        // Dates: each round on start_date + (round-1) * cadence_days.
+        const start = new Date(lg.start_date);
+        const cadence = Math.max(1, parseInt(lg.cadence_days, 10) || 7);
+        let inserted = 0;
+        for (const fx of plan) {
+            const dt = new Date(start.getTime());
+            dt.setUTCDate(dt.getUTCDate() + (fx.round - 1) * cadence);
+            // FIX-405: auto-create the games row that powers RSVP/payments/awards.
+            const gameId = await _createLeagueGameRow(client, lid, req.tenant.id, dt.toISOString());
+            await client.query(
+                `INSERT INTO league_fixtures (league_id, home_team_id, away_team_id, round_number, sequence_in_round, scheduled_at, status, game_id)
+                 VALUES ($1,$2,$3,$4,$5,$6,'scheduled',$7)`,
+                [lid, fx.home, fx.away, fx.round, fx.seq, dt.toISOString(), gameId]
+            );
+            inserted++;
+        }
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'league_fixtures_generated', null, `${inserted} fixtures for league ${lid} (${lg.format})`, req.tenant.id).catch(() => {});
+        res.status(201).json({ ok: true, fixtures_created: inserted, format: lg.format });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-403 generate-fixtures:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// Admin fixtures list (joined with team names) — ordered by round then sequence.
+app.get('/api/t/:tenant_short_id/admin/leagues/:id/fixtures', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const lid = req.params.id;
+        if (!isValidUuid(lid)) return res.status(400).json({ error: 'invalid_id' });
+        const own = await pool.query('SELECT 1 FROM leagues WHERE id=$1 AND tenant_id=$2', [lid, req.tenant.id]);
+        if (own.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const r = await pool.query(
+            `SELECT f.id, f.round_number, f.sequence_in_round, f.scheduled_at, f.status,
+                    f.home_score, f.away_score, f.game_id,
+                    h.name AS home_name, a.name AS away_name
+               FROM league_fixtures f
+               JOIN league_teams h ON h.id = f.home_team_id
+               JOIN league_teams a ON a.id = f.away_team_id
+              WHERE f.league_id = $1
+              ORDER BY f.round_number ASC, f.sequence_in_round ASC`, [lid]);
+        res.json({ fixtures: r.rows });
+    } catch (e) {
+        if (e.code === '42P01') return res.json({ fixtures: [] });
+        console.error('FIX-403 fixtures list:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-404 (Block N Phase 5): public league page payload.
+// GET /api/public/leagues/:short_id → meta + live table (standings) + fixtures
+// (by round) + teams. Public (no auth). Powers league.html. Standings include
+// only status='active' teams (dropped teams disappear cleanly per the drop spec).
+// ════════════════════════════════════════════════════════════════════════
+// FIX-410h (audit v2): standings tie-break ordering. Primary is always points DESC.
+// After that, the league's tiebreak_order (e.g. 'h2h,goal_diff,goals_for' or
+// 'goal_diff,h2h,goals_for') is applied in order, then a deterministic per-league
+// random fallback so the table is stable across page loads. Head-to-head is computed
+// RELATIVE to the currently-tied group (confirmed fixtures among only those teams);
+// a tied group with no games among themselves skips H2H and falls through.
+function _orderLeagueStandings(rows, confirmedFixtures, lg) {
+    const pw = lg.points_for_win, pd = lg.points_for_draw, pl = lg.points_for_loss;
+    const allowed = ['h2h', 'goal_diff', 'goals_for'];
+    let crits = String(lg.tiebreak_order || 'goal_diff,goals_for')
+        .split(',').map(s => s.trim()).filter(c => allowed.includes(c));
+    if (!crits.includes('goal_diff')) crits.push('goal_diff');
+    if (!crits.includes('goals_for')) crits.push('goals_for');
+    crits.push('random');
+
+    const seedRank = (teamId) => {
+        let h = 2166136261; const s = String(lg.id) + ':' + String(teamId);
+        for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+        return (h >>> 0);
+    };
+    const h2hStats = (ids) => {
+        const set = new Set(ids.map(String));
+        const acc = {}; ids.forEach(id => { acc[String(id)] = { pts: 0, gd: 0, gf: 0, played: 0 }; });
+        for (const f of confirmedFixtures) {
+            const ht = String(f.home_team_id), at = String(f.away_team_id);
+            if (!set.has(ht) || !set.has(at)) continue;
+            const hs = Number(f.home_score), as = Number(f.away_score);
+            const H = acc[ht], A = acc[at];
+            H.played++; A.played++; H.gf += hs; A.gf += as; H.gd += (hs - as); A.gd += (as - hs);
+            if (hs > as) { H.pts += pw; A.pts += pl; }
+            else if (hs < as) { A.pts += pw; H.pts += pl; }
+            else { H.pts += pd; A.pts += pd; }
+        }
+        return acc;
+    };
+    const cmpDesc = (a, b) => {
+        if (Array.isArray(a)) { for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return b[i] - a[i]; } return 0; }
+        return b - a;
+    };
+    const resolve = (group, depth) => {
+        if (group.length <= 1 || depth >= crits.length) return group;
+        const c = crits[depth];
+        let keyed;
+        if (c === 'goal_diff') keyed = group.map(t => ({ t, k: Number(t.gd) }));
+        else if (c === 'goals_for') keyed = group.map(t => ({ t, k: Number(t.gf) }));
+        else if (c === 'random') keyed = group.map(t => ({ t, k: seedRank(t.team_id) }));
+        else if (c === 'h2h') {
+            const ids = group.map(t => t.team_id);
+            const hh = h2hStats(ids);
+            if (!ids.some(id => hh[String(id)].played > 0)) return resolve(group, depth + 1);
+            keyed = group.map(t => { const x = hh[String(t.team_id)]; return { t, k: [x.pts, x.gd, x.gf] }; });
+        } else return resolve(group, depth + 1);
+        keyed.sort((a, b) => cmpDesc(a.k, b.k));
+        const out = []; let i = 0;
+        while (i < keyed.length) {
+            let j = i + 1;
+            while (j < keyed.length && cmpDesc(keyed[i].k, keyed[j].k) === 0) j++;
+            const sub = keyed.slice(i, j).map(x => x.t);
+            out.push(...(sub.length > 1 ? resolve(sub, depth + 1) : sub));
+            i = j;
+        }
+        return out;
+    };
+    const sorted = rows.slice().sort((a, b) => Number(b.points) - Number(a.points));
+    const result = []; let i = 0;
+    while (i < sorted.length) {
+        let j = i + 1;
+        while (j < sorted.length && Number(sorted[j].points) === Number(sorted[i].points)) j++;
+        const group = sorted.slice(i, j);
+        result.push(...(group.length > 1 ? resolve(group, 0) : group));
+        i = j;
+    }
+    return result;
+}
+
+app.get('/api/public/leagues/:short_id', async (req, res) => {
+    try {
+        const sid = String(req.params.short_id || '').trim();
+        const lr = await pool.query(
+            `SELECT l.id, l.short_id, l.name, l.description, l.logo_url, l.primary_color, l.status,
+                    l.format, l.rounds, l.start_date, l.team_count,
+                    l.points_for_win, l.points_for_draw, l.points_for_loss, l.tiebreak_order,
+                    t.name AS tenant_name
+               FROM leagues l JOIN tenants t ON t.id = l.tenant_id
+              WHERE l.short_id = $1 LIMIT 1`, [sid]);
+        if (lr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const lg = lr.rows[0];
+        if (lg.status === 'cancelled') return res.status(404).json({ error: 'not_found' });
+
+        // Standings (active teams only; points from the league's own config).
+        const tableR = await pool.query(
+            `WITH team_stats AS (
+                SELECT t.id AS team_id, t.name, t.bib_colour,
+                       COUNT(f.id) FILTER (WHERE f.status='confirmed')::int AS played,
+                       SUM(CASE WHEN f.status='confirmed' AND
+                                ((f.home_team_id=t.id AND f.home_score>f.away_score)
+                              OR (f.away_team_id=t.id AND f.away_score>f.home_score)) THEN 1 ELSE 0 END)::int AS won,
+                       SUM(CASE WHEN f.status='confirmed' AND f.home_score=f.away_score THEN 1 ELSE 0 END)::int AS drawn,
+                       SUM(CASE WHEN f.status='confirmed' AND
+                                ((f.home_team_id=t.id AND f.home_score<f.away_score)
+                              OR (f.away_team_id=t.id AND f.away_score<f.home_score)) THEN 1 ELSE 0 END)::int AS lost,
+                       SUM(CASE WHEN f.home_team_id=t.id THEN COALESCE(f.home_score,0)
+                                WHEN f.away_team_id=t.id THEN COALESCE(f.away_score,0) ELSE 0 END)::int AS gf,
+                       SUM(CASE WHEN f.home_team_id=t.id THEN COALESCE(f.away_score,0)
+                                WHEN f.away_team_id=t.id THEN COALESCE(f.home_score,0) ELSE 0 END)::int AS ga
+                  FROM league_teams t
+                  LEFT JOIN league_fixtures f
+                    ON (f.home_team_id=t.id OR f.away_team_id=t.id) AND f.status='confirmed'
+                 WHERE t.league_id=$1 AND t.status='active'
+                 GROUP BY t.id, t.name, t.bib_colour
+             )
+             SELECT team_id, name, bib_colour, played, won, drawn, lost, gf, ga,
+                    (won*$2 + drawn*$3 + lost*$4) AS points,
+                    (gf - ga) AS gd
+               FROM team_stats
+              ORDER BY points DESC, gd DESC, gf DESC, name ASC`,
+            [lg.id, lg.points_for_win, lg.points_for_draw, lg.points_for_loss]);
+
+        // FIX-410h: confirmed head-to-head fixtures (for relative H2H tie-breaks).
+        const h2hR = await pool.query(
+            `SELECT home_team_id, away_team_id, home_score, away_score
+               FROM league_fixtures
+              WHERE league_id=$1 AND status='confirmed' AND home_score IS NOT NULL AND away_score IS NOT NULL`, [lg.id]);
+
+        // Teams (all non-replaced, incl. dropped flag for context) + captain + roster size.
+        const teamsR = await pool.query(
+            `SELECT lt.id, lt.name, lt.bib_colour, lt.status, lt.claimed_at,
+                    p.alias AS captain_name,
+                    (SELECT COUNT(*)::int FROM league_team_players ltp
+                      WHERE ltp.league_team_id = lt.id AND ltp.status='active') AS roster_count
+               FROM league_teams lt
+               LEFT JOIN players p ON p.id = lt.captain_player_id
+              WHERE lt.league_id=$1 AND lt.status <> 'replaced'
+              ORDER BY lt.created_at ASC`, [lg.id]);
+
+        // Fixtures (by round) with team names + colours.
+        const fixR = await pool.query(
+            `SELECT f.id, f.round_number, f.sequence_in_round, f.scheduled_at, f.status,
+                    f.home_score, f.away_score, f.game_id,
+                    h.name AS home_name, h.bib_colour AS home_bib, h.status AS home_status,
+                    a.name AS away_name, a.bib_colour AS away_bib, a.status AS away_status
+               FROM league_fixtures f
+               JOIN league_teams h ON h.id = f.home_team_id
+               JOIN league_teams a ON a.id = f.away_team_id
+              WHERE f.league_id=$1
+              ORDER BY f.round_number ASC, f.sequence_in_round ASC`, [lg.id]);
+
+        res.json({
+            league: {
+                id: lg.id, short_id: lg.short_id, name: lg.name, description: lg.description,
+                logo_url: lg.logo_url, primary_color: lg.primary_color, status: lg.status,
+                format: lg.format, rounds: lg.rounds, start_date: lg.start_date, team_count: lg.team_count,
+                tenant_name: lg.tenant_name
+            },
+            table: _orderLeagueStandings(tableR.rows, h2hR.rows, lg),
+            teams: teamsR.rows,
+            fixtures: fixR.rows
+        });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.status(404).json({ error: 'not_found' }); // pre-migration
+        console.error('FIX-404 public league:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-406 (Block N Phase 2): ROSTER MANAGEMENT.
+// Captain (already claimed via claim-team.html) shares ONE stable invite link;
+// players join directly or are prompted to sign up first. Unlimited squad size.
+// Captain removes players; players can leave themselves. Same-league dual
+// membership blocked. Captain can't be removed / can't self-leave.
+// ════════════════════════════════════════════════════════════════════════
+
+// ── MOBILE PARITY (Block N): authed league context for a game ──────────────
+// The web game.html reads the league block off the PUBLIC details endpoint, but
+// the React Native app loads games via the AUTHED /api/games/:id. This dedicated
+// endpoint returns the same league block (banner + fixed home/away rosters with
+// per-player availability) so the app's GameDetailScreen can render the league
+// branch and skip the balancer. Returns { league: null } for normal games.
+app.get('/api/games/:id/league-context', authenticateToken, async (req, res) => {
+    try {
+        const gid = parseInt(req.params.id, 10);
+        if (!Number.isInteger(gid)) return res.status(400).json({ error: 'bad id' });
+        const gr = await pool.query('SELECT id, league_id FROM games WHERE id = $1', [gid]);
+        if (!gr.rows.length) return res.status(404).json({ error: 'not found' });
+        const game = gr.rows[0];
+        if (!game.league_id) return res.json({ league: null });
+        const _lq = await pool.query(
+            `SELECT l.id, l.short_id, l.name, l.status, l.primary_color,
+                    f.round_number, f.status AS fixture_status, f.home_score, f.away_score,
+                    h.id AS home_id, h.name AS home_name, h.bib_colour AS home_colour,
+                    a.id AS away_id, a.name AS away_name, a.bib_colour AS away_colour
+               FROM leagues l
+               JOIN league_fixtures f ON f.league_id = l.id AND f.game_id = $1
+               JOIN league_teams h ON h.id = f.home_team_id
+               JOIN league_teams a ON a.id = f.away_team_id
+              WHERE l.id = $2 LIMIT 1`, [game.id, game.league_id]);
+        if (!_lq.rows.length) return res.json({ league: null });
+        const lx = _lq.rows[0];
+        const block = {
+            id: lx.id, short_id: lx.short_id, name: lx.name, status: lx.status, primary_color: lx.primary_color,
+            round: lx.round_number, fixture_status: lx.fixture_status,
+            home_score: lx.home_score, away_score: lx.away_score,
+            home_team: { id: lx.home_id, name: lx.home_name, bib_colour: lx.home_colour },
+            away_team: { id: lx.away_id, name: lx.away_name, bib_colour: lx.away_colour }
+        };
+        const _rq = await pool.query(
+            `SELECT ltp.league_team_id, ltp.player_id, ltp.is_captain, p.alias,
+                    EXISTS(SELECT 1 FROM registrations r WHERE r.game_id=$1 AND r.player_id=ltp.player_id AND r.status IN ('confirmed','rsvp')) AS available
+               FROM league_team_players ltp JOIN players p ON p.id = ltp.player_id
+              WHERE ltp.league_team_id IN ($2,$3) AND ltp.status='active'
+              ORDER BY ltp.is_captain DESC, p.alias ASC`,
+            [game.id, lx.home_id, lx.away_id]);
+        const _map = (teamId) => _rq.rows.filter(r => String(r.league_team_id) === String(teamId))
+            .map(r => ({ player_id: r.player_id, alias: r.alias, is_captain: r.is_captain, available: r.available }));
+        block.home_roster = _map(lx.home_id);
+        block.away_roster = _map(lx.away_id);
+        res.json({ league: block });
+    } catch (e) {
+        if (e.code === '42P01') return res.json({ league: null });
+        console.error('league-context (mobile):', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// FIX-410b (Block N Phase 6 online): a player's own unpaid league split shares,
+// for the "what you owe" list + pay button (pays via the split-aware initiate).
+app.get('/api/leagues/my-dues', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT s.id AS split_id, s.amount_owed_pence, s.amount_paid_pence,
+                    f.scheduled_at, l.name AS league_name, myt.name AS team_name,
+                    opp.name AS opponent_name
+               FROM league_payments_split s
+               JOIN league_fixtures f ON f.id = s.fixture_id
+               JOIN leagues l ON l.id = f.league_id
+               JOIN league_teams myt ON myt.id = s.league_team_id
+               JOIN league_teams opp ON opp.id = (CASE WHEN f.home_team_id = s.league_team_id THEN f.away_team_id ELSE f.home_team_id END)
+              WHERE s.player_id = $1 AND s.amount_owed_pence > 0 AND s.amount_paid_pence < s.amount_owed_pence
+                AND f.status <> 'cancelled'
+              ORDER BY f.scheduled_at ASC`, [req.user.playerId]);
+        res.json({ dues: r.rows });
+    } catch (e) {
+        if (e.code === '42P01') return res.json({ dues: [] });
+        console.error('FIX-410b my-dues:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// FIX-410g (audit v2): pay a league share from WALLET — free-credit-first then real
+// (mirrors applyGameFee, the normal game-fee path). Partial allowed: applies whatever
+// the wallet covers; the remainder is left for the bank top-up (split-aware initiate
+// now charges amount_owed - amount_paid). Wallet drains only on this explicit action,
+// so there is no abandoned-payment mess.
+app.post('/api/leagues/my-dues/:split_id/pay-wallet', authenticateToken, async (req, res) => {
+    const splitId = req.params.split_id;
+    if (!isValidUuid(splitId)) return res.status(400).json({ error: 'invalid_id' });
+    const playerId = req.user.playerId;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const sr = await client.query(
+            `SELECT s.id, s.player_id, s.amount_owed_pence, s.amount_paid_pence, f.status
+               FROM league_payments_split s
+               JOIN league_fixtures f ON f.id = s.fixture_id
+              WHERE s.id = $1 FOR UPDATE OF s`,
+            [splitId]);
+        if (sr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'share_not_found' }); }
+        const sp = sr.rows[0];
+        if (String(sp.player_id) !== String(playerId)) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'not_your_share' }); }
+        if (sp.status === 'cancelled') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'fixture_cancelled' }); }
+        const remaining = sp.amount_owed_pence - sp.amount_paid_pence;
+        if (remaining <= 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'already_paid' }); }
+
+        // Wallet = free credit + real balance (pence-accurate).
+        // FIX-410k (audit v3): lock the wallet row FOR UPDATE so two concurrent
+        // wallet spends by the SAME player (double-tap, two tabs, or two different
+        // shares) serialize here. Without the lock both read the same balance, both
+        // call applyGameFee, and the second drives credits.balance negative once the
+        // first commits (applyGameFee has no overdraft guard of its own).
+        const wr = await client.query(
+            `SELECT COALESCE(balance,0) AS balance, COALESCE(free_credit_balance,0) AS free_credit_balance
+               FROM credits WHERE player_id = $1 FOR UPDATE`, [playerId]);
+        const realP = Math.round(parseFloat(wr.rows[0]?.balance || 0) * 100);
+        const freeP = Math.round(parseFloat(wr.rows[0]?.free_credit_balance || 0) * 100);
+        const applyP = Math.min(realP + freeP, remaining);
+
+        if (applyP > 0) {
+            // applyGameFee drains free-first then real; applyP <= wallet so no overdraft.
+            await applyGameFee(client, playerId, applyP / 100, 'League match-fee share');
+            const newPaid = sp.amount_paid_pence + applyP;
+            const fully = newPaid >= sp.amount_owed_pence;
+            const method = fully ? (sp.amount_paid_pence > 0 ? 'mixed' : 'wallet') : 'wallet';
+            await client.query(
+                `UPDATE league_payments_split
+                    SET amount_paid_pence = $2,
+                        payment_method = $3,
+                        paid_at = CASE WHEN $4 THEN NOW() ELSE paid_at END
+                  WHERE id = $1`,
+                [splitId, newPaid, method, fully]);
+        }
+        await client.query('COMMIT');
+
+        const stillOwed = remaining - applyP;
+        return res.json({
+            paid: stillOwed <= 0,
+            applied_pence: applyP,
+            remaining_pence: stillOwed,
+            remaining_below_min: stillOwed > 0 && stillOwed < 100,
+            message: stillOwed <= 0
+                ? `Paid £${(applyP/100).toFixed(2)} from your balance — share settled`
+                : `£${(applyP/100).toFixed(2)} applied from balance · remaining top-up required £${(stillOwed/100).toFixed(2)}`
+        });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-410g pay-wallet:', e.message);
+        return res.status(500).json({ error: 'failed' });
+    } finally {
+        try { client.release(); } catch (_) {}
+    }
+});
+
+// Lazily mint a stable per-team invite slug (readable stub + unguessable suffix).
+async function _ensureInviteSlug(teamId, teamName) {
+    const cur = await pool.query('SELECT invite_slug FROM league_teams WHERE id=$1', [teamId]);
+    if (cur.rows.length && cur.rows[0].invite_slug) return cur.rows[0].invite_slug;
+    for (let attempt = 0; attempt < 6; attempt++) {
+        let stub = 'team';
+        try { stub = (_fix322Slugify(teamName || 'team') || 'team').slice(0, 20); } catch (_) {}
+        const slug = 'join-' + stub + '-' + crypto.randomBytes(6).toString('base64url');
+        try {
+            const u = await pool.query('UPDATE league_teams SET invite_slug=$1 WHERE id=$2 AND invite_slug IS NULL RETURNING invite_slug', [slug, teamId]);
+            if (u.rows.length) return u.rows[0].invite_slug;
+            const again = await pool.query('SELECT invite_slug FROM league_teams WHERE id=$1', [teamId]);
+            if (again.rows.length && again.rows[0].invite_slug) return again.rows[0].invite_slug;
+        } catch (e) { if (e.code !== '23505') throw e; }
+    }
+    return null;
+}
+
+// Teams the calling player is in (captain or member).
+app.get('/api/leagues/my-teams', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT lt.id, lt.name, lt.bib_colour, lt.status,
+                    (lt.captain_player_id = $1) AS is_captain,
+                    l.id AS league_id, l.short_id AS league_short_id, l.name AS league_name, l.status AS league_status,
+                    (SELECT COUNT(*)::int FROM league_team_players x WHERE x.league_team_id=lt.id AND x.status='active') AS roster_count
+               FROM league_team_players ltp
+               JOIN league_teams lt ON lt.id = ltp.league_team_id
+               JOIN leagues l ON l.id = lt.league_id
+              WHERE ltp.player_id = $1 AND ltp.status='active' AND lt.status <> 'replaced'
+              ORDER BY l.created_at DESC`, [req.user.playerId]);
+        res.json({ teams: r.rows });
+    } catch (e) {
+        if (e.code === '42P01') return res.json({ teams: [] });
+        console.error('FIX-406 my-teams:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Captain/admin team-management view: roster + the shareable invite link.
+app.get('/api/leagues/teams/:id/manage', authenticateToken, async (req, res) => {
+    try {
+        const tid = req.params.id;
+        if (!isValidUuid(tid)) return res.status(400).json({ error: 'invalid_id' });
+        const tr = await pool.query(
+            `SELECT lt.id, lt.name, lt.bib_colour, lt.status, lt.captain_player_id, lt.invite_slug,
+                    l.tenant_id, l.short_id AS league_short_id, l.name AS league_name
+               FROM league_teams lt JOIN leagues l ON l.id = lt.league_id WHERE lt.id=$1`, [tid]);
+        if (tr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const team = tr.rows[0];
+        const isCaptain = String(team.captain_player_id) === String(req.user.playerId);
+        let allowed = isCaptain || req.user.role === 'superadmin';
+        if (!allowed) { const role = await _getTenantRole(req.user.playerId, team.tenant_id); allowed = (role === 'tenant_admin'); }
+        if (!allowed) return res.status(403).json({ error: 'forbidden' });
+        let inviteSlug = team.invite_slug || await _ensureInviteSlug(tid, team.name);
+        const roster = await pool.query(
+            `SELECT ltp.player_id, ltp.is_captain, ltp.joined_at, p.alias, p.photo_url
+               FROM league_team_players ltp JOIN players p ON p.id = ltp.player_id
+              WHERE ltp.league_team_id=$1 AND ltp.status='active'
+              ORDER BY ltp.is_captain DESC, ltp.joined_at ASC`, [tid]);
+        // FIX-410 (Phase 6): the team's fixtures + per-fixture bill/paid summary.
+        const fixtures = await pool.query(
+            `SELECT f.id, f.scheduled_at, f.status, f.round_number,
+                    CASE WHEN f.home_team_id=$1 THEN a.name ELSE h.name END AS opponent_name,
+                    g.cost_per_player,
+                    (SELECT COUNT(*)::int FROM league_team_players x WHERE x.league_team_id=$1 AND x.status='active') AS squad_size,
+                    COALESCE((SELECT SUM(amount_owed_pence) FROM league_payments_split sp WHERE sp.fixture_id=f.id AND sp.league_team_id=$1),0)::int AS split_owed,
+                    COALESCE((SELECT SUM(amount_paid_pence) FROM league_payments_split sp WHERE sp.fixture_id=f.id AND sp.league_team_id=$1),0)::int AS split_paid
+               FROM league_fixtures f
+               JOIN league_teams h ON h.id=f.home_team_id
+               JOIN league_teams a ON a.id=f.away_team_id
+               LEFT JOIN games g ON g.id=f.game_id
+              WHERE (f.home_team_id=$1 OR f.away_team_id=$1) AND f.status <> 'cancelled'
+              ORDER BY f.round_number ASC, f.sequence_in_round ASC`, [tid]);
+        const fixturesOut = fixtures.rows.map(r => {
+            const costPence = Math.round((parseFloat(r.cost_per_player) || 0) * 100);
+            return {
+                id: r.id, opponent_name: r.opponent_name, scheduled_at: r.scheduled_at, status: r.status,
+                cost_per_player_pence: costPence, total_pence: costPence * (r.squad_size || 0),
+                split_owed_pence: r.split_owed, split_paid_pence: r.split_paid
+            };
+        });
+        res.json({
+            team: { id: team.id, name: team.name, bib_colour: team.bib_colour, status: team.status, is_captain: isCaptain },
+            league: { short_id: team.league_short_id, name: team.league_name },
+            invite_slug: inviteSlug,
+            invite_url: inviteSlug ? `https://totalfooty.co.uk/join-team.html?slug=${encodeURIComponent(inviteSlug)}` : null,
+            roster: roster.rows,
+            fixtures: fixturesOut
+        });
+    } catch (e) {
+        console.error('FIX-406 manage:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Public join-page context (by invite slug).
+app.get('/api/leagues/teams/invite/:invite_slug', async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT lt.id, lt.name, lt.bib_colour, lt.status,
+                    l.name AS league_name, l.short_id AS league_short_id, l.status AS league_status, l.team_count, l.format,
+                    (SELECT COUNT(*)::int FROM league_team_players x WHERE x.league_team_id=lt.id AND x.status='active') AS roster_count
+               FROM league_teams lt JOIN leagues l ON l.id = lt.league_id
+              WHERE lt.invite_slug=$1 LIMIT 1`, [req.params.invite_slug]);
+        if (r.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const row = r.rows[0];
+        res.json({
+            team: { id: row.id, name: row.name, bib_colour: row.bib_colour, status: row.status, roster_count: row.roster_count },
+            league: { name: row.league_name, short_id: row.league_short_id, status: row.league_status, team_count: row.team_count, format: row.format }
+        });
+    } catch (e) {
+        if (e.code === '42P01') return res.status(404).json({ error: 'not_found' });
+        console.error('FIX-406 invite ctx:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Join a team via its invite link (caller becomes a roster member).
+app.post('/api/leagues/teams/invite/:invite_slug/join', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const tr = await client.query(`SELECT id, league_id, status FROM league_teams WHERE invite_slug=$1 FOR UPDATE`, [req.params.invite_slug]);
+        if (tr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        const team = tr.rows[0];
+        if (team.status === 'dropped' || team.status === 'replaced') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'team_unavailable' }); }
+        const other = await client.query(
+            `SELECT 1 FROM league_team_players ltp JOIN league_teams lt ON lt.id=ltp.league_team_id
+              WHERE lt.league_id=$1 AND ltp.player_id=$2 AND ltp.status='active' AND lt.id<>$3 LIMIT 1`,
+            [team.league_id, req.user.playerId, team.id]);
+        if (other.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'already_in_league' }); }
+        await client.query(
+            `INSERT INTO league_team_players (league_team_id, player_id, is_captain, status)
+             VALUES ($1,$2,FALSE,'active')
+             ON CONFLICT (league_team_id, player_id) DO UPDATE SET status='active', left_at=NULL`,
+            [team.id, req.user.playerId]);
+        await client.query('COMMIT');
+        res.json({ ok: true, team_id: team.id, league_id: team.league_id });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-406 join:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// Captain/admin removes a roster player (not the captain).
+app.delete('/api/leagues/teams/:id/players/:playerId', authenticateToken, async (req, res) => {
+    try {
+        const tid = req.params.id, pid = req.params.playerId;
+        if (!isValidUuid(tid) || !isValidUuid(pid)) return res.status(400).json({ error: 'invalid_id' });
+        const tr = await pool.query(`SELECT lt.captain_player_id, l.tenant_id FROM league_teams lt JOIN leagues l ON l.id=lt.league_id WHERE lt.id=$1`, [tid]);
+        if (tr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        const team = tr.rows[0];
+        if (String(pid) === String(team.captain_player_id)) return res.status(409).json({ error: 'cannot_remove_captain' });
+        let allowed = String(team.captain_player_id) === String(req.user.playerId) || req.user.role === 'superadmin';
+        if (!allowed) { const role = await _getTenantRole(req.user.playerId, team.tenant_id); allowed = (role === 'tenant_admin'); }
+        if (!allowed) return res.status(403).json({ error: 'forbidden' });
+        await pool.query(`UPDATE league_team_players SET status='removed', left_at=NOW() WHERE league_team_id=$1 AND player_id=$2`, [tid, pid]);
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-406 remove:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Player leaves a team themselves (captain can't — they'd need to drop the team).
+app.post('/api/leagues/teams/:id/leave', authenticateToken, async (req, res) => {
+    try {
+        const tid = req.params.id;
+        if (!isValidUuid(tid)) return res.status(400).json({ error: 'invalid_id' });
+        const tr = await pool.query('SELECT captain_player_id FROM league_teams WHERE id=$1', [tid]);
+        if (tr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+        if (String(tr.rows[0].captain_player_id) === String(req.user.playerId)) return res.status(409).json({ error: 'captain_cannot_leave' });
+        await pool.query(`UPDATE league_team_players SET status='left', left_at=NOW() WHERE league_team_id=$1 AND player_id=$2`, [tid, req.user.playerId]);
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-406 leave:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-408 (Block N Phase 7): SCORE CONFIRMATION + fixture admin tools.
+// Scoped (superadmin OR tenant_admin). Confirming a fixture sets its score +
+// status='confirmed' → the league.html standings recompute (they read confirmed
+// fixtures). Admin can ALWAYS confirm regardless of payment state (Mitchell's rule).
+// ════════════════════════════════════════════════════════════════════════
+
+// Confirm a fixture's result.
+app.post('/api/t/:tenant_short_id/admin/league-fixtures/:id/confirm-score', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) return res.status(400).json({ error: 'invalid_id' });
+        const hs = parseInt(req.body && req.body.home_score, 10);
+        const as = parseInt(req.body && req.body.away_score, 10);
+        if (!Number.isInteger(hs) || !Number.isInteger(as) || hs < 0 || as < 0 || hs > 99 || as > 99) {
+            return res.status(400).json({ error: 'invalid_score' });
+        }
+        const fr = await pool.query(`SELECT l.tenant_id FROM league_fixtures f JOIN leagues l ON l.id=f.league_id WHERE f.id=$1`, [fid]);
+        if (fr.rows.length === 0 || String(fr.rows[0].tenant_id) !== String(req.tenant.id)) return res.status(404).json({ error: 'not_found' });
+        const upd = await pool.query(
+            `UPDATE league_fixtures SET home_score=$1, away_score=$2, status='confirmed', confirmed_at=NOW(), confirmed_by=$3
+              WHERE id=$4 AND status <> 'cancelled' RETURNING id`,
+            [hs, as, req.user.playerId, fid]);
+        if (upd.rowCount === 0) return res.status(409).json({ error: 'fixture_not_confirmable' }); // FIX-410d: a cancelled fixture can't be (re)scored
+        await auditLog(pool, req.user.playerId, 'league_score_confirmed', null, `Fixture ${fid}: ${hs}-${as}`, req.tenant.id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-408 confirm-score:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Undo a confirmation (wrong score) — back to scheduled, scores cleared.
+app.post('/api/t/:tenant_short_id/admin/league-fixtures/:id/reopen', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) return res.status(400).json({ error: 'invalid_id' });
+        const fr = await pool.query(`SELECT l.tenant_id FROM league_fixtures f JOIN leagues l ON l.id=f.league_id WHERE f.id=$1`, [fid]);
+        if (fr.rows.length === 0 || String(fr.rows[0].tenant_id) !== String(req.tenant.id)) return res.status(404).json({ error: 'not_found' });
+        const upd = await pool.query(`UPDATE league_fixtures SET status='scheduled', home_score=NULL, away_score=NULL, confirmed_at=NULL, confirmed_by=NULL WHERE id=$1 AND status='confirmed' RETURNING id`, [fid]);
+        if (upd.rowCount === 0) return res.status(409).json({ error: 'fixture_not_reopenable' }); // FIX-410d: only undo a real confirmation; never resurrect a cancelled fixture
+        await auditLog(pool, req.user.playerId, 'league_score_reopened', null, `Fixture ${fid}`, req.tenant.id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-408 reopen:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Postpone — reschedule to a new date (and sync the linked games row's date).
+app.post('/api/t/:tenant_short_id/admin/league-fixtures/:id/postpone', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) return res.status(400).json({ error: 'invalid_id' });
+        const when = (req.body && req.body.scheduled_at) ? new Date(req.body.scheduled_at) : null;
+        if (!when || isNaN(when.getTime())) return res.status(400).json({ error: 'invalid_date' });
+        const fr = await pool.query(`SELECT f.game_id, l.tenant_id FROM league_fixtures f JOIN leagues l ON l.id=f.league_id WHERE f.id=$1`, [fid]);
+        if (fr.rows.length === 0 || String(fr.rows[0].tenant_id) !== String(req.tenant.id)) return res.status(404).json({ error: 'not_found' });
+        const upd = await pool.query(`UPDATE league_fixtures SET scheduled_at=$1, status='scheduled', home_score=NULL, away_score=NULL, confirmed_at=NULL, confirmed_by=NULL WHERE id=$2 AND status NOT IN ('confirmed','cancelled') RETURNING id`, [when.toISOString(), fid]);
+        if (upd.rowCount === 0) return res.status(409).json({ error: 'fixture_not_postponable' }); // FIX-410d: don't wipe a confirmed score or resurrect a cancelled fixture (reopen first to correct)
+        if (fr.rows[0].game_id) await pool.query(`UPDATE games SET game_date=$1 WHERE id=$2`, [when.toISOString(), fr.rows[0].game_id]).catch((e) => console.error('FIX-410d postpone games-row sync:', e.message));
+        await auditLog(pool, req.user.playerId, 'league_fixture_postponed', null, `Fixture ${fid} → ${when.toISOString()}`, req.tenant.id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-408 postpone:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Payment status for the confirm-UI pills (degrades to zeros when no splits yet — Phase 6).
+app.get('/api/t/:tenant_short_id/admin/league-fixtures/:id/payment-status', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) return res.status(400).json({ error: 'invalid_id' });
+        const fr = await pool.query(`SELECT f.home_team_id, f.away_team_id, l.tenant_id FROM league_fixtures f JOIN leagues l ON l.id=f.league_id WHERE f.id=$1`, [fid]);
+        if (fr.rows.length === 0 || String(fr.rows[0].tenant_id) !== String(req.tenant.id)) return res.status(404).json({ error: 'not_found' });
+        const f = fr.rows[0];
+        const agg = await pool.query(
+            `SELECT league_team_id, COALESCE(SUM(amount_owed_pence),0)::int AS owed, COALESCE(SUM(amount_paid_pence),0)::int AS paid
+               FROM league_payments_split WHERE fixture_id=$1 GROUP BY league_team_id`, [fid]).catch(() => ({ rows: [] }));
+        const find = (tid) => agg.rows.find(r => String(r.league_team_id) === String(tid)) || { owed: 0, paid: 0 };
+        const h = find(f.home_team_id), a = find(f.away_team_id);
+        const homePaid = h.owed > 0 && h.paid >= h.owed;
+        const awayPaid = a.owed > 0 && a.paid >= a.owed;
+        res.json({
+            home_team_owed_pence: h.owed, home_team_paid_pence: h.paid,
+            away_team_owed_pence: a.owed, away_team_paid_pence: a.paid,
+            both_sides_paid: homePaid && awayPaid
+        });
+    } catch (e) {
+        if (e.code === '42P01') return res.json({ both_sides_paid: false });
+        console.error('FIX-408 payment-status:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-409 (Block N Phase 8): TEAM DROP + REPLACEMENT + FIXTURE SURGERY.
+// Scoped (superadmin OR tenant_admin). Standings already exclude dropped teams
+// (Phase 5 filters status='active'), so the table self-corrects. Confirmed
+// fixtures are left intact for audit. Transactional throughout (fail-safe).
+// NOTE: the cross-table stats soft-flag (monthly_trophies/motm/awards
+// removed_due_to_team_drop) is deferred — not needed for table correctness.
+// ════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-411 (Block N Phase 8 finish): dropped-team stats soft-flag. Adds
+// removed_due_to_team_drop to game_awards/motm_votes + stats_void to games, so a
+// dropped team's players' stats from confirmed league games are PRESERVED but
+// excluded from player aggregates (the league table already excludes dropped
+// teams via the active-teams filter). Idempotent + non-fatal.
+// ════════════════════════════════════════════════════════════════════════
+async function fix411BootstrapStatsVoid() {
+    try {
+        await pool.query(`ALTER TABLE game_awards ADD COLUMN IF NOT EXISTS removed_due_to_team_drop BOOLEAN NOT NULL DEFAULT FALSE`);
+        await pool.query(`ALTER TABLE motm_votes ADD COLUMN IF NOT EXISTS removed_due_to_team_drop BOOLEAN NOT NULL DEFAULT FALSE`);
+        await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS stats_void BOOLEAN NOT NULL DEFAULT FALSE`);
+        console.log('✅ FIX-411 stats-void columns ready');
+    } catch (e) {
+        console.error('❌ FIX-411 stats-void bootstrap failed:', e.message);
+    }
+}
+
+// Void a dropped team's players' stats from CONFIRMED league games (soft-flag).
+// Called inside the drop transaction. Only the dropped team's players are touched
+// (the opponents keep their stats). Runs against confirmed fixtures, which retain
+// the dropped team's id (scheduled fixtures are transferred/cancelled separately).
+async function _voidDroppedTeamStats(client, leagueId, droppedTeamId) {
+    const g = await client.query(
+        `SELECT game_id FROM league_fixtures
+          WHERE league_id=$1 AND status='confirmed' AND (home_team_id=$2 OR away_team_id=$2) AND game_id IS NOT NULL`,
+        [leagueId, droppedTeamId]);
+    const gameIds = g.rows.map(r => r.game_id);
+    if (!gameIds.length) return;
+    const roster = await client.query(`SELECT player_id FROM league_team_players WHERE league_team_id=$1`, [droppedTeamId]);
+    const pids = roster.rows.map(r => r.player_id);
+    if (!pids.length) return;
+    await client.query(`UPDATE game_awards SET removed_due_to_team_drop=TRUE WHERE game_id = ANY($1::uuid[]) AND recipient_player_id = ANY($2::uuid[])`, [gameIds, pids]);
+    await client.query(`UPDATE motm_votes SET removed_due_to_team_drop=TRUE WHERE game_id = ANY($1::uuid[]) AND voted_for_id = ANY($2::uuid[])`, [gameIds, pids]);
+    await client.query(`UPDATE games SET stats_void=TRUE WHERE id = ANY($1::uuid[]) AND motm_winner_id = ANY($2::uuid[])`, [gameIds, pids]);
+}
+
+// 8a — Drop a team and replace it with a new one. Scheduled fixtures transfer to
+// the replacement (originals recorded for audit); confirmed fixtures untouched.
+app.post('/api/t/:tenant_short_id/admin/leagues/:id/replace-team', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const lid = req.params.id;
+        if (!isValidUuid(lid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const b = req.body || {};
+        const droppedId = b.dropped_team_id;
+        const rep = b.replacement_team || {};
+        if (!isValidUuid(droppedId) || !String(rep.name || '').trim()) { client.release(); return res.status(400).json({ error: 'dropped_team_id + replacement_team.name required' }); }
+        // FIX-410k (audit v3): validate replacement bib_colour hex (renders into inline style="").
+        const _repBib = rep.bib_colour ? String(rep.bib_colour).trim() : null;
+        if (_repBib && !/^#[0-9a-fA-F]{3,8}$/.test(_repBib)) { client.release(); return res.status(400).json({ error: 'replacement_team.bib_colour must be a hex code like #ff0066' }); }
+        await client.query('BEGIN');
+        const lr = await client.query('SELECT id FROM leagues WHERE id=$1 AND tenant_id=$2', [lid, req.tenant.id]);
+        if (lr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'league_not_found' }); }
+        const dr = await client.query(`SELECT status FROM league_teams WHERE id=$1 AND league_id=$2 FOR UPDATE`, [droppedId, lid]);
+        if (dr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'team_not_found' }); }
+        if (dr.rows[0].status === 'dropped' || dr.rows[0].status === 'replaced') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'already_dropped' }); }
+
+        await client.query(`UPDATE league_teams SET status='dropped', dropped_at=NOW(), dropped_reason=$1 WHERE id=$2`, [String(b.reason || 'Replaced'), droppedId]);
+
+        const slug = _genClaimSlug(rep.name);
+        const hasCaptain = isValidUuid(rep.captain_player_id);
+        const nr = await client.query(
+            `INSERT INTO league_teams (league_id, name, bib_colour, claim_slug, status, replacement_for_id, captain_player_id, claimed_at)
+             VALUES ($1,$2,$3,$4,'active',$5,$6,$7) RETURNING id`,
+            [lid, String(rep.name).trim(), _repBib, slug, droppedId,
+             hasCaptain ? rep.captain_player_id : null, hasCaptain ? new Date().toISOString() : null]);
+        const newId = nr.rows[0].id;
+        if (hasCaptain) {
+            await client.query(
+                `INSERT INTO league_team_players (league_team_id, player_id, is_captain) VALUES ($1,$2,TRUE)
+                 ON CONFLICT (league_team_id, player_id) DO UPDATE SET is_captain=TRUE, status='active'`, [newId, rep.captain_player_id]);
+        }
+        // Transfer scheduled fixtures to the replacement (record originals for audit).
+        await client.query(`UPDATE league_fixtures SET original_home_team_id=home_team_id, home_team_id=$1 WHERE league_id=$2 AND home_team_id=$3 AND status='scheduled'`, [newId, lid, droppedId]);
+        await client.query(`UPDATE league_fixtures SET original_away_team_id=away_team_id, away_team_id=$1 WHERE league_id=$2 AND away_team_id=$3 AND status='scheduled'`, [newId, lid, droppedId]);
+
+        await _voidDroppedTeamStats(client, lid, droppedId);
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'league_team_replaced', null, `Dropped ${droppedId} → new ${newId} in league ${lid}`, req.tenant.id).catch(() => {});
+        res.status(201).json({ ok: true, replacement_team_id: newId, claim_slug: slug, claim_url: `https://totalfooty.co.uk/claim-team.html?slug=${encodeURIComponent(slug)}` });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-409 replace-team:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// 8b — Drop a team with NO replacement. redistribute='cancel' (cancel their
+// scheduled fixtures) or 'reshuffle' (delete them + greedily rebuild matchups).
+app.post('/api/t/:tenant_short_id/admin/leagues/:id/drop-team-no-replace', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const lid = req.params.id;
+        if (!isValidUuid(lid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const b = req.body || {};
+        const droppedId = b.dropped_team_id;
+        const mode = (b.redistribute === 'reshuffle') ? 'reshuffle' : 'cancel';
+        if (!isValidUuid(droppedId)) { client.release(); return res.status(400).json({ error: 'dropped_team_id required' }); }
+        await client.query('BEGIN');
+        const lr = await client.query('SELECT id, start_date, cadence_days FROM leagues WHERE id=$1 AND tenant_id=$2', [lid, req.tenant.id]);
+        if (lr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'league_not_found' }); }
+        const dr = await client.query(`SELECT status FROM league_teams WHERE id=$1 AND league_id=$2 FOR UPDATE`, [droppedId, lid]);
+        if (dr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'team_not_found' }); }
+        if (dr.rows[0].status === 'dropped' || dr.rows[0].status === 'replaced') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'already_dropped' }); }
+
+        await client.query(`UPDATE league_teams SET status='dropped', dropped_at=NOW(), dropped_reason=$1 WHERE id=$2`, [String(b.reason || 'Withdrew'), droppedId]);
+
+        const sched = await client.query(`SELECT id, game_id FROM league_fixtures WHERE league_id=$1 AND status='scheduled' AND (home_team_id=$2 OR away_team_id=$2)`, [lid, droppedId]);
+        const gameIds = sched.rows.map(r => r.game_id).filter(Boolean);
+
+        if (mode === 'cancel') {
+            await client.query(`UPDATE league_fixtures SET status='cancelled' WHERE league_id=$1 AND status='scheduled' AND (home_team_id=$2 OR away_team_id=$2)`, [lid, droppedId]);
+            if (gameIds.length) await client.query(`UPDATE games SET game_status='cancelled' WHERE id = ANY($1::uuid[])`, [gameIds]).catch(() => {});
+            await _voidDroppedTeamStats(client, lid, droppedId);
+            await client.query('COMMIT');
+            await auditLog(pool, req.user.playerId, 'league_team_dropped_cancel', null, `Team ${droppedId} dropped; ${sched.rows.length} fixtures cancelled`, req.tenant.id).catch(() => {});
+            return res.json({ ok: true, mode, fixtures_cancelled: sched.rows.length });
+        }
+
+        // reshuffle: deficit per opponent = scheduled fixtures they had vs the dropped team.
+        const oppQ = await client.query(
+            `SELECT CASE WHEN home_team_id=$2 THEN away_team_id ELSE home_team_id END AS opp
+               FROM league_fixtures WHERE league_id=$1 AND status='scheduled' AND (home_team_id=$2 OR away_team_id=$2)`, [lid, droppedId]);
+        const deficit = {};
+        oppQ.rows.forEach(r => { deficit[r.opp] = (deficit[r.opp] || 0) + 1; });
+
+        // delete the dropped team's scheduled fixtures + their games + RSVPs
+        await client.query(`DELETE FROM league_fixtures WHERE league_id=$1 AND status='scheduled' AND (home_team_id=$2 OR away_team_id=$2)`, [lid, droppedId]);
+        if (gameIds.length) {
+            await client.query(`DELETE FROM registrations WHERE game_id = ANY($1::uuid[])`, [gameIds]);
+            await client.query(`DELETE FROM games WHERE id = ANY($1::uuid[])`, [gameIds]);
+        }
+
+        // greedy re-pair: highest-deficit team vs lowest existing-matchup opponent.
+        const pkey = (a, b) => (a < b ? a + '|' + b : b + '|' + a);
+        const existing = {};
+        const exQ = await client.query(`SELECT home_team_id AS h, away_team_id AS a FROM league_fixtures WHERE league_id=$1`, [lid]);
+        exQ.rows.forEach(r => { existing[pkey(r.h, r.a)] = (existing[pkey(r.h, r.a)] || 0) + 1; });
+        const teamsWithDeficit = Object.keys(deficit);
+        const newPairs = [];
+        let guard = 1000;
+        while (guard-- > 0) {
+            const avail = teamsWithDeficit.filter(t => deficit[t] > 0);
+            if (avail.length < 2) break;
+            avail.sort((x, y) => deficit[y] - deficit[x]);
+            const a = avail[0];
+            const cands = avail.slice(1).sort((x, y) =>
+                ((existing[pkey(a, x)] || 0) - (existing[pkey(a, y)] || 0)) || (deficit[y] - deficit[x]) || (Math.random() - 0.5));
+            const bb = cands[0];
+            newPairs.push([a, bb]);
+            deficit[a]--; deficit[bb]--;
+            existing[pkey(a, bb)] = (existing[pkey(a, bb)] || 0) + 1;
+        }
+
+        // schedule the replacements on a single new matchday after the last round.
+        const maxR = await client.query('SELECT COALESCE(MAX(round_number),0)::int AS m FROM league_fixtures WHERE league_id=$1', [lid]);
+        const roundNo = maxR.rows[0].m + 1;
+        const start = new Date(lr.rows[0].start_date);
+        const cad = Math.max(1, parseInt(lr.rows[0].cadence_days, 10) || 7);
+        const dt = new Date(start.getTime()); dt.setUTCDate(dt.getUTCDate() + (roundNo - 1) * cad);
+        let seq = 0;
+        for (const [h, a] of newPairs) {
+            seq++;
+            const gid = await _createLeagueGameRow(client, lid, req.tenant.id, dt.toISOString());
+            await client.query(
+                `INSERT INTO league_fixtures (league_id, home_team_id, away_team_id, round_number, sequence_in_round, scheduled_at, status, game_id)
+                 VALUES ($1,$2,$3,$4,$5,$6,'scheduled',$7)`, [lid, h, a, roundNo, seq, dt.toISOString(), gid]);
+        }
+
+        await _voidDroppedTeamStats(client, lid, droppedId);
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'league_team_dropped_reshuffle', null, `Team ${droppedId} dropped; ${sched.rows.length} removed, ${newPairs.length} new fixtures`, req.tenant.id).catch(() => {});
+        res.json({ ok: true, mode, fixtures_removed: sched.rows.length, fixtures_created: newPairs.length });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-409 drop-no-replace:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-410 (Block N Phase 6): CAPTAIN PAYMENT SPLIT (v1 — tracking + cash).
+// Captain-facing. The split divides the team's bill (game.cost_per_player × squad)
+// across the squad: even by default, but the captain can set custom amounts and
+// absorb the remainder. v1 = split-tracking + cash mark-paid (NO webhook changes —
+// the live money path is untouched). Online exact-share auto-credit is a later,
+// isolated pass. Money model unchanged: players pay the platform.
+// ════════════════════════════════════════════════════════════════════════
+
+// Resolve which fixture-team the caller may manage the split for.
+// Captain of home/away → that team. superadmin/tenant_admin → may pass ?team_id.
+async function _resolveSplitTeam(req, fixtureRow) {
+    const playerId = req.user.playerId;
+    if (String(fixtureRow.home_captain) === String(playerId)) return fixtureRow.home_team_id;
+    if (String(fixtureRow.away_captain) === String(playerId)) return fixtureRow.away_team_id;
+    // admin override
+    let isAdmin = req.user.role === 'superadmin';
+    if (!isAdmin) { const role = await _getTenantRole(playerId, fixtureRow.tenant_id); isAdmin = (role === 'tenant_admin'); }
+    if (isAdmin) {
+        const want = req.query.team_id || (req.body && req.body.team_id);
+        if (want && (String(want) === String(fixtureRow.home_team_id) || String(want) === String(fixtureRow.away_team_id))) return want;
+    }
+    return null;
+}
+
+async function _loadSplitFixture(fid) {
+    const r = await pool.query(
+        `SELECT f.id, f.home_team_id, f.away_team_id, f.game_id, l.tenant_id,
+                g.cost_per_player,
+                h.captain_player_id AS home_captain, a.captain_player_id AS away_captain
+           FROM league_fixtures f
+           JOIN leagues l ON l.id = f.league_id
+           JOIN league_teams h ON h.id = f.home_team_id
+           JOIN league_teams a ON a.id = f.away_team_id
+           LEFT JOIN games g ON g.id = f.game_id
+          WHERE f.id = $1`, [fid]);
+    return r.rows[0] || null;
+}
+
+// GET the split context for the caller's team (squad + bill + default even share + existing split).
+app.get('/api/leagues/fixtures/:id/split', authenticateToken, async (req, res) => {
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) return res.status(400).json({ error: 'invalid_id' });
+        const fx = await _loadSplitFixture(fid);
+        if (!fx) return res.status(404).json({ error: 'not_found' });
+        const teamId = await _resolveSplitTeam(req, fx);
+        if (!teamId) return res.status(403).json({ error: 'forbidden' });
+        const squad = await pool.query(
+            `SELECT ltp.player_id, ltp.is_captain, p.alias
+               FROM league_team_players ltp JOIN players p ON p.id = ltp.player_id
+              WHERE ltp.league_team_id=$1 AND ltp.status='active'
+              ORDER BY ltp.is_captain DESC, p.alias ASC`, [teamId]);
+        const costPence = Math.round((parseFloat(fx.cost_per_player) || 0) * 100);
+        const totalPence = costPence * squad.rows.length;
+        const existing = await pool.query(
+            `SELECT player_id, amount_owed_pence, amount_paid_pence, payment_method, paid_at
+               FROM league_payments_split WHERE fixture_id=$1 AND league_team_id=$2`, [fid, teamId]);
+        res.json({
+            team_id: teamId,
+            cost_per_player_pence: costPence,
+            total_pence: totalPence,
+            squad: squad.rows,
+            splits: existing.rows
+        });
+    } catch (e) {
+        if (e.code === '42P01') return res.status(404).json({ error: 'not_found' });
+        console.error('FIX-410 get split:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// POST a split: { splits:[{player_id, amount_pence}], absorb_pence }. Replaces any
+// existing split for the caller's team. Sum of shares + absorb must equal the bill.
+app.post('/api/leagues/fixtures/:id/split', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const fx = await _loadSplitFixture(fid);
+        if (!fx) { client.release(); return res.status(404).json({ error: 'not_found' }); }
+        const teamId = await _resolveSplitTeam(req, fx);
+        if (!teamId) { client.release(); return res.status(403).json({ error: 'forbidden' }); }
+
+        const costPence = Math.round((parseFloat(fx.cost_per_player) || 0) * 100);
+        const b = req.body || {};
+        const inSplits = Array.isArray(b.splits) ? b.splits : [];
+        const absorb = Math.max(0, parseInt(b.absorb_pence, 10) || 0);
+
+        // squad membership set (only active squad players are valid payers)
+        const squad = await client.query(`SELECT player_id FROM league_team_players WHERE league_team_id=$1 AND status='active'`, [teamId]);
+        const squadIds = new Set(squad.rows.map(r => String(r.player_id)));
+        const totalPence = costPence * squadIds.size;
+
+        let sum = 0;
+        const clean = [];
+        for (const s of inSplits) {
+            if (!s || !isValidUuid(s.player_id) || !squadIds.has(String(s.player_id))) continue;
+            const amt = Math.max(0, parseInt(s.amount_pence, 10) || 0);
+            sum += amt;
+            clean.push({ player_id: s.player_id, amount_pence: amt });
+        }
+        if (sum + absorb !== totalPence) {
+            client.release();
+            return res.status(400).json({ error: 'split_mismatch', detail: `shares (${sum}) + absorb (${absorb}) must equal bill (${totalPence})` });
+        }
+
+        await client.query('BEGIN');
+
+        // FIX-410k (audit v3): preserve payments across a captain re-save.
+        // The old code DELETEd every split row then re-INSERTed owed-only, which
+        // (a) wiped amount_paid_pence/payment_method/paid_at for shares already
+        // settled (cash, wallet or bank) so the chase-list lied, and
+        // (b) minted NEW row ids, orphaning wonderful_payments.league_split_id so a
+        // credited bank share could no longer be marked paid (silent "unpaid").
+        // Now: diff-UPSERT. Existing players in the new split are UPDATEd in place
+        // (owed changes; paid/method/paid_at + row id preserved -> FK stays valid);
+        // brand-new players are INSERTed; players dropped from the split are DELETEd
+        // ONLY when nothing has been paid on them (a paid row is never destroyed --
+        // its money record + any Wonderful FK must survive).
+        const existingRows = await client.query(
+            `SELECT player_id, amount_paid_pence
+               FROM league_payments_split
+              WHERE fixture_id=$1 AND league_team_id=$2 AND player_id IS NOT NULL`, [fid, teamId]);
+        const existingByPlayer = new Map(existingRows.rows.map(r => [String(r.player_id), r]));
+        const cleanIds = new Set(clean.map(s => String(s.player_id)));
+
+        // Rebuild the captain-absorbed row from scratch (player_id IS NULL -- no
+        // external payment ever references it, so recreating is safe).
+        await client.query(
+            `DELETE FROM league_payments_split WHERE fixture_id=$1 AND league_team_id=$2 AND player_id IS NULL`, [fid, teamId]);
+
+        // Upsert each submitted share.
+        for (const s of clean) {
+            if (existingByPlayer.has(String(s.player_id))) {
+                await client.query(
+                    `UPDATE league_payments_split SET amount_owed_pence=$4
+                      WHERE fixture_id=$1 AND league_team_id=$2 AND player_id=$3`,
+                    [fid, teamId, s.player_id, s.amount_pence]);
+            } else {
+                await client.query(
+                    `INSERT INTO league_payments_split (fixture_id, league_team_id, player_id, amount_owed_pence)
+                     VALUES ($1,$2,$3,$4)`, [fid, teamId, s.player_id, s.amount_pence]);
+            }
+        }
+
+        // Drop players removed from the split, but ONLY when no money landed on
+        // them. A paid row is preserved (its payment + Wonderful FK must live on).
+        for (const [pid, row] of existingByPlayer) {
+            if (!cleanIds.has(pid) && (parseInt(row.amount_paid_pence, 10) || 0) === 0) {
+                await client.query(
+                    `DELETE FROM league_payments_split WHERE fixture_id=$1 AND league_team_id=$2 AND player_id=$3`,
+                    [fid, teamId, pid]);
+            }
+        }
+
+        if (absorb > 0) {
+            await client.query(
+                `INSERT INTO league_payments_split (fixture_id, league_team_id, player_id, amount_owed_pence, amount_paid_pence, payment_method, paid_at)
+                 VALUES ($1,$2,NULL,$3,$3,'captain_absorbed',NOW())`, [fid, teamId, absorb]);
+        }
+        await client.query('COMMIT');
+        res.status(201).json({ ok: true, total_pence: totalPence });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-410 post split:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// Captain marks a player's share paid (cash / off-platform).
+app.post('/api/leagues/fixtures/:id/split/:player_id/mark-paid', authenticateToken, async (req, res) => {
+    try {
+        const fid = req.params.id, pid = req.params.player_id;
+        if (!isValidUuid(fid) || !isValidUuid(pid)) return res.status(400).json({ error: 'invalid_id' });
+        const fx = await _loadSplitFixture(fid);
+        if (!fx) return res.status(404).json({ error: 'not_found' });
+        const teamId = await _resolveSplitTeam(req, fx);
+        if (!teamId) return res.status(403).json({ error: 'forbidden' });
+        const unpay = !!(req.body && req.body.unpay);
+        const r = await pool.query(
+            unpay
+                ? `UPDATE league_payments_split SET amount_paid_pence=0, payment_method=NULL, paid_at=NULL WHERE fixture_id=$1 AND league_team_id=$2 AND player_id=$3`
+                : `UPDATE league_payments_split SET amount_paid_pence=amount_owed_pence, payment_method='cash', paid_at=NOW() WHERE fixture_id=$1 AND league_team_id=$2 AND player_id=$3`,
+            [fid, teamId, pid]);
+        if (r.rowCount === 0) return res.status(404).json({ error: 'split_row_not_found' });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-410 mark-paid:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
 app.post('/api/games/:gameUrl/rating-feedback/more', authenticateToken, async (req, res) => {
     try {
         const { gameUrl } = req.params;
@@ -40690,15 +42521,34 @@ async function sendWonderfulCreditEmail(playerId, pounds, ref, balAfter = null) 
 app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiateLimiter, async (req, res) => {
     if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'Online payments are temporarily unavailable' });
     try {
-        const { amount_pounds, game_id, position_preference, backup_type } = req.body;
+        const { amount_pounds, game_id, position_preference, backup_type, league_split_id } = req.body;
         const playerId = req.user.playerId;
 
-        // Validate amount: £1–£200 in whole pounds
-        const pounds = parseFloat(amount_pounds);
-        if (!pounds || pounds < 1 || pounds > 200 || pounds !== Math.floor(pounds)) {
-            return res.status(400).json({ error: 'Amount must be a whole number between £1 and £200' });
+        // FIX-410b (Block N Phase 6 online): a league split-share payment derives its
+        // amount + game from the split row (server-controlled — the client can't set
+        // the price). Skips the whole-pound rule so exact shares (e.g. £4.50) work.
+        let pounds, amountPence, _splitId = null, _splitGameId = null;
+        if (league_split_id) {
+            const _sp = await pool.query(
+                `SELECT s.id, s.amount_owed_pence, s.amount_paid_pence, f.game_id
+                   FROM league_payments_split s JOIN league_fixtures f ON f.id = s.fixture_id
+                  WHERE s.id = $1 AND s.player_id = $2`, [league_split_id, playerId]);
+            if (!_sp.rows.length) return res.status(404).json({ error: 'Payment share not found' });
+            if (_sp.rows[0].amount_paid_pence >= _sp.rows[0].amount_owed_pence) return res.status(400).json({ error: 'This share is already paid' });
+            amountPence = _sp.rows[0].amount_owed_pence - _sp.rows[0].amount_paid_pence; // FIX-410g: charge REMAINING (wallet may have part-paid)
+            if (amountPence < 100 || amountPence > 20000) return res.status(400).json({ error: 'Share must be between £1 and £200 to pay online' });
+            pounds = amountPence / 100;
+            _splitId = _sp.rows[0].id;
+            _splitGameId = _sp.rows[0].game_id || null;
+        } else {
+            // Validate amount: £1–£200 in whole pounds
+            pounds = parseFloat(amount_pounds);
+            if (!pounds || pounds < 1 || pounds > 200 || pounds !== Math.floor(pounds)) {
+                return res.status(400).json({ error: 'Amount must be a whole number between £1 and £200' });
+            }
+            amountPence = Math.round(pounds * 100);
         }
-        const amountPence = Math.round(pounds * 100);
+        const effectiveGameId = (_splitGameId !== null) ? _splitGameId : (game_id || null);
 
         // Fetch player email for Wonderful — LEFT JOIN so legacy accounts without user_id still resolve
         const playerRow = await pool.query(
@@ -40733,7 +42583,7 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
                AND pay_link IS NOT NULL
                AND created_at > NOW() - INTERVAL '60 seconds'
              ORDER BY created_at DESC LIMIT 1`,
-            [playerId, amountPence, game_id || null]
+            [playerId, amountPence, effectiveGameId]
         );
         if (dupeCheck.rows.length) {
             const dup = dupeCheck.rows[0];
@@ -40765,10 +42615,10 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         const insertRes = await pool.query(
             `INSERT INTO wonderful_payments
                 (wonderful_payment_id, merchant_reference, player_id, amount_pence, status, game_id, pay_link,
-                 position_preference, backup_type)
-             VALUES (NULL, $1, $2, $3, 'init_pending', $4, NULL, $5, $6)
+                 position_preference, backup_type, league_split_id)
+             VALUES (NULL, $1, $2, $3, 'init_pending', $4, NULL, $5, $6, $7)
              RETURNING id`,
-            [merchantRef, playerId, amountPence, game_id || null, validPos, validBackupType]
+            [merchantRef, playerId, amountPence, effectiveGameId, validPos, validBackupType, _splitId]
         );
         const pmtRowId = insertRes.rows[0].id;
         console.log(`[WF initiate] inserted init_pending row ${pmtRowId} · ref ${merchantRef} · £${pounds.toFixed(2)}${game_id ? ` · game ${game_id}` : ''}`);
@@ -41476,7 +43326,7 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
     // Atomic claim + credit. Rollback on any failure — payment stays non-credited
     // so the reconciler / next webhook can retry safely.
     const client = await pool.connect();
-    let pounds, balBefore, balAfter, freshPmt;
+    let pounds, balBefore, balAfter, freshPmt, isLeagueShare = false;
     try {
         await client.query('BEGIN');
         const claim = await client.query(
@@ -41493,19 +43343,51 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
         }
         freshPmt = claim.rows[0];
         pounds = freshPmt.amount_pence / 100;
-        const balRes = await client.query(
-            'SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1',
-            [freshPmt.player_id]
-        );
-        balBefore = parseFloat(balRes.rows[0]?.balance || 0);
-        await client.query(
-            `INSERT INTO credits (player_id, balance, last_updated)
-             VALUES ($1, $2, NOW())
-             ON CONFLICT (player_id) DO UPDATE
-             SET balance = credits.balance + $2, last_updated = NOW()`,
-            [freshPmt.player_id, pounds]
-        );
-        balAfter = balBefore + pounds;
+        // FIX-410e (audit v2): a league split-share is a MATCH-FEE contribution, not a
+        // wallet top-up. Crediting the payer's wallet minted free game-credit — normal
+        // games consume the credit via auto-register, but league players have no such
+        // consumption, so it sat as spendable credit (a money leak). For a share we skip
+        // the wallet credit + every credit-only side-effect; status flip + in-tx split
+        // mark + audit + admin-notify still happen.
+        isLeagueShare = !!freshPmt.league_split_id;
+        if (!isLeagueShare) {
+            const balRes = await client.query(
+                'SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1',
+                [freshPmt.player_id]
+            );
+            balBefore = parseFloat(balRes.rows[0]?.balance || 0);
+            await client.query(
+                `INSERT INTO credits (player_id, balance, last_updated)
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (player_id) DO UPDATE
+                 SET balance = credits.balance + $2, last_updated = NOW()`,
+                [freshPmt.player_id, pounds]
+            );
+            balAfter = balBefore + pounds;
+        } else {
+            balBefore = 0; balAfter = 0;
+        }
+        // FIX-410c (audit v2): mark the league split row paid INSIDE the tx so it
+        // commits atomically with the credit. The former post-commit best-effort
+        // setImmediate (a) was never retried and (b) sat after the already-credited
+        // early-return, so a single failure left the share stuck "unpaid" forever
+        // despite a successful payment+credit. Gated — NULL for every normal payment.
+        if (freshPmt.league_split_id) {
+            // FIX-410k (audit v3): additive + capped mark. The bank payment for a
+            // share is the REMAINING owed at initiate time (owed - already-paid), so
+            // the credit must ADD that pence to amount_paid, not blindly set it to
+            // owed. LEAST(owed, paid+bank) caps at owed if the captain shrank the
+            // share mid-flight and leaves it partial if the captain grew it, so it can
+            // never overstate what the player actually paid. Gated to run exactly once
+            // by the atomic status-claim above, so the add is never double-applied.
+            await client.query(
+                `UPDATE league_payments_split
+                    SET amount_paid_pence = LEAST(amount_owed_pence, amount_paid_pence + $2),
+                        payment_method = CASE WHEN amount_paid_pence > 0 THEN 'mixed' ELSE 'wonderful' END,
+                        paid_at = NOW()
+                  WHERE id = $1`,
+                [freshPmt.league_split_id, freshPmt.amount_pence]);
+        }
         await client.query('COMMIT');
     } catch (txErr) {
         await client.query('ROLLBACK').catch(() => {});
@@ -41517,16 +43399,25 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
 
     // Post-commit side-effects. Intentionally outside the tx — if any fail, log but
     // don't roll back the credit (balance is correct, ledger/audit are best-effort).
-    await recordCreditTransaction(pool, freshPmt.player_id, pounds, 'wonderful_topup',
-        `Wonderful bank payment${ctxSuffix} — ref ${freshPmt.merchant_reference}`, adminId);
-
     const auditActor = adminId || freshPmt.player_id;
-    const auditPrefix = adminId ? 'ADMIN CREDIT: ' : '';
-    await auditLog(pool, auditActor, 'wonderful_credited', freshPmt.player_id,
-        `${auditPrefix}£${pounds.toFixed(2)} credited via Wonderful${ctxSuffix} · Balance: £${balBefore.toFixed(2)} → £${balAfter.toFixed(2)} · Ref: ${freshPmt.merchant_reference}`);
+    if (isLeagueShare) {
+        // FIX-410e: league share — no wallet credit, so no top-up ledger entry / credit
+        // email / RAF / credit push. Audit-log the fee payment for the money trail.
+        await auditLog(pool, auditActor, 'league_share_paid', freshPmt.player_id,
+            `£${pounds.toFixed(2)} league match-fee share paid via Wonderful (no wallet credit) · split ${freshPmt.league_split_id} · Ref: ${freshPmt.merchant_reference}`);
+    } else {
+        await recordCreditTransaction(pool, freshPmt.player_id, pounds, 'wonderful_topup',
+            `Wonderful bank payment${ctxSuffix} — ref ${freshPmt.merchant_reference}`, adminId);
+        const auditPrefix = adminId ? 'ADMIN CREDIT: ' : '';
+        await auditLog(pool, auditActor, 'wonderful_credited', freshPmt.player_id,
+            `${auditPrefix}£${pounds.toFixed(2)} credited via Wonderful${ctxSuffix} · Balance: £${balBefore.toFixed(2)} → £${balAfter.toFixed(2)} · Ref: ${freshPmt.merchant_reference}`);
+        setImmediate(() => triggerRafActivation(freshPmt.player_id).catch(() => {}));
+        setImmediate(() => sendWonderfulCreditEmail(freshPmt.player_id, pounds, freshPmt.merchant_reference, balAfter));
+    }
 
-    setImmediate(() => triggerRafActivation(freshPmt.player_id).catch(() => {}));
-    setImmediate(() => sendWonderfulCreditEmail(freshPmt.player_id, pounds, freshPmt.merchant_reference, balAfter));
+    // FIX-410c (audit v2): split mark-paid moved INSIDE the credit tx above (now
+    // atomic + retry-safe). It previously lived here as a post-commit setImmediate,
+    // unreachable on the already-credited re-entry path, so it ran at most once.
     // Fire superadmin notification for every Wonderful payment (parallel to player email).
     setImmediate(() => notifyAdminWonderfulPayment(freshPmt.player_id, pounds, freshPmt.merchant_reference, balAfter, freshPmt.game_id || null));
 
@@ -41536,6 +43427,7 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
     // — even if multiple credit paths (webhook + reconciler) race, the column
     // guards against double-pushing. Best-effort: failures never block credit.
     setImmediate(async () => {
+        if (isLeagueShare) return; // FIX-410e: no credit push for a league share (no credit happened)
         try {
             // Idempotency: claim the right to push by setting notified_at, only
             // if it isn't already set. Atomic check + set in one UPDATE.
@@ -41917,7 +43809,7 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
 
         // Return fresh state (reflects any update above)
         const row2 = await pool.query(
-            `SELECT status, amount_pence, game_id, credited_at, auto_register_status, auto_register_reason
+            `SELECT status, amount_pence, game_id, credited_at, auto_register_status, auto_register_reason, league_split_id
              FROM wonderful_payments WHERE id = $1`,
             [p.id]
         );
@@ -41929,6 +43821,7 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
             credited_at:          pp.credited_at,
             auto_register_status: pp.auto_register_status || null,
             auto_register_reason: pp.auto_register_reason || null,
+            league_split:         !!pp.league_split_id, // FIX-410g: lets the success screen show share-paid copy (no wallet credit)
         });
     } catch (e) {
         console.error('Wonderful status error:', e.message);
@@ -47817,7 +49710,11 @@ const _FIX322_BOOL_FIELDS = [
     'notify_motm_voting_email', 'notify_motm_voting_push',
     'notify_awards_published_email', 'notify_awards_published_push',
     // FIX-332 (Day 18): VAT registration toggle
-    'vat_registered'
+    'vat_registered',
+    // FIX-386 (Block C / item 8): "no refund after teams generated" toggle.
+    // Independent of refund_cutoff_hours — both can be active (no refund if
+    // within X hours OR — when this is on — once teams are generated).
+    'no_refund_after_teams'
 ];
 const _FIX322_INT_FIELDS = [
     'platform_fee_pence', 'refund_cutoff_hours',
@@ -48028,13 +49925,37 @@ app.patch('/api/admin/tenants/:id', authenticateToken, requireSuperAdmin, async 
                 v = _fix322Slugify(v);
                 v = await _fix322UniqueSlug(v, req.params.id);
             }
-            // Status whitelist
-            if (f === 'status' && v !== null && !['active','paused','exited'].includes(v)) {
-                return res.status(400).json({ error: 'status must be active/paused/exited' });
+            // Status whitelist (FIX-398: 'pilot' is a valid lifecycle state)
+            if (f === 'status' && v !== null && !['active','pilot','paused','exited'].includes(v)) {
+                return res.status(400).json({ error: 'status must be active/pilot/paused/exited' });
             }
             updates.push(`${f} = $${idx++}`);
             values.push(v);
         }
+    }
+
+    // FIX-398 (Block J): pilot_ends_at — TIMESTAMPTZ, handled separately from the
+    // TEXT loop so empty clears to NULL (an empty string can't cast to a timestamp).
+    let _pilotDateChanged = false;
+    if (body.pilot_ends_at !== undefined) {
+        let pv = body.pilot_ends_at;
+        if (pv === null || (typeof pv === 'string' && pv.trim() === '')) {
+            updates.push(`pilot_ends_at = $${idx++}`);
+            values.push(null);
+        } else {
+            const d = new Date(pv);
+            if (isNaN(d.getTime())) {
+                return res.status(400).json({ error: 'pilot_ends_at must be a valid date (e.g. 2026-09-01) or empty' });
+            }
+            updates.push(`pilot_ends_at = $${idx++}`);
+            values.push(d.toISOString());
+        }
+        _pilotDateChanged = true;
+    }
+    // Reset the one-shot expiry-notified flag whenever the pilot window or status
+    // is touched, so a re-set pilot can fire a fresh CRM task when it next expires.
+    if (_pilotDateChanged || body.status === 'pilot') {
+        updates.push(`pilot_expiry_notified = FALSE`);
     }
 
     if (updates.length === 0) {
@@ -53512,6 +55433,246 @@ async function fix366BootstrapMultiRegion() {
     }
 }
 
+// FIX-386 (Block C): refund-policy columns on tenants. Idempotent + non-fatal.
+//   refund_cutoff_hours  — no refund if dropout is within this many hours of kickoff
+//                          (default 2 — preserves the previous hardcoded behaviour).
+//   no_refund_after_teams — when TRUE, no refund once teams are generated
+//                          (default TRUE — preserves previous behaviour). Independent
+//                          of the hours rule; both can apply (OR'd).
+// NULL backfill so existing rows get the defaults explicitly. The dropout logic
+// also COALESCEs defensively, so pre-migration deploys behave identically.
+// FIX-398 (Block J): pilot lifecycle. Adds pilot_ends_at (when the pilot period
+// ends) + pilot_expiry_notified (one-shot guard so the cron raises exactly one CRM
+// task per expiry). Idempotent + non-fatal.
+// FIX-400 (Block M1): overrated/underrated capture. A NEW signal that runs ALONGSIDE
+// the FIX-263 pairwise rating-feedback system (not a replacement). Binary, per-subject,
+// no magnitude. This bootstrap is CAPTURE-ONLY — it does not touch the recalc; wiring
+// it into OVR (heavily weighted) is a separate, deliberate step (M2) so we never risk
+// the live rating system before the signal is observed on real data.
+// ════════════════════════════════════════════════════════════════════════
+// FIX-401 (Block N Phase 0): LEAGUE GAME TYPE — schema foundations.
+// Persistent teams, fixtures, league tables, captains, payment splits.
+// Per HOW_TO_BUILD_LEAGUE_GAME_TYPE.md. Idempotent + non-fatal (boot bootstrap).
+//
+// SCHEMA-TYPE ADAPTATION vs the design guide (verified against the live DB):
+//   • games.id is UUID → league_fixtures.game_id is
+//     INTEGER, NOT the guide's UUID. games.league_id is UUID (leagues.id is UUID).
+//   • players.id / tenants.id / leagues.id = UUID. game_series.id = INTEGER (untouched here).
+// ════════════════════════════════════════════════════════════════════════
+async function fix401BootstrapLeagues() {
+    try {
+        // 1) leagues — config + lifecycle. Belongs to a tenant.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS leagues (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                short_id        TEXT NOT NULL UNIQUE,
+                tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                name            TEXT NOT NULL,
+                description     TEXT,
+                logo_url        TEXT,
+                primary_color   TEXT,
+                format          TEXT NOT NULL DEFAULT 'round_robin'
+                                  CHECK (format IN ('round_robin','random_evenly')),
+                rounds          INTEGER NOT NULL DEFAULT 1 CHECK (rounds >= 1 AND rounds <= 10),
+                games_per_team  INTEGER,
+                team_count      INTEGER NOT NULL CHECK (team_count >= 2 AND team_count <= 32),
+                cadence_days    INTEGER NOT NULL DEFAULT 7,
+                start_date      DATE NOT NULL,
+                points_for_win  INTEGER NOT NULL DEFAULT 3,
+                points_for_draw INTEGER NOT NULL DEFAULT 1,
+                points_for_loss INTEGER NOT NULL DEFAULT 0,
+                tiebreak_order  TEXT NOT NULL DEFAULT 'points,goal_diff,goals_for',
+                status          TEXT NOT NULL DEFAULT 'setup'
+                                  CHECK (status IN ('setup','active','paused','completed','cancelled')),
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                activated_at    TIMESTAMPTZ,
+                completed_at    TIMESTAMPTZ,
+                created_by      UUID REFERENCES players(id) ON DELETE SET NULL
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_leagues_tenant ON leagues(tenant_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_leagues_status ON leagues(status)`);
+
+        // 2) league_teams — persistent team entities + claim flow + drop lifecycle.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS league_teams (
+                id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                league_id          UUID NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+                name               TEXT NOT NULL,
+                bib_colour         TEXT,
+                crest_url          TEXT,
+                captain_player_id  UUID REFERENCES players(id) ON DELETE SET NULL,
+                claim_slug         TEXT NOT NULL UNIQUE,
+                claimed_at         TIMESTAMPTZ,
+                status             TEXT NOT NULL DEFAULT 'unclaimed'
+                                     CHECK (status IN ('unclaimed','active','dropped','replaced')),
+                dropped_at         TIMESTAMPTZ,
+                dropped_reason     TEXT,
+                replacement_for_id UUID REFERENCES league_teams(id) ON DELETE SET NULL,
+                created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (league_id, name)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_league_teams_league ON league_teams(league_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_league_teams_captain ON league_teams(captain_player_id)`);
+        await pool.query(`ALTER TABLE league_teams ADD COLUMN IF NOT EXISTS invite_slug TEXT UNIQUE`); // FIX-406 Block N P2: shared team invite link
+
+        // 3) league_team_players — roster.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS league_team_players (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                league_team_id  UUID NOT NULL REFERENCES league_teams(id) ON DELETE CASCADE,
+                player_id       UUID NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+                is_captain      BOOLEAN NOT NULL DEFAULT FALSE,
+                is_vice_captain BOOLEAN NOT NULL DEFAULT FALSE,
+                squad_position  TEXT,
+                status          TEXT NOT NULL DEFAULT 'active'
+                                  CHECK (status IN ('active','left','removed')),
+                joined_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                left_at         TIMESTAMPTZ,
+                UNIQUE (league_team_id, player_id)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_ltp_team ON league_team_players(league_team_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_ltp_player ON league_team_players(player_id)`);
+
+        // 4) league_fixtures — fixtures + scores. game_id is UUID (games.id is UUID).
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS league_fixtures (
+                id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                league_id             UUID NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+                game_id               UUID UNIQUE REFERENCES games(id) ON DELETE SET NULL,
+                home_team_id          UUID NOT NULL REFERENCES league_teams(id) ON DELETE CASCADE,
+                away_team_id          UUID NOT NULL REFERENCES league_teams(id) ON DELETE CASCADE,
+                round_number          INTEGER NOT NULL,
+                sequence_in_round     INTEGER NOT NULL,
+                scheduled_at          TIMESTAMPTZ NOT NULL,
+                status                TEXT NOT NULL DEFAULT 'scheduled'
+                                        CHECK (status IN ('scheduled','in_progress','awaiting_confirmation','confirmed','cancelled','postponed')),
+                home_score            INTEGER,
+                away_score            INTEGER,
+                original_home_team_id UUID REFERENCES league_teams(id) ON DELETE SET NULL,
+                original_away_team_id UUID REFERENCES league_teams(id) ON DELETE SET NULL,
+                created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                confirmed_at          TIMESTAMPTZ,
+                confirmed_by          UUID REFERENCES players(id) ON DELETE SET NULL,
+                CHECK (home_team_id <> away_team_id)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_lf_league ON league_fixtures(league_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_lf_round ON league_fixtures(league_id, round_number)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_lf_home ON league_fixtures(home_team_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_lf_away ON league_fixtures(away_team_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_lf_status ON league_fixtures(league_id, status)`);
+
+        // 5) league_payments_split — captain's per-fixture split (who owes what).
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS league_payments_split (
+                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                fixture_id        UUID NOT NULL REFERENCES league_fixtures(id) ON DELETE CASCADE,
+                league_team_id    UUID NOT NULL REFERENCES league_teams(id) ON DELETE CASCADE,
+                player_id         UUID REFERENCES players(id) ON DELETE SET NULL,
+                amount_owed_pence INTEGER NOT NULL CHECK (amount_owed_pence >= 0),
+                amount_paid_pence INTEGER NOT NULL DEFAULT 0 CHECK (amount_paid_pence >= 0),
+                payment_method    TEXT,
+                paid_at           TIMESTAMPTZ,
+                note              TEXT,
+                UNIQUE (fixture_id, league_team_id, player_id)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_lps_fixture ON league_payments_split(fixture_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_lps_player ON league_payments_split(player_id)`);
+
+        // 6) games.league_id — links a game row to its league (UUID → leagues.id).
+        await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS league_id UUID REFERENCES leagues(id) ON DELETE SET NULL`);
+        await pool.query(`ALTER TABLE wonderful_payments ADD COLUMN IF NOT EXISTS league_split_id UUID`); // FIX-410b: online split-share link
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_league_id ON games(league_id) WHERE league_id IS NOT NULL`);
+
+        console.log('✅ FIX-401 league schema ready (5 tables + games.league_id)');
+    } catch (e) {
+        console.error('❌ FIX-401 league bootstrap failed:', e.message);
+    }
+}
+
+async function fix400BootstrapOverrated() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS player_overrated_votes (
+                id                BIGSERIAL PRIMARY KEY,
+                voter_player_id   UUID NOT NULL,
+                subject_player_id UUID NOT NULL,
+                game_id           INTEGER,
+                direction         TEXT NOT NULL CHECK (direction IN ('overrated','underrated')),
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (voter_player_id, subject_player_id, game_id)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_overrated_subject ON player_overrated_votes (subject_player_id)`);
+        console.log('✅ FIX-400 overrated-votes capture table ready');
+    } catch (e) {
+        console.error('❌ FIX-400 overrated bootstrap failed:', e.message);
+    }
+}
+
+async function fix398BootstrapPilot() {
+    try {
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS pilot_ends_at TIMESTAMPTZ`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS pilot_expiry_notified BOOLEAN NOT NULL DEFAULT FALSE`);
+        console.log('✅ FIX-398 pilot lifecycle schema ready');
+    } catch (e) {
+        console.error('❌ FIX-398 pilot bootstrap failed:', e.message);
+    }
+}
+
+// FIX-398 (Block J): hourly check — pilots whose window has ended raise a single
+// CRM task (admin_action_queue) prompting the superadmin to convert/pause/exit.
+// Manual status changes are via the Manage Tenants panel; this just flags expiry.
+async function tickPilotExpiryCron() {
+    try {
+        const due = await pool.query(
+            `SELECT id, name, short_id, pilot_ends_at
+               FROM tenants
+              WHERE status = 'pilot'
+                AND pilot_ends_at IS NOT NULL
+                AND pilot_ends_at < NOW()
+                AND COALESCE(pilot_expiry_notified, FALSE) = FALSE`
+        );
+        for (const t of due.rows) {
+            try {
+                await pool.query(
+                    `INSERT INTO admin_action_queue
+                        (type, status, title, notes, subject_player_id, flagged_by, recommend_refund)
+                     VALUES ('pilot_expiry', 'pending', $1, $2, NULL, NULL, FALSE)`,
+                    [
+                        `Pilot ended — ${t.name || ('#' + t.short_id)}`,
+                        `Tenant #${t.short_id} (${t.name || 'unnamed'}) reached the end of its pilot on `
+                        + `${new Date(t.pilot_ends_at).toISOString().slice(0,10)}. Decide next step in CRM → `
+                        + `Manage Tenants: set status to active (convert), paused, or exited.`
+                    ]
+                );
+                await pool.query(`UPDATE tenants SET pilot_expiry_notified = TRUE WHERE id = $1`, [t.id]);
+                console.log(`[FIX-398] Pilot-expiry task raised for tenant ${t.short_id}`);
+            } catch (ie) {
+                // Missing table/column (pre-migration) — stop quietly; retry next tick.
+                if (/relation.*does not exist|column.*does not exist/i.test(ie.message || '')) return;
+                console.warn('[FIX-398] pilot task insert failed:', ie.message);
+            }
+        }
+    } catch (e) {
+        if (!/relation.*does not exist|column.*does not exist/i.test(e.message || '')) {
+            console.warn('[FIX-398] pilot expiry cron failed:', e.message);
+        }
+    }
+}
+
+async function fix386BootstrapRefundPolicy() {
+    try {
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS refund_cutoff_hours INT NOT NULL DEFAULT 2`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS no_refund_after_teams BOOLEAN NOT NULL DEFAULT TRUE`);
+        await pool.query(`UPDATE tenants SET refund_cutoff_hours = 2 WHERE refund_cutoff_hours IS NULL`);
+        await pool.query(`UPDATE tenants SET no_refund_after_teams = TRUE WHERE no_refund_after_teams IS NULL`);
+        console.log('✅ FIX-386 refund-policy schema ready (refund_cutoff_hours default 2, no_refund_after_teams default TRUE)');
+    } catch (e) {
+        console.error('❌ FIX-386 refund-policy bootstrap failed:', e.message);
+        // Non-fatal — dropout logic defaults to 2h + teams-on when columns absent.
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // FIX-357 — Lock-preempt helpers
 // ──────────────────────────────────────────────────────────────────────────
@@ -53947,6 +56108,11 @@ app.listen(PORT, () => {
 
     // FIX-366: bootstrap multi-region column + backfill (non-blocking)
     fix366BootstrapMultiRegion().catch(e => console.error('FIX-366 bootstrap surfaced:', e.message));
+    fix386BootstrapRefundPolicy().catch(e => console.error('FIX-386 bootstrap surfaced:', e.message));
+    fix398BootstrapPilot().catch(e => console.error('FIX-398 bootstrap surfaced:', e.message));
+    fix400BootstrapOverrated().catch(e => console.error('FIX-400 bootstrap surfaced:', e.message));
+    fix401BootstrapLeagues().catch(e => console.error('FIX-401 bootstrap surfaced:', e.message));
+    fix411BootstrapStatsVoid().catch(e => console.error('FIX-411 bootstrap surfaced:', e.message));
 
     // ── Email transport self-check ──────────────────────────────────────────
     // Verifies SMTP credentials on boot so silent email failures become loud.
@@ -54007,6 +56173,7 @@ app.listen(PORT, () => {
     // only fires on day 1 of month. Idempotent via UNIQUE constraint on
     // invoices(tenant_id, period_start, period_end) + audit-log dedup.
     setInterval(_fix331TickInvoiceCron, 60 * 60 * 1000); // every hour
+    setInterval(tickPilotExpiryCron, 60 * 60 * 1000); // FIX-398: hourly pilot-expiry check
 
     // ── Wonderful payment reconciler ────────────────────────────────────────
     // The webhook is the primary credit path but it can fail silently: Render
