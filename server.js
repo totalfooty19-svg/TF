@@ -51632,6 +51632,105 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
     }
 });
 
+// ───────────────────────────────────────────────────────────────────────
+// Multi-organiser: every CONFIRMED player flagged is_organiser counts as an
+// organiser on the game (matches the confirmed_organiser_count pattern used
+// across the codebase). Returns an array so game.html can render a carousel
+// and a per-organiser rating section. Backward-compatible: the singular
+// /organiser endpoint above is unchanged.
+app.get('/api/public/game/:game_url/organisers', publicEndpointLimiter, async (req, res) => {
+    const gameUrl = req.params.game_url;
+    if (!gameUrl || gameUrl.length > 100) return res.status(400).json({ error: 'Invalid game_url' });
+    try {
+        const gRes = await pool.query(
+            `SELECT g.id, g.default_organiser_id, g.tenant_id,
+                    t.short_id AS tenant_short_id, t.name AS tenant_name,
+                    t.logo_url AS tenant_logo, t.primary_color AS tenant_primary_color,
+                    t.status AS tenant_status
+               FROM games g
+          LEFT JOIN tenants t ON t.id = g.tenant_id
+              WHERE g.game_url = $1
+              LIMIT 1`,
+            [gameUrl]
+        );
+        if (gRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const game = gRes.rows[0];
+        const tenantActive = game.tenant_id && game.tenant_status === 'active';
+        const tenant = tenantActive ? {
+            short_id: game.tenant_short_id, name: game.tenant_name,
+            logo_url: game.tenant_logo, primary_color: game.tenant_primary_color,
+        } : { short_id: null, name: 'TotalFooty', logo_url: null, primary_color: null };
+
+        // Confirmed players flagged is_organiser. Also fold in the default
+        // organiser id (it is normally auto-added as a confirmed comped player,
+        // but include defensively so the assigned organiser always appears).
+        const oRes = await pool.query(
+            `SELECT DISTINCT p.id, p.full_name, p.alias, p.photo_url,
+                    p.phone, p.phone_public_for_organising AS phone_consent
+               FROM registrations r
+               JOIN players p ON p.id = r.player_id
+              WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = TRUE`,
+            [game.id]
+        );
+        const rows = oRes.rows.slice();
+        if (game.default_organiser_id && !rows.some(r => r.id === game.default_organiser_id)) {
+            const dRes = await pool.query(
+                `SELECT id, full_name, alias, photo_url, phone,
+                        phone_public_for_organising AS phone_consent, is_organiser
+                   FROM players WHERE id = $1 LIMIT 1`,
+                [game.default_organiser_id]
+            );
+            if (dRes.rows[0] && dRes.rows[0].is_organiser) rows.unshift(dRes.rows[0]);
+        }
+
+        // Decorate each with rating aggregates + verified flag (failure-tolerant).
+        const organisers = [];
+        for (const r of rows) {
+            const phoneOk = r.phone_consent && r.phone;
+            let avg_rating = null, review_count = 0;
+            try {
+                const rr = await pool.query(
+                    `SELECT ROUND(AVG(rating)::numeric,1) AS avg_rating, COUNT(*)::int AS review_count
+                       FROM organiser_reviews WHERE organiser_player_id = $1`,
+                    [r.id]
+                );
+                if (rr.rows[0]) {
+                    const a = rr.rows[0].avg_rating;
+                    avg_rating = (a !== null && a !== undefined) ? parseFloat(a) : null;
+                    review_count = parseInt(rr.rows[0].review_count, 10) || 0;
+                }
+            } catch (e) {
+                if (!(e && (e.code === '42P01' || e.code === '42703'))) {
+                    console.warn('[multi-org] rating fetch failed (non-fatal):', e.message);
+                }
+            }
+            let verified = false, verified_reason = null;
+            try {
+                const vc = await _fix334CheckVerifiedOrganiser(r.id, game.tenant_id);
+                verified = vc.verified; verified_reason = vc.reason;
+            } catch (_) {}
+            organisers.push({
+                player_id: r.id,
+                full_name: r.full_name,
+                alias:     r.alias,
+                photo_url: r.photo_url,
+                phone:     phoneOk ? r.phone : null,
+                verified, verified_reason,
+                avg_rating, review_count,
+                is_default: r.id === game.default_organiser_id,
+            });
+        }
+
+        res.json({ organisers, tenant, game_completed: false });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) {
+            return res.status(503).json({ error: 'Feature not yet provisioned' });
+        }
+        console.error('multi-organiser card failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch organisers' });
+    }
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // END FIX-327 endpoints
 // ═══════════════════════════════════════════════════════════════════════
@@ -51685,12 +51784,20 @@ app.post('/api/games/:gameUrl/organiser-review', authenticateToken, async (req, 
     const allowContact = req.body?.allow_tenant_contact;
     const allowContactSet = typeof allowContact === 'boolean';
 
+    // Multi-organiser: body may specify which organiser is being reviewed.
+    //   organiser_player_id : rate that specific organiser
+    //   review_all === true : rate EVERY organiser on the game with the same score
+    //   (neither)           : back-compat — falls back to default_organiser_id
+    const targetOrganiserId = (typeof req.body?.organiser_player_id === 'string' && req.body.organiser_player_id)
+        ? req.body.organiser_player_id : null;
+    const reviewAll = req.body?.review_all === true;
+
     let client;
     try {
         client = await pool.connect();
         await client.query('BEGIN');
 
-        // Load game + organiser + tenant context
+        // Load game + tenant context
         const gRes = await client.query(
             `SELECT g.id, g.game_status, g.default_organiser_id, g.tenant_id
                FROM games g
@@ -51707,16 +51814,8 @@ app.post('/api/games/:gameUrl/organiser-review', authenticateToken, async (req, 
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Reviews can only be submitted after the game has completed' });
         }
-        if (!g.default_organiser_id) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'This game has no assigned organiser to review' });
-        }
-        if (g.default_organiser_id === req.user.playerId) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'You cannot review yourself' });
-        }
 
-        // Must have played in this game (confirmed registration)
+        // Reviewer must have a CONFIRMED registration in the game.
         const partRes = await client.query(
             `SELECT 1 FROM registrations
               WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
@@ -51728,24 +51827,61 @@ app.post('/api/games/:gameUrl/organiser-review', authenticateToken, async (req, 
             return res.status(403).json({ error: 'Only confirmed participants can review the organiser' });
         }
 
-        // UPSERT review
-        const isEdit = await client.query(
-            'SELECT id FROM organiser_reviews WHERE game_id = $1 AND reviewer_player_id = $2 LIMIT 1',
-            [g.id, req.user.playerId]
+        // Resolve the set of valid organisers for this game = confirmed players
+        // flagged is_organiser (+ the default organiser, defensively).
+        const orgRes = await client.query(
+            `SELECT DISTINCT p.id
+               FROM registrations r
+               JOIN players p ON p.id = r.player_id
+              WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = TRUE`,
+            [g.id]
         );
-        const wasEdit = isEdit.rows.length > 0;
+        const validOrgIds = new Set(orgRes.rows.map(r => r.id));
+        if (g.default_organiser_id) validOrgIds.add(g.default_organiser_id);
+        validOrgIds.delete(req.user.playerId); // never review yourself
 
-        const insRes = await client.query(
-            `INSERT INTO organiser_reviews
-                (game_id, organiser_player_id, reviewer_player_id, tenant_id, rating, comment)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (game_id, reviewer_player_id)
-             DO UPDATE SET rating     = EXCLUDED.rating,
-                           comment    = EXCLUDED.comment,
-                           updated_at = NOW()
-             RETURNING id, rating, comment, created_at, updated_at`,
-            [g.id, g.default_organiser_id, req.user.playerId, g.tenant_id, rating, safeComment]
-        );
+        if (validOrgIds.size === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This game has no organiser you can review' });
+        }
+
+        // Determine target list.
+        let targets;
+        if (reviewAll) {
+            targets = [...validOrgIds];
+        } else {
+            const chosen = targetOrganiserId || g.default_organiser_id;
+            if (!chosen || !validOrgIds.has(chosen)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'Invalid organiser for this game' });
+            }
+            targets = [chosen];
+        }
+
+        // UPSERT a review row per target organiser. Unique key is now
+        // (game_id, organiser_player_id, reviewer_player_id).
+        let wasEdit = false;
+        let lastRow = null;
+        for (const orgId of targets) {
+            const pre = await client.query(
+                'SELECT id FROM organiser_reviews WHERE game_id = $1 AND organiser_player_id = $2 AND reviewer_player_id = $3 LIMIT 1',
+                [g.id, orgId, req.user.playerId]
+            );
+            if (pre.rows.length > 0) wasEdit = true;
+            const ins = await client.query(
+                `INSERT INTO organiser_reviews
+                    (game_id, organiser_player_id, reviewer_player_id, tenant_id, rating, comment)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (game_id, organiser_player_id, reviewer_player_id)
+                 DO UPDATE SET rating     = EXCLUDED.rating,
+                               comment    = EXCLUDED.comment,
+                               updated_at = NOW()
+                 RETURNING id, rating, comment, created_at, updated_at`,
+                [g.id, orgId, req.user.playerId, g.tenant_id, rating, safeComment]
+            );
+            lastRow = ins.rows[0];
+        }
+        const insRes = { rows: [lastRow] };
 
         // A.50 side-effect: flip allow_tenant_contact if requested and game is tenant-scoped
         if (allowContactSet && g.tenant_id) {
@@ -51760,8 +51896,9 @@ app.post('/api/games/:gameUrl/organiser-review', authenticateToken, async (req, 
         await client.query('COMMIT');
 
         const action = wasEdit ? 'organiser_review_updated' : 'organiser_review_received';
-        setImmediate(() => auditLog(pool, req.user.playerId, action, g.default_organiser_id,
-            `Rated organiser ${rating}★${safeComment ? ' — ' + safeComment.slice(0, 80) : ''}`,
+        const _auditTarget = reviewAll ? null : (targetOrganiserId || g.default_organiser_id);
+        setImmediate(() => auditLog(pool, req.user.playerId, action, _auditTarget,
+            `Rated ${reviewAll ? 'all organisers' : 'organiser'} ${rating}★${safeComment ? ' — ' + safeComment.slice(0, 80) : ''}`,
             g.tenant_id));
 
         res.json({
@@ -51789,14 +51926,15 @@ app.get('/api/games/:gameUrl/my-review', authenticateToken, async (req, res) => 
     if (!gameUrl || gameUrl.length > 100) return res.status(400).json({ error: 'Invalid gameUrl' });
     try {
         const r = await pool.query(
-            `SELECT orv.id, orv.rating, orv.comment, orv.created_at, orv.updated_at
+            `SELECT orv.id, orv.organiser_player_id, orv.rating, orv.comment, orv.created_at, orv.updated_at
                FROM organiser_reviews orv
                JOIN games g ON g.id = orv.game_id
-              WHERE g.game_url = $1 AND orv.reviewer_player_id = $2
-              LIMIT 1`,
+              WHERE g.game_url = $1 AND orv.reviewer_player_id = $2`,
             [gameUrl, req.user.playerId]
         );
-        res.json({ review: r.rows[0] || null });
+        // Multi-organiser: return all of this reviewer's reviews for the game,
+        // plus `review` (first) for backward-compatibility with older clients.
+        res.json({ review: r.rows[0] || null, reviews: r.rows });
     } catch (e) {
         if (e && e.code === '42P01') return res.json({ review: null });
         console.error('FIX-328 my-review failed:', e.message);
@@ -55644,6 +55782,78 @@ async function fix356BootstrapFaq() {
 //      "Webhook log" diagnostic added in FIX-364. Separate table (not JSONB
 //      on wonderful_payments) so webhook acks stay fast and the main row
 //      doesn't bloat over time.
+// Bootstrap the organiser_reviews table. This was historically provisioned
+// out-of-band and was MISSING on production (every query catches 42P01 and
+// degrades silently — which is why organiser ratings never appeared). Created
+// here idempotently with the multi-organiser unique key so a player can review
+// each organiser on a game exactly once.
+async function bootstrapOrganiserReviews() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS organiser_reviews (
+                id                  BIGSERIAL PRIMARY KEY,
+                game_id             UUID NOT NULL REFERENCES games(id)   ON DELETE CASCADE,
+                organiser_player_id UUID NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+                reviewer_player_id  UUID NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+                tenant_id           UUID REFERENCES tenants(id) ON DELETE SET NULL,
+                rating              INT  NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                comment             TEXT,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT organiser_reviews_game_org_reviewer_key
+                    UNIQUE (game_id, organiser_player_id, reviewer_player_id)
+            )
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_organiser_reviews_organiser
+                ON organiser_reviews (organiser_player_id)
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_organiser_reviews_game
+                ON organiser_reviews (game_id)
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_organiser_reviews_tenant
+                ON organiser_reviews (tenant_id, created_at DESC)
+        `);
+        // Migration path: if the table pre-existed with the OLD unique key
+        // (game_id, reviewer_player_id), swap it for the multi-organiser key.
+        await pool.query(`
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conrelid = 'organiser_reviews'::regclass
+                       AND contype = 'u'
+                       AND conname <> 'organiser_reviews_game_org_reviewer_key'
+                ) THEN
+                    -- Drop any other unique constraint(s) (old single-target key).
+                    EXECUTE (
+                        SELECT string_agg('ALTER TABLE organiser_reviews DROP CONSTRAINT ' || quote_ident(conname) || ';', ' ')
+                          FROM pg_constraint
+                         WHERE conrelid = 'organiser_reviews'::regclass
+                           AND contype = 'u'
+                           AND conname <> 'organiser_reviews_game_org_reviewer_key'
+                    );
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conrelid = 'organiser_reviews'::regclass
+                       AND conname = 'organiser_reviews_game_org_reviewer_key'
+                ) THEN
+                    ALTER TABLE organiser_reviews
+                        ADD CONSTRAINT organiser_reviews_game_org_reviewer_key
+                        UNIQUE (game_id, organiser_player_id, reviewer_player_id);
+                END IF;
+            END $$;
+        `);
+        console.log('✅ organiser_reviews schema ready (multi-organiser unique key)');
+    } catch (e) {
+        console.error('❌ organiser_reviews bootstrap failed:', e.message);
+        // Non-fatal — endpoints already degrade gracefully if the table is absent.
+    }
+}
+
 async function fix359BootstrapWonderfulHardening() {
     try {
         await pool.query(`
@@ -56134,6 +56344,7 @@ app.listen(PORT, () => {
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
 
     // FIX-359..364: bootstrap Wonderful hardening schema (notified_at + webhook log)
+    bootstrapOrganiserReviews().catch(e => console.error('organiser_reviews bootstrap surfaced:', e.message));
     fix359BootstrapWonderfulHardening().catch(e => console.error('FIX-359 bootstrap surfaced:', e.message));
 
     // FIX-366: bootstrap multi-region column + backfill (non-blocking)
