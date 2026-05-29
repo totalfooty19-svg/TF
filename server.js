@@ -9753,6 +9753,7 @@ function validateVenuePayload(body) {
             parking_pin:           trim(body.parking_pin, 200),
             pitch_pin:             trim(body.pitch_pin, 200),
             boot_type:             trim(body.boot_type, 50),
+            pitch_type:            trim(body.pitch_type, 20),
             availability_rule:     trim(body.availability_rule, 200),
             coaching_suitable:     body.coaching_suitable === true || body.coaching_suitable === 'true',
             coaching_cost_per_hour:    num(body.coaching_cost_per_hour),
@@ -9837,7 +9838,7 @@ app.post('/api/admin/venues', authenticateToken, requireAdmin, async (req, res) 
         const cols = [
             'name','address','region','postcode','pitch_location','pitch_name',
             'facilities','notes','special_instructions','parking_pin','pitch_pin',
-            'boot_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
+            'boot_type','pitch_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
             'pay_and_play_coach_hourly','pay_and_play_player_hourly',
             'default_pitch_cost','default_max_players','default_format','default_position_type',
             'background_image_filename'
@@ -9904,7 +9905,7 @@ app.put('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req, re
         const cols = [
             'name','address','region','postcode','pitch_location','pitch_name',
             'facilities','notes','special_instructions','parking_pin','pitch_pin',
-            'boot_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
+            'boot_type','pitch_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
             'pay_and_play_coach_hourly','pay_and_play_player_hourly',
             'default_pitch_cost','default_max_players','default_format','default_position_type',
             'background_image_filename'
@@ -47606,7 +47607,7 @@ app.post('/api/admin/queue/:id/approve', authenticateToken, requireAdmin, async 
                      AND r.player_id = q.subject_player_id
                      AND r.status = 'confirmed'
               WHERE q.id = $1
-              FOR UPDATE`,
+              FOR UPDATE OF q`,
             [queueId]
         );
         if (qr.rows.length === 0) {
