@@ -10108,6 +10108,9 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                    ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
+                   -- Confirmed-only headcount (confirmed regs + guests), EXCLUDING rsvp.
+                   -- Matches /claim-spot's open-spot check so the UI can gate the CLAIM button.
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as confirmed_only_count,
                    EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1) as registration_status,
                    (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1) as my_backup_type,
@@ -10392,6 +10395,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                    ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp') AND UPPER(TRIM(position_preference)) = 'GK') as gk_count /* FIX-315 */,
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as confirmed_only_count,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1) as registration_status,
                    (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1) as my_backup_type,
                    -- P2.3: amount paid by current user (drives drop-out penalty dialog in game.html)
@@ -47517,10 +47521,11 @@ app.delete('/api/admin/tasks/:id', authenticateToken, requireAdmin, async (req, 
 app.get('/api/admin/tasks/assignable', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const r = await pool.query(`
-            SELECT id, COALESCE(alias, full_name) AS name, role, is_organiser
-              FROM players
-             WHERE role IN ('admin', 'superadmin') OR is_organiser = TRUE
-             ORDER BY COALESCE(alias, full_name) ASC
+            SELECT p.id, COALESCE(p.alias, p.full_name) AS name, u.role, p.is_organiser
+              FROM players p
+              JOIN users u ON u.id = p.user_id
+             WHERE u.role IN ('admin', 'superadmin') OR p.is_organiser = TRUE
+             ORDER BY COALESCE(p.alias, p.full_name) ASC
         `);
         res.json({ assignable: r.rows });
     } catch (e) {
@@ -51525,7 +51530,7 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
 
     try {
         const r = await pool.query(
-            `SELECT g.id, g.default_organiser_id,
+            `SELECT g.id, g.default_organiser_id, g.game_status,
                     p.full_name AS organiser_full_name,
                     p.alias     AS organiser_alias,
                     p.photo_url AS organiser_photo,
@@ -51563,7 +51568,26 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
         // via the phone_public_for_organising consent toggle. Default FALSE on
         // schema migration → existing TF organisers stay opted-out until they
         // explicitly opt in via /api/player/preferences PATCH.
-        const phoneOk = row.organiser_phone_consent && row.organiser_phone;
+        // Phone-visibility gate (security): only when game not completed AND the
+        // viewer is logged in with a CONFIRMED (paid) registration on this game.
+        let _viewerPaid = false;
+        if (row.game_status !== 'completed') {
+            try {
+                const tok = req.cookies && (req.cookies.token || req.cookies.tf_token);
+                if (tok) {
+                    const decoded = jwt.verify(tok, JWT_SECRET);
+                    const vpid = decoded && decoded.playerId;
+                    if (vpid) {
+                        const reg = await pool.query(
+                            `SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed' LIMIT 1`,
+                            [row.id, vpid]
+                        );
+                        _viewerPaid = reg.rows.length > 0;
+                    }
+                }
+            } catch (_) {}
+        }
+        const phoneOk = _viewerPaid && row.organiser_phone_consent && row.organiser_phone;
 
         // FIX-334 (ROW Day 26): verified badge (check-on-demand per Q12=B)
         const verifiedCheck = await _fix334CheckVerifiedOrganiser(
@@ -51643,7 +51667,7 @@ app.get('/api/public/game/:game_url/organisers', publicEndpointLimiter, async (r
     if (!gameUrl || gameUrl.length > 100) return res.status(400).json({ error: 'Invalid game_url' });
     try {
         const gRes = await pool.query(
-            `SELECT g.id, g.default_organiser_id, g.tenant_id,
+            `SELECT g.id, g.default_organiser_id, g.tenant_id, g.game_status,
                     t.short_id AS tenant_short_id, t.name AS tenant_name,
                     t.logo_url AS tenant_logo, t.primary_color AS tenant_primary_color,
                     t.status AS tenant_status
@@ -51655,6 +51679,34 @@ app.get('/api/public/game/:game_url/organisers', publicEndpointLimiter, async (r
         );
         if (gRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
         const game = gRes.rows[0];
+
+        // ── Phone-visibility gate (security) ──────────────────────────────
+        // The organiser's mobile is only returned when ALL hold:
+        //   1. the game is NOT completed, AND
+        //   2. the viewer is logged in AND has a CONFIRMED (paid) registration
+        //      on this game (RSVP/backup do NOT qualify), AND
+        //   3. the organiser opted in to sharing their number (checked per-row).
+        // This endpoint is otherwise public, so we read the cookie token
+        // optionally (no auth required to view the card — only to see phones).
+        let viewerEligibleForPhone = false;
+        if (game.game_status !== 'completed') {
+            try {
+                const tok = req.cookies && (req.cookies.token || req.cookies.tf_token);
+                if (tok) {
+                    const decoded = jwt.verify(tok, JWT_SECRET);
+                    const viewerPid = decoded && decoded.playerId;
+                    if (viewerPid) {
+                        const reg = await pool.query(
+                            `SELECT 1 FROM registrations
+                              WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
+                              LIMIT 1`,
+                            [game.id, viewerPid]
+                        );
+                        viewerEligibleForPhone = reg.rows.length > 0;
+                    }
+                }
+            } catch (_) { /* not logged in / bad token — no phone */ }
+        }
         const tenantActive = game.tenant_id && game.tenant_status === 'active';
         const tenant = tenantActive ? {
             short_id: game.tenant_short_id, name: game.tenant_name,
@@ -51686,7 +51738,7 @@ app.get('/api/public/game/:game_url/organisers', publicEndpointLimiter, async (r
         // Decorate each with rating aggregates + verified flag (failure-tolerant).
         const organisers = [];
         for (const r of rows) {
-            const phoneOk = r.phone_consent && r.phone;
+            const phoneOk = viewerEligibleForPhone && r.phone_consent && r.phone;
             let avg_rating = null, review_count = 0;
             try {
                 const rr = await pool.query(
@@ -51952,7 +52004,16 @@ app.get('/api/t/:tenant_short_id/admin/organiser-reviews',
         if (!Number.isFinite(offset) || offset < 0)  offset = 0;
         if (limit > 200) limit = 200;
 
+        // Optional per-organiser filter (?organiser_player_id=) for the
+        // star-rating drill-down in the CRM panel.
+        const orgFilter = (typeof req.query.organiser_player_id === 'string' && isValidUuid(req.query.organiser_player_id))
+            ? req.query.organiser_player_id : null;
         try {
+            const params = [req.tenant.id];
+            let orgClause = '';
+            if (orgFilter) { params.push(orgFilter); orgClause = ` AND orv.organiser_player_id = $${params.length}`; }
+            params.push(limit); const limIdx = params.length;
+            params.push(offset); const offIdx = params.length;
             const r = await pool.query(
                 `SELECT orv.id, orv.game_id, orv.organiser_player_id,
                         orv.rating, orv.comment, orv.created_at, orv.updated_at,
@@ -51965,10 +52026,10 @@ app.get('/api/t/:tenant_short_id/admin/organiser-reviews',
                    JOIN players po ON po.id = orv.organiser_player_id
                    JOIN players pr ON pr.id = orv.reviewer_player_id
                    JOIN games   g  ON g.id  = orv.game_id
-                  WHERE orv.tenant_id = $1
+                  WHERE orv.tenant_id = $1${orgClause}
                   ORDER BY orv.created_at DESC
-                  LIMIT $2 OFFSET $3`,
-                [req.tenant.id, limit, offset]
+                  LIMIT $${limIdx} OFFSET $${offIdx}`,
+                params
             );
             res.json({ reviews: r.rows, count: r.rows.length });
         } catch (e) {
@@ -52116,6 +52177,85 @@ app.delete('/api/t/:tenant_short_id/admin/organisers/:player_id',
         }
     }
 );
+
+// ── Superadmin: cross-tenant organiser management ───────────────────────────
+// Lists tenant organisers across ALL tenants (or one tenant via ?tenant_id=),
+// each with their review score aggregate. Superadmin-only. Tenant admins use the
+// per-tenant endpoints above (/api/t/:short_id/admin/organisers).
+app.get('/api/admin/organisers', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const tenantFilter = (typeof req.query.tenant_id === 'string' && isValidUuid(req.query.tenant_id))
+            ? req.query.tenant_id : null;
+        const params = [];
+        let where = "pt.status = 'active' AND pt.role IN ('organiser','tenant_admin')";
+        if (tenantFilter) { params.push(tenantFilter); where += ` AND pt.tenant_id = $${params.length}`; }
+
+        const r = await pool.query(
+            `SELECT pt.player_id, pt.role, pt.tenant_id, pt.joined_at,
+                    p.full_name, p.alias, p.photo_url,
+                    t.name AS tenant_name, t.short_id AS tenant_short_id,
+                    COALESCE(rv.avg_rating, NULL) AS avg_rating,
+                    COALESCE(rv.review_count, 0)  AS review_count
+               FROM player_tenants pt
+               JOIN players p ON p.id = pt.player_id
+          LEFT JOIN tenants t ON t.id = pt.tenant_id
+          LEFT JOIN (
+                    SELECT organiser_player_id,
+                           ROUND(AVG(rating)::numeric,1) AS avg_rating,
+                           COUNT(*)::int                 AS review_count
+                      FROM organiser_reviews
+                     GROUP BY organiser_player_id
+               ) rv ON rv.organiser_player_id = pt.player_id
+              WHERE ${where}
+              ORDER BY t.name NULLS LAST, pt.role DESC, p.full_name ASC`,
+            params
+        );
+        res.json({ organisers: r.rows });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return res.json({ organisers: [] });
+        console.error('superadmin organisers list failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch organisers' });
+    }
+});
+
+// Superadmin: list ALL tenants (for the organiser-management tenant filter).
+app.get('/api/admin/organisers/tenants', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, name, short_id FROM tenants WHERE status = 'active' ORDER BY name ASC`
+        );
+        res.json({ tenants: r.rows });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ tenants: [] });
+        console.error('superadmin tenant list (organisers) failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch tenants' });
+    }
+});
+
+// Superadmin: every review for one organiser (the star-rating drill-down).
+app.get('/api/admin/organisers/:player_id/reviews', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (!isValidUuid(req.params.player_id)) return res.status(400).json({ error: 'Invalid player_id' });
+    try {
+        const r = await pool.query(
+            `SELECT orv.id, orv.rating, orv.comment, orv.created_at, orv.game_id,
+                    g.game_url, g.game_date,
+                    v.name AS venue_name,
+                    pr.full_name AS reviewer_full_name, pr.alias AS reviewer_alias
+               FROM organiser_reviews orv
+               JOIN games   g  ON g.id  = orv.game_id
+          LEFT JOIN venues  v  ON v.id  = g.venue_id
+               JOIN players pr ON pr.id = orv.reviewer_player_id
+              WHERE orv.organiser_player_id = $1
+              ORDER BY orv.created_at DESC`,
+            [req.params.player_id]
+        );
+        res.json({ reviews: r.rows, count: r.rows.length });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ reviews: [], count: 0 });
+        console.error('superadmin organiser reviews failed:', e.message);
+        res.status(500).json({ error: 'Failed to fetch reviews' });
+    }
+});
 
 // ════════════════════════════════════════════════════════════════════════════
 // FIX-334 — ROW Day 23: Tenant member ban + Manage Players view-only
@@ -53340,9 +53480,10 @@ app.get('/api/players/me/tcs-status', authenticateToken, async (req, res) => {
                 organiser_accepted_at:      row.accepted_organiser_tcs_at || null,
                 tenant_accepted_version: row.accepted_tenant_tcs_version || null,
                 tenant_accepted_at:      row.accepted_tenant_tcs_at || null,
-                must_accept_organiser:
-                    (row.role === 'organiser' || row.role === 'tenant_admin') &&
-                    row.accepted_organiser_tcs_version !== CURRENT_ORGANISER_TCS_VERSION,
+                // Organisers do not require separate T&Cs (product decision):
+                // never force organiser-tier acceptance. The column + accept
+                // endpoint remain for backward-compat but never block.
+                must_accept_organiser: false,
                 must_accept_tenant:
                     row.role === 'tenant_admin' &&
                     row.accepted_tenant_tcs_version !== CURRENT_TENANT_TCS_VERSION,
