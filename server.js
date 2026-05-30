@@ -10034,41 +10034,29 @@ app.post('/api/admin/venues/:id/restore', authenticateToken, requireAdmin, async
 
 app.get('/api/games', authenticateToken, async (req, res) => {
     try {
-        const playerResult = await pool.query(
-            'SELECT reliability_tier, overall_rating, goalkeeper_rating FROM players WHERE id = $1',
-            [req.user.playerId]
-        );
-        
+        // PERF: batch the 4 preamble round-trips (player row + 3 badge checks)
+        // into 2 parallel queries. Badges fetched in one IN() query rather than
+        // three separate JOINs. Same results, ~3 fewer DB round-trips per call.
+        const [playerResult, badgeResult] = await Promise.all([
+            pool.query(
+                'SELECT reliability_tier, overall_rating, goalkeeper_rating FROM players WHERE id = $1',
+                [req.user.playerId]
+            ),
+            pool.query(`
+                SELECT b.name FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                WHERE pb.player_id = $1 AND b.name IN ('TF All Star', 'CLM', 'Misfits')
+            `, [req.user.playerId]),
+        ]);
+
         const tier      = playerResult.rows[0]?.reliability_tier || 'silver';
         const playerOvr = parseInt(playerResult.rows[0]?.overall_rating    ?? 0);
         const playerGk  = parseInt(playerResult.rows[0]?.goalkeeper_rating ?? 0);
-        
-        // Check if player has TF All Star badge
-        const allStarBadgeResult = await pool.query(`
-            SELECT 1 FROM player_badges pb
-            JOIN badges b ON b.id = pb.badge_id
-            WHERE pb.player_id = $1 AND b.name = 'TF All Star'
-        `, [req.user.playerId]);
-        
-        const hasAllStarBadge = allStarBadgeResult.rows.length > 0;
-        
-        // Check if player has CLM badge
-        const clmBadgeResult = await pool.query(`
-            SELECT 1 FROM player_badges pb
-            JOIN badges b ON b.id = pb.badge_id
-            WHERE pb.player_id = $1 AND b.name = 'CLM'
-        `, [req.user.playerId]);
-        
-        const hasCLMBadge = clmBadgeResult.rows.length > 0;
-        
-        // Check if player has Misfits badge
-        const misfitsBadgeResult = await pool.query(`
-            SELECT 1 FROM player_badges pb
-            JOIN badges b ON b.id = pb.badge_id
-            WHERE pb.player_id = $1 AND b.name = 'Misfits'
-        `, [req.user.playerId]);
-        
-        const hasMisfitsBadge = misfitsBadgeResult.rows.length > 0;
+
+        const _badgeNames   = new Set((badgeResult.rows || []).map(r => r.name));
+        const hasAllStarBadge = _badgeNames.has('TF All Star');
+        const hasCLMBadge     = _badgeNames.has('CLM');
+        const hasMisfitsBadge = _badgeNames.has('Misfits');
         
         // Tier-based visibility (exact requirements)
         let hoursAhead = 168; // silver default (168 hours = 7 days)
@@ -56117,6 +56105,29 @@ async function fix366BootstrapMultiRegion() {
 //     INTEGER, NOT the guide's UUID. games.league_id is UUID (leagues.id is UUID).
 //   • players.id / tenants.id / leagues.id = UUID. game_series.id = INTEGER (untouched here).
 // ════════════════════════════════════════════════════════════════════════
+// Dedicated performance-index bootstrap. Kept SEPARATE from feature bootstraps
+// so a failure in (say) the league bootstrap can never prevent these core
+// indexes from being created. Each is idempotent; behaviour-neutral (indexes
+// only affect query speed). These accelerate /api/games and every registration-
+// count query across the app.
+async function bootstrapPerfIndexes() {
+    const idx = [
+        ['idx_reg_game_status',   'registrations(game_id, status)'],
+        ['idx_reg_game_player',   'registrations(game_id, player_id)'],
+        ['idx_game_guests_game',  'game_guests(game_id)'],
+        ['idx_games_status_date', 'games(game_status, game_date)'],
+    ];
+    for (const [name, cols] of idx) {
+        try {
+            await pool.query(`CREATE INDEX IF NOT EXISTS ${name} ON ${cols}`);
+        } catch (e) {
+            // Per-index isolation: a single failure never blocks the others.
+            console.error(`perf index ${name} failed (non-fatal):`, e.message);
+        }
+    }
+    console.log('✅ performance indexes ready');
+}
+
 async function fix401BootstrapLeagues() {
     try {
         // 1) leagues — config + lifecycle. Belongs to a tenant.
@@ -56493,6 +56504,7 @@ app.listen(PORT, () => {
     fix386BootstrapRefundPolicy().catch(e => console.error('FIX-386 bootstrap surfaced:', e.message));
     fix398BootstrapPilot().catch(e => console.error('FIX-398 bootstrap surfaced:', e.message));
     fix400BootstrapOverrated().catch(e => console.error('FIX-400 bootstrap surfaced:', e.message));
+    bootstrapPerfIndexes().catch(e => console.error('perf index bootstrap surfaced:', e.message));
     fix401BootstrapLeagues().catch(e => console.error('FIX-401 bootstrap surfaced:', e.message));
     fix411BootstrapStatsVoid().catch(e => console.error('FIX-411 bootstrap surfaced:', e.message));
 
