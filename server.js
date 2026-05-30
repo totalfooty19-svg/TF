@@ -10075,56 +10075,99 @@ app.get('/api/games', authenticateToken, async (req, res) => {
         const visScope = await getVisibleTenantContext(req.user.playerId);
 
         const result = await pool.query(`
+            WITH base_games AS (
+                -- PERF: resolve the eligible game set ONCE. The aggregate CTEs below
+                -- are scoped to these rows so we never aggregate the whole registrations
+                -- / game_guests tables. WHERE logic is byte-identical to the old query.
+                SELECT g.*
+                FROM games g
+                WHERE (
+                    (g.game_status = 'available' AND g.game_date >= CURRENT_TIMESTAMP)
+                    OR (g.game_status = 'confirmed')
+                    OR (g.game_status = 'completed' AND (
+                        ${isAdmin ? "(g.game_date >= NOW() - INTERVAL '30 days')" : 'EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1)'}
+                    ))
+                )
+                ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
+                AND g.game_status != 'cancelled'
+                ${!isAdmin && !hasAllStarBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'allstars')" : ''}
+                ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
+                ${!isAdmin && !hasMisfitsBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'misfits')" : ''}
+                AND ($2 = TRUE OR (g.tenant_id IS NULL AND $3 = TRUE) OR g.tenant_id = ANY($4::uuid[]) OR ($5 = TRUE AND g.tenant_id IS NOT NULL))
+            ),
+            reg_agg AS (
+                -- One GROUP BY pass over registrations (joined to players once), replacing
+                -- the former per-row correlated subqueries for current_players,
+                -- confirmed_only_count, backup_count, confirmed_organiser_count and the
+                -- live_avg_ovr numerator/denominator. COUNT(expr) FILTER (...) counts only
+                -- rows matching the status AND having a non-null rating — identical to the
+                -- old subqueries' "WHERE status IN (...) AND rating IS NOT NULL".
+                SELECT r.game_id,
+                       COUNT(*) FILTER (WHERE r.status IN ('confirmed','rsvp'))                  AS conf_rsvp_regs,
+                       COUNT(*) FILTER (WHERE r.status = 'confirmed')                            AS confirmed_regs,
+                       COUNT(*) FILTER (WHERE r.status = 'backup')                               AS backup_count,
+                       COUNT(*) FILTER (WHERE r.status = 'confirmed' AND p.is_organiser = true)  AS confirmed_organiser_count,
+                       SUM(CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                THEN NULLIF(p.goalkeeper_rating, 0)
+                                ELSE p.overall_rating END) FILTER (WHERE r.status IN ('confirmed','rsvp'))   AS reg_rating_sum,
+                       COUNT(CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
+                                  THEN NULLIF(p.goalkeeper_rating, 0)
+                                  ELSE p.overall_rating END) FILTER (WHERE r.status IN ('confirmed','rsvp')) AS reg_rating_cnt
+                FROM registrations r
+                JOIN players p ON p.id = r.player_id
+                WHERE r.game_id IN (SELECT id FROM base_games)
+                GROUP BY r.game_id
+            ),
+            guest_agg AS (
+                SELECT gg.game_id,
+                       COUNT(*) AS guest_count,
+                       SUM(CASE WHEN gg.position_classification = 'gk'
+                                THEN NULLIF(gg.goalkeeper_rating, 0)
+                                ELSE gg.overall_rating END)   AS guest_rating_sum,
+                       COUNT(CASE WHEN gg.position_classification = 'gk'
+                                  THEN NULLIF(gg.goalkeeper_rating, 0)
+                                  ELSE gg.overall_rating END) AS guest_rating_cnt
+                FROM game_guests gg
+                WHERE gg.game_id IN (SELECT id FROM base_games)
+                GROUP BY gg.game_id
+            ),
+            my_reg AS (
+                -- This player's own registration row per game (was 5 correlated subqueries
+                -- + 1 EXISTS). DISTINCT ON matches the old "LIMIT 1" arbitrariness; for the
+                -- one-row-per-(game,player) reality it is exactly equivalent.
+                SELECT DISTINCT ON (r.game_id)
+                       r.game_id, r.status, r.backup_type, r.amount_paid, r.amount_paid_free
+                FROM registrations r
+                WHERE r.player_id = $1 AND r.game_id IN (SELECT id FROM base_games)
+                ORDER BY r.game_id
+            )
             SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location,
                    v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
                    g.teams_generated,
                    gs.series_name,
                    g.format as game_format,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') as game_time,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp')) + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
-                   ROUND((SELECT AVG(rating) FROM (
-                       SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
-                                   THEN NULLIF(p.goalkeeper_rating, 0)
-                                   ELSE p.overall_rating END AS rating
-                       FROM registrations r JOIN players p ON p.id = r.player_id
-                       WHERE r.game_id = g.id AND r.status IN ('confirmed', 'rsvp') /* FIX-315: include RSVPs in live_avg_ovr */
-                       UNION ALL
-                       SELECT CASE WHEN gg.position_classification = 'gk'
-                                   THEN NULLIF(gg.goalkeeper_rating, 0)
-                                   ELSE gg.overall_rating END AS rating
-                       FROM game_guests gg WHERE gg.game_id = g.id
-                   ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
-                   COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup') as backup_count,
-                   -- Confirmed-only headcount (confirmed regs + guests), EXCLUDING rsvp.
-                   -- Matches /claim-spot's open-spot check so the UI can gate the CLAIM button.
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as confirmed_only_count,
-                   EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1) as is_registered,
-                   (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1) as registration_status,
-                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1) as my_backup_type,
-                   -- P2.3: amount paid by current user (drives drop-out "you'll lose £X" dialog)
-                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1), 0) as my_amount_paid,
-                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1), 0) as my_amount_paid_free,
+                   (COALESCE(ra.conf_rsvp_regs, 0) + COALESCE(ga.guest_count, 0)) as current_players,
+                   ROUND((COALESCE(ra.reg_rating_sum, 0) + COALESCE(ga.guest_rating_sum, 0))::numeric
+                         / NULLIF(COALESCE(ra.reg_rating_cnt, 0) + COALESCE(ga.guest_rating_cnt, 0), 0), 1) as live_avg_ovr,
+                   COALESCE(ra.confirmed_organiser_count, 0)::int as confirmed_organiser_count,
+                   COALESCE(ra.backup_count, 0) as backup_count,
+                   (COALESCE(ra.confirmed_regs, 0) + COALESCE(ga.guest_count, 0)) as confirmed_only_count,
+                   (mr.game_id IS NOT NULL) as is_registered,
+                   mr.status as registration_status,
+                   mr.backup_type as my_backup_type,
+                   COALESCE(mr.amount_paid, 0) as my_amount_paid,
+                   COALESCE(mr.amount_paid_free, 0) as my_amount_paid_free,
                    motm_p.alias as motm_winner_alias, motm_p.full_name as motm_winner_name,
                    opp_list.logo_url AS opponent_logo_url, opp_list.star_rating AS opponent_star_rating
-            FROM games g
+            FROM base_games g
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
             LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
             LEFT JOIN opponents opp_list ON opp_list.id = g.opponent_id
-            WHERE (
-                (g.game_status = 'available' AND g.game_date >= CURRENT_TIMESTAMP)
-                OR (g.game_status = 'confirmed')
-                OR (g.game_status = 'completed' AND (
-                    ${isAdmin ? "(g.game_date >= NOW() - INTERVAL '30 days')" : 'EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1)'}
-                ))
-            )
-            ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
-            AND g.game_status != 'cancelled'
-            ${!isAdmin && !hasAllStarBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'allstars')" : ''}
-            ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
-            ${!isAdmin && !hasMisfitsBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'misfits')" : ''}
-            AND ($2 = TRUE OR (g.tenant_id IS NULL AND $3 = TRUE) OR g.tenant_id = ANY($4::uuid[]) OR ($5 = TRUE AND g.tenant_id IS NOT NULL))
+            LEFT JOIN reg_agg ra ON ra.game_id = g.id
+            LEFT JOIN guest_agg ga ON ga.game_id = g.id
+            LEFT JOIN my_reg mr ON mr.game_id = g.id
             ORDER BY g.game_date DESC
         `, [req.user.playerId, isAdmin, visScope.includeTfRoot, visScope.tenantIds, visScope.includeAllPublicTenants]);
         
@@ -17849,6 +17892,30 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 members: [p],
                 sumOverall: p.overall_rating || 0
             });
+        }
+
+        // FIX (orphaned guests): a guest's inviter (invited_by) may NOT be in the
+        // playing pool — e.g. an admin/superadmin added the guest via add-guest
+        // without being registered for this game themselves. The beef5 / parent /
+        // solo passes above attach guests ONLY through a present parent, so such a
+        // guest is never pulled into any unit: it stays orphaned in guestGroups,
+        // never gets placed on a team (invisible in the team-generation screen) and
+        // is excluded from the team rating sums — yet totalPlayerCount already counts
+        // it (skewing team-size/balance). Pick up each parentless guest here as its
+        // own SOLO unit (free agent: placed wherever it balances best, no pairing,
+        // since the parent isn't playing). Normally-invited guests (parent present)
+        // are untouched — their group key matches a present player and is skipped.
+        const _presentPlayerIds = new Set(players.map(p => toStrId(p.player_id)));
+        for (const [invitedBy, guests] of guestGroups.entries()) {
+            if (_presentPlayerIds.has(toStrId(invitedBy))) continue; // handled via parent/beef5 above
+            for (const g of guests) {
+                if (beef5MemberIds.has(toStrId(g.player_id))) continue; // defensive: never double-place
+                units.push({
+                    kind: 'solo',
+                    members: [g],
+                    sumOverall: g.overall_rating || 0
+                });
+            }
         }
 
         // FIX-220: Hoist the team-state bindings to the outer endpoint scope so
@@ -42591,9 +42658,16 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
             ? backup_type : null;
 
         // Idempotency (W-25): if the SAME player has an in-flight pay request
-        // for the SAME amount + game_id in the last 60s, return its pay_link
+        // for the SAME amount + game_id in the last 10s, return its pay_link
         // instead of creating a duplicate. Guards against double-click / fast
         // back-and-forward / mobile fat-finger.
+        // FIX (Wonderful retry): window shortened 60s -> 10s. A user who opens their
+        // bank app, the payment fails or is cancelled, then returns and retries
+        // always takes >10s — under the old 60s window they were handed back the
+        // SAME, now-stale/consumed pay_link ("couldn't use Wonderful"). At 10s a real
+        // retry gets a FRESH link, while genuine double-taps (sub-3s) are still caught.
+        // Orphaned init_pending rows are harmless: only one link is ever paid and the
+        // reconciler sweeps the rest.
         const dupeCheck = await pool.query(
             `SELECT id, merchant_reference, pay_link
              FROM wonderful_payments
@@ -42602,7 +42676,7 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
                AND (game_id IS NOT DISTINCT FROM $3)
                AND status IN ('pending', 'init_pending')
                AND pay_link IS NOT NULL
-               AND created_at > NOW() - INTERVAL '60 seconds'
+               AND created_at > NOW() - INTERVAL '10 seconds'
              ORDER BY created_at DESC LIMIT 1`,
             [playerId, amountPence, effectiveGameId]
         );
@@ -50429,6 +50503,76 @@ app.put('/api/t/:tenant_short_id/admin/bank-details',
     }
 );
 
+// ───────────────────────────────────────────────────────────────────────
+// Refund / cancellation policy — tenant_admin self-service (its own CRM tile).
+// Mirrors the bank-details GET/PUT pattern. Edits tenants.refund_cutoff_hours,
+// no_refund_after_teams, cancellation_policy_text for the admin's OWN tenant.
+// (Previously only the superadmin manage-tenants editor could touch these.)
+// ───────────────────────────────────────────────────────────────────────
+app.get('/api/t/:tenant_short_id/admin/refund-policy',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT refund_cutoff_hours, no_refund_after_teams, cancellation_policy_text
+                   FROM tenants WHERE id = $1 LIMIT 1`,
+                [req.tenant.id]
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+            res.json({
+                refund_cutoff_hours:      r.rows[0].refund_cutoff_hours,
+                no_refund_after_teams:    r.rows[0].no_refund_after_teams,
+                cancellation_policy_text: r.rows[0].cancellation_policy_text || '',
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Refund policy feature not yet provisioned' });
+            }
+            console.error('get refund policy failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch refund policy' });
+        }
+    }
+);
+
+// PUT /api/t/:tenant_short_id/admin/refund-policy — tenant_admin sets their own.
+// Body: { refund_cutoff_hours:int>=0, no_refund_after_teams:bool,
+//         cancellation_policy_text:string (<=2000 chars, optional) }
+app.put('/api/t/:tenant_short_id/admin/refund-policy',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const body = req.body || {};
+        const hrs = parseInt(body.refund_cutoff_hours, 10);
+        if (isNaN(hrs) || hrs < 0 || hrs > 8760) {
+            return res.status(400).json({ error: 'refund_cutoff_hours must be an integer between 0 and 8760' });
+        }
+        const noRefundAfterTeams = !!body.no_refund_after_teams;
+        const text = typeof body.cancellation_policy_text === 'string'
+            ? body.cancellation_policy_text.trim().slice(0, 2000) : '';
+        try {
+            const r = await pool.query(
+                `UPDATE tenants
+                    SET refund_cutoff_hours      = $1,
+                        no_refund_after_teams    = $2,
+                        cancellation_policy_text = $3
+                  WHERE id = $4
+                  RETURNING refund_cutoff_hours, no_refund_after_teams, cancellation_policy_text`,
+                [hrs, noRefundAfterTeams, text || null, req.tenant.id]
+            );
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_refund_policy_updated',
+                req.tenant.id, `Refund policy set (cutoff ${hrs}h, no-refund-after-teams ${noRefundAfterTeams})`, req.tenant.id).catch(() => {}));
+            res.json({
+                refund_cutoff_hours:      r.rows[0].refund_cutoff_hours,
+                no_refund_after_teams:    r.rows[0].no_refund_after_teams,
+                cancellation_policy_text: r.rows[0].cancellation_policy_text || '',
+            });
+        } catch (e) {
+            if (e && (e.code === '42P01' || e.code === '42703')) {
+                return res.status(503).json({ error: 'Refund policy feature not yet provisioned' });
+            }
+            console.error('update refund policy failed:', e.message);
+            res.status(500).json({ error: 'Failed to update refund policy' });
+        }
+    }
+);
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // END FIX-323 endpoints
@@ -55911,6 +56055,33 @@ async function fix356BootstrapFaq() {
 //      "Webhook log" diagnostic added in FIX-364. Separate table (not JSONB
 //      on wonderful_payments) so webhook acks stay fast and the main row
 //      doesn't bloat over time.
+// FIX (organiser section): the organiser-card endpoints
+// (/api/public/game/:url/organiser and /organisers) query
+// games.default_organiser_id and players.phone_public_for_organising directly,
+// with NO defensive guard — yet NEITHER column is created anywhere in this
+// codebase (game-create even catches the 42703 and silently re-inserts WITHOUT
+// the organiser). On any DB missing these columns the query throws 42703, the
+// endpoint 503s, and game.html's organiser section renders nothing at all
+// ("built twice, never works"). Create them idempotently on boot. Also add the
+// gracefully-degraded verified-override column so the verified badge can work.
+// Per-column isolation: one failure never blocks the others. Each is a no-op
+// if the column already exists.
+async function bootstrapOrganiserColumns() {
+    const cols = [
+        ['games',   'default_organiser_id',               'UUID'],
+        ['players', 'phone_public_for_organising',        'BOOLEAN NOT NULL DEFAULT FALSE'],
+        ['players', 'verified_organiser_manual_override', 'BOOLEAN'],
+    ];
+    for (const [table, col, type] of cols) {
+        try {
+            await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${col} ${type}`);
+        } catch (e) {
+            console.error(`bootstrapOrganiserColumns ${table}.${col} failed (non-fatal):`, e.message);
+        }
+    }
+    console.log('✅ organiser columns ready');
+}
+
 // Bootstrap the organiser_reviews table. This was historically provisioned
 // out-of-band and was MISSING on production (every query catches 42P01 and
 // degrades silently — which is why organiser ratings never appeared). Created
@@ -56333,9 +56504,16 @@ async function fix386BootstrapRefundPolicy() {
     try {
         await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS refund_cutoff_hours INT NOT NULL DEFAULT 2`);
         await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS no_refund_after_teams BOOLEAN NOT NULL DEFAULT TRUE`);
+        // FIX (refunds & cancellation tile): cancellation_policy_text was referenced
+        // in game-detail, the superadmin/branding tenant editors, and the new
+        // tenant-admin refund-policy endpoint, but was never created here — so on any
+        // DB missing it those queries 42703 (game-detail silently falls back to
+        // defaults; the new tile would 503). Add it idempotently alongside the other
+        // two refund columns. Nullable TEXT — empty = no custom policy text shown.
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS cancellation_policy_text TEXT`);
         await pool.query(`UPDATE tenants SET refund_cutoff_hours = 2 WHERE refund_cutoff_hours IS NULL`);
         await pool.query(`UPDATE tenants SET no_refund_after_teams = TRUE WHERE no_refund_after_teams IS NULL`);
-        console.log('✅ FIX-386 refund-policy schema ready (refund_cutoff_hours default 2, no_refund_after_teams default TRUE)');
+        console.log('✅ FIX-386 refund-policy schema ready (refund_cutoff_hours default 2, no_refund_after_teams default TRUE, cancellation_policy_text)');
     } catch (e) {
         console.error('❌ FIX-386 refund-policy bootstrap failed:', e.message);
         // Non-fatal — dropout logic defaults to 2h + teams-on when columns absent.
@@ -56496,6 +56674,7 @@ app.listen(PORT, () => {
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
 
     // FIX-359..364: bootstrap Wonderful hardening schema (notified_at + webhook log)
+    bootstrapOrganiserColumns().catch(e => console.error('organiser columns bootstrap surfaced:', e.message));
     bootstrapOrganiserReviews().catch(e => console.error('organiser_reviews bootstrap surfaced:', e.message));
     fix359BootstrapWonderfulHardening().catch(e => console.error('FIX-359 bootstrap surfaced:', e.message));
 
