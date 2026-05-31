@@ -401,6 +401,26 @@ function _massShortDate(d) {
         return dt.toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short', timeZone:'Europe/London' });
     } catch { return ''; }
 }
+// "[Weekday] [kick-off]" e.g. "Monday 8pm" — used to refer to a game in
+// WhatsApp messages so the wording is correct whatever the time of day
+// (replaces the old hardcoded "tonight's"). Empty string on invalid date.
+function _massWhen(d) {
+    try {
+        const dt = d instanceof Date ? d : new Date(d);
+        if (isNaN(dt.getTime())) return '';
+        const day = dt.toLocaleDateString('en-GB', { weekday:'long', timeZone:'Europe/London' });
+        const hm  = dt.toLocaleTimeString('en-GB', { hour:'numeric', minute:'2-digit', hour12:true, timeZone:'Europe/London' })
+                      .replace(':00','').replace(' ','').toLowerCase();
+        return `${day} ${hm}`;
+    } catch { return ''; }
+}
+// "Venue's [Weekday] [kick-off] game" e.g. "Powerleague's Monday 8pm game".
+// Falls back gracefully: missing venue -> "the … game"; missing time -> drops it.
+function _massGameLabel(venueName, whenStr) {
+    const v = (venueName || '').trim();
+    const prefix = v ? `${v}'s` : 'the';
+    return `${prefix}${whenStr ? ' ' + whenStr : ''} game`;
+}
 
 // Mass-message template definitions. Hardcoded in v1 (admin can edit the body
 // in the UI before sending, but the 6 default texts live here).
@@ -481,11 +501,21 @@ And lock in your spot for next week in one tap — RSVP here: {rsvp_link}
         label: 'Teams Are Ready',
         subject_template: '📋 Teams are ready — {venue_name}',
         body_template:
-`📋 Teams are ready for tonight's game at {venue_name}!
+`📋 Teams are ready for {game_label}!
 
 View the line-ups here: {view_teams_link}
 
 Make sure you arrive on time — kick-off is {kickoff_time}. See you there! ⚽
+
+— TotalFooty`,
+    },
+    game_complete_reserve: {
+        label: 'Game Complete + Reserve Next Week',
+        subject_template: '✅ {venue_name} — game complete',
+        body_template:
+`✅ {game_label} is done — see how it went here: {view_teams_link}
+
+Reserve your spot for next week in one tap — RSVP here: {next_game_rsvp_link}
 
 — TotalFooty`,
     },
@@ -503,6 +533,8 @@ function _resolvePlaceholders(text, player, game, extras) {
     if (!text) return '';
     extras = extras || {};
     const friendlyDate = _massFriendlyDate(game?.game_date);
+    const gameWhen     = _massWhen(game?.game_date);
+    const gameLabel    = _massGameLabel(game?.venue_name, gameWhen);
     const kickoffTime  = (() => {
         try {
             const dt = new Date(game?.game_date);
@@ -514,6 +546,12 @@ function _resolvePlaceholders(text, player, game, extras) {
     const signupLink = game?.game_url ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(game.game_url)}` : 'https://totalfooty.co.uk';
     const rsvpLink   = game?.game_url ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(game.game_url)}&rsvp=1` : 'https://totalfooty.co.uk';
     const viewLink   = signupLink;
+    // Post-game "reserve next week" links. Caller passes the resolved next
+    // series game via extras.next_game_url; absent → reserve link falls back to
+    // the site root (the complete-game wizard omits the line entirely instead).
+    const nextGameUrl      = extras.next_game_url || (game && game.next_game_url) || null;
+    const nextGameLink     = nextGameUrl ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(nextGameUrl)}` : 'https://totalfooty.co.uk';
+    const nextGameRsvpLink = nextGameUrl ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(nextGameUrl)}&rsvp=1` : 'https://totalfooty.co.uk';
     const spotsLeft  = (() => {
         const max = parseInt(game?.max_players || 0);
         const cur = parseInt(extras.current_players != null ? extras.current_players : game?.current_players || 0);
@@ -526,12 +564,16 @@ function _resolvePlaceholders(text, player, game, extras) {
         '{full_name}':          (player?.full_name || ''),
         '{venue_name}':         (game?.venue_name || ''),
         '{game_date_friendly}': friendlyDate,
+        '{game_when}':          gameWhen,
+        '{game_label}':         gameLabel,
         '{kickoff_time}':       kickoffTime,
         '{format}':             (game?.format || ''),
         '{price_credits}':      (game?.cost_per_player != null ? parseFloat(game.cost_per_player).toFixed(2) : ''),
         '{signup_link}':        signupLink,
         '{rsvp_link}':          rsvpLink,
         '{view_teams_link}':    viewLink,
+        '{next_game_link}':      nextGameLink,
+        '{next_game_rsvp_link}': nextGameRsvpLink,
         '{spots_left}':         spotsLeft,
         '{region}':             (game?.venue_region || ''),
         '{series_name}':        (game?.series_name || ''),
@@ -541,6 +583,27 @@ function _resolvePlaceholders(text, player, game, extras) {
         out = out.split(k).join(map[k] || '');
     }
     return out;
+}
+
+// Resolve the soonest upcoming game in the same series (for post-game
+// "reserve next week" links). Returns the game_url or null if none exists yet.
+// db = pool or a checked-out client.
+async function _resolveNextSeriesGameUrl(db, seriesId, afterDate) {
+    if (!seriesId || !afterDate) return null;
+    try {
+        const r = await db.query(
+            `SELECT game_url FROM games
+              WHERE series_id = $1 AND game_date > $2
+                AND game_status NOT IN ('completed','cancelled')
+                AND game_url IS NOT NULL
+              ORDER BY game_date ASC
+              LIMIT 1`,
+            [seriesId, afterDate]);
+        return r.rows.length ? r.rows[0].game_url : null;
+    } catch (e) {
+        console.error('next-series-game resolve failed (non-fatal):', e.message);
+        return null;
+    }
 }
 
 // Build the recipient audience for a mass-message. Returns array of
@@ -2711,7 +2774,12 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     // SEC-011: rejectUnauthorized true enforces valid server cert — prevents MITM on DB connection
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false,
-    max: 10,
+    // PERF: pool was capped at 10. Every authenticated request runs a DB query in
+    // authenticateToken, and the heavy /api/players query is fired in the background
+    // on dashboard load — a few concurrent heavy queries drained all 10 connections,
+    // so light player searches queued behind them and timed out/retried (~45s spin).
+    // 20 gives headroom while staying well under the DB connection cap.
+    max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
 });
@@ -6309,6 +6377,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res) => {
+    const _t0 = Date.now(); // PERF instrumentation — see logs below
     try {
         // FIX-284: light mode skips the 4 expensive CTEs (player_stats,
         // motm_stats, win_stats with team_players+teams join, ext_wins),
@@ -6341,6 +6410,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 ORDER BY p.squad_number NULLS LAST, p.full_name
                 LIMIT 500
             `);
+            console.log(`[/api/players] light=1 rows=${lightResult.rows.length} ms=${Date.now()-_t0} pool(total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount})`);
             if (isAdmin) {
                 return res.json(lightResult.rows);
             }
@@ -6396,6 +6466,15 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                   AND g.team_selection_type = 'vs_external'
                   AND LOWER(g.winning_team) = 'red'
                 GROUP BY r.player_id
+            ),
+            player_badge_agg AS (
+                -- PERF: badges were fetched via a correlated sub-SELECT that ran once
+                -- per player row (~500x). Aggregate once here, join below. Same output.
+                SELECT pb.player_id,
+                       json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon)) AS badges
+                FROM player_badges pb
+                JOIN badges b ON pb.badge_id = b.id
+                GROUP BY pb.player_id
             )
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.player_number_text, p.photo_url, /* FIX-302 */
@@ -6411,8 +6490,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 p.social_tiktok, p.social_instagram, p.social_youtube, p.social_facebook,
                 COALESCE(p.position, 'outfield') AS position,
                 p.referral_code,
-                (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
-                 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges,
+                pba.badges AS badges,
                 COALESCE(ps.apps_3m, 0)   AS apps_3m,
                 COALESCE(ms.motm_3m, 0)   AS motm_3m,
                 COALESCE(ws.wins_3m, 0)   AS wins_3m,
@@ -6434,10 +6512,12 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
             LEFT JOIN motm_stats ms ON ms.player_id = p.id
             LEFT JOIN win_stats ws ON ws.player_id = p.id
             LEFT JOIN ext_wins ew ON ew.player_id = p.id
+            LEFT JOIN player_badge_agg pba ON pba.player_id = p.id
             ORDER BY p.squad_number NULLS LAST, p.full_name
             LIMIT 500
         `);
         
+        console.log(`[/api/players] heavy rows=${result.rows.length} ms=${Date.now()-_t0} pool(total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount})`);
         if (isAdmin) {
             res.json(result.rows);
         } else {
@@ -7873,7 +7953,7 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
             g.max_players, g.teams_generated,
             v.name AS venue_name, v.region AS venue_region,
             v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
-            ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+            ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
              + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players,
             ROUND((SELECT AVG(rating) FROM (
                        SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
@@ -8056,7 +8136,7 @@ app.get('/api/dashboard/my-booked-games', authenticateToken, async (req, res) =>
                    v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
                    r.status AS my_status,
                    r.backup_type AS my_backup_type,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players,
                    ROUND((SELECT AVG(rating) FROM (
                               SELECT CASE WHEN UPPER(TRIM(r2.position_preference)) = 'GK'
@@ -8225,7 +8305,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             v.photo_url AS venue_photo,
             gs.series_name,
             TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
-            ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+            ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
               + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))         AS current_players,
             (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $1 LIMIT 1)
                                                                                   AS my_status
@@ -12238,6 +12318,26 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
         if (tier === 'white') { await client.query('ROLLBACK'); return res.status(403).json({ error: 'You are currently serving a 1-week signup ban.' }); }
         if (tier === 'black') { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Your account has been suspended.' }); }
 
+        // Tier advance-booking window — RSVP must respect the SAME tier windows as
+        // the games list / regular signup: gold 28d, silver 7d, bronze 24h. A player
+        // can only RSVP a game inside their window. Bronze's 24h window combined with
+        // the "RSVPs close 24h before kickoff" rule above means bronze can never RSVP
+        // (correct — bronze is the probationary tier and can only sign up last-minute).
+        // Admin-on-behalf RSVP (FIX-342) is a separate endpoint and is not affected.
+        {
+            let _windowHours = 168;                         // silver default = 7d
+            if (tier === 'gold')   _windowHours = 28 * 24;  // 28d
+            if (tier === 'bronze') _windowHours = 24;       // 24h
+            const _hoursUntilKick = (new Date(game.game_date).getTime() - Date.now()) / 3600000;
+            if (_hoursUntilKick > _windowHours) {
+                await client.query('ROLLBACK');
+                const _msg = tier === 'bronze'
+                    ? "Bronze members can only sign up within 24 hours of kick-off, so you can't reserve this game in advance. Sign up closer to kick-off."
+                    : `Your tier lets you book up to ${Math.round(_windowHours / 24)} days ahead. You'll be able to RSVP this game closer to kick-off.`;
+                return res.status(403).json({ error: _msg, code: 'RSVP_OUTSIDE_TIER_WINDOW' });
+            }
+        }
+
         // Existing registration check — RSVP / confirmed / backup / bumped are
         // all considered "already involved" — no double-signup.
         const existing = await client.query(
@@ -13112,9 +13212,10 @@ app.post('/api/admin/mass-message/send', authenticateToken, requireAdmin, async 
         // Fetch game context for template substitution.
         const gRes = await client.query(`
             SELECT g.id, g.game_url, g.game_date, g.format, g.cost_per_player, g.max_players,
+                   g.series_id,
                    v.name AS venue_name, v.region AS venue_region,
                    gs.series_name,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))::int AS current_players
               FROM games g
               LEFT JOIN venues v ON v.id = g.venue_id
@@ -13124,6 +13225,9 @@ app.post('/api/admin/mass-message/send', authenticateToken, requireAdmin, async 
         );
         if (gRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
         const game = gRes.rows[0];
+        // Resolve next series game once so {next_game_rsvp_link} works in the
+        // "Game Complete + Reserve Next Week" template (read by _resolvePlaceholders).
+        game.next_game_url = await _resolveNextSeriesGameUrl(client, game.series_id, game.game_date);
 
         // Resolve subject once (no per-recipient diff in subject — only body).
         const subjectResolved = _resolvePlaceholders(subjectTemplate, { first_name: 'there' }, game);
@@ -21588,6 +21692,41 @@ app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameM
     res.json({ message: 'Player stats updated', updated: playerStats.length - errors.length });
 });
 
+// Post-game WhatsApp message for the complete-game wizard's final step.
+// Resolves the soonest next game in the same series and builds a message with a
+// view link (this game) + a one-tap reserve link (next game, &rsvp=1). If no
+// next game exists yet, the reserve line is omitted (view link only).
+app.get('/api/admin/games/:gameId/complete-message', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const gRes = await pool.query(
+            `SELECT g.game_url, g.game_date, g.series_id, v.name AS venue_name
+               FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+              WHERE g.id = $1 LIMIT 1`,
+            [req.params.gameId]);
+        if (gRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const g = gRes.rows[0];
+        const nextUrl = await _resolveNextSeriesGameUrl(pool, g.series_id, g.game_date);
+
+        const when     = _massWhen(g.game_date);
+        const label    = _massGameLabel(g.venue_name, when);
+        const viewLink = g.game_url
+            ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(g.game_url)}`
+            : 'https://totalfooty.co.uk';
+
+        let message = `✅ ${label} is done — see how it went here: ${viewLink}`;
+        if (nextUrl) {
+            const reserveLink = `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(nextUrl)}&rsvp=1`;
+            message += `\n\nReserve your spot for next week in one tap — RSVP here: ${reserveLink}`;
+        }
+        message += `\n\n— TotalFooty`;
+
+        res.json({ message, has_next: !!nextUrl, next_game_url: nextUrl || null });
+    } catch (e) {
+        console.error('complete-message build failed:', e.message);
+        res.status(500).json({ error: 'Failed to build post-game message' });
+    }
+});
+
 app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameManager, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -23679,7 +23818,7 @@ app.get('/api/public/games', async (req, res) => {
                    v.name AS venue_name, v.address AS venue_address, v.region AS venue_region,
                    gs.series_name,
                    TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'HH24:MI') AS game_time,
-                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                   (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
                      + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id) AS current_players,
                    ROUND((SELECT AVG(rating) FROM (
                        SELECT CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
@@ -44369,7 +44508,7 @@ app.get('/api/admin/comms/games-pool', authenticateToken, requireAdmin, async (r
         const result = await pool.query(`
             SELECT g.id, g.format, v.name AS venue_name, v.region AS venue_region,
                    g.game_date, g.max_players, g.cost_per_player,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))::int AS current_players
               FROM games g
               LEFT JOIN venues v ON v.id = g.venue_id
@@ -44408,7 +44547,7 @@ app.get('/api/admin/comms/past-games', authenticateToken, requireAdmin, async (r
         const result = await pool.query(`
             SELECT g.id, g.format, g.game_date,
                    v.name AS venue_name, v.region AS venue_region,
-                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                   ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
                     + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))::int AS current_players
               FROM games g
               LEFT JOIN venues v ON v.id = g.venue_id
@@ -44660,7 +44799,7 @@ app.post('/api/admin/comms/send', authenticateToken, requireAdmin, async (req, r
             const gameCheck = await client.query(`
                 SELECT g.id, g.format, v.name AS venue_name, g.game_date, g.max_players,
                        g.team_selection_type, g.game_status,
-                       ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                       ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp'))
                         + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))::int AS current_players
                   FROM games g
                   LEFT JOIN venues v ON v.id = g.venue_id
@@ -56066,6 +56205,45 @@ async function fix356BootstrapFaq() {
 // gracefully-degraded verified-override column so the verified badge can work.
 // Per-column isolation: one failure never blocks the others. Each is a no-op
 // if the column already exists.
+async function bootstrapPlayerQueryIndexes() {
+    // PERF: the /api/players heavy query (and other player-stats queries) join
+    // registrations/team_players/teams/games and aggregate player_badges. If those
+    // join/filter columns aren't indexed, the CTEs do sequential scans that grow
+    // with data — the likely cause of slow player loads. Create the supporting
+    // indexes, but ONLY where no index already leads with that column, so we never
+    // add a redundant index (which would add write overhead to inserts elsewhere).
+    const wanted = [
+        ['idx_reg_player',     'registrations', 'player_id'],
+        ['idx_reg_game',       'registrations', 'game_id'],
+        ['idx_tp_player',      'team_players',  'player_id'],
+        ['idx_tp_team',        'team_players',  'team_id'],
+        ['idx_teams_game',     'teams',         'game_id'],
+        ['idx_games_status',   'games',         'game_status'],
+        ['idx_games_motm',     'games',         'motm_winner_id'],
+        ['idx_pbadges_player', 'player_badges', 'player_id'],
+        ['idx_credits_player', 'credits',       'player_id'],
+    ];
+    let created = 0;
+    for (const [name, table, col] of wanted) {
+        try {
+            const existing = await pool.query(
+                `SELECT 1
+                   FROM pg_index ix
+                   JOIN pg_class t ON t.oid = ix.indrelid
+                   JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ix.indkey[0]
+                  WHERE t.relname = $1 AND a.attname = $2
+                  LIMIT 1`, [table, col]);
+            if (existing.rows.length) continue; // already covered — don't add a duplicate
+            await pool.query(`CREATE INDEX IF NOT EXISTS ${name} ON ${table}(${col})`);
+            created++;
+            console.log(`  + index ${name} on ${table}(${col})`);
+        } catch (e) {
+            console.error(`  index ${name} skipped (non-fatal):`, e.message);
+        }
+    }
+    console.log(`✅ player-query indexes ensured (${created} created, rest already present)`);
+}
+
 async function bootstrapOrganiserColumns() {
     const cols = [
         ['games',   'default_organiser_id',               'UUID'],
@@ -56674,6 +56852,7 @@ app.listen(PORT, () => {
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
 
     // FIX-359..364: bootstrap Wonderful hardening schema (notified_at + webhook log)
+    bootstrapPlayerQueryIndexes().catch(e => console.error('player-query index bootstrap surfaced:', e.message));
     bootstrapOrganiserColumns().catch(e => console.error('organiser columns bootstrap surfaced:', e.message));
     bootstrapOrganiserReviews().catch(e => console.error('organiser_reviews bootstrap surfaced:', e.message));
     fix359BootstrapWonderfulHardening().catch(e => console.error('FIX-359 bootstrap surfaced:', e.message));
