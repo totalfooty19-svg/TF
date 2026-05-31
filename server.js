@@ -51825,8 +51825,45 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
         // not 'active' (paused/exited). Player still sees the card via the
         // "TotalFooty" fallback; tenant name/logo doesn't leak.
         const tenantActive = row.tenant_id && row.tenant_status === 'active';
-        if (!row.default_organiser_id) {
-            // Game has no assigned organiser — return a tenant-fallback card
+
+        // FIX-392: resolve the EFFECTIVE organiser. Prefer the explicitly assigned
+        // default_organiser_id; if a game has none set, fall back to a CONFIRMED
+        // player flagged is_organiser on this game (the de-facto organiser — same
+        // source the multi-organiser /organisers endpoint uses). This restores the
+        // pre-game organiser card (name/photo/phone/DM) on games where the default
+        // organiser column was never populated, instead of dropping to the bare
+        // "Organised by <tenant>" fallback. Players always get a real person to
+        // contact (e.g. for help finding the pitch).
+        let _orgId = row.default_organiser_id;
+        if (!_orgId) {
+            try {
+                const fb = await pool.query(
+                    `SELECT p.id, p.full_name, p.alias, p.photo_url, p.phone,
+                            p.phone_public_for_organising AS phone_consent, p.is_organiser
+                       FROM registrations r
+                       JOIN players p ON p.id = r.player_id
+                      WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = TRUE
+                      ORDER BY r.registered_at ASC
+                      LIMIT 1`,
+                    [row.id]
+                );
+                if (fb.rows[0]) {
+                    _orgId = fb.rows[0].id;
+                    row.organiser_full_name     = fb.rows[0].full_name;
+                    row.organiser_alias         = fb.rows[0].alias;
+                    row.organiser_photo         = fb.rows[0].photo_url;
+                    row.organiser_phone         = fb.rows[0].phone;
+                    row.organiser_phone_consent = fb.rows[0].phone_consent;
+                    row.is_organiser            = fb.rows[0].is_organiser;
+                }
+            } catch (e) {
+                if (!(e && (e.code === '42P01' || e.code === '42703'))) {
+                    console.warn('[FIX-392] organiser fallback lookup failed (non-fatal):', e.message);
+                }
+            }
+        }
+        if (!_orgId) {
+            // Genuinely no organiser anywhere — tenant-fallback card.
             return res.json({
                 organiser: null,
                 tenant: tenantActive ? {
@@ -51862,7 +51899,7 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
 
         // FIX-334 (ROW Day 26): verified badge (check-on-demand per Q12=B)
         const verifiedCheck = await _fix334CheckVerifiedOrganiser(
-            row.default_organiser_id, row.tenant_id
+            _orgId, row.tenant_id
         );
 
         // FIX-370 (Web66): include rating aggregates so the card UI can show
@@ -51879,7 +51916,7 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
                     COUNT(*)::int                  AS review_count
                    FROM organiser_reviews
                   WHERE organiser_player_id = $1`,
-                [row.default_organiser_id]
+                [_orgId]
             );
             if (rr.rows[0]) {
                 const a = rr.rows[0].avg_rating;
@@ -51896,7 +51933,7 @@ app.get('/api/public/game/:game_url/organiser', publicEndpointLimiter, async (re
 
         res.json({
             organiser: {
-                player_id: row.default_organiser_id,
+                player_id: _orgId,
                 full_name: row.organiser_full_name,
                 alias:     row.organiser_alias,
                 photo_url: row.organiser_photo,
