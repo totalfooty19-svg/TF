@@ -10451,7 +10451,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                         ${isAdmin ? "(g.game_date >= NOW() - INTERVAL '30 days')" : 'EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1)'}
                     ))
                 )
-                ${isAdmin ? '' : `AND (
+                AND ($2 = TRUE OR (
                     ${_tierWindowsOffSql()}
                     OR ((CASE COALESCE((SELECT reliability_tier FROM player_tenants WHERE player_id = $1 AND tenant_id = g.tenant_id AND status = 'active'), $6, 'silver')
                             WHEN 'gold' THEN 672 WHEN 'silver' THEN 168 WHEN 'bronze' THEN 24
@@ -10459,16 +10459,12 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                         AND g.game_date <= CURRENT_TIMESTAMP + ((CASE COALESCE((SELECT reliability_tier FROM player_tenants WHERE player_id = $1 AND tenant_id = g.tenant_id AND status = 'active'), $6, 'silver')
                             WHEN 'gold' THEN 672 WHEN 'silver' THEN 168 WHEN 'bronze' THEN 24
                             WHEN 'white' THEN 0 WHEN 'black' THEN 0 ELSE 168 END) * INTERVAL '1 hour'))
-                )`}
+                ))
                 AND g.game_status != 'cancelled'
                 ${!isAdmin && !hasAllStarBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'allstars')" : ''}
                 ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
                 ${!isAdmin && !hasMisfitsBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'misfits')" : ''}
                 AND ($2 = TRUE OR (g.tenant_id IS NULL AND $3 = TRUE) OR g.tenant_id = ANY($4::uuid[]) OR ($5 = TRUE AND g.tenant_id IS NOT NULL))
-                -- HOTFIX: keep $6 (tier) referenced in ALL branches. For admins the tier-window
-                -- block above (the only other $6 use) is omitted, so the prepared statement needed
-                -- only 5 params while the code always binds 6 -> "supplies 6, requires 5" 500.
-                AND ($6::text IS NOT NULL OR $6::text IS NULL)
             ),
             reg_agg AS (
                 -- One GROUP BY pass over registrations (joined to players once), replacing
