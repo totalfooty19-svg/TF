@@ -10468,7 +10468,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                 -- HOTFIX: keep $6 (tier) referenced in ALL branches. For admins the tier-window
                 -- block above (the only other $6 use) is omitted, so the prepared statement needed
                 -- only 5 params while the code always binds 6 -> "supplies 6, requires 5" 500.
-                AND ($6 IS NOT NULL OR $6 IS NULL)
+                AND ($6::text IS NOT NULL OR $6::text IS NULL)
             ),
             reg_agg AS (
                 -- One GROUP BY pass over registrations (joined to players once), replacing
