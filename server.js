@@ -10465,6 +10465,10 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                 ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
                 ${!isAdmin && !hasMisfitsBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'misfits')" : ''}
                 AND ($2 = TRUE OR (g.tenant_id IS NULL AND $3 = TRUE) OR g.tenant_id = ANY($4::uuid[]) OR ($5 = TRUE AND g.tenant_id IS NOT NULL))
+                -- HOTFIX: keep $6 (tier) referenced in ALL branches. For admins the tier-window
+                -- block above (the only other $6 use) is omitted, so the prepared statement needed
+                -- only 5 params while the code always binds 6 -> "supplies 6, requires 5" 500.
+                AND ($6 IS NOT NULL OR $6 IS NULL)
             ),
             reg_agg AS (
                 -- One GROUP BY pass over registrations (joined to players once), replacing
