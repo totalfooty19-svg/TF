@@ -8440,7 +8440,11 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
         // index is correct. Admins bypass.
         const _gtIdxTl = baseParams.length + 1;
         const tierClause = isAdmin ? '' : _perRowTierWindowSql(`$${_gtIdxTl}`);
-        if (!isAdmin) baseParams.push(tier);
+        // FIX: tier is referenced ONLY by the upcoming query's tier-window clause.
+        // pastSql has no tier window, so it must NOT receive this param or Postgres
+        // rejects it ("supplies N, requires N-1"). Mirror region-slider: keep tier in a
+        // SEPARATE array for upcoming; leave baseParams (tier-free) for pastSql.
+        const tierParams = isAdmin ? baseParams : [...baseParams, tier];
         const _ptwJoinTl = isAdmin ? '' :
             `LEFT JOIN player_tenants _ptw ON _ptw.player_id = $1 AND _ptw.tenant_id = g.tenant_id AND _ptw.status = 'active'`;
 
@@ -8504,7 +8508,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
         `;
 
         const [upcomingRes, pastRes] = await Promise.all([
-            pool.query(upcomingSql, baseParams),
+            pool.query(upcomingSql, tierParams),
             pool.query(pastSql,     baseParams),
         ]);
 
