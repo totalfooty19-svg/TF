@@ -1659,40 +1659,88 @@ async function recordCreditTransaction(db, playerId, amount, type, description, 
 
 // ── FREE-CREDIT-FIRST GAME FEE HELPER ───────────────────────────────────────
 // Deducts a game fee, consuming any remaining free credits before real balance.
+// FIX-406: a registration row in any of these "dead" states means the player is NOT
+// currently in the game — they were bumped, left, dropped out, cancelled or rejected.
+// Such a row must NEVER block a fresh join/RSVP/convert; every entry path was previously
+// treating ANY existing row as "already registered", trapping bumped players permanently.
+// Clearing the dead row(s) lets the player re-enter cleanly (the (game_id,player_id) index
+// is non-unique, so leaving a stale row would also risk duplicate rows). Returns the count
+// cleared. Callers should run this inside their transaction (pass the client).
+const DEAD_REG_STATUSES = ['bumped', 'left', 'dropped_out', 'cancelled', 'rejected'];
+async function _clearDeadRegistration(db, gameId, playerId) {
+    const r = await db.query(
+        `DELETE FROM registrations
+          WHERE game_id = $1 AND player_id = $2
+            AND status = ANY($3::text[])`,
+        [gameId, playerId, DEAD_REG_STATUSES]
+    );
+    return r.rowCount || 0;
+}
+
 // New model: free_credit_balance is a separate column from balance. Free-first
 // means we drain free_credit_balance down to zero before touching balance.
 // Returns { realCharged, freeCharged } — the portions drawn from each bucket,
 // used by callers to persist amount_paid + amount_paid_free on the registration.
-async function applyGameFee(db, playerId, cost, description) {
+async function applyGameFee(db, playerId, cost, description, tenantId = null, gameId = null) {
     if (!cost || cost <= 0) return { realCharged: 0, freeCharged: 0 };
 
-    // Read BOTH balances in the same query for atomicity.
+    // FIX-398: if a gameId is supplied and no explicit tenantId, resolve the game's tenant
+    // so the correct per-tenant free-credit bucket is spent. Fail-safe to Original on error.
+    if (tenantId === null && gameId) {
+        try {
+            const gt = await db.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+            tenantId = gt.rows.length ? (gt.rows[0].tenant_id || null) : null;
+        } catch (_) { tenantId = null; }
+    }
+
+    // Read real balance + Original (legacy) free bucket atomically.
     const balRes = await db.query(
         `SELECT COALESCE(balance, 0) AS balance,
                 COALESCE(free_credit_balance, 0) AS free_credit_balance
-           FROM credits WHERE player_id = $1`,
+           FROM credits WHERE player_id = $1 FOR UPDATE`,
         [playerId]
     );
-    const freeAvailable = parseFloat(balRes.rows[0]?.free_credit_balance || 0);
+    const originalFree = parseFloat(balRes.rows[0]?.free_credit_balance || 0);
 
-    // Pence-accurate split: free first, real for the remainder.
-    const costCents = Math.round(cost * 100);
-    const freeCents = Math.min(Math.round(freeAvailable * 100), costCents);
-    const realCents = costCents - freeCents;
-    const freeUsed    = freeCents / 100;
-    const realCharged = realCents / 100;
+    // FIX-398: per-tenant free credits. At a tenant's game, that tenant's free-credit
+    // bucket is spent FIRST, then the Original bucket, then real balance. NULL tenant
+    // (Original game) → no tenant bucket, behaves exactly as before.
+    let tenantFree = 0;
+    if (tenantId) tenantFree = await getTenantFreeCredits(playerId, tenantId, db);
 
-    // Single UPDATE decrements both columns in one hit. last_updated bumped to
-    // match the existing convention used by other balance writers.
-    if (freeUsed > 0 || realCharged > 0) {
-        await db.query(
+    const costCents     = Math.round(cost * 100);
+    const tenantCents0  = Math.round(tenantFree * 100);
+    const originalCents0 = Math.round(originalFree * 100);
+
+    const tenantCents   = Math.min(tenantCents0, costCents);
+    const afterTenant   = costCents - tenantCents;
+    const originalCents = Math.min(originalCents0, afterTenant);
+    const realCents     = afterTenant - originalCents;
+
+    const tenantUsed   = tenantCents / 100;
+    const originalUsed = originalCents / 100;
+    const realCharged  = realCents / 100;
+    const freeUsed     = tenantUsed + originalUsed;
+
+    // Drain tenant bucket first (its own table).
+    if (tenantUsed > 0) {
+        await adjustTenantFreeCredits(playerId, tenantId, -tenantUsed, db);
+    }
+    // Then Original free bucket + real balance in the credits row.
+    if (originalUsed > 0 || realCharged > 0) {
+        const _ded = await db.query(
             `UPDATE credits
                 SET free_credit_balance = free_credit_balance - $1,
                     balance             = balance - $2,
                     last_updated        = CURRENT_TIMESTAMP
-              WHERE player_id = $3`,
-            [freeUsed, realCharged, playerId]
+              WHERE player_id = $3 AND balance >= $2 AND free_credit_balance >= $1`,
+            [originalUsed, realCharged, playerId]
         );
+        // P2-1 fix: FOR UPDATE (read above) + this WHERE guard serialize concurrent
+        // same-player spends. rowCount 0 means a concurrent registration invalidated the
+        // upfront affordability check — throw so the caller's tx rolls back instead of
+        // driving the balance negative.
+        if (_ded.rowCount === 0) throw new Error('INSUFFICIENT_CREDITS');
     }
 
     // Transaction log — one row per bucket used, so audit + reconciliation works.
@@ -2911,6 +2959,94 @@ const requireSuperAdmin = (req, res, next) => {
 //
 // All three return 403 if the user has no qualifying row. 401 only if auth
 // itself failed (handled upstream by authenticateToken).
+// FIX-393: resolve the caller's owning tenant for venue actions. An admin maps to
+// their active tenant(s) via player_tenants; we take the single active one. Superadmin
+// (and admins with no tenant row) own as TF root (NULL). Returns the owner_tenant_id
+// to stamp on a created venue (NULL = TF-owned).
+async function _resolveOwnerTenantId(req) {
+    if (req.user.role === 'superadmin') return null;  // TF root
+    try {
+        const r = await pool.query(
+            `SELECT tenant_id FROM player_tenants
+              WHERE player_id = $1 AND status = 'active'
+              ORDER BY joined_at ASC NULLS LAST
+              LIMIT 1`,
+            [req.user.playerId]);
+        return r.rows.length ? r.rows[0].tenant_id : null;
+    } catch (e) {
+        if (e && e.code === '42P01') return null;  // pre-migration
+        throw e;
+    }
+}
+
+// FIX-394: SQL fragment — TRUE when game g's owning tenant has tier windows OFF.
+// Used to OR-exempt those games from the tier date filter in list queries. Empty
+// string (no exemption) until the column is confirmed present, so pre-migration is safe.
+function _tierWindowsOffSql() {
+    return _tierWindowsColumnReady
+        ? "(g.tenant_id IS NOT NULL AND EXISTS (SELECT 1 FROM tenants _tt WHERE _tt.id = g.tenant_id AND _tt.tier_windows_enabled = FALSE))"
+        : "FALSE";
+}
+
+// FIX-397: per-row, per-tenant advance-booking window clause for list endpoints.
+// Each game row's visibility window is derived from the player's tier IN THAT GAME'S
+// TENANT (via a LEFT JOIN aliased `_ptw` on the game's tenant_id), falling back to the
+// player's global/Original tier when there's no membership row. Requires the caller's
+// query to include:  LEFT JOIN player_tenants _ptw ON _ptw.player_id = <playerExpr>
+//                     AND _ptw.tenant_id = g.tenant_id AND _ptw.status = 'active'
+// `globalTierSqlExpr` is a SQL expression yielding the player's global tier (e.g. a
+// bound param placeholder or a correlated subquery). Admins bypass via the caller
+// passing null (caller omits the clause entirely). Composes with _tierWindowsOffSql so
+// a tenant with windows OFF still exempts its games. Pre-migration safe: if the
+// per-tenant column isn't ready, _ptw.reliability_tier is simply NULL → global tier used.
+function _perRowTierWindowSql(globalTierSqlExpr) {
+    // Effective per-row tier: per-tenant if present, else the global expression.
+    const t = `COALESCE(_ptw.reliability_tier, ${globalTierSqlExpr}, 'silver')`;
+    // hours: gold 672, silver 168, bronze 24, white/black 0
+    const hours = `CASE ${t}
+        WHEN 'gold' THEN 672
+        WHEN 'silver' THEN 168
+        WHEN 'bronze' THEN 24
+        WHEN 'white' THEN 0
+        WHEN 'black' THEN 0
+        ELSE 168 END`;
+    // A row is visible if: its tenant has windows OFF, OR it falls within the per-row
+    // window. A zero-hour (banned) tier means only the windows-off exemption can show it.
+    return `AND (
+        ${_tierWindowsOffSql()}
+        OR (( ${hours} ) > 0 AND g.game_date <= CURRENT_TIMESTAMP + (( ${hours} ) * INTERVAL '1 hour'))
+    )`;
+}
+
+// FIX-394: is the advance-booking tier window in force for this game's owning
+// tenant? TF root (tenant_id NULL) and un-migrated tenants → TRUE (windows apply).
+// A tenant that has set tier_windows_enabled = FALSE → windows skipped.
+async function _tierWindowsEnabledForTenant(tenantId) {
+    if (!tenantId) return true;   // TF root
+    try {
+        const r = await pool.query('SELECT tier_windows_enabled FROM tenants WHERE id = $1', [tenantId]);
+        if (r.rows.length && r.rows[0].tier_windows_enabled === false) return false;
+        return true;
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return true;  // pre-migration
+        throw e;
+    }
+}
+
+// FIX-393: can this caller edit/delete this venue? Owner or superadmin only.
+// Returns { ok, status, error, venue } — venue row included for reuse.
+async function _venueEditGate(req, venueId) {
+    const r = await pool.query('SELECT * FROM venues WHERE id = $1', [venueId]);
+    if (!r.rows.length) return { ok: false, status: 404, error: 'Venue not found' };
+    const venue = r.rows[0];
+    if (req.user.role === 'superadmin') return { ok: true, venue };
+    const callerTenant = await _resolveOwnerTenantId(req);
+    const ownerTenant = venue.owner_tenant_id || null;
+    if (ownerTenant !== null && ownerTenant === callerTenant) return { ok: true, venue };
+    return { ok: false, status: 403, venue,
+        error: 'You can only edit venues you own. Duplicate this venue to make an editable copy.' };
+}
+
 async function _getTenantRole(playerId, tenantId) {
     try {
         const r = await pool.query(
@@ -3119,7 +3255,7 @@ async function _fix329GetAllowance(gameTenantId, dbClient = null) {
     if (!gameTenantId) {
         return {
             enabled: true,             // TF root: always on (existing behaviour)
-            per_game: 6,               // matches existing < 6 cap
+            per_game: -1,              // BUGFIX: organisers free ALWAYS on main TF (-1 = unlimited; was 6)
             pct_discount: 100,         // existing full comp
             games_per_week: -1,        // unlimited (existing behaviour)
             tenant_id: null,
@@ -3202,7 +3338,7 @@ async function _fix329ResolveOrganiserComp(playerId, game, currentCompCountInGam
         _diag('allowance_disabled', ` (tenant.organiser_allowance_enabled=false)`);
         return { comped: false, discount_pct: 0, reason: 'allowance_disabled' };
     }
-    if (currentCompCountInGame >= allowance.per_game) {
+    if (allowance.per_game !== -1 && currentCompCountInGame >= allowance.per_game) {
         _diag('per_game_cap_reached', ` (used=${currentCompCountInGame}/${allowance.per_game})`);
         return { comped: false, discount_pct: 0, reason: 'per_game_cap_reached' };
     }
@@ -3876,12 +4012,16 @@ const FIX268_NEW_PLAYER_CUTOFF = 6;
 // whether this is a new player. Returns the magnitude (always positive).
 // Returns 0 if thresholds not met.
 function _fix268MovementMagnitude(matchingVotes, matchingVoters, isNewPlayer) {
+    // FIX-405: matchingVotes may be a WEIGHTED sum (stretched pairs count 0.5), so it can
+    // be fractional. The tier checks below use >= ranges (never === ) so a fractional total
+    // lands in the correct band rather than skipping one. Integer inputs behave exactly as
+    // before: 3→1, 4→2, 5+→3 (new); 5-7→1, 8-9→2, 10+→3 (established).
     if (isNewPlayer) {
         // New player tiers (more lenient).
         if (matchingVoters < 2) return 0;
         if (matchingVotes < 3) return 0;
-        if (matchingVotes === 3) return 1;
-        if (matchingVotes === 4) return 2;
+        if (matchingVotes < 4) return 1;                                         // [3,4)
+        if (matchingVotes < 5) return 2;                                         // [4,5)
         if (matchingVotes >= 5 && matchingVoters >= 3) return Math.min(3 + Math.floor((matchingVotes - 5)), 10);
         // 5 votes but <3 voters → fall back to ±2
         return 2;
@@ -4633,7 +4773,8 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
         // Read via the same client so we see anything committed before our lock.
         const votesR = await client.query(
             `SELECT id, voter_player_id, reference_player_id, delta_vote,
-                    COALESCE(applied_amount, 0) AS applied_amount, created_at
+                    COALESCE(applied_amount, 0) AS applied_amount,
+                    COALESCE(weight, 1.0) AS weight, created_at
              FROM player_rating_feedback
              WHERE subject_player_id = $1 AND fully_consumed = false
                    AND delta_vote IS NOT NULL
@@ -4650,9 +4791,15 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
         const matchingVotes = votes.filter(v => Math.sign(v.delta_vote) === suspicionDir);
         const counterVotes  = votes.filter(v => Math.sign(v.delta_vote) === -suspicionDir);
 
-        const matchingCount  = matchingVotes.length;
+        // FIX-405: weighted tallies. A stretched (wider-band) pair carries weight 0.5,
+        // so it counts as half a vote toward its side — the direction still registers but
+        // its pull is dampened, exactly as intended for "halfway" comparisons. Distinct
+        // voters still counted as whole people (a person is a person); only the vote
+        // strength is weighted. Rounded to avoid float dust tripping integer thresholds.
+        const _wsum = arr => Math.round(arr.reduce((s, v) => s + (Number(v.weight) || 1), 0) * 100) / 100;
+        const matchingCount  = _wsum(matchingVotes);
         const matchingVoters = new Set(matchingVotes.map(v => v.voter_player_id)).size;
-        const counterCount   = counterVotes.length;
+        const counterCount   = _wsum(counterVotes);
         const counterVoters  = new Set(counterVotes.map(v => v.voter_player_id)).size;
 
         // FIX-268a: NEW threshold model.
@@ -7939,12 +8086,14 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
             badgeFilter = exclusions.length ? 'AND ' + exclusions.join(' AND ') : '';
         }
 
-        // Tier window clause for upcoming
-        const tierClause = (effectiveHoursAhead === null)
-            ? ''
-            : (effectiveHoursAhead === 0)
-                ? 'AND 1 = 0'
-                : `AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL '${effectiveHoursAhead} hours'`;
+        // Tier window clause for upcoming — FIX-397: per-row, per-tenant. Each game row's
+        // window is derived from the player's tier in THAT game's tenant (LEFT JOIN _ptw),
+        // falling back to the player's global tier ($globalTierParam). Admins bypass.
+        const _gtIdx = baseParams.length + 1;            // next bound param index
+        const tierClause = isAdmin ? '' : _perRowTierWindowSql(`$${_gtIdx}`);
+        const tierParams = isAdmin ? baseParams : [...baseParams, tier];
+        const _ptwJoin = isAdmin ? '' :
+            `LEFT JOIN player_tenants _ptw ON _ptw.player_id = $1 AND _ptw.tenant_id = g.tenant_id AND _ptw.status = 'active'`;
 
         // Common SELECT fields (kept lean for slider — matches what game cards need)
         const selectFields = `
@@ -7974,6 +8123,7 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
             SELECT ${selectFields}
             FROM games g
             LEFT JOIN venues v ON v.id = g.venue_id
+            ${_ptwJoin}
             WHERE g.game_status IN ('available','confirmed')
               AND g.game_date >= CURRENT_TIMESTAMP
               ${regionClause}
@@ -7981,7 +8131,7 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
               ${badgeFilter}
             ORDER BY g.game_date ASC
             LIMIT ${upcomingLimit}`,
-            baseParams
+            tierParams
         );
 
         // Determine if tier limited the upcoming count.
@@ -8284,12 +8434,15 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             baseParams.push(searchParam);
         }
 
-        // ── Tier window clause for UPCOMING games ──
-        const tierClause = (effectiveHoursAhead === null)
-            ? ''
-            : (effectiveHoursAhead === 0)
-                ? 'AND 1 = 0'
-                : `AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL '${effectiveHoursAhead} hours'`;
+        // ── Tier window clause for UPCOMING games — FIX-397: per-row, per-tenant ──
+        // Each row's window comes from the player's tier in that game's tenant (LEFT JOIN
+        // _ptw), else their global tier. Computed after any searchParam push so the bound
+        // index is correct. Admins bypass.
+        const _gtIdxTl = baseParams.length + 1;
+        const tierClause = isAdmin ? '' : _perRowTierWindowSql(`$${_gtIdxTl}`);
+        if (!isAdmin) baseParams.push(tier);
+        const _ptwJoinTl = isAdmin ? '' :
+            `LEFT JOIN player_tenants _ptw ON _ptw.player_id = $1 AND _ptw.tenant_id = g.tenant_id AND _ptw.status = 'active'`;
 
         // ── Common SELECT — lean projection matching what the Timeline card needs ──
         const baseSelect = `
@@ -8318,6 +8471,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             LEFT JOIN venues v       ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
             LEFT JOIN opponents opp ON opp.id = g.opponent_id
+            ${_ptwJoinTl}
             WHERE g.game_status IN ('available','confirmed')
               AND g.game_date >= CURRENT_TIMESTAMP
               ${regionClause}
@@ -9196,17 +9350,11 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
 
         const desc = description?.trim() || (parsedAmount < 0 ? 'Free credit removal' : 'Free credit grant');
 
-        // Option B: free credits are a separate bucket from the real-money balance.
-        // Positive grants add to free_credit_balance; admins can also pass a negative
-        // value to remove granted credits. Balance (real money) is NOT touched here.
-        await pool.query(
-            `INSERT INTO credits (player_id, balance, free_credit_balance)
-             VALUES ($1, 0, $2)
-             ON CONFLICT (player_id) DO UPDATE
-                SET free_credit_balance = credits.free_credit_balance + $2,
-                    last_updated        = CURRENT_TIMESTAMP`,
-            [req.params.id, parsedAmount]
-        );
+        // FIX-398: per-tenant free credits. Route the grant to the ACTING ADMIN's tenant
+        // bucket (superadmin → Original/NULL = legacy free_credit_balance). A tenant admin's
+        // grant is spendable only at that tenant's games.
+        const _grantTenantId = await _resolveOwnerTenantId(req);
+        await adjustTenantFreeCredits(req.params.id, _grantTenantId, parsedAmount, pool);
 
         await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
             desc, req.user.userId);
@@ -9881,16 +10029,18 @@ function validateVenuePayload(body) {
 app.get('/api/admin/venues', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const includeInactive = req.query.include_inactive === 'true';
+        const isSuper = req.user.role === 'superadmin';
+        const callerTenant = await _resolveOwnerTenantId(req);  // NULL = TF root
         const sql = `
             SELECT v.*,
                    (SELECT COUNT(*)::int FROM games WHERE venue_id = v.id) AS game_count,
                    (SELECT COUNT(*)::int FROM games WHERE venue_id = v.id AND game_status = 'completed') AS completed_count
             FROM venues v
             ${includeInactive ? '' : 'WHERE COALESCE(v.is_active, TRUE) = TRUE'}
-            ORDER BY v.name ASC
+            ORDER BY COALESCE(v.is_verified, FALSE) DESC, v.name ASC
         `;
         const result = await pool.query(sql).catch(async (err) => {
-            // Pre-migration: is_active column missing
+            // Pre-migration: ownership/verification or is_active columns missing.
             if (err.code === '42703') {
                 return await pool.query(`
                     SELECT v.*,
@@ -9900,7 +10050,24 @@ app.get('/api/admin/venues', authenticateToken, requireAdmin, async (req, res) =
             }
             throw err;
         });
-        res.json({ venues: result.rows });
+        // Decorate each venue with caller-relative flags for the Manage Venues UI.
+        const venues = result.rows.map(v => {
+            const ownerTenantId = v.owner_tenant_id || null;  // NULL = TF-owned
+            const isOwner = isSuper || (ownerTenantId === callerTenant);
+            return {
+                ...v,
+                owner_tenant_id: ownerTenantId,
+                is_verified: !!v.is_verified,
+                verification_status: v.verification_status || (v.is_verified ? 'verified' : 'none'),
+                _can_edit: isOwner,
+                _can_delete: isOwner,
+                _can_duplicate: true,
+                _can_request_verification: isOwner && !v.is_verified && !isSuper,
+                _can_verify: isSuper,
+                _is_tf_owned: ownerTenantId === null,
+            };
+        });
+        res.json({ venues });
     } catch (error) {
         console.error('Admin venues list error:', error);
         res.status(500).json({ error: 'Failed to load venues' });
@@ -9943,16 +10110,18 @@ app.post('/api/admin/venues', authenticateToken, requireAdmin, async (req, res) 
             }
         }
 
+        // FIX-393: stamp the creating tenant as owner (NULL = TF root for superadmin).
+        const _ownerTenantId = await _resolveOwnerTenantId(req);
         const cols = [
             'name','address','region','postcode','pitch_location','pitch_name',
             'facilities','notes','special_instructions','parking_pin','pitch_pin',
             'boot_type','pitch_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
             'pay_and_play_coach_hourly','pay_and_play_player_hourly',
             'default_pitch_cost','default_max_players','default_format','default_position_type',
-            'background_image_filename'
+            'background_image_filename','owner_tenant_id'
         ];
         const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
-        const values = cols.map(c => v.data[c]);
+        const values = cols.map(c => c === 'owner_tenant_id' ? _ownerTenantId : v.data[c]);
         const result = await pool.query(
             `INSERT INTO venues (${cols.join(', ')}) VALUES (${placeholders}) RETURNING id, name`,
             values
@@ -9990,8 +10159,8 @@ app.put('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req, re
         const { id } = req.params;
         if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
 
-        const exists = await pool.query('SELECT id FROM venues WHERE id = $1', [id]);
-        if (!exists.rows.length) return res.status(404).json({ error: 'Venue not found' });
+        const _gate = await _venueEditGate(req, id);
+        if (!_gate.ok) return res.status(_gate.status).json({ error: _gate.error });
 
         const v = validateVenuePayload(req.body);
         if (!v.ok) return res.status(v.status).json({ error: v.error });
@@ -10057,8 +10226,9 @@ app.delete('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req,
         const { id } = req.params;
         if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
 
-        const r = await pool.query('SELECT name FROM venues WHERE id = $1', [id]);
-        if (!r.rows.length) return res.status(404).json({ error: 'Venue not found' });
+        const _gate = await _venueEditGate(req, id);
+        if (!_gate.ok) return res.status(_gate.status).json({ error: _gate.error });
+        const r = { rows: [{ name: _gate.venue.name }] };
 
         await pool.query('UPDATE venues SET is_active = FALSE WHERE id = $1', [id])
             .catch(err => {
@@ -10083,13 +10253,126 @@ app.delete('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req,
     }
 });
 
+// ── FIX-393: Manage Venues — duplicate + verification endpoints ──────────────
+
+// POST — duplicate a venue. Anyone (admin) can duplicate ANY venue; the copy is
+// owned by the duplicator (NULL = TF for superadmin), starts UNverified, and links
+// back to the source via duplicated_from_venue_id so venue stats can roll up.
+app.post('/api/admin/venues/:id/duplicate', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
+        const src = await pool.query('SELECT * FROM venues WHERE id = $1', [id]);
+        if (!src.rows.length) return res.status(404).json({ error: 'Venue not found' });
+        const v = src.rows[0];
+        const ownerTenantId = await _resolveOwnerTenantId(req);
+        // Copy editable fields only; reset ownership/verification/identity.
+        const copyCols = [
+            'name','address','region','postcode','pitch_location','pitch_name',
+            'facilities','notes','special_instructions','parking_pin','pitch_pin',
+            'boot_type','pitch_type','availability_rule','coaching_suitable','coaching_cost_per_hour',
+            'pay_and_play_coach_hourly','pay_and_play_player_hourly',
+            'default_pitch_cost','default_max_players','default_format','default_position_type',
+            'background_image_filename'
+        ];
+        const allCols = [...copyCols, 'owner_tenant_id', 'duplicated_from_venue_id',
+                         'verification_status', 'is_verified'];
+        const vals = allCols.map(c => {
+            if (c === 'name') return `${v.name} (copy)`;
+            if (c === 'owner_tenant_id') return ownerTenantId;
+            if (c === 'duplicated_from_venue_id') return id;
+            if (c === 'verification_status') return 'none';
+            if (c === 'is_verified') return false;
+            return v[c];
+        });
+        const ph = allCols.map((_, i) => `$${i + 1}`).join(', ');
+        const ins = await pool.query(
+            `INSERT INTO venues (${allCols.join(', ')}) VALUES (${ph}) RETURNING id, name`,
+            vals
+        ).catch(err => {
+            if (err.code === '42703') {
+                throw Object.assign(new Error('Venue ownership columns missing — restart the server to run the bootstrap, then retry.'),
+                                    { code: 'MIGRATION_NEEDED' });
+            }
+            throw err;
+        });
+        const nv = ins.rows[0];
+        setImmediate(() => auditLog(pool, req.user.playerId, 'venue_duplicated', nv.id,
+            `Duplicated venue "${v.name}" → "${nv.name}"`).catch(() => {}));
+        res.json({ ok: true, id: nv.id, name: nv.name, duplicated_from: id });
+    } catch (error) {
+        if (error.code === 'MIGRATION_NEEDED') return res.status(503).json({ error: error.message });
+        console.error('Duplicate venue error:', error);
+        res.status(500).json({ error: 'Failed to duplicate venue', detail: error.message });
+    }
+});
+
+// POST — owner requests TF verification for their venue.
+app.post('/api/admin/venues/:id/request-verification', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
+        const gate = await _venueEditGate(req, id);   // owner (or superadmin) only
+        if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+        if (gate.venue.is_verified) return res.status(400).json({ error: 'Venue is already verified.' });
+        await pool.query(
+            `UPDATE venues SET verification_status = 'requested',
+                    verification_requested_at = NOW() WHERE id = $1`, [id]);
+        setImmediate(() => auditLog(pool, req.user.playerId, 'venue_verification_requested', id,
+            `Requested verification for "${gate.venue.name}"`).catch(() => {}));
+        res.json({ ok: true, verification_status: 'requested' });
+    } catch (error) {
+        console.error('Request verification error:', error);
+        res.status(500).json({ error: 'Failed to request verification' });
+    }
+});
+
+// POST — superadmin verifies a venue (TF Verified badge).
+app.post('/api/admin/venues/:id/verify', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
+        const r = await pool.query(
+            `UPDATE venues SET is_verified = TRUE, verification_status = 'verified',
+                    verified_at = NOW(), verified_by = $2 WHERE id = $1 RETURNING name`,
+            [id, req.user.playerId]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Venue not found' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'venue_verified', id,
+            `Verified venue "${r.rows[0].name}"`).catch(() => {}));
+        res.json({ ok: true, is_verified: true, verification_status: 'verified' });
+    } catch (error) {
+        console.error('Verify venue error:', error);
+        res.status(500).json({ error: 'Failed to verify venue' });
+    }
+});
+
+// POST — superadmin removes verification.
+app.post('/api/admin/venues/:id/unverify', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
+        const r = await pool.query(
+            `UPDATE venues SET is_verified = FALSE, verification_status = 'none',
+                    verified_at = NULL, verified_by = NULL WHERE id = $1 RETURNING name`,
+            [id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Venue not found' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'venue_unverified', id,
+            `Removed verification from "${r.rows[0].name}"`).catch(() => {}));
+        res.json({ ok: true, is_verified: false, verification_status: 'none' });
+    } catch (error) {
+        console.error('Unverify venue error:', error);
+        res.status(500).json({ error: 'Failed to unverify venue' });
+    }
+});
+
 // POST — restore archived venue
 app.post('/api/admin/venues/:id/restore', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         if (!isValidUuid(id)) return res.status(400).json({ error: 'Invalid venue id' });
-        const r = await pool.query('SELECT name FROM venues WHERE id = $1', [id]);
-        if (!r.rows.length) return res.status(404).json({ error: 'Venue not found' });
+        const _gate = await _venueEditGate(req, id);   // FIX-393: owner/superadmin only
+        if (!_gate.ok) return res.status(_gate.status).json({ error: _gate.error });
+        const r = { rows: [{ name: _gate.venue.name }] };
 
         await pool.query('UPDATE venues SET is_active = TRUE WHERE id = $1', [id])
             .catch(err => {
@@ -10168,7 +10451,15 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                         ${isAdmin ? "(g.game_date >= NOW() - INTERVAL '30 days')" : 'EXISTS(SELECT 1 FROM registrations WHERE game_id = g.id AND player_id = $1)'}
                     ))
                 )
-                ${isAdmin ? '' : hoursAhead > 0 ? 'AND g.game_date <= CURRENT_TIMESTAMP + INTERVAL \'' + hoursAhead + ' hours\'' : 'AND 1 = 0'}
+                ${isAdmin ? '' : `AND (
+                    ${_tierWindowsOffSql()}
+                    OR ((CASE COALESCE((SELECT reliability_tier FROM player_tenants WHERE player_id = $1 AND tenant_id = g.tenant_id AND status = 'active'), $6, 'silver')
+                            WHEN 'gold' THEN 672 WHEN 'silver' THEN 168 WHEN 'bronze' THEN 24
+                            WHEN 'white' THEN 0 WHEN 'black' THEN 0 ELSE 168 END) > 0
+                        AND g.game_date <= CURRENT_TIMESTAMP + ((CASE COALESCE((SELECT reliability_tier FROM player_tenants WHERE player_id = $1 AND tenant_id = g.tenant_id AND status = 'active'), $6, 'silver')
+                            WHEN 'gold' THEN 672 WHEN 'silver' THEN 168 WHEN 'bronze' THEN 24
+                            WHEN 'white' THEN 0 WHEN 'black' THEN 0 ELSE 168 END) * INTERVAL '1 hour'))
+                )`}
                 AND g.game_status != 'cancelled'
                 ${!isAdmin && !hasAllStarBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'allstars')" : ''}
                 ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
@@ -10212,14 +10503,26 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                 GROUP BY gg.game_id
             ),
             my_reg AS (
-                -- This player's own registration row per game (was 5 correlated subqueries
-                -- + 1 EXISTS). DISTINCT ON matches the old "LIMIT 1" arbitrariness; for the
-                -- one-row-per-(game,player) reality it is exactly equivalent.
+                -- This player's own registration row per game. FIX-406: when a player has
+                -- MULTIPLE rows for a game (the (game_id,player_id) index is non-unique, so a
+                -- stale bumped/left/cancelled row can coexist with a live rsvp/confirmed one),
+                -- the old "DISTINCT ON ... ORDER BY game_id" returned an ARBITRARY row — often a
+                -- dead one — so an RSVP'd player was reported with the wrong status and the client
+                -- routed them to /register, which rejected them as "already registered". We now
+                -- order by a status priority so the ACTIVE row always wins.
                 SELECT DISTINCT ON (r.game_id)
                        r.game_id, r.status, r.backup_type, r.amount_paid, r.amount_paid_free
                 FROM registrations r
                 WHERE r.player_id = $1 AND r.game_id IN (SELECT id FROM base_games)
-                ORDER BY r.game_id
+                ORDER BY r.game_id,
+                         CASE r.status
+                             WHEN 'confirmed' THEN 1
+                             WHEN 'confirmed_backup' THEN 2
+                             WHEN 'rsvp' THEN 3
+                             WHEN 'backup' THEN 4
+                             ELSE 9
+                         END,
+                         r.id DESC
             )
             SELECT g.*, v.name as venue_name, v.address as venue_address, v.region as venue_region, v.special_instructions as venue_special_instructions, v.notes as venue_notes, v.pitch_location as venue_pitch_location,
                    v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
@@ -10249,7 +10552,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             LEFT JOIN guest_agg ga ON ga.game_id = g.id
             LEFT JOIN my_reg mr ON mr.game_id = g.id
             ORDER BY g.game_date DESC
-        `, [req.user.playerId, isAdmin, visScope.includeTfRoot, visScope.tenantIds, visScope.includeAllPublicTenants]);
+        `, [req.user.playerId, isAdmin, visScope.includeTfRoot, visScope.tenantIds, visScope.includeAllPublicTenants, tier]);
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -10507,11 +10810,11 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp') AND UPPER(TRIM(position_preference)) = 'GK') as gk_count /* FIX-315 */,
                    COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as confirmed_only_count,
-                   (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1) as registration_status,
-                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1) as my_backup_type,
+                   (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2 ORDER BY CASE status WHEN 'confirmed' THEN 1 WHEN 'confirmed_backup' THEN 2 WHEN 'rsvp' THEN 3 WHEN 'backup' THEN 4 ELSE 9 END, id DESC LIMIT 1) as registration_status,
+                   (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2 ORDER BY CASE status WHEN 'confirmed' THEN 1 WHEN 'confirmed_backup' THEN 2 WHEN 'rsvp' THEN 3 WHEN 'backup' THEN 4 ELSE 9 END, id DESC LIMIT 1) as my_backup_type,
                    -- P2.3: amount paid by current user (drives drop-out penalty dialog in game.html)
-                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1), 0) as my_amount_paid,
-                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $2 LIMIT 1), 0) as my_amount_paid_free,
+                   COALESCE((SELECT amount_paid      FROM registrations WHERE game_id = g.id AND player_id = $2 ORDER BY CASE status WHEN 'confirmed' THEN 1 WHEN 'confirmed_backup' THEN 2 WHEN 'rsvp' THEN 3 WHEN 'backup' THEN 4 ELSE 9 END, id DESC LIMIT 1), 0) as my_amount_paid,
+                   COALESCE((SELECT amount_paid_free FROM registrations WHERE game_id = g.id AND player_id = $2 ORDER BY CASE status WHEN 'confirmed' THEN 1 WHEN 'confirmed_backup' THEN 2 WHEN 'rsvp' THEN 3 WHEN 'backup' THEN 4 ELSE 9 END, id DESC LIMIT 1), 0) as my_amount_paid_free,
                    -- FIX-315: RSVP system state.
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'rsvp') as rsvp_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup' AND backup_type = 'confirmed_backup') as confirmed_backup_count,
@@ -10620,7 +10923,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         // authoritatively at registration time.
         game.organiser_comp_available = callerIsOrganiser
             && _fix329Allowance.enabled
-            && compCount < _fix329Allowance.per_game;
+            && (_fix329Allowance.per_game === -1 || compCount < _fix329Allowance.per_game);
         
         // Map venue names to their photo URLs
         const venuePhotoMap = {
@@ -12313,8 +12616,7 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
         }
 
         // Block White/Black tier — same as /register
-        const tierRes = await client.query('SELECT reliability_tier FROM players WHERE id = $1', [req.user.playerId]);
-        const tier = tierRes.rows[0]?.reliability_tier;
+        const tier = await _gameTierFor(req.user.playerId, req.params.id, client);
         if (tier === 'white') { await client.query('ROLLBACK'); return res.status(403).json({ error: 'You are currently serving a 1-week signup ban.' }); }
         if (tier === 'black') { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Your account has been suspended.' }); }
 
@@ -12324,7 +12626,7 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
         // the "RSVPs close 24h before kickoff" rule above means bronze can never RSVP
         // (correct — bronze is the probationary tier and can only sign up last-minute).
         // Admin-on-behalf RSVP (FIX-342) is a separate endpoint and is not affected.
-        {
+        if (await _tierWindowsEnabledForTenant(game.tenant_id)) {
             let _windowHours = 168;                         // silver default = 7d
             if (tier === 'gold')   _windowHours = 28 * 24;  // 28d
             if (tier === 'bronze') _windowHours = 24;       // 24h
@@ -12347,12 +12649,21 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
         if (existing.rows.length > 0) {
             await client.query('ROLLBACK');
             const exStatus = existing.rows[0].status;
-            const msg = exStatus === 'confirmed' ? 'You are already confirmed for this game.'
-                      : exStatus === 'rsvp'      ? "You've already RSVP'd — pay to confirm or cancel first."
-                      : exStatus === 'backup'    ? 'You are already on the backup list.'
-                      : exStatus === 'bumped'    ? 'You were bumped from this game. Re-pay via the game page to claim a spot.'
-                      : 'You are already involved with this game.';
-            return res.status(400).json({ error: msg });
+            // FIX-406: only ACTIVE involvement blocks a new RSVP. A dead row (bumped/left/
+            // dropped_out/cancelled/rejected) is cleared so the player can RSVP again — the
+            // old code told bumped players to "re-pay to claim a spot" via a path that itself
+            // rejected them, leaving them permanently stuck.
+            const ACTIVE_RSVP_STATUSES = ['confirmed', 'rsvp', 'backup', 'confirmed_backup'];
+            if (ACTIVE_RSVP_STATUSES.includes(exStatus)) {
+                await client.query('ROLLBACK');
+                const msg = exStatus === 'confirmed' ? 'You are already confirmed for this game.'
+                          : exStatus === 'rsvp'      ? "You've already RSVP'd — pay to confirm or cancel first."
+                          : exStatus === 'backup'    ? 'You are already on the backup list.'
+                          : 'You are already involved with this game.';
+                return res.status(400).json({ error: msg });
+            }
+            // Dead row → clear it and fall through to a fresh RSVP.
+            await _clearDeadRegistration(client, gameId, req.user.playerId);
         }
 
         // Capacity check — confirmed + rsvp count against max.
@@ -12517,12 +12828,17 @@ app.post('/api/admin/games/:gameId/rsvp-on-behalf',
                 [gameId, targetPlayerId]
             );
             if (existing.rows.length > 0) {
-                await client.query('ROLLBACK');
                 const exStatus = existing.rows[0].status;
-                return res.status(409).json({
-                    error: `Player is already involved with this game (status: ${exStatus})`,
-                    existing_status: exStatus,
-                });
+                // FIX-406: only ACTIVE involvement blocks an admin RSVP-on-behalf. A dead row
+                // (bumped/left/etc) is cleared so the admin can re-RSVP a previously-bumped player.
+                if (['confirmed', 'rsvp', 'backup', 'confirmed_backup'].includes(exStatus)) {
+                    await client.query('ROLLBACK');
+                    return res.status(409).json({
+                        error: `Player is already involved with this game (status: ${exStatus})`,
+                        existing_status: exStatus,
+                    });
+                }
+                await _clearDeadRegistration(client, gameId, targetPlayerId);
             }
 
             // Capacity check — if full, place on backup instead of refusing.
@@ -12602,14 +12918,24 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
             [gameId, req.user.playerId]
         );
         if (reg.rows.length === 0) {
-            // Could be already bumped (cron raced). Check and surface a clear error.
-            const checkBumped = await client.query(
+            // FIX-406: no active RSVP to convert. If they hold a dead row (bumped/left/etc),
+            // the convert flow can't help (it only upgrades an existing rsvp) — but normal
+            // registration now accepts them, so tell the client to route there rather than
+            // dead-ending. The client treats code 'USE_REGISTER' as "call /register instead".
+            const checkRow = await client.query(
                 `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2`,
                 [gameId, req.user.playerId]
             );
             await client.query('ROLLBACK');
-            if (checkBumped.rows[0]?.status === 'bumped') {
-                return res.status(409).json({ error: 'Your RSVP deadline passed. Race for an open spot if any remain.', code: 'rsvp_bumped' });
+            const st = checkRow.rows[0]?.status;
+            if (st && DEAD_REG_STATUSES.includes(st)) {
+                return res.status(409).json({
+                    error: 'Your RSVP expired — you can sign up again directly.',
+                    code: 'USE_REGISTER'
+                });
+            }
+            if (['confirmed', 'backup', 'confirmed_backup'].includes(st)) {
+                return res.status(409).json({ error: 'You are already in this game.', code: 'ALREADY_IN' });
             }
             return res.status(404).json({ error: 'No active RSVP to convert' });
         }
@@ -12652,7 +12978,7 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
         let realCharged = 0, freeCharged = 0;
         if (!isComped && parseFloat(game.cost_per_player) > 0) {
             const creditRes = await client.query(
-                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                    FROM credits WHERE player_id = $1`,
                 [req.user.playerId]
             );
@@ -12665,7 +12991,7 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
                 });
             }
             const charge = await applyGameFee(client, req.user.playerId, effectiveCost,
-                `RSVP converted to paid - game ${gameId} (${pricingTier} pricing)`);
+                `RSVP converted to paid - game ${gameId} (${pricingTier} pricing)`, null, gameId);
             realCharged = charge.realCharged;
             freeCharged = charge.freeCharged;
         }
@@ -13641,11 +13967,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         }
         
         // Block White/Black tier players from registering
-        const tierCheckResult = await client.query(
-            'SELECT reliability_tier FROM players WHERE id = $1',
-            [req.user.playerId]
-        );
-        const playerTier = tierCheckResult.rows[0]?.reliability_tier;
+        const playerTier = await _gameTierFor(req.user.playerId, req.params.id, client);
         if (playerTier === 'white') {
             await client.query('ROLLBACK');
             return res.status(403).json({
@@ -13659,15 +13981,23 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             });
         }
 
-        // Check if already registered
+        // Check if already registered — FIX-406: only an ACTIVE registration blocks.
+        // A player holding a "dead" row (bumped, left, dropped_out, cancelled, rejected)
+        // must be able to re-register: previously ANY existing row returned "Already
+        // registered", trapping bumped players so they could never sign up/pay again.
         const existingReg = await client.query(
             'SELECT id, status, backup_type FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, req.user.playerId]
         );
-        
-        if (existingReg.rows.length > 0) {
+        const ACTIVE_REG_STATUSES = ['confirmed', 'rsvp', 'backup', 'confirmed_backup'];
+        const activeRow = existingReg.rows.find(r => ACTIVE_REG_STATUSES.includes(r.status));
+        if (activeRow) {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Already registered' });
+        }
+        // Clear any dead rows (bumped/left/etc) so re-registration is a clean insert.
+        if (existingReg.rows.length > 0) {
+            await _clearDeadRegistration(client, gameId, req.user.playerId);
         }
 
         // Min-rating is visibility-only — registration is never blocked by rating.
@@ -13789,7 +14119,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                 if (!isComped && parseFloat(game.cost_per_player) > 0) {
                     // Option B: affordability = regular balance + free_credit_balance.
                     const creditResult = await client.query(
-                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                            FROM credits WHERE player_id = $1`,
                         [req.user.playerId]
                     );
@@ -13801,7 +14131,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     
                     // Capture realCharged + freeCharged so amount_paid and amount_paid_free
                     // correctly record both portions — needed for exact EB-aware refund on drop-out
-                    const { realCharged: backupCharged, freeCharged: backupFreeCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Confirmed backup for game ${gameId} (${pricingTier} pricing)`);
+                    const { realCharged: backupCharged, freeCharged: backupFreeCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Confirmed backup for game ${gameId} (${pricingTier} pricing)`, null, gameId);
                     regAmountPaid = backupCharged;
                     regAmountPaidFree = backupFreeCharged;
                 }
@@ -13866,7 +14196,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             if (!isComped && parseFloat(game.cost_per_player) > 0) {
                 // Option B: affordability = regular balance + free_credit_balance.
                 const creditResult = await client.query(
-                    `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                    `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                        FROM credits WHERE player_id = $1`,
                     [req.user.playerId]
                 );
@@ -13876,7 +14206,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     return res.status(400).json({ error: 'Insufficient credits' });
                 }
                 
-                const { realCharged: selfRegCharged, freeCharged: selfRegFreeCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Registration for game ${gameId} (${pricingTier} pricing)`);
+                const { realCharged: selfRegCharged, freeCharged: selfRegFreeCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Registration for game ${gameId} (${pricingTier} pricing)`, null, gameId);
                 regAmountPaid = selfRegCharged;
                 regAmountPaidFree = selfRegFreeCharged;
             }
@@ -14449,7 +14779,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         if (effectiveCost > 0) {
             // Option B: affordability = balance + free_credit_balance.
             const creditResult = await client.query(
-                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                    FROM credits WHERE player_id = $1`,
                 [playerId]
             );
@@ -14461,7 +14791,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             // Deduct credits from the inviting player (free credits first).
             // Capture the split so we can store it on game_guests for correct-bucket refunds.
             const { realCharged: _guestReal, freeCharged: _guestFree } =
-                await applyGameFee(client, playerId, effectiveCost, `+1 guest (${guestName.trim()}) for game`);
+                await applyGameFee(client, playerId, effectiveCost, `+1 guest (${guestName.trim()}) for game`, null, gameId);
             _guestRealCharged = _guestReal;
             _guestFreeCharged = _guestFree;
         }
@@ -15352,11 +15682,8 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
 
         await client.query('BEGIN');
 
-        // Block banned players from claiming spots
-        const claimTierCheck = await client.query(
-            'SELECT reliability_tier FROM players WHERE id = $1', [playerId]
-        );
-        const claimTier = claimTierCheck.rows[0]?.reliability_tier;
+        // Block banned players from claiming spots (per-tenant: this game's tenant)
+        const claimTier = await _gameTierFor(playerId, gameId, client);
         if (claimTier === 'white') {
             await client.query('ROLLBACK');
             return res.status(403).json({ error: 'You are currently serving a 1-week signup ban and cannot claim spots.' });
@@ -15405,12 +15732,16 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
         const { price: cost } = getEffectivePrice(game.rows[0]);
         // Option B: affordability = regular balance + free_credit_balance.
         const creditRes = await client.query(
-            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                FROM credits WHERE player_id = $1`,
             [playerId]
         );
         const balance = parseFloat(creditRes.rows[0]?.total_available || 0);
-        if (balance < cost) {
+        // BUGFIX: a comped organiser (is_comped=TRUE on their backup row) is never charged on
+        // claim (see the !_claimWasComped charge-skip below). Don't block them on affordability —
+        // previously this gate rejected comped organisers with "Insufficient credits" on busy
+        // games before the charge-skip could apply.
+        if (!regCheck.rows[0].is_comped && balance < cost) {
             await client.query('ROLLBACK');
             return res.status(400).json({
                 error: `Insufficient credits. You need £${cost.toFixed(2)} but have £${balance.toFixed(2)}.`,
@@ -15441,7 +15772,7 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
         let realCharged = 0;
         let freeCharged = 0;
         if (cost > 0 && !_claimWasComped) {
-            const chargeResult = await applyGameFee(client, playerId, cost, `Claimed open spot — game ${gameId}`);
+            const chargeResult = await applyGameFee(client, playerId, cost, `Claimed open spot — game ${gameId}`, null, gameId);
             realCharged = chargeResult.realCharged;
             freeCharged = chargeResult.freeCharged || 0;
             // Record both real-balance and free-credit portions — enables exact drop-out refund.
@@ -15580,24 +15911,32 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         const friend = friendResult.rows[0];
         const friendName = friend.alias || friend.full_name;
 
-        // Banned tiers cannot be registered
-        if (friend.reliability_tier === 'white' || friend.reliability_tier === 'black') {
+        // Banned tiers cannot be registered (per-tenant: the friend's tier in THIS game's tenant)
+        const friendTenantTier = await _gameTierFor(friendPlayerId, gameId, client);
+        if (friendTenantTier === 'white' || friendTenantTier === 'black') {
             await client.query('ROLLBACK');
             return res.status(403).json({ error: `${friendName} is not eligible to register for games` });
         }
 
-        // Friend must not already be registered (any status)
+        // FIX-406: only an ACTIVE registration blocks adding the friend. A dead row
+        // (bumped/left/dropped_out/cancelled/rejected) is cleared so a mate can sign them
+        // back in — previously any row, including a bumped one, blocked them permanently.
         const existingReg = await client.query(
-            'SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2',
+            'SELECT id, status FROM registrations WHERE game_id = $1 AND player_id = $2',
             [gameId, friendPlayerId]
         );
-        if (existingReg.rows.length > 0) {
+        const _friendActive = existingReg.rows.find(r =>
+            ['confirmed', 'rsvp', 'backup', 'confirmed_backup'].includes(r.status));
+        if (_friendActive) {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: `${friendName} is already registered for this game` });
         }
+        if (existingReg.rows.length > 0) {
+            await _clearDeadRegistration(client, gameId, friendPlayerId);
+        }
 
-        // Tier timing window — apply the FRIEND's tier, as if they registered themselves
-        const friendTier = friend.reliability_tier || 'silver';
+        // Tier timing window — apply the FRIEND's tier (per-tenant), as if they registered themselves
+        const friendTier = friendTenantTier || 'silver';
         let hoursAhead = 168; // silver (7 days)
         if (friendTier === 'gold') hoursAhead = 28 * 24;
         if (friendTier === 'bronze') hoursAhead = 24;
@@ -15716,7 +16055,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 // price but not full price (bug fixed web47).
                 const { price: effectivePrice, tier: priceTier } = getEffectivePrice(game);
                 const creditResult = await client.query(
-                    `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                    `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                        FROM credits WHERE player_id = $1`,
                     [registeringPlayerId]
                 );
@@ -15724,7 +16063,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                 }
-                const { realCharged, freeCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Confirmed backup for ${friendName} in game ${gameId} (${priceTier} pricing)`);
+                const { realCharged, freeCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Confirmed backup for ${friendName} in game ${gameId} (${priceTier} pricing)`, null, gameId);
                 friendRealCharged = realCharged;
                 friendFreeCharged = freeCharged || 0;
             }
@@ -15733,7 +16072,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             // Effective price honours early-bird / super-early-bird tiers (bug fixed web47).
             const { price: effectivePrice, tier: priceTier } = getEffectivePrice(game);
             const creditResult = await client.query(
-                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                    FROM credits WHERE player_id = $1`,
                 [registeringPlayerId]
             );
@@ -15741,7 +16080,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
-            const { realCharged, freeCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Registration for ${friendName} in game ${gameId} (${priceTier} pricing)`);
+            const { realCharged, freeCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Registration for ${friendName} in game ${gameId} (${priceTier} pricing)`, null, gameId);
             friendRealCharged = realCharged;
             friendFreeCharged = freeCharged || 0;
         }
@@ -16575,20 +16914,35 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             const _disciplinePoints = _is11a ? 3 : 2;
             // notes column is optional pre-migration — wrap in try/catch and fall back to a
             // 5-arg INSERT if the column doesn't exist yet (deploy safety, no DDL race).
+            // FIX-397: stamp the game's tenant on the discipline record (NULL = TF-root).
+            const _drTenantId = gameCheck.rows[0].tenant_id || null;
             try {
                 await client.query(
-                    `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level, notes)
-                     VALUES ($1, $2, 'Late Drop Out', $3, 0, $4)`,
-                    [req.user.playerId, gameId, _disciplinePoints, dropoutReason || null]
+                    `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level, notes, tenant_id)
+                     VALUES ($1, $2, 'Late Drop Out', $3, 0, $4, $5)`,
+                    [req.user.playerId, gameId, _disciplinePoints, dropoutReason || null, _drTenantId]
                 );
             } catch (colErr) {
-                // Column likely doesn't exist yet — insert without notes.
+                // Column(s) likely don't exist yet — degrade. Try without notes (keep tenant),
+                // then without tenant (oldest schema), matching the pre-migration fallbacks.
                 if (colErr && colErr.code === '42703') {
-                    await client.query(
-                        `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
-                         VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
-                        [req.user.playerId, gameId, _disciplinePoints]
-                    );
+                    try {
+                        await client.query(
+                            `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level, tenant_id)
+                             VALUES ($1, $2, 'Late Drop Out', $3, 0, $4)`,
+                            [req.user.playerId, gameId, _disciplinePoints, _drTenantId]
+                        );
+                    } catch (colErr2) {
+                        if (colErr2 && colErr2.code === '42703') {
+                            await client.query(
+                                `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
+                                 VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
+                                [req.user.playerId, gameId, _disciplinePoints]
+                            );
+                        } else {
+                            throw colErr2;
+                        }
+                    }
                 } else {
                     throw colErr;
                 }
@@ -16666,7 +17020,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 // affordability now). EB-aware via effectiveDebited (bug fixed web47).
                 for (const candidate of gkBackups.rows) {
                     const creditCheck = await client.query(
-                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                            FROM credits WHERE player_id = $1`,
                         [candidate.player_id]
                     );
@@ -16721,7 +17075,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 // under the 6-comp cap.
                 const _promotedWasComped = !!promotedPlayer.is_comped;
                 if (promotedPlayer.backup_type !== 'confirmed_backup' && !_promotedWasComped) {
-                    const { realCharged: promotedCharged, freeCharged: promotedFreeCharged } = await applyGameFee(client, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`);
+                    const { realCharged: promotedCharged, freeCharged: promotedFreeCharged } = await applyGameFee(client, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`, null, gameId);
                     // Record both portions so drop-out refund is exact.
                     await client.query(
                         'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
@@ -21319,7 +21673,7 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
         
         // Get game details
         const gameResult = await client.query(
-            'SELECT cost_per_player, format FROM games WHERE id = $1',
+            'SELECT cost_per_player, format, tenant_id FROM games WHERE id = $1',
             [gameId]
         );
         
@@ -21398,11 +21752,25 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                             (formatLower.includes('side') || formatLower.includes('v') || formatLower.includes('x'));
                         const disciplinePoints = is11aSide ? 3 : 2;
                         
-                        await client.query(
-                            `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
-                             VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
-                            [playerId, gameId, disciplinePoints]
-                        );
+                        // FIX-397: stamp the game's tenant (NULL = TF-root); degrade if column absent.
+                        const _drTenantId2 = game.tenant_id || null;
+                        try {
+                            await client.query(
+                                `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level, tenant_id)
+                                 VALUES ($1, $2, 'Late Drop Out', $3, 0, $4)`,
+                                [playerId, gameId, disciplinePoints, _drTenantId2]
+                            );
+                        } catch (drErr) {
+                            if (drErr && drErr.code === '42703') {
+                                await client.query(
+                                    `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
+                                     VALUES ($1, $2, 'Late Drop Out', $3, 0)`,
+                                    [playerId, gameId, disciplinePoints]
+                                );
+                            } else {
+                                throw drErr;
+                            }
+                        }
                         // NOTE: Tier recalculation runs AFTER commit (see below) — never inside
                         // the transaction, to prevent a DB function error from aborting everything
                         lateDropoutPlayerIds.push(playerId);
@@ -21468,15 +21836,19 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
             // Cast to ::uuid so Postgres resolves the overloaded function correctly.
             if (lateDropoutPlayerIds.length > 0) {
                 setImmediate(async () => {
+                    // FIX-397: per-tenant tier recalc. Resolve the game's tenant once; tier is
+                    // computed in JS (getRevolvingPointsForTenant + tierFromRevolvingPoints) so
+                    // the read path and write path share one source of truth.
+                    let _gTenant = null;
+                    try {
+                        const _gt = await pool.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+                        _gTenant = _gt.rows.length ? (_gt.rows[0].tenant_id || null) : null;
+                    } catch (_) { _gTenant = null; }
                     for (const pid of lateDropoutPlayerIds) {
                         try {
-                            const tierResult = await pool.query(
-                                'SELECT calculate_player_tier($1::uuid) as new_tier', [pid]
-                            );
-                            const newTier = tierResult.rows[0]?.new_tier;
-                            if (newTier) {
-                                await applyTierChange(pool, pid, newTier);
-                            }
+                            const pts = await getRevolvingPointsForTenant(pid, _gTenant, pool);
+                            const newTier = tierFromRevolvingPoints(pts);
+                            await applyTierChangeForTenant(pool, pid, _gTenant, newTier);
                         } catch (tierError) {
                             console.error('Tier recalc failed for player', pid, ':', tierError.message);
                         }
@@ -21979,6 +22351,12 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         
         // 3. Save discipline records (only for offenses, not on_time)
         // FIX-022: Only process discipline for players who were actually in the game
+        // FIX-397: resolve the game's owning tenant once (NULL = TF-root) to stamp records.
+        let _pgTenantId = null;
+        try {
+            const _tq = await client.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+            _pgTenantId = _tq.rows.length ? (_tq.rows[0].tenant_id || null) : null;
+        } catch (_) { _pgTenantId = null; }
         const confirmedPlayerSet = new Set(allPlayerIds);
         for (const record of disciplineRecords || []) {
             if (!confirmedPlayerSet.has(record.playerId)) continue; // skip non-participants
@@ -21992,11 +22370,23 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                     'no_show': 'No Show'
                 };
                 
-                await client.query(
-                    `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
-                     VALUES ($1, $2, $3, $4, $5)`,
-                    [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
-                );
+                try {
+                    await client.query(
+                        `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level, tenant_id)
+                         VALUES ($1, $2, $3, $4, $5, $6)`,
+                        [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning, _pgTenantId]
+                    );
+                } catch (drErr) {
+                    if (drErr && drErr.code === '42703') {
+                        await client.query(
+                            `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
+                             VALUES ($1, $2, $3, $4, $5)`,
+                            [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
+                        );
+                    } else {
+                        throw drErr;
+                    }
+                }
             }
         }
 
@@ -22345,15 +22735,17 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         // (not client) with ::uuid cast so the overloaded DB function resolves correctly
         if (uniqueDisciplinedIds.length > 0) {
             setImmediate(async () => {
+                // FIX-397: per-tenant tier recalc (game's tenant; JS source of truth).
+                let _gTenant = null;
+                try {
+                    const _gt = await pool.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+                    _gTenant = _gt.rows.length ? (_gt.rows[0].tenant_id || null) : null;
+                } catch (_) { _gTenant = null; }
                 for (const dpId of uniqueDisciplinedIds) {
                     try {
-                        const tierResult = await pool.query(
-                            'SELECT calculate_player_tier($1::uuid) as new_tier', [dpId]
-                        );
-                        const newTier = tierResult.rows[0]?.new_tier;
-                        if (newTier) {
-                            await applyTierChange(pool, dpId, newTier);
-                        }
+                        const pts = await getRevolvingPointsForTenant(dpId, _gTenant, pool);
+                        const newTier = tierFromRevolvingPoints(pts);
+                        await applyTierChangeForTenant(pool, dpId, _gTenant, newTier);
                     } catch (tierError) {
                         console.error('Tier recalc failed for player', dpId, ':', tierError.message);
                     }
@@ -23137,6 +23529,20 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             }
         }
         
+        // FIX-393: resolve the venue's TF-Verified status for the display badge.
+        // Defensive separate lookup so a pre-migration missing column can never
+        // 500 this high-traffic public endpoint.
+        let _venueVerified = false;
+        if (game.venue_id) {
+            try {
+                const _vv = await pool.query('SELECT is_verified FROM venues WHERE id = $1', [game.venue_id]);
+                if (_vv.rows.length) _venueVerified = !!_vv.rows[0].is_verified;
+            } catch (e) {
+                if (!(e && (e.code === '42P01' || e.code === '42703'))) throw e;
+                // pre-migration → not verified
+            }
+        }
+
         // Map venue names to their photo URLs (override database)
         const venuePhotoMap = {
             'Daimler Green - Astro': 'https://totalfooty.co.uk/assets/Daimler_Green.jpg',
@@ -23230,6 +23636,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             game_date: game.game_date,
             venue_id: game.venue_id,
             venue_name: game.venue_name,
+            venue_verified: _venueVerified,
             venue_address: game.venue_address,
             venue_photo: venue_photo,
             venue_pitch_location: game.venue_pitch_location || null,
@@ -24494,7 +24901,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         // Check/deduct credits — wrapped in transaction to prevent partial failure.
         // Option B: affordability = balance + free_credit_balance.
         const creditResult = await pool.query(
-            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                FROM credits WHERE player_id = $1`,
             [playerId]
         );
@@ -24508,7 +24915,18 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         try {
             await txClient.query('BEGIN');
         
-            const { realCharged: adminAddCharged, freeCharged: adminAddFree } = await applyGameFee(txClient, playerId, cost, `Admin added to game ${gameId}`);
+            // P3-1 fix: block double-charge + duplicate row when an admin re-adds a player
+            // who already has a registration. Active row → 409; dead rows → clear then proceed.
+            const _existAdd = await txClient.query(
+                `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2 FOR UPDATE`,
+                [gameId, playerId]);
+            if (_existAdd.rows.some(r => ['confirmed','rsvp','backup','confirmed_backup'].includes(r.status))) {
+                await txClient.query('ROLLBACK');
+                return res.status(409).json({ error: 'Player is already registered for this game.' });
+            }
+            await _clearDeadRegistration(txClient, gameId, playerId);
+
+            const { realCharged: adminAddCharged, freeCharged: adminAddFree } = await applyGameFee(txClient, playerId, cost, `Admin added to game ${gameId}`, null, gameId);
         
             // Add player — normalise 'goalkeeper' -> 'GK' to match all server-side position checks
             const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper'
@@ -24539,6 +24957,10 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         });
     } catch (error) {
         console.error('Add player error:', error);
+        // P2-1 fix: surface the serialized-spend insufficiency as a clean 400, not a 500.
+        if (error && error.message === 'INSUFFICIENT_CREDITS') {
+            return res.status(400).json({ error: 'Player has insufficient credits' });
+        }
         res.status(500).json({ error: 'Failed to add player' });
     }
 });
@@ -24607,7 +25029,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         
         // Get player credits — Option B: affordability = balance + free_credit_balance.
         const creditResult = await pool.query(
-            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                FROM credits WHERE player_id = $1`,
             [playerId]
         );
@@ -24627,7 +25049,17 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         const discountClient = await pool.connect();
         try {
             await discountClient.query('BEGIN');
-            const { realCharged: customAddCharged, freeCharged: customAddFree } = await applyGameFee(discountClient, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`);
+            // P3-1 fix: block double-charge + duplicate row when an admin re-adds a player
+            // who already has a registration. Active row → 409; dead rows → clear then proceed.
+            const _existDisc = await discountClient.query(
+                `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2 FOR UPDATE`,
+                [gameId, playerId]);
+            if (_existDisc.rows.some(r => ['confirmed','rsvp','backup','confirmed_backup'].includes(r.status))) {
+                await discountClient.query('ROLLBACK');
+                return res.status(409).json({ error: 'Player is already registered for this game.' });
+            }
+            await _clearDeadRegistration(discountClient, gameId, playerId);
+            const { realCharged: customAddCharged, freeCharged: customAddFree } = await applyGameFee(discountClient, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`, null, gameId);
             const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper' ? 'GK' : (position || 'outfield');
             // FIX-175: capture reg id so we can apply BFFs/Rivals auto-fill.
             const customDiscRegResult = await discountClient.query(
@@ -24652,6 +25084,10 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         });
     } catch (error) {
         console.error('Add player with discount error:', error);
+        // P2-1 fix: surface the serialized-spend insufficiency as a clean 400, not a 500.
+        if (error && error.message === 'INSUFFICIENT_CREDITS') {
+            return res.status(400).json({ error: 'Player has insufficient credits' });
+        }
         res.status(500).json({ error: 'Failed to add player with discount' });
     }
 });
@@ -24766,7 +25202,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
 
                 for (const candidate of gkBackups.rows) {
                     const creditCheck = await pool.query(
-                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) AS total_available
+                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
                            FROM credits WHERE player_id = $1`, [candidate.player_id]
                     );
                     if (parseFloat(creditCheck.rows[0]?.total_available || 0) >= cost) {
@@ -24808,7 +25244,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                     if (promotedPlayer.backup_type !== 'confirmed_backup' && !_adminPromoWasComped) {
                         // Charge effective price + record both portions so future dropout
                         // refunds the correct real+free split.
-                        const { realCharged: adminPromoCharged, freeCharged: adminPromoFree } = await applyGameFee(promoClient, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`);
+                        const { realCharged: adminPromoCharged, freeCharged: adminPromoFree } = await applyGameFee(promoClient, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`, null, gameId);
                         await promoClient.query(
                             'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
                             [adminPromoCharged, adminPromoFree || 0, promotedPlayer.id]
@@ -27569,7 +28005,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
         
         // Validate game is a tournament and not already finalised
         const gameCheck = await client.query(
-            'SELECT team_selection_type, tournament_results_finalised, tournament_team_count FROM games WHERE id = $1 FOR UPDATE',
+            'SELECT team_selection_type, tournament_results_finalised, tournament_team_count, tenant_id FROM games WHERE id = $1 FOR UPDATE',
             [gameId]
         );
         if (gameCheck.rows[0]?.team_selection_type !== 'tournament') {
@@ -27692,13 +28128,26 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
             'no_show': 'No Show'
         };
         const tournamentDisciplinedIds = [];
+        const _tourTenantId = gameCheck.rows[0].tenant_id || null; // FIX-397
         for (const record of disciplineRecords || []) {
             if (record.points > 0) {
-                await client.query(
-                    `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
-                     VALUES ($1, $2, $3, $4, $5)`,
-                    [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
-                );
+                try {
+                    await client.query(
+                        `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level, tenant_id)
+                         VALUES ($1, $2, $3, $4, $5, $6)`,
+                        [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning, _tourTenantId]
+                    );
+                } catch (drErr) {
+                    if (drErr && drErr.code === '42703') {
+                        await client.query(
+                            `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
+                             VALUES ($1, $2, $3, $4, $5)`,
+                            [record.playerId, gameId, offenseTypes[record.offense] || 'Unknown', record.points, record.warning]
+                        );
+                    } else {
+                        throw drErr;
+                    }
+                }
                 tournamentDisciplinedIds.push(record.playerId);
             }
         }
@@ -27776,15 +28225,17 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
         const uniqueTournamentDisciplinedIds = [...new Set(tournamentDisciplinedIds)];
         if (uniqueTournamentDisciplinedIds.length > 0) {
             setImmediate(async () => {
+                // FIX-397: per-tenant tier recalc (game's tenant; JS source of truth).
+                let _gTenant = null;
+                try {
+                    const _gt = await pool.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+                    _gTenant = _gt.rows.length ? (_gt.rows[0].tenant_id || null) : null;
+                } catch (_) { _gTenant = null; }
                 for (const dpId of uniqueTournamentDisciplinedIds) {
                     try {
-                        const tierResult = await pool.query(
-                            'SELECT calculate_player_tier($1::uuid) as new_tier', [dpId]
-                        );
-                        const newTier = tierResult.rows[0]?.new_tier;
-                        if (newTier) {
-                            await applyTierChange(pool, dpId, newTier);
-                        }
+                        const pts = await getRevolvingPointsForTenant(dpId, _gTenant, pool);
+                        const newTier = tierFromRevolvingPoints(pts);
+                        await applyTierChangeForTenant(pool, dpId, _gTenant, newTier);
                     } catch (tierError) {
                         console.error('Tier recalc failed for player', dpId, ':', tierError.message);
                     }
@@ -29292,6 +29743,15 @@ app.post('/api/push/register', authenticateToken, async (req, res) => {
             );
         }
 
+        // M-PUSH-1 fix: a device token belongs to exactly the CURRENT user. Remove any
+        // OTHER player's binding to this same token, so a device hand-off (user B logs in on
+        // user A's phone and re-registers the token) doesn't leave user A still receiving
+        // pushes on the device now used by B.
+        await pool.query(
+            `DELETE FROM fcm_tokens WHERE fcm_token = $1 AND player_id <> $2`,
+            [fcmToken, req.user.playerId]
+        );
+
         await pool.query(`
             INSERT INTO fcm_tokens (player_id, fcm_token, device_name, last_used_at)
             VALUES ($1, $2, $3, NOW())
@@ -29465,6 +29925,106 @@ async function applyTierChange(db, playerId, newTier) {
     );
 }
 
+// FIX-397: per-tenant tier writer. Routes by the game's tenant:
+//   • Original / TF-root (tenantId NULL) → players.reliability_tier (the legacy column
+//     IS Original's home — unchanged behaviour for Original games).
+//   • Any other tenant → player_tenants.reliability_tier for that (player, tenant).
+// For non-Original tenants the membership row may not exist yet (a non-member who
+// played a tenant game via share link). Upsert a gold/0 row first (the locked
+// "start gold in a new tenant" default) so per-tenant discipline always sticks, then
+// apply the tier. The same white-ban timestamp logic is preserved, per tenant.
+async function applyTierChangeForTenant(db, playerId, tenantId, newTier) {
+    if (!tenantId) {
+        // Original / TF-root: write the legacy global column (Original's tier home).
+        await applyTierChange(db, playerId, newTier);
+        if (newTier === 'black') await _maybeEscalateGlobalPermaban(db, playerId);
+        return;
+    }
+    // Ensure a membership row exists (gold default), without disturbing an existing one.
+    await db.query(
+        `INSERT INTO player_tenants
+            (player_id, tenant_id, role, status, joined_at,
+             show_in_dashboard, allow_tenant_contact,
+             accepted_organiser_tcs_version, accepted_organiser_tcs_at)
+         VALUES ($1::uuid, $2::uuid, 'player', 'active', NOW(), TRUE, TRUE, NULL, NULL)
+         ON CONFLICT (player_id, tenant_id) DO NOTHING`,
+        [playerId, tenantId]
+    );
+    await db.query(
+        `UPDATE player_tenants
+            SET reliability_tier     = $1::text,
+                white_ban_started_at = CASE
+                  WHEN $1::text = 'white' AND white_ban_started_at IS NULL THEN NOW()
+                  WHEN $1::text != 'white' THEN NULL
+                  ELSE white_ban_started_at
+                END
+          WHERE player_id = $2::uuid AND tenant_id = $3::uuid`,
+        [newTier, playerId, tenantId]
+    );
+    if (newTier === 'black') await _maybeEscalateGlobalPermaban(db, playerId);
+}
+
+// FIX-397: cross-tenant permaban escalation. A player black-banned (permaban) in 3 OR
+// MORE distinct tenants is permabanned everywhere — the GLOBAL (Original) tier is forced
+// to black, which the resolver/gates then surface across all games. Original itself
+// counts as one tenant (its black lives in players.reliability_tier). Distinct count =
+// number of player_tenants rows at 'black' + 1 if the global column is 'black'. Idempotent:
+// re-running when already global-black is a harmless no-op. Fail-safe: never throws into
+// the caller (a counting hiccup must not break a legitimate tier write).
+async function _maybeEscalateGlobalPermaban(db, playerId) {
+    try {
+        const r = await db.query(
+            `SELECT
+               (SELECT COUNT(DISTINCT tenant_id) FROM player_tenants
+                  WHERE player_id = $1::uuid AND reliability_tier = 'black'
+                    AND status = 'active') AS tenant_blacks,
+               (SELECT reliability_tier FROM players WHERE id = $1::uuid) AS global_tier`,
+            [playerId]
+        );
+        const tenantBlacks = parseInt(r.rows[0]?.tenant_blacks) || 0;
+        const globalIsBlack = r.rows[0]?.global_tier === 'black';
+        const distinctBlackTenants = tenantBlacks + (globalIsBlack ? 1 : 0);
+        if (distinctBlackTenants >= 3 && !globalIsBlack) {
+            // Trip the global permaban (Original tier → black). Gates read this everywhere.
+            await db.query(
+                `UPDATE players SET reliability_tier = 'black' WHERE id = $1::uuid`,
+                [playerId]
+            );
+            console.log(`⛔ FIX-397 global permaban escalated for player ${playerId} (black in ${distinctBlackTenants} tenants)`);
+        }
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return; // pre-migration
+        console.error('_maybeEscalateGlobalPermaban failed (non-fatal):', e.message);
+    }
+}
+
+// FIX-397: recompute EVERY rating a player holds — Original (NULL) plus each tenant
+// they have a membership in OR have discipline records for. Used by the admin
+// recalc-tier tool, which has no single tenant context ("fix this player's tiers").
+async function recalcAllTenantTiers(db, playerId) {
+    // Distinct tenants the player is tied to: memberships ∪ tenants on their records.
+    // Always include Original (NULL) explicitly.
+    const tRes = await db.query(
+        `SELECT DISTINCT tenant_id FROM (
+            SELECT tenant_id FROM player_tenants WHERE player_id = $1::uuid
+            UNION
+            SELECT tenant_id FROM discipline_records WHERE player_id = $1::uuid
+         ) s`,
+        [playerId]
+    );
+    const tenants = new Set();
+    tenants.add(null); // Original always
+    for (const r of tRes.rows) tenants.add(r.tenant_id || null);
+    const out = [];
+    for (const tid of tenants) {
+        const pts = await getRevolvingPointsForTenant(playerId, tid, db);
+        const tier = tierFromRevolvingPoints(pts);
+        await applyTierChangeForTenant(db, playerId, tid, tier);
+        out.push({ tenant_id: tid, revolvingTotal: pts, newTier: tier });
+    }
+    return out;
+}
+
 app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, async (req, res) => {
     const { id } = req.params;
     const { points } = req.body;
@@ -29479,33 +30039,31 @@ app.post('/api/admin/players/:id/discipline', authenticateToken, requireAdmin, a
         await client.query('BEGIN');
 
         // Insert manual record (game_id NULL = manual admin entry)
-        await client.query(`
-            INSERT INTO discipline_records (player_id, game_id, points, offense_type, recorded_by)
-            VALUES ($1, NULL, $2, 'Manual (admin)', $3)
-        `, [id, pts, req.user.userId]);
+        // FIX-397: attribute to the acting admin's tenant (superadmin → NULL = TF-root).
+        const _manualTenantId = await _resolveOwnerTenantId(req);
+        try {
+            await client.query(`
+                INSERT INTO discipline_records (player_id, game_id, points, offense_type, recorded_by, tenant_id)
+                VALUES ($1, NULL, $2, 'Manual (admin)', $3, $4)
+            `, [id, pts, req.user.userId, _manualTenantId]);
+        } catch (drErr) {
+            if (drErr && drErr.code === '42703') {
+                await client.query(`
+                    INSERT INTO discipline_records (player_id, game_id, points, offense_type, recorded_by)
+                    VALUES ($1, NULL, $2, 'Manual (admin)', $3)
+                `, [id, pts, req.user.userId]);
+            } else {
+                throw drErr;
+            }
+        }
 
-        // Compute revolving points inline — includes manual (game_id IS NULL) entries.
-        // calculate_player_tier() is a DB function that filters game_id IS NOT NULL so it
-        // never counts manual entries. We bypass it here and derive tier ourselves.
-        //
-        // FIX-292: explicit ::uuid casts on $1 (same reason as the discipline-remove
-        // endpoint — PG 14+ can deduce inconsistent types for $1 when it's used
-        // in both the outer SELECT and the inner correlated subquery).
-        const revolvingResult = await client.query(`
-            SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
-            FROM discipline_records dr
-            WHERE dr.player_id = $1::uuid
-            AND (dr.game_id IS NULL OR dr.game_id IN (
-                SELECT r.game_id FROM registrations r
-                JOIN games g ON g.id = r.game_id
-                WHERE r.player_id = $1::uuid AND r.status = 'confirmed'
-                AND g.game_status = 'completed'
-                ORDER BY g.game_date DESC LIMIT 10
-            ))
-        `, [id]);
-        const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
+        // FIX-397: per-tenant tier. The manual point was attributed to _manualTenantId
+        // above; recompute that tenant's revolving total (the helper includes manual
+        // entries) and write the tier to the same (player, tenant). Pass `client` so the
+        // just-inserted, uncommitted record is counted within this transaction.
+        const revolvingPts = await getRevolvingPointsForTenant(id, _manualTenantId, client);
         const newTier = tierFromRevolvingPoints(revolvingPts);
-        await applyTierChange(client, id, newTier);
+        await applyTierChangeForTenant(client, id, _manualTenantId, newTier);
 
         await client.query('COMMIT');
         res.json({ success: true, newTier, pointsAdded: pts, revolvingTotal: revolvingPts });
@@ -29536,7 +30094,7 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
 
         // Fetch the record before deleting so we can audit it
         const recordResult = await client.query(
-            'SELECT id, player_id, points, offense_type FROM discipline_records WHERE id = $1',
+            'SELECT id, player_id, points, offense_type, tenant_id FROM discipline_records WHERE id = $1',
             [recordId]
         );
         if (recordResult.rows.length === 0) {
@@ -29549,40 +30107,14 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
         // Delete the record
         await client.query('DELETE FROM discipline_records WHERE id = $1', [recordId]);
 
-        // FIX-250: Restructured recalc — the previous version used ORDER BY +
-        // LIMIT inside an IN() subquery which is valid PostgreSQL but unusual.
-        // Restructure as a derived-table LEFT JOIN for clarity and to make the
-        // 10-most-recent-completed-games intent explicit. Same result, lower
-        // surprise factor for future maintainers.
-        //
-        // FIX-292: explicit ::uuid casts on $1. Without them, PG 14+ raises
-        //   "inconsistent types deduced for parameter $1" (SQLSTATE 42P08)
-        // because $1 is referenced both inside the CTE (registrations.player_id)
-        // AND in the outer SELECT (discipline_records.player_id). Both columns
-        // ARE uuid per the FK migration, but the planner deduces the type
-        // independently per CTE scope and the two deductions can disagree
-        // under some plan shapes. A single explicit cast pins the type and
-        // makes the query bulletproof.
-        const revolvingResult = await client.query(`
-            WITH recent_games AS (
-                SELECT r.game_id
-                FROM registrations r
-                JOIN games g ON g.id = r.game_id
-                WHERE r.player_id = $1::uuid
-                  AND r.status = 'confirmed'
-                  AND g.game_status = 'completed'
-                ORDER BY g.game_date DESC
-                LIMIT 10
-            )
-            SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
-            FROM discipline_records dr
-            WHERE dr.player_id = $1::uuid
-              AND (dr.game_id IS NULL OR dr.game_id IN (SELECT game_id FROM recent_games))
-        `, [playerId]);
-        const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
+        // FIX-397: recompute the tier for the TENANT the removed record belonged to
+        // (a record carries its tenant_id; NULL = Original). One source of truth via
+        // the JS helper; write to the same (player, tenant).
+        const _remTenant = record.tenant_id || null;
+        const revolvingPts = await getRevolvingPointsForTenant(playerId, _remTenant, client);
         const newTier = tierFromRevolvingPoints(revolvingPts);
 
-        await applyTierChange(client, playerId, newTier);
+        await applyTierChangeForTenant(client, playerId, _remTenant, newTier);
         await client.query('COMMIT');
 
         res.json({ success: true, newTier, revolvingTotal: revolvingPts, removedPoints: record.points });
@@ -29619,25 +30151,19 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
 app.post('/api/admin/players/:id/recalc-tier', authenticateToken, requireAdmin, async (req, res) => {
     const { id } = req.params;
     try {
-        // FIX-292: explicit ::uuid casts on $1 — same PG inference issue.
-        const revolvingResult = await pool.query(`
-            SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
-            FROM discipline_records dr
-            WHERE dr.player_id = $1::uuid
-            AND (dr.game_id IS NULL OR dr.game_id IN (
-                SELECT r.game_id FROM registrations r
-                JOIN games g ON g.id = r.game_id
-                WHERE r.player_id = $1::uuid AND r.status = 'confirmed'
-                AND g.game_status = 'completed'
-                ORDER BY g.game_date DESC LIMIT 10
-            ))
-        `, [id]);
-        const revolvingPts = parseInt(revolvingResult.rows[0].revolving_pts);
-        const newTier = tierFromRevolvingPoints(revolvingPts);
-        await applyTierChange(pool, id, newTier);
-        res.json({ success: true, newTier, revolvingTotal: revolvingPts });
+        // FIX-397: recompute ALL of the player's ratings (Original + every tenant they're
+        // tied to). No single tenant context here, so a full pass leaves nothing stale.
+        const results = await recalcAllTenantTiers(pool, id);
+        // Original (tenant_id NULL) is the headline value for the legacy response shape.
+        const original = results.find(r => r.tenant_id === null) || results[0];
+        res.json({
+            success: true,
+            newTier: original ? original.newTier : null,
+            revolvingTotal: original ? original.revolvingTotal : 0,
+            perTenant: results
+        });
         setImmediate(() => auditLog(pool, req.user.playerId, 'tier_recalculated', id,
-            `Tier recalculated | revolving pts: ${revolvingPts} | new tier: ${newTier}`));
+            `Tier recalculated across ${results.length} rating(s) | Original: ${original ? original.newTier : 'n/a'}`));
     } catch (error) {
         console.error('Recalc tier error:', error);
         res.status(500).json({ error: 'Failed to recalculate tier' });
@@ -29652,14 +30178,25 @@ app.post('/api/admin/players/:id/unban', authenticateToken, requireSuperAdmin, a
     try {
         await client.query('BEGIN');
 
-        // Clear all existing discipline records — clean slate, zero points
+        // Clear all existing discipline records — clean slate, zero points (all tenants)
         await client.query('DELETE FROM discipline_records WHERE player_id = $1', [id]);
 
-        // Force gold tier — player returns with a clean record, clear ban timestamp
+        // FIX-397: full reinstatement resets EVERY rating to gold — Original (legacy
+        // column) AND every per-tenant membership — and clears all white-ban timestamps.
         await client.query(
             'UPDATE players SET reliability_tier = $1, white_ban_started_at = NULL WHERE id = $2',
             ['gold', id]
         );
+        try {
+            await client.query(
+                `UPDATE player_tenants SET reliability_tier = 'gold', white_ban_started_at = NULL
+                  WHERE player_id = $1::uuid`,
+                [id]
+            );
+        } catch (e) {
+            if (!(e && (e.code === '42703' || e.code === '42P01'))) throw e;
+            // pre-migration: per-tenant columns not present yet — Original reset suffices.
+        }
 
         // Insert reinstatement notification for the player
         await client.query(`
@@ -39300,6 +39837,14 @@ async function calcSeriesLeaderboard(seriesId, metricId, calcType) {
 //
 // All metrics use calc_type='most' (raw counts) — the move away from %-based
 // metrics is intentional. Trophy displays no longer surface % supporting stats.
+// FIX-399: id→label for the per-tenant monthly-awards picker (matches the comments below).
+const MONTHLY_METRIC_LABELS = {
+    1: 'Win %', 2: 'MOTM', 3: 'Win Count', 5: 'Appearances', 6: 'Brick Wall',
+    7: 'Best Engine', 9: 'Goal Scorer', 11: 'The Moaner', 13: 'Donkey',
+    16: 'Discipline Points', 19: 'Cold Moment', 20: 'Walker', 21: 'Pig',
+    24: 'Assist King', 28: 'Best Ref', 29: 'Worst Ref'
+};
+const MONTHLY_STARTER_METRIC_IDS = [9, 5, 1, 2]; // Goal Scorer, Appearances, Win %, MOTM
 const MONTHLY_METRICS = [
     // (metric_id, calc_type, min_games, min_awards)
     { metric_id: 1,  calc_type: 'most', min_games: 4, min_awards: 0 },  // Win %         — keeps % primary
@@ -39755,8 +40300,15 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
             }
 
             for (const tenant of activeTenants) {
+                // FIX-399: per-tenant monthly-awards config. Skip if disabled; otherwise run
+                // the tenant's chosen metrics (no config row → all metrics = prior behaviour).
+                const _mCfg = await getMonthlyConfigForTenant(tenant.id, client);
+                if (!_mCfg.enabled) continue;
+                const _tenantMetrics = _mCfg.metricIds
+                    ? MONTHLY_METRICS.filter(m => _mCfg.metricIds.includes(m.metric_id))
+                    : MONTHLY_METRICS;
                 for (const region of MONTHLY_REGIONS) {
-                    for (const m of MONTHLY_METRICS) {
+                    for (const m of _tenantMetrics) {
                         const leaderboard = await calcMonthlyLeaderboard(
                             year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards,
                             tenant.id  // per-tenant pass
@@ -39920,29 +40472,82 @@ app.get('/api/games/:gameUrl/rating-feedback-pair', authenticateToken, async (re
 
         // For each candidate subject, try to find a reference. Take the
         // first subject that has at least one valid reference.
+        // FIX-405: position adjacency + tiered rating window.
+        //  • Position: GK only matches GK; outfield matches by adjacency —
+        //    DEF↔DEF/MID, MID↔DEF/MID/ATT, ATT↔MID/ATT; DEF↔ATT is BLOCKED.
+        //    Uses signup_positions (CSV of gk/def/mid/att) when present; legacy
+        //    players without it fall back to GK-vs-outfield only (can't sub-band).
+        //  • Rating: prefer ±2 (full weight=1.0); if no ±2 ref exists, widen to
+        //    ±4 and mark the pair half-weight (0.5) — direction still counts, the
+        //    magnitude of influence is dampened (per the "halfway" rule).
+        function _posCats(signupCsv, legacyPos) {
+            const s = String(signupCsv || '').toLowerCase();
+            const cats = [];
+            if (s) {
+                if (s.includes('gk'))  cats.push('gk');
+                if (s.includes('def')) cats.push('def');
+                if (s.includes('mid')) cats.push('mid');
+                if (s.includes('att')) cats.push('att');
+            }
+            if (cats.length === 0) {
+                // Legacy fallback: only GK vs outfield is known.
+                const lp = String(legacyPos || '').toUpperCase().trim();
+                return lp === 'GK' ? ['gk'] : ['outfield'];
+            }
+            return cats;
+        }
+        // Two categories are comparable if they share a cat, or are adjacent
+        // (def-mid, mid-att). gk only with gk. outfield (legacy) matches any
+        // non-gk. def-att never (unless bridged by a shared mid).
+        function _posCompatible(a, b) {
+            const ADJ = { gk: ['gk'], def: ['def','mid'], mid: ['def','mid','att'],
+                          att: ['mid','att'], outfield: ['def','mid','att','outfield'] };
+            for (const x of a) {
+                for (const y of b) {
+                    if (x === 'gk' || y === 'gk') { if (x === 'gk' && y === 'gk') return true; continue; }
+                    if ((ADJ[x] && ADJ[x].includes(y)) || (ADJ[y] && ADJ[y].includes(x))) return true;
+                }
+            }
+            return false;
+        }
+
         for (const subj of subjR.rows) {
-            const refR = await pool.query(
-                `SELECT p.id, p.alias, p.first_name, p.position, p.signup_positions
+            const subjCats = _posCats(subj.signup_positions, subj.position);
+            // Pull a pool of potential references (settled players), then filter
+            // by position-adjacency in JS and rank by rating closeness.
+            const poolR = await pool.query(
+                `SELECT p.id, p.alias, p.first_name, p.position, p.signup_positions,
+                        COALESCE(p.overall_rating,0) AS overall_rating
                    FROM registrations r
                    JOIN players p ON p.id = r.player_id
                   WHERE r.game_id = $1
                     AND r.status = 'confirmed'
                     AND p.ovr_suspicion IS NULL
-                    AND p.position = $2
+                    AND p.id != $2
                     AND p.id != $3
-                    AND p.id != $4
-                    AND p.total_appearances >= 5
-                    AND ABS(COALESCE(p.overall_rating, 0) - COALESCE($5::int, 0)) <= 2
-                  ORDER BY RANDOM()
-                  LIMIT 1`,
-                [gameId, subj.position, voterId, subj.id, subj.overall_rating]
+                    AND p.total_appearances >= 5`,
+                [gameId, voterId, subj.id]
             );
-            if (refR.rows.length === 0) continue;
-            const ref = refR.rows[0];
+            const subjOvr = Number(subj.overall_rating) || 0;
+            const compatible = poolR.rows
+                .filter(r => _posCompatible(subjCats, _posCats(r.signup_positions, r.position)))
+                .map(r => ({ ...r, _diff: Math.abs(Number(r.overall_rating) - subjOvr) }))
+                .sort((a, b) => a._diff - b._diff);
+            // Tier 1: within ±2 (full weight). Tier 2: ±4 (half weight).
+            const full = compatible.filter(r => r._diff <= 2);
+            const half = compatible.filter(r => r._diff > 2 && r._diff <= 4);
+            const chosen = full.length > 0
+                ? { ref: full[Math.floor(Math.random() * full.length)], weight: 1.0 }
+                : (half.length > 0
+                    ? { ref: half[Math.floor(Math.random() * half.length)], weight: 0.5 }
+                    : null);
+            if (!chosen) continue;
+            const ref = chosen.ref;
 
             // Both records sanitised — NO OVR, win rate, stats.
             return res.json({
                 gameId,
+                weight: chosen.weight,   // 1.0 = within band; 0.5 = stretched (halfway)
                 subject:   { id: subj.id, alias: subj.alias, first_name: subj.first_name,
                              position: subj.position, signup_positions: subj.signup_positions },
                 reference: { id: ref.id,  alias: ref.alias,  first_name: ref.first_name,
@@ -39965,7 +40570,9 @@ app.post('/api/games/:gameUrl/rating-feedback', authenticateToken, async (req, r
     try {
         const { gameUrl } = req.params;
         const voterId     = req.user.playerId;
-        const { subjectPlayerId, referencePlayerId, deltaVote } = req.body;
+        const { subjectPlayerId, referencePlayerId, deltaVote, weight } = req.body;
+        // FIX-405: stretched (wider-band) pairs arrive with weight 0.5; normal 1.0.
+        const voteWeight = (weight === 0.5 || weight === '0.5') ? 0.5 : 1.0;
 
         // Resolve game
         const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
@@ -40022,14 +40629,15 @@ app.post('/api/games/:gameUrl/rating-feedback', authenticateToken, async (req, r
         const insertR = await pool.query(
             `INSERT INTO player_rating_feedback
                (subject_player_id, reference_player_id, voter_player_id, game_id,
-                delta_vote, applied_amount, fully_consumed, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                delta_vote, applied_amount, fully_consumed, weight, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
              ON CONFLICT (subject_player_id, voter_player_id, game_id) DO NOTHING
              RETURNING id`,
             [subjectPlayerId, referencePlayerId, voterId, gameId,
              validatedDelta,
              isSkip ? 0 : 0,        // start with 0 magnitude consumed (real votes get consumed by aggregation)
-             isSkip ? true : false] // skips are immediately fully_consumed
+             isSkip ? true : false, // skips are immediately fully_consumed
+             voteWeight]
         );
         if (insertR.rows.length === 0) {
             // Conflict — already voted on this pair-in-game
@@ -43270,7 +43878,7 @@ async function _wonderfulAutoRegister(pmt) {
             `SELECT g.id, g.cost_per_player, g.game_status, g.team_selection_type,
                     g.max_players, g.requires_organiser, g.exclusivity,
                     g.early_bird_price, g.super_early_bird_price, g.game_date,
-                    g.tournament_team_count,
+                    g.tournament_team_count, g.tenant_id,
                     ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
                      + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) AS current_players
              FROM games g WHERE g.id = $1`,
@@ -43309,15 +43917,46 @@ async function _wonderfulAutoRegister(pmt) {
         }
 
         // Idempotency — already registered? (webhook can fire twice, reconciler too)
+        // FIX-406: only an ACTIVE row means "already handled". A dead row (bumped/left/
+        // dropped_out/cancelled/rejected) must NOT short-circuit — otherwise a player who
+        // was bumped and then PAYS via Wonderful gets credited but the auto-register bails
+        // reporting "backup", leaving them charged-but-not-confirmed. Clear the dead row and
+        // fall through to normal placement (capacity check + confirmed/backup insert).
         const already = await pool.query(
             `SELECT status FROM registrations WHERE game_id = $1 AND player_id = $2`,
             [pmt.game_id, pmt.player_id]
         );
-        if (already.rows.length) {
-            return {
-                status: already.rows[0].status === 'confirmed' ? 'confirmed' : 'backup',
-                reason: 'Already registered'
-            };
+        const _activeAlready = already.rows.find(r =>
+            ['confirmed', 'rsvp', 'backup', 'confirmed_backup'].includes(r.status));
+        if (_activeAlready) {
+            // FIX-406: if they hold an RSVP, a Wonderful payment is them CONVERTING it — upgrade
+            // the row to confirmed rather than reporting "already registered" and leaving them
+            // unpaid-but-credited. Previously an RSVP'd player who paid via the main page (open
+            // banking) had the money credited but stayed 'rsvp' — never confirmed. confirmed /
+            // backup / confirmed_backup are genuinely already-handled and short-circuit as before.
+            if (_activeAlready.status === 'rsvp') {
+                const upd = await pool.query(
+                    `UPDATE registrations
+                        SET status = 'confirmed', rsvp_deadline = NULL, rsvp_warned_at = NULL
+                      WHERE game_id = $1 AND player_id = $2 AND status = 'rsvp'
+                      RETURNING id`,
+                    [pmt.game_id, pmt.player_id]
+                );
+                if (upd.rows.length) {
+                    try { await applyBffRivalAutoFill(pool, pmt.player_id, pmt.game_id, upd.rows[0].id); }
+                    catch (e) { console.warn('[FIX-406] BFF auto-fill on Wonderful RSVP-convert failed (non-fatal):', e.message); }
+                    return { status: 'confirmed', reason: 'RSVP converted to confirmed via payment' };
+                }
+                // Row changed under us (e.g. cron) — fall through to normal placement.
+            } else {
+                return {
+                    status: _activeAlready.status === 'confirmed' ? 'confirmed' : 'backup',
+                    reason: 'Already registered'
+                };
+            }
+        }
+        if (already.rows.length && !_activeAlready) {
+            await _clearDeadRegistration(pool, pmt.game_id, pmt.player_id);
         }
 
         // Capacity — mirror /register. effectiveMax reserves the last slot for an
@@ -43339,14 +43978,16 @@ async function _wonderfulAutoRegister(pmt) {
         const requestedBackupType = pmt.backup_type;
         const isGKOnly = String(positionValue).trim().toUpperCase() === 'GK';
 
-        // Organiser comp (cap 6 per game, matches /register)
+        // Organiser comp — allowance-aware (was hardcoded < 6; -1 = unlimited, e.g. main TF)
         let isComped = false;
         if (isOrganiser) {
             const compRes = await pool.query(
                 "SELECT COUNT(*) AS cnt FROM registrations WHERE game_id = $1 AND is_comped = TRUE",
                 [pmt.game_id]
             );
-            if (parseInt(compRes.rows[0].cnt) < 6) isComped = true;
+            const _wfAllow = await _fix329GetAllowance(game.tenant_id);
+            const _wfCount = parseInt(compRes.rows[0].cnt) || 0;
+            if (_wfAllow.enabled && (_wfAllow.per_game === -1 || _wfCount < _wfAllow.per_game)) isComped = true;
         }
 
         const effectivePrice = getEffectivePrice(game).price;
@@ -43386,7 +44027,7 @@ async function _wonderfulAutoRegister(pmt) {
                 if (finalBackupType === 'confirmed_backup' && !isComped) {
                     const { realCharged, freeCharged } = await applyGameFee(
                         client, pmt.player_id, effectivePrice,
-                        `Confirmed backup for game ${pmt.game_id} (via Wonderful)`
+                        `Confirmed backup for game ${pmt.game_id} (via Wonderful)`, null, pmt.game_id
                     );
                     amountPaid = realCharged;
                     amountPaidFree = freeCharged || 0;
@@ -43461,7 +44102,7 @@ async function _wonderfulAutoRegister(pmt) {
                 if (!isComped) {
                     const { realCharged, freeCharged } = await applyGameFee(
                         client, pmt.player_id, effectivePrice,
-                        `Registration for game ${pmt.game_id} (via Wonderful${getEffectivePrice(game).tier !== 'standard' ? ' · ' + getEffectivePrice(game).tier : ''})`
+                        `Registration for game ${pmt.game_id} (via Wonderful${getEffectivePrice(game).tier !== 'standard' ? ' · ' + getEffectivePrice(game).tier : ''})`, null, pmt.game_id
                     );
                     amountPaid = realCharged;
                     amountPaidFree = freeCharged || 0;
@@ -50066,6 +50707,17 @@ app.post('/api/admin/tenants', authenticateToken, requireSuperAdmin, async (req,
                 [shortId, name, workingSlug, logoUrl, primaryColor, replyToEmail]
             );
             inserted = r.rows[0];
+            // FIX-399: seed NEW tenants with the curated starter-4 monthly awards. Existing
+            // tenants have no row and keep all-16 (preservation rule); only new ones start at 4.
+            try {
+                await pool.query(
+                    `INSERT INTO tenant_monthly_config (tenant_id, enabled, metric_ids)
+                     VALUES ($1, TRUE, $2) ON CONFLICT (tenant_id) DO NOTHING`,
+                    [inserted.id, MONTHLY_STARTER_METRIC_IDS]);
+            } catch (seedErr) {
+                if (!(seedErr && (seedErr.code === '42P01' || seedErr.code === '42703')))
+                    console.error('FIX-399 starter-4 seed failed (non-fatal):', seedErr.message);
+            }
             break;
         } catch (e) {
             // 23505 = unique_violation — could be short_id OR slug
@@ -51387,7 +52039,16 @@ app.get('/api/public/organiser/:player_id', publicEndpointLimiter, async (req, r
                 MIN(g.game_date) FILTER (WHERE g.game_status = 'completed')                                  AS first_game_date,
                 MAX(g.game_date) FILTER (WHERE g.game_status = 'completed')                                  AS most_recent_game_date
                FROM games g
-              WHERE g.default_organiser_id = $1`,
+              WHERE g.id IN (
+                  -- FIX-403: a game this player ORGANISED = they had a confirmed registration
+                  -- as an organiser in it (matches the multi-organiser card), OR they were the
+                  -- explicitly-assigned default organiser. DISTINCT via IN avoids double-count.
+                  SELECT r.game_id FROM registrations r
+                    JOIN players p ON p.id = r.player_id
+                   WHERE r.player_id = $1 AND r.status = 'confirmed' AND p.is_organiser = TRUE
+                  UNION
+                  SELECT id FROM games WHERE default_organiser_id = $1
+              )`,
             [playerId]
         );
         const stats = statsRes.rows[0] || {};
@@ -53077,6 +53738,23 @@ app.post('/api/t/:tenant_short_id/admin/refund-player',
                 return res.status(404).json({ error: 'Player is not a member of this tenant' });
             }
             // Allow refunds to left/banned members (refunding their final games is legit)
+
+            // P2-2 fix: idempotency guard against admin double-submit. If an identical
+            // tenant_refund for this player + amount was recorded in the last 30s, refuse
+            // rather than refund twice. (credit_transactions has no structured idempotency
+            // key — a schema-backed key would be the fuller fix; this catches the real
+            // double-click/double-submit case without a migration.)
+            const _recentRefund = await client.query(
+                `SELECT id FROM credit_transactions
+                  WHERE player_id = $1 AND type = 'tenant_refund' AND amount = $2
+                    AND created_at > NOW() - INTERVAL '30 seconds'
+                  LIMIT 1`,
+                [playerId, parseFloat((amountPence / 100).toFixed(2))]
+            );
+            if (_recentRefund.rows.length > 0) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ error: 'A matching refund was processed moments ago — refused as a likely duplicate. Retry shortly if this was intentional.' });
+            }
 
             // Lock player credit row + apply refund
             const amountPounds = (amountPence / 100).toFixed(2);
@@ -55327,6 +56005,391 @@ app.post('/api/admin/faq-unanswered/:id/resolve', authenticateToken, requireSupe
     }
 });
 
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-396 — Tenant-admin tier controls (discipline_enabled + tier_windows_enabled)
+// Tenant admins may toggle their OWN tenant's discipline engine on/off (and the
+// advance-booking windows). Scoped to req.tenant.id; superadmin passes through
+// requireTenantAdmin too. discipline_enabled is the single gate for the whole
+// discipline/tier engine (no per-metric/per-label customisation). Mirrors the
+// per-tenant leagues routes (path-resolved tenant, requireTenantAdmin).
+// ──────────────────────────────────────────────────────────────────────────
+app.get('/api/t/:tenant_short_id/admin/tier-controls', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            'SELECT discipline_enabled, tier_windows_enabled FROM tenants WHERE id = $1',
+            [req.tenant.id]
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        // Defensive: pre-migration rows could be NULL before the bootstrap default lands.
+        const row = r.rows[0];
+        res.json({
+            discipline_enabled:  row.discipline_enabled  !== false,
+            tier_windows_enabled: row.tier_windows_enabled !== false
+        });
+    } catch (e) {
+        // FIX-396: pre-migration safety — if the bootstrap hasn't added the columns yet
+        // (42703 undefined_column, e.g. a request in the brief startup window before the
+        // fire-and-forget bootstrapTierControls() completes), degrade to defaults (both ON
+        // = current behaviour) rather than 500, matching _tierWindowsEnabledForTenant.
+        if (e && e.code === '42703') {
+            return res.json({ discipline_enabled: true, tier_windows_enabled: true });
+        }
+        console.error('FIX-396 get tier-controls failed:', e.message);
+        res.status(500).json({ error: 'Failed to load tier controls' });
+    }
+});
+
+app.patch('/api/t/:tenant_short_id/admin/tier-controls', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const updates = [];
+        const vals = [];
+        let i = 1;
+        for (const f of ['discipline_enabled', 'tier_windows_enabled']) {
+            if (b[f] === undefined) continue;
+            updates.push(`${f} = $${i++}`);
+            vals.push(!!b[f]);
+        }
+        if (!updates.length) return res.status(400).json({ error: 'No valid fields to update' });
+        vals.push(req.tenant.id);
+        const r = await pool.query(
+            `UPDATE tenants SET ${updates.join(', ')} WHERE id = $${i}
+             RETURNING discipline_enabled, tier_windows_enabled`,
+            vals
+        );
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const row = r.rows[0];
+        res.json({
+            ok: true,
+            discipline_enabled:  row.discipline_enabled  !== false,
+            tier_windows_enabled: row.tier_windows_enabled !== false
+        });
+    } catch (e) {
+        // FIX-396: if columns aren't present yet (brief startup window), say so clearly.
+        if (e && e.code === '42703') {
+            return res.status(503).json({ error: 'Tier controls not ready yet — please retry shortly' });
+        }
+        console.error('FIX-396 patch tier-controls failed:', e.message);
+        res.status(500).json({ error: 'Failed to update tier controls' });
+    }
+});
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-396 — Tenant Admin: Manage Players (reduced, tenant-scoped)
+// A tenant admin manages THEIR tenant's members only. Reduced toolset vs the
+// superadmin manage-players: player details, alias, password reset, tenant-
+// scoped free credits, ban/unban, and (only when discipline_enabled) points.
+// No suspicion/over-rated analytics. All tier/points are per-tenant for THIS
+// tenant. Every route is requireTenantAdmin + scoped to req.tenant.id.
+// ──────────────────────────────────────────────────────────────────────────
+
+// List this tenant's members with reduced fields + per-tenant tier/points.
+app.get('/api/t/:tenant_short_id/admin/players', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const tenantId = req.tenant.id;
+        const discEnabled = await (async () => {
+            try {
+                const d = await pool.query('SELECT discipline_enabled FROM tenants WHERE id = $1', [tenantId]);
+                return d.rows.length ? d.rows[0].discipline_enabled !== false : true;
+            } catch (_) { return true; }
+        })();
+        const q = (req.query.q || '').trim().toLowerCase();
+        const params = [tenantId];
+        let search = '';
+        if (q) { params.push('%' + q + '%'); search = `AND (LOWER(p.alias) LIKE $2 OR LOWER(p.full_name) LIKE $2 OR LOWER(u.email) LIKE $2)`; }
+        const r = await pool.query(`
+            SELECT p.id, p.alias, p.full_name, p.squad_number, u.email,
+                   pt.reliability_tier AS tenant_tier, pt.status AS membership_status
+            FROM player_tenants pt
+            JOIN players p ON p.id = pt.player_id
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE pt.tenant_id = $1 AND pt.status = 'active' ${search}
+            ORDER BY LOWER(COALESCE(p.alias, p.full_name)) ASC
+            LIMIT 500`, params);
+        // Attach per-tenant points only when discipline is on.
+        const players = [];
+        for (const row of r.rows) {
+            let points = null, tier = row.tenant_tier || 'gold';
+            if (discEnabled) {
+                points = await getRevolvingPointsForTenant(row.id, tenantId, pool);
+                tier = await getPlayerTierForTenant(row.id, tenantId, pool);
+            }
+            players.push({
+                id: row.id, alias: row.alias, full_name: row.full_name,
+                squad_number: row.squad_number, email: row.email,
+                tier: discEnabled ? tier : null,
+                points: discEnabled ? points : null,
+                membership_status: row.membership_status
+            });
+        }
+        res.json({ discipline_enabled: discEnabled, players });
+    } catch (e) {
+        console.error('FIX-396 tenant players list failed:', e.message);
+        res.status(500).json({ error: 'Failed to load players' });
+    }
+});
+
+// Helper: confirm a player is an active member of this tenant (scoping guard).
+async function _tenantHasMember(tenantId, playerId, db = pool) {
+    try {
+        const r = await db.query(
+            `SELECT 1 FROM player_tenants WHERE tenant_id = $1 AND player_id = $2 AND status = 'active' LIMIT 1`,
+            [tenantId, playerId]);
+        return r.rows.length > 0;
+    } catch (_) { return false; }
+}
+
+// Set alias (tenant admin, own members only).
+app.patch('/api/t/:tenant_short_id/admin/players/:playerId/alias', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        if (!(await _tenantHasMember(req.tenant.id, playerId))) return res.status(404).json({ error: 'Not a member of your tenant' });
+        const alias = (req.body && req.body.alias || '').trim();
+        if (!alias || alias.length > 40) return res.status(400).json({ error: 'Alias must be 1–40 chars' });
+        await pool.query('UPDATE players SET alias = $1 WHERE id = $2', [alias, playerId]);
+        await auditLog(pool, req.user.playerId, 'tenant_player_alias', playerId, `Alias set to ${alias} (tenant ${req.tenant.id})`);
+        res.json({ success: true, alias });
+    } catch (e) {
+        console.error('FIX-396 alias failed:', e.message);
+        res.status(500).json({ error: 'Failed to set alias' });
+    }
+});
+
+// Reset password — issues a new temporary password, forces change at next login.
+app.post('/api/t/:tenant_short_id/admin/players/:playerId/reset-password', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        if (!(await _tenantHasMember(req.tenant.id, playerId))) return res.status(404).json({ error: 'Not a member of your tenant' });
+        const temp = 'TF-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+        const hash = await bcrypt.hash(temp, 10);
+        const u = await pool.query(
+            `UPDATE users SET password_hash = $1, token_version = token_version + 1, force_password_change = TRUE
+              WHERE id = (SELECT user_id FROM players WHERE id = $2) RETURNING id`,
+            [hash, playerId]);
+        if (!u.rows.length) return res.status(404).json({ error: 'No login account for this player' });
+        await auditLog(pool, req.user.playerId, 'tenant_player_pwreset', playerId, `Password reset (tenant ${req.tenant.id})`);
+        res.json({ success: true, temporary_password: temp });
+    } catch (e) {
+        console.error('FIX-396 pwreset failed:', e.message);
+        res.status(500).json({ error: 'Failed to reset password' });
+    }
+});
+
+// Grant/remove tenant-scoped free credits (spendable only at this tenant's games).
+app.post('/api/t/:tenant_short_id/admin/players/:playerId/free-credits', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        if (!(await _tenantHasMember(req.tenant.id, playerId))) return res.status(404).json({ error: 'Not a member of your tenant' });
+        const amount = parseFloat(req.body && req.body.amount);
+        if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: 'Amount required' });
+        if (Math.abs(amount) > 500) return res.status(400).json({ error: 'Max ±£500' });
+        const newBal = await adjustTenantFreeCredits(playerId, req.tenant.id, amount, pool);
+        await recordCreditTransaction(pool, playerId, amount, 'free_credit',
+            `Tenant free credit ${amount >= 0 ? 'grant' : 'removal'} (tenant ${req.tenant.id})`, req.user.userId);
+        await auditLog(pool, req.user.playerId, 'tenant_free_credit', playerId, `${amount >= 0 ? '+' : ''}£${amount.toFixed(2)} tenant free credits`);
+        res.json({ success: true, tenant_free_balance: newBal });
+    } catch (e) {
+        console.error('FIX-396 tenant free-credits failed:', e.message);
+        res.status(500).json({ error: 'Failed to grant credits' });
+    }
+});
+
+// Ban (1-week white / perma black) — per-tenant tier write.
+app.post('/api/t/:tenant_short_id/admin/players/:playerId/ban', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+        if (!(await _tenantHasMember(req.tenant.id, playerId))) return res.status(404).json({ error: 'Not a member of your tenant' });
+        const kind = (req.body && req.body.kind || '').toLowerCase();
+        if (kind !== 'white' && kind !== 'black') return res.status(400).json({ error: "kind must be 'white' or 'black'" });
+        await applyTierChangeForTenant(pool, playerId, req.tenant.id, kind);
+        await auditLog(pool, req.user.playerId, 'tenant_player_ban', playerId, `${kind} ban (tenant ${req.tenant.id})`);
+        res.json({ success: true, tier: kind });
+    } catch (e) {
+        console.error('FIX-396 ban failed:', e.message);
+        res.status(500).json({ error: 'Failed to ban' });
+    }
+});
+
+// Unban — reset THIS tenant's rating to gold + clear this tenant's discipline records.
+app.post('/api/t/:tenant_short_id/admin/players/:playerId/unban', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { playerId } = req.params;
+        if (!(await _tenantHasMember(req.tenant.id, playerId, client))) { return res.status(404).json({ error: 'Not a member of your tenant' }); }
+        await client.query('BEGIN');
+        // Clear only THIS tenant's discipline records (per-tenant clean slate).
+        await client.query('DELETE FROM discipline_records WHERE player_id = $1 AND tenant_id = $2', [playerId, req.tenant.id]);
+        await applyTierChangeForTenant(client, playerId, req.tenant.id, 'gold');
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'tenant_player_unban', playerId, `Unbanned + cleared (tenant ${req.tenant.id})`);
+        res.json({ success: true, tier: 'gold' });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-396 unban failed:', e.message);
+        res.status(500).json({ error: 'Failed to unban' });
+    } finally {
+        client.release();
+    }
+});
+
+// Add/remove discipline points — ONLY when this tenant has discipline_enabled.
+app.post('/api/t/:tenant_short_id/admin/players/:playerId/points', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { playerId } = req.params;
+        if (!(await _tenantHasMember(req.tenant.id, playerId, client))) { return res.status(404).json({ error: 'Not a member of your tenant' }); }
+        // Gate: discipline must be enabled for this tenant.
+        const d = await client.query('SELECT discipline_enabled FROM tenants WHERE id = $1', [req.tenant.id]);
+        if (d.rows.length && d.rows[0].discipline_enabled === false) {
+            return res.status(403).json({ error: 'Discipline system is turned off for this tenant' });
+        }
+        const pts = parseInt(req.body && req.body.points);
+        if (!Number.isFinite(pts) || pts === 0 || Math.abs(pts) > 20) { return res.status(400).json({ error: 'Points must be ±1–20' }); }
+        await client.query('BEGIN');
+        // Manual record attributed to THIS tenant.
+        try {
+            await client.query(
+                `INSERT INTO discipline_records (player_id, game_id, points, offense_type, recorded_by, tenant_id)
+                 VALUES ($1, NULL, $2, 'Manual (tenant admin)', $3, $4)`,
+                [playerId, pts, req.user.userId, req.tenant.id]);
+        } catch (drErr) {
+            if (drErr && drErr.code === '42703') {
+                await client.query(
+                    `INSERT INTO discipline_records (player_id, game_id, points, offense_type, recorded_by)
+                     VALUES ($1, NULL, $2, 'Manual (tenant admin)', $3)`,
+                    [playerId, pts, req.user.userId]);
+            } else { throw drErr; }
+        }
+        const newPts = await getRevolvingPointsForTenant(playerId, req.tenant.id, client);
+        const newTier = tierFromRevolvingPoints(newPts);
+        await applyTierChangeForTenant(client, playerId, req.tenant.id, newTier);
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'tenant_player_points', playerId, `${pts >= 0 ? '+' : ''}${pts} pts → ${newTier} (tenant ${req.tenant.id})`);
+        res.json({ success: true, points: newPts, tier: newTier });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-396 points failed:', e.message);
+        res.status(500).json({ error: 'Failed to adjust points' });
+    } finally {
+        client.release();
+    }
+});
+
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// FIX-399 — Tenant Admin: Monthly Awards config (which metrics run, on/off)
+// Per-tenant generation already exists (Layer 1); these let a tenant choose.
+// On any change we regenerate the CURRENT month immediately (force) so the
+// tenant sees the effect now rather than waiting for the 1st — "instant +
+// backfill" per the spec.
+// ──────────────────────────────────────────────────────────────────────────
+app.get('/api/t/:tenant_short_id/admin/monthly-config', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const cfg = await getMonthlyConfigForTenant(req.tenant.id, pool);
+        const all = MONTHLY_METRICS.map(m => ({
+            metric_id: m.metric_id,
+            label: MONTHLY_METRIC_LABELS[m.metric_id] || ('Metric ' + m.metric_id),
+            selected: cfg.metricIds ? cfg.metricIds.includes(m.metric_id) : true
+        }));
+        res.json({ enabled: cfg.enabled, metrics: all, all_selected: !cfg.metricIds });
+    } catch (e) {
+        console.error('FIX-399 get monthly-config failed:', e.message);
+        res.status(500).json({ error: 'Failed to load config' });
+    }
+});
+
+app.patch('/api/t/:tenant_short_id/admin/monthly-config', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const validIds = new Set(MONTHLY_METRICS.map(m => m.metric_id));
+        let metricIds = null;
+        if (Array.isArray(b.metric_ids)) {
+            metricIds = b.metric_ids.map(n => parseInt(n)).filter(n => validIds.has(n));
+            if (!metricIds.length) metricIds = null; // empty selection = all (avoids zero-trophy tenants)
+        }
+        const enabled = b.enabled === undefined ? true : !!b.enabled;
+        await pool.query(`
+            INSERT INTO tenant_monthly_config (tenant_id, enabled, metric_ids, updated_at, updated_by)
+            VALUES ($1, $2, $3, NOW(), $4)
+            ON CONFLICT (tenant_id) DO UPDATE
+               SET enabled = $2, metric_ids = $3, updated_at = NOW(), updated_by = $4`,
+            [req.tenant.id, enabled, metricIds, req.user.userId]);
+        await auditLog(pool, req.user.playerId, 'tenant_monthly_config', req.tenant.id,
+            `enabled=${enabled} metrics=${metricIds ? metricIds.join(',') : 'ALL'}`);
+
+        // Instant + backfill: regenerate THIS TENANT's current-month trophies now so the
+        // change is visible immediately — tenant-scoped so other tenants' trophies are never
+        // touched (avoids the whole-month all-tenant wipe of runMonthlyTrophyJob).
+        const now = new Date();
+        const yy = now.getUTCFullYear(), mm = now.getUTCMonth() + 1;
+        const _regenTenantId = req.tenant.id;
+        setImmediate(() => {
+            regenerateTenantMonth(_regenTenantId, yy, mm)
+                .catch(e => console.error('FIX-399 monthly regen failed:', e.message));
+        });
+
+        res.json({ success: true, enabled, metric_ids: metricIds, regenerating: true });
+    } catch (e) {
+        console.error('FIX-399 patch monthly-config failed:', e.message);
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
+
+
+// FIX-400: dynamic tier-drop warning data. Returns the signed-in player's CURRENT
+// revolving discipline points + tier in THIS game's tenant, the points a late drop-out
+// would add (3 for 11-a-side, else 2), and the tier they'd fall to — so the signup form
+// can show "a late drop-out (+3) would move you to Bronze" instead of static text.
+// Gated on the tenant's discipline_enabled (off → null, client shows no warning).
+app.get('/api/games/:id/my-discipline-preview', authenticateToken, async (req, res) => {
+    try {
+        const gameId = req.params.id;
+        const g = await pool.query(
+            'SELECT tenant_id, format FROM games WHERE id = $1', [gameId]);
+        if (!g.rows.length) return res.status(404).json({ error: 'Game not found' });
+        const tenantId = g.rows[0].tenant_id || null;
+        // FIX-400: 11-a-side detection MUST match the late-dropout write path exactly
+        // (server.js ~21662 / ~16823) — it derives from the format string, NOT position_type,
+        // so the predicted dropout points (+3 for 11-a-side, else +2) equals what's actually charged.
+        const _formatLower = (g.rows[0].format || '').toLowerCase().replace(/\s+/g, '');
+        const is11a = _formatLower.includes('11') &&
+            (_formatLower.includes('side') || _formatLower.includes('v') || _formatLower.includes('x'));
+
+        // Discipline gate: if this tenant has discipline OFF, there are no tiers/points.
+        if (tenantId) {
+            try {
+                const d = await pool.query('SELECT discipline_enabled FROM tenants WHERE id = $1', [tenantId]);
+                if (d.rows.length && d.rows[0].discipline_enabled === false) {
+                    return res.json({ discipline_enabled: false });
+                }
+            } catch (_) { /* pre-migration: treat as enabled */ }
+        }
+
+        const currentPoints = await getRevolvingPointsForTenant(req.user.playerId, tenantId, pool);
+        const currentTier   = await getPlayerTierForTenant(req.user.playerId, tenantId, pool);
+        const dropCost = is11a ? 3 : 2;
+        const projectedPoints = currentPoints + dropCost;
+        const projectedTier   = tierFromRevolvingPoints(projectedPoints);
+
+        res.json({
+            discipline_enabled: true,
+            current_points: currentPoints,
+            current_tier: currentTier,
+            dropout_points: dropCost,
+            projected_points: projectedPoints,
+            projected_tier: projectedTier,
+            tier_changes: projectedTier !== currentTier
+        });
+    } catch (e) {
+        console.error('FIX-400 discipline preview failed:', e.message);
+        res.status(500).json({ error: 'Failed to load discipline preview' });
+    }
+});
+
+
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 
@@ -56297,6 +57360,443 @@ async function bootstrapOrganiserColumns() {
     console.log('✅ organiser columns ready');
 }
 
+// FIX-393: Manage Venues — ownership + verification.
+// Adds owner/duplicate/verification columns and backfills existing venues as
+// TF-owned (owner_tenant_id IS NULL = TotalFooty root) + verified. Idempotent.
+async function bootstrapVenueOwnership() {
+    const cols = [
+        ['owner_tenant_id',          'UUID'],
+        ['duplicated_from_venue_id', 'UUID'],
+        ['verification_status',      "TEXT NOT NULL DEFAULT 'none'"],  // none|requested|verified
+        ['is_verified',              'BOOLEAN NOT NULL DEFAULT FALSE'],
+        ['verified_at',              'TIMESTAMPTZ'],
+        ['verified_by',              'UUID'],
+        ['verification_requested_at','TIMESTAMPTZ'],
+    ];
+    for (const [col, type] of cols) {
+        try {
+            await pool.query(`ALTER TABLE venues ADD COLUMN IF NOT EXISTS ${col} ${type}`);
+        } catch (e) {
+            console.error(`bootstrapVenueOwnership venues.${col} failed (non-fatal):`, e.message);
+        }
+    }
+    // Backfill: existing venues become TF-owned (owner stays NULL) + verified.
+    // Only touch rows still at the default (verification_status='none' AND not verified)
+    // so we never clobber a tenant's later choices on re-run.
+    try {
+        await pool.query(
+            `UPDATE venues
+                SET is_verified = TRUE,
+                    verification_status = 'verified',
+                    verified_at = COALESCE(verified_at, NOW())
+              WHERE owner_tenant_id IS NULL
+                AND is_verified = FALSE
+                AND verification_status = 'none'`);
+    } catch (e) {
+        console.error('bootstrapVenueOwnership backfill failed (non-fatal):', e.message);
+    }
+    console.log('✅ venue ownership/verification columns ready');
+}
+
+// FIX-394: per-tenant tier controls. Toggles default ON so existing tenants keep
+// today's behaviour. tier_windows_enabled=FALSE skips the advance-booking windows
+// for that tenant's games (white/black bans still apply).
+// FIX-396: discipline_enabled is the SINGLE gate for the whole discipline/tier engine.
+// FALSE = no points, no tier movement, no tier surfaces, no lateness warning for that
+// tenant; manage-players then exposes only the 3 manual-ban controls (week/perma/unban).
+// No per-metric or per-label customisation — a tenant either runs discipline (GAFFA's
+// rules) or turns the section off. (The old per-tenant label-visibility stub was
+// never wired and is removed — discipline_enabled supersedes it.)
+// FIX-394: set TRUE once the tier-control columns exist, so hot list queries can
+// safely reference tenants.tier_windows_enabled without a per-request 42703 risk.
+let _tierWindowsColumnReady = false;
+async function bootstrapTierControls() {
+    const cols = [
+        ['tier_windows_enabled', 'BOOLEAN NOT NULL DEFAULT TRUE'],
+        ['discipline_enabled',   'BOOLEAN NOT NULL DEFAULT TRUE'],
+    ];
+    for (const [col, type] of cols) {
+        try {
+            await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS ${col} ${type}`);
+        } catch (e) {
+            console.error(`bootstrapTierControls tenants.${col} failed (non-fatal):`, e.message);
+        }
+    }
+    _tierWindowsColumnReady = true;
+    console.log('✅ tenant tier-control columns ready');
+}
+
+// FIX-395 (Per-Tenant Tiers, Stage 1): tier + 1-week-ban become per (player, tenant).
+// Adds player_tenants.reliability_tier + white_ban_started_at and backfills each
+// membership row from the player's current GLOBAL tier, so nobody's tier changes on
+// day one. players.reliability_tier remains the TF-ROOT tier (decision §6.1).
+// New members default to 'gold' (decision §6.3) — handled at membership-insert sites.
+// This stage adds the columns + resolver only; reads/writes are rerouted in later stages.
+let _ptTierColumnReady = false;
+async function bootstrapPerTenantTiers() {
+    const cols = [
+        ['reliability_tier',     "TEXT NOT NULL DEFAULT 'gold'"],
+        ['white_ban_started_at', 'TIMESTAMPTZ'],
+    ];
+    for (const [col, type] of cols) {
+        try {
+            await pool.query(`ALTER TABLE player_tenants ADD COLUMN IF NOT EXISTS ${col} ${type}`);
+        } catch (e) {
+            console.error(`bootstrapPerTenantTiers player_tenants.${col} failed (non-fatal):`, e.message);
+        }
+    }
+    // One-time backfill: copy the player's current global tier into membership rows
+    // that are still at the 'gold' default and have never been stamped. Guard with a
+    // marker column so re-runs don't clobber tenant-specific tiers set later.
+    try {
+        await pool.query(`ALTER TABLE player_tenants ADD COLUMN IF NOT EXISTS tier_backfilled BOOLEAN NOT NULL DEFAULT FALSE`);
+        // P5-1 fix: this per-row backfill previously re-ran on EVERY restart and clobbered NEW
+        // members (who default tier_backfilled=FALSE) with their GLOBAL tier, defeating the
+        // per-tenant fresh-start. Make it a true one-shot via a global marker so it runs the
+        // migration at most once, then never touches membership rows again (new members keep gold).
+        await pool.query(`CREATE TABLE IF NOT EXISTS system_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())`);
+        const _ptBackfillDone = await pool.query(
+            `SELECT 1 FROM system_settings WHERE key = 'pt_tier_backfill_done' LIMIT 1`
+        ).catch(() => ({ rows: [] }));
+        if (!_ptBackfillDone.rows.length) {
+            await pool.query(
+                `UPDATE player_tenants pt
+                    SET reliability_tier = COALESCE(p.reliability_tier, 'gold'),
+                        white_ban_started_at = p.white_ban_started_at,
+                        tier_backfilled = TRUE
+                   FROM players p
+                  WHERE pt.player_id = p.id
+                    AND pt.tier_backfilled = FALSE`);
+            await pool.query(
+                `INSERT INTO system_settings (key, value, updated_at)
+                 VALUES ('pt_tier_backfill_done', '1', NOW())
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`);
+        }
+    } catch (e) {
+        console.error('bootstrapPerTenantTiers backfill failed (non-fatal):', e.message);
+    }
+    _ptTierColumnReady = true;
+    console.log('✅ per-tenant tier columns ready (Stage 1)');
+}
+
+// FIX-397: per-tenant discipline attribution. discipline_records gets a tenant_id
+// (NULL = TF-root). Game-linked records → the GAME's tenant ("whoever made the game
+// owns the discipline"); manual admin records → the acting admin's tenant (resolved
+// at insert via _resolveOwnerTenantId; superadmin → NULL). Existing records backfill:
+// game-linked → their game's tenant_id; manual (game_id NULL) → left NULL (TF-root).
+let _discTenantColumnReady = false;
+async function bootstrapDisciplineTenant() {
+    try {
+        await pool.query(`ALTER TABLE discipline_records ADD COLUMN IF NOT EXISTS tenant_id UUID`);
+    } catch (e) {
+        console.error('bootstrapDisciplineTenant add column failed (non-fatal):', e.message);
+        return; // can't backfill what doesn't exist
+    }
+    // One-time backfill, guarded by a marker so re-runs never reattribute records that
+    // were later corrected. Game-linked rows inherit their game's tenant_id; manual rows
+    // (game_id NULL) stay NULL (TF-root) per the locked decision.
+    try {
+        await pool.query(`ALTER TABLE discipline_records ADD COLUMN IF NOT EXISTS tenant_backfilled BOOLEAN NOT NULL DEFAULT FALSE`);
+        // Supporting indexes: the backfill joins on game_id, and the per-tenant points
+        // read (Piece 2) sums by (player_id, tenant_id). Created idempotently, CONCURRENTLY
+        // not used (runs at boot, table-level lock is brief on this table's size).
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_discipline_records_game_id ON discipline_records (game_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_discipline_records_player_tenant ON discipline_records (player_id, tenant_id)`);
+        // Cheap pre-check: skip the full-table UPDATE entirely once everything is backfilled,
+        // so cold starts don't repeatedly scan/UPDATE the table. LIMIT 1 short-circuits.
+        const pending = await pool.query(`SELECT 1 FROM discipline_records WHERE tenant_backfilled = FALSE LIMIT 1`);
+        if (pending.rows.length) {
+            await pool.query(
+                `UPDATE discipline_records dr
+                    SET tenant_id = g.tenant_id,
+                        tenant_backfilled = TRUE
+                   FROM games g
+                  WHERE dr.game_id = g.id
+                    AND dr.tenant_backfilled = FALSE`);
+            // Manual rows: just flip the marker (tenant_id stays NULL = TF-root).
+            await pool.query(
+                `UPDATE discipline_records
+                    SET tenant_backfilled = TRUE
+                  WHERE game_id IS NULL
+                    AND tenant_backfilled = FALSE`);
+            console.log('✅ discipline_records tenant backfill applied');
+        }
+    } catch (e) {
+        console.error('bootstrapDisciplineTenant backfill failed (non-fatal):', e.message);
+    }
+    _discTenantColumnReady = true;
+    console.log('✅ discipline_records.tenant_id ready (FIX-397)');
+}
+
+// FIX-398: per-tenant free credits. Free credits granted by a tenant admin are scoped
+// to THAT tenant and spendable only at that tenant's games. New ledger table keyed on
+// (player_id, tenant_id); tenant_id NULL = Original/global free credits (legacy bucket,
+// equivalent to the existing players-wide free_credit_balance). Spend rule: at a game,
+// drain the GAME'S-TENANT bucket first, then the player's real balance. We KEEP the
+// existing credits.free_credit_balance as the Original (NULL) bucket so legacy grants
+// and all existing reads keep working unchanged; per-tenant buckets are additive.
+let _ptFreeCreditsReady = false;
+async function bootstrapTenantFreeCredits() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS player_tenant_free_credits (
+                player_id UUID NOT NULL,
+                tenant_id UUID NOT NULL,
+                balance   NUMERIC(10,2) NOT NULL DEFAULT 0,
+                last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (player_id, tenant_id)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_ptfc_player ON player_tenant_free_credits (player_id)`);
+        _ptFreeCreditsReady = true;
+        console.log('✅ player_tenant_free_credits ready (FIX-398)');
+    } catch (e) {
+        console.error('bootstrapTenantFreeCredits failed (non-fatal):', e.message);
+    }
+}
+
+// FIX-399: per-tenant Monthly Awards control. Per-tenant generation (Layer 1) already
+// exists; this adds tenant CHOICE of which of the MONTHLY_METRICS run, plus an on/off.
+// Model: a row per tenant. enabled=FALSE skips Layer-1 generation for that tenant.
+// metric_ids = int[] of chosen metric ids; NULL/empty = ALL metrics (the existing
+// behaviour). KEY PRESERVATION RULE: a tenant with NO config row is treated as ALL-16
+// (today's behaviour) — existing tenants are never silently narrowed. NEW tenants get a
+// seeded starter-4 row at creation (handled where tenants are created); this bootstrap
+// only creates the table.
+let _tenantMonthlyConfigReady = false;
+async function bootstrapTenantMonthlyConfig() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_monthly_config (
+                tenant_id  UUID PRIMARY KEY,
+                enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+                metric_ids INTEGER[],
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_by UUID
+            )`);
+        _tenantMonthlyConfigReady = true;
+        console.log('✅ tenant_monthly_config ready (FIX-399)');
+    } catch (e) {
+        console.error('bootstrapTenantMonthlyConfig failed (non-fatal):', e.message);
+    }
+}
+
+// FIX-399: regenerate ONLY one tenant's Layer-1 monthly trophies for a month — used after
+// a tenant edits its config so the change is instant WITHOUT nuking every other tenant's
+// trophies (runMonthlyTrophyJob is whole-month/all-layers and would briefly wipe everyone).
+// Deletes just this tenant's rows for the month, then rebuilds them from current config.
+// Concurrency-guarded per (tenant,year,month) via an in-process lock set.
+const _tenantRegenLocks = new Set();
+async function regenerateTenantMonth(tenantId, year, month) {
+    if (!tenantId) return; // Original is handled by the universal layer / cron only
+    const lockKey = `${tenantId}:${year}:${month}`;
+    if (_tenantRegenLocks.has(lockKey)) return; // a regen is already in flight
+    _tenantRegenLocks.add(lockKey);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        // Remove this tenant's existing Layer-1 rows for the month (results cascade via trophy_id).
+        await client.query(
+            `DELETE FROM monthly_trophy_results WHERE trophy_id IN (
+                SELECT id FROM monthly_trophies WHERE year = $1 AND month = $2 AND tenant_id = $3)`,
+            [year, month, tenantId]);
+        await client.query(
+            `DELETE FROM monthly_trophies WHERE year = $1 AND month = $2 AND tenant_id = $3`,
+            [year, month, tenantId]);
+        // Rebuild from current config (skip if disabled).
+        const cfg = await getMonthlyConfigForTenant(tenantId, client);
+        if (cfg.enabled) {
+            const metrics = cfg.metricIds
+                ? MONTHLY_METRICS.filter(m => cfg.metricIds.includes(m.metric_id))
+                : MONTHLY_METRICS;
+            for (const region of MONTHLY_REGIONS) {
+                for (const m of metrics) {
+                    const leaderboard = await calcMonthlyLeaderboard(
+                        year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards, tenantId);
+                    if (!leaderboard || leaderboard.length === 0) continue;
+                    const trophyRow = await client.query(
+                        `INSERT INTO monthly_trophies
+                         (year, month, region, metric_id, calculation_type,
+                          eligibility_min_games, eligibility_min_awards, tenant_id)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+                        [year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards || 0, tenantId]);
+                    const trophyId = trophyRow.rows[0].id;
+                    for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
+                        const row = leaderboard[i];
+                        await client.query(
+                            `INSERT INTO monthly_trophy_results
+                             (trophy_id, player_id, rank, primary_stat, supporting_stat, games_played)
+                             VALUES ($1, $2, $3, $4, $5, $6)`,
+                            [trophyId, row.player_id, i + 1, row.primary_stat, row.supporting_stat, row.appearances]);
+                    }
+                }
+            }
+        }
+        await client.query('COMMIT');
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('regenerateTenantMonth failed:', e.message);
+    } finally {
+        client.release();
+        _tenantRegenLocks.delete(lockKey);
+    }
+}
+
+// Resolve a tenant's monthly-awards config. Returns { enabled, metricIds | null }.
+// No row → { enabled: true, metricIds: null } = run ALL metrics (preserves behaviour).
+// metricIds null/empty → ALL metrics. Fail-safe to all-on on any error.
+async function getMonthlyConfigForTenant(tenantId, db = pool) {
+    if (!tenantId || !_tenantMonthlyConfigReady) return { enabled: true, metricIds: null };
+    try {
+        const r = await db.query(
+            'SELECT enabled, metric_ids FROM tenant_monthly_config WHERE tenant_id = $1', [tenantId]);
+        if (!r.rows.length) return { enabled: true, metricIds: null }; // no row = all-16
+        const row = r.rows[0];
+        const ids = Array.isArray(row.metric_ids) && row.metric_ids.length ? row.metric_ids : null;
+        return { enabled: row.enabled !== false, metricIds: ids };
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return { enabled: true, metricIds: null };
+        console.error('getMonthlyConfigForTenant failed:', e.message);
+        return { enabled: true, metricIds: null };
+    }
+}
+
+// Read a player's free-credit balance for a given tenant context (NULL = Original, which
+// lives in credits.free_credit_balance). Returns a number; 0 / fail-safe on any error.
+async function getTenantFreeCredits(playerId, tenantId, db = pool) {
+    try {
+        if (!tenantId) {
+            const r = await db.query('SELECT COALESCE(free_credit_balance,0) AS b FROM credits WHERE player_id = $1', [playerId]);
+            return parseFloat(r.rows[0]?.b || 0);
+        }
+        if (!_ptFreeCreditsReady) return 0;
+        const r = await db.query(
+            'SELECT COALESCE(balance,0) AS b FROM player_tenant_free_credits WHERE player_id = $1 AND tenant_id = $2',
+            [playerId, tenantId]);
+        return parseFloat(r.rows[0]?.b || 0);
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return 0;
+        console.error('getTenantFreeCredits failed:', e.message);
+        return 0;
+    }
+}
+
+// Adjust a player's tenant free-credit bucket by delta (can be negative). NULL tenant →
+// the Original bucket (credits.free_credit_balance). Clamps at 0. Returns new balance.
+async function adjustTenantFreeCredits(playerId, tenantId, delta, db = pool) {
+    if (!tenantId) {
+        await db.query(
+            `INSERT INTO credits (player_id, balance, free_credit_balance)
+             VALUES ($1, 0, GREATEST(0,$2))
+             ON CONFLICT (player_id) DO UPDATE
+                SET free_credit_balance = GREATEST(0, credits.free_credit_balance + $2),
+                    last_updated = CURRENT_TIMESTAMP`,
+            [playerId, delta]);
+        return getTenantFreeCredits(playerId, null, db);
+    }
+    await db.query(
+        `INSERT INTO player_tenant_free_credits (player_id, tenant_id, balance)
+         VALUES ($1, $2, GREATEST(0,$3))
+         ON CONFLICT (player_id, tenant_id) DO UPDATE
+            SET balance = GREATEST(0, player_tenant_free_credits.balance + $3),
+                last_updated = NOW()`,
+        [playerId, tenantId, delta]);
+    return getTenantFreeCredits(playerId, tenantId, db);
+}
+
+// FIX-398: refund a free-credit amount to the bucket it belongs to. Resolves the game's
+// tenant (NULL = Original) and credits that bucket, preserving per-tenant containment so
+// a Tenant-B free refund can't become spend-anywhere Original credit. No-op for amount<=0.
+async function refundFreeCredits(playerId, amount, gameId, db = pool) {
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0) return;
+    let tenantId = null;
+    if (gameId) {
+        try {
+            const g = await db.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+            tenantId = g.rows.length ? (g.rows[0].tenant_id || null) : null;
+        } catch (_) { tenantId = null; }
+    }
+    await adjustTenantFreeCredits(playerId, tenantId, amt, db);
+}
+
+// FIX-395 resolver: the player's tier in the context of a given tenant.
+// tenantId NULL (TF root) → players.reliability_tier (the root tier, §6.1).
+// A tenant context → player_tenants.reliability_tier for that (player, tenant);
+// falls back to the global tier if no membership row / pre-migration. This is the
+// single read path ALL tier checks will route through in later stages.
+async function getPlayerTierForTenant(playerId, tenantId, dbClient = pool) {
+    // Always have the global tier as the fallback / TF-root answer.
+    let globalTier = 'gold';
+    try {
+        const g = await dbClient.query('SELECT reliability_tier FROM players WHERE id = $1', [playerId]);
+        if (g.rows.length && g.rows[0].reliability_tier) globalTier = g.rows[0].reliability_tier;
+    } catch (_) {}
+    if (!tenantId) return globalTier;            // TF root
+    if (!_ptTierColumnReady) return globalTier;  // pre-migration safety
+    try {
+        const r = await dbClient.query(
+            `SELECT reliability_tier FROM player_tenants
+              WHERE player_id = $1 AND tenant_id = $2 LIMIT 1`,
+            [playerId, tenantId]);
+        if (r.rows.length && r.rows[0].reliability_tier) return r.rows[0].reliability_tier;
+    } catch (e) {
+        if (!(e && (e.code === '42P01' || e.code === '42703'))) throw e;
+    }
+    return globalTier;  // no membership row yet → fall back to global
+}
+
+// FIX-397: per-tenant revolving discipline points. Mirrors the canonical global calc
+// (manual entries game_id IS NULL + the player's last-10 completed+confirmed games),
+// but scoped to ONE tenant: only that tenant's discipline records count, and the
+// last-10 window is over that tenant's games (games whose tenant_id = the tenant).
+// tenantId NULL → TF-root: counts only TF-root records (tenant_id IS NULL) over
+// TF-root games. Returns an integer (0 on any pre-migration / error, fail-safe low).
+// FIX-397: convenience — a player's reliability tier in the context of a GAME's tenant.
+// Resolves the game's tenant_id (NULL = Original) then defers to getPlayerTierForTenant.
+// Used by the ban-gates and window checks so enforcement reads the per-tenant tier
+// rather than the legacy global column. Fail-safe: on any error returns the global
+// tier via the resolver's own fallback (never throws into a gate).
+async function _gameTierFor(playerId, gameId, db = pool) {
+    let tenantId = null;
+    try {
+        const g = await db.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+        tenantId = g.rows.length ? (g.rows[0].tenant_id || null) : null;
+    } catch (_) { tenantId = null; }
+    return getPlayerTierForTenant(playerId, tenantId, db);
+}
+
+async function getRevolvingPointsForTenant(playerId, tenantId, dbClient = pool) {
+    if (!_discTenantColumnReady) return 0; // pre-migration: no tenant dimension yet
+    try {
+        const tenantMatch = tenantId
+            ? 'dr.tenant_id = $2::uuid'
+            : 'dr.tenant_id IS NULL';
+        const gameTenantMatch = tenantId
+            ? 'g.tenant_id = $2::uuid'
+            : 'g.tenant_id IS NULL';
+        const params = tenantId ? [playerId, tenantId] : [playerId];
+        const r = await dbClient.query(`
+            SELECT COALESCE(SUM(dr.points), 0) AS revolving_pts
+            FROM discipline_records dr
+            WHERE dr.player_id = $1::uuid
+              AND ${tenantMatch}
+              AND (dr.game_id IS NULL OR dr.game_id IN (
+                  SELECT r.game_id FROM registrations r
+                  JOIN games g ON g.id = r.game_id
+                  WHERE r.player_id = $1::uuid AND r.status = 'confirmed'
+                    AND g.game_status = 'completed'
+                    AND ${gameTenantMatch}
+                  ORDER BY g.game_date DESC LIMIT 10
+              ))
+        `, params);
+        return parseInt(r.rows[0].revolving_pts) || 0;
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return 0;
+        console.error('getRevolvingPointsForTenant failed:', e.message);
+        return 0;
+    }
+}
+
 // Bootstrap the organiser_reviews table. This was historically provisioned
 // out-of-band and was MISSING on production (every query catches 42P01 and
 // degrades silently — which is why organiser ratings never appeared). Created
@@ -56891,6 +58391,16 @@ app.listen(PORT, () => {
     // FIX-359..364: bootstrap Wonderful hardening schema (notified_at + webhook log)
     bootstrapPlayerQueryIndexes().catch(e => console.error('player-query index bootstrap surfaced:', e.message));
     bootstrapOrganiserColumns().catch(e => console.error('organiser columns bootstrap surfaced:', e.message));
+    bootstrapVenueOwnership().catch(e => console.error('venue ownership bootstrap surfaced:', e.message));
+    bootstrapTierControls().catch(e => console.error('tier controls bootstrap surfaced:', e.message));
+    bootstrapPerTenantTiers().catch(e => console.error('per-tenant tiers bootstrap surfaced:', e.message));
+    bootstrapDisciplineTenant().catch(e => console.error('discipline tenant bootstrap surfaced:', e.message));
+    bootstrapTenantFreeCredits().catch(e => console.error('tenant free credits bootstrap surfaced:', e.message));
+    bootstrapTenantMonthlyConfig().catch(e => console.error('tenant monthly config bootstrap surfaced:', e.message));
+    // FIX-405: weight column for rating feedback (1.0 = within band, 0.5 = stretched/halfway).
+    pool.query(`ALTER TABLE player_rating_feedback ADD COLUMN IF NOT EXISTS weight NUMERIC(3,2) NOT NULL DEFAULT 1.0`)
+        .then(() => console.log('✅ player_rating_feedback.weight ready (FIX-405)'))
+        .catch(e => console.error('rating feedback weight column bootstrap (non-fatal):', e.message));
     bootstrapOrganiserReviews().catch(e => console.error('organiser_reviews bootstrap surfaced:', e.message));
     fix359BootstrapWonderfulHardening().catch(e => console.error('FIX-359 bootstrap surfaced:', e.message));
 
@@ -57569,6 +59079,9 @@ app.listen(PORT, () => {
                     const TARGET_PTS = 9; // Bronze ceiling
 
                     if (currentPts > TARGET_PTS) {
+                        // FIX-397: this white-ban-expiry cron is still global (loops players,
+                        // not (player,tenant)). The compensating ban_served record stays
+                        // tenant_id NULL (TF-root) until Stage 5b reworks the cron per-tenant.
                         await pool.query(
                             `INSERT INTO discipline_records
                                 (player_id, game_id, points, offense_type, recorded_by)
@@ -57600,6 +59113,50 @@ app.listen(PORT, () => {
             }
         } catch (e) {
             console.error('White-ban expiry scheduler error:', e.message);
+        }
+
+        // P5-2 fix: per-tenant white-ban expiry (was global-only — looped players, not
+        // (player,tenant)). Mirror the sweep for player_tenants so a tenant 1-week ban
+        // auto-lifts after 7 days instead of staying permanent until a manual unban.
+        try {
+            const ptExpired = await pool.query(`
+                SELECT player_id, tenant_id FROM player_tenants
+                WHERE reliability_tier = 'white'
+                  AND white_ban_started_at IS NOT NULL
+                  AND white_ban_started_at <= NOW() - INTERVAL '7 days'
+            `);
+            for (const { player_id: pid, tenant_id: tid } of ptExpired.rows) {
+                try {
+                    const curPts = await getRevolvingPointsForTenant(pid, tid, pool);
+                    const TARGET_PTS = 9; // Bronze ceiling
+                    if (curPts > TARGET_PTS) {
+                        await pool.query(
+                            `INSERT INTO discipline_records
+                                (player_id, game_id, points, offense_type, recorded_by, tenant_id)
+                             VALUES ($1, NULL, $2, 'ban_served', NULL, $3)`,
+                            [pid, -(curPts - TARGET_PTS), tid]
+                        );
+                    }
+                    await pool.query(
+                        `UPDATE player_tenants SET reliability_tier = 'bronze', white_ban_started_at = NULL
+                          WHERE player_id = $1 AND tenant_id = $2`,
+                        [pid, tid]
+                    );
+                    await pool.query(
+                        `INSERT INTO notifications (player_id, type, message)
+                         VALUES ($1, 'ban_lifted', 'Your 1-week ban has been served. You have been restored to Bronze tier — keep it clean!')`,
+                        [pid]
+                    );
+                    sendNotification('ban_lifted', pid, {}).catch(() => {});
+                    await auditLog(pool, null, 'ban_served', pid,
+                        `Per-tenant white ban expired (tenant ${tid}) — tier: bronze`, tid);
+                    console.log(`\u2713 Per-tenant ban lifted: player ${pid} tenant ${tid}`);
+                } catch (ptErr) {
+                    console.error(`Per-tenant ban expiry failed for ${pid}/${tid}:`, ptErr.message);
+                }
+            }
+        } catch (e) {
+            console.error('Per-tenant white-ban expiry scheduler error:', e.message);
         }
     }, 60 * 60 * 1000); // Every hour
 
