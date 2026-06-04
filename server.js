@@ -1887,6 +1887,7 @@ async function _getRafConfig() {
 
 // Trigger £1 activation bonus — called when admin tops up a referred player for the first time
 async function triggerRafActivation(referredPlayerId) {
+    return; // RAF-V2: superseded by per-tenant engine (legacy global-balance activation disabled)
     try {
         const enabled = await getRafEnabled();
         if (!enabled) return;
@@ -1952,6 +1953,7 @@ async function triggerRafActivation(referredPlayerId) {
 
 // Trigger 50p game credit — called on every confirmed self-registration by a referred player
 async function triggerRafGameCredit(referredPlayerId) {
+    return; // RAF-V2: superseded by per-tenant engine (welcome now on first signup; per-game now on completion)
     try {
         const enabled = await getRafEnabled();
         if (!enabled) return;
@@ -2045,6 +2047,169 @@ async function triggerRafGameCredit(referredPlayerId) {
             }).catch(() => {});
         }
     } catch (e) { console.error('triggerRafGameCredit error (non-critical):', e.message); }
+}
+
+// ============================================================================
+// RAF-V2 — per-tenant Refer-A-Friend engine.
+//   Welcome  : paid ONCE on the referred player's first confirmed game signup in
+//              a tenant. Amount = tenants.raf_welcome_pence.
+//   Per-game : paid on game COMPLETION per confirmed referred player, capped at
+//              tenants.raf_max_games_paid per (referrer, referred, tenant).
+//   Links are global (players.referred_by). Payouts go to that tenant's
+//   player_tenant_free_credits bucket (tenant-locked spend) and are recorded in
+//   raf_payouts (idempotent via partial-unique indexes uq_raf_welcome/uq_raf_game).
+//   Legacy triggerRafActivation/triggerRafGameCredit are neutralised below.
+// ============================================================================
+// Affordability for a SPECIFIC game = real + global(Original free) + that game's
+// tenant free bucket. Mirrors exactly what applyGameFee can draw, so a pre-flight
+// check and the actual charge agree (prevents "looks affordable -> INSUFFICIENT_CREDITS"
+// once a player holds free credits across multiple tenants). Returns a pg-style result
+// ({ rows: [{ total_available }] }) so existing call sites need no other change. Fails
+// OPEN to the legacy all-tenant sum on any error, so it can never wrongly block a pay.
+async function _spendableForGameRows(db, playerId, gameId) {
+    try {
+        const r = await db.query(
+            `SELECT COALESCE(c.balance,0)
+                  + COALESCE(c.free_credit_balance,0)
+                  + COALESCE((SELECT ptfc.balance FROM player_tenant_free_credits ptfc
+                                JOIN games g2 ON g2.id = $2 AND g2.tenant_id = ptfc.tenant_id
+                               WHERE ptfc.player_id = $1),0) AS total_available
+               FROM credits c WHERE c.player_id = $1`,
+            [playerId, gameId]);
+        return { rows: r.rows };
+    } catch (e) {
+        console.error('_spendableForGameRows fallback (all-tenant sum):', e.message);
+        const r2 = await db.query(
+            `SELECT COALESCE(balance,0)+COALESCE(free_credit_balance,0)
+                  + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id=$1),0) AS total_available
+               FROM credits WHERE player_id=$1`, [playerId]);
+        return { rows: r2.rows };
+    }
+}
+
+// Wave 3b: return a refunded FREE-credit portion to the ORIGINATING game's tenant
+// bucket (tenant-locked). Falls back to the global Original bucket if the game or
+// its tenant can't be resolved, so a refund path can never error out on this.
+async function _refundFreeToGame(db, playerId, freeAmount, gameId) {
+    const amt = parseFloat(freeAmount || 0);
+    if (!amt || amt <= 0) return;
+    let tenantId = null;
+    try {
+        if (gameId) {
+            const g = await db.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+            tenantId = g.rows[0]?.tenant_id || null;
+        }
+    } catch (_) { tenantId = null; }
+    await adjustTenantFreeCredits(playerId, tenantId, amt, db);
+}
+
+async function _getTenantRafConfig(tenantId, db = pool) {
+    const tid = tenantId || TF_COVENTRY_TENANT_ID;
+    const off = { enabled: false, welcomePence: 0, perGamePence: 0, maxGames: 0, tenantId: tid };
+    try {
+        const r = await db.query(
+            'SELECT raf_enabled, raf_welcome_pence, raf_per_game_pence, raf_max_games_paid FROM tenants WHERE id = $1',
+            [tid]);
+        if (!r.rows.length) return off;
+        const row = r.rows[0];
+        return {
+            enabled: row.raf_enabled === true,
+            welcomePence: parseInt(row.raf_welcome_pence, 10) || 0,
+            perGamePence: parseInt(row.raf_per_game_pence, 10) || 0,
+            maxGames: (row.raf_max_games_paid == null) ? 0 : parseInt(row.raf_max_games_paid, 10),
+            tenantId: tid
+        };
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return off; // schema not migrated yet
+        console.error('_getTenantRafConfig failed:', e.message);
+        return off;
+    }
+}
+
+// Idempotent payout primitive. Inserts a raf_payouts row; only on a NEW row does
+// it credit the referrer's per-tenant free bucket. Returns true if it paid.
+async function _rafPayout(db, { referrerId, referredId, tenantId, type, gameId = null, amountPence }) {
+    if (!referrerId || !referredId || !tenantId || !amountPence || amountPence <= 0) return false;
+    if (referrerId === referredId) return false; // never self-pay
+    const ins = await db.query(
+        `INSERT INTO raf_payouts (referrer_id, referred_id, tenant_id, payout_type, game_id, amount_pence, status)
+         VALUES ($1,$2,$3,$4,$5,$6,'paid')
+         ON CONFLICT DO NOTHING
+         RETURNING id`,
+        [referrerId, referredId, tenantId, type, (type === 'game' ? gameId : null), amountPence]);
+    if (!ins.rows.length) return false; // already paid (dedup) — no double credit
+    await adjustTenantFreeCredits(referrerId, tenantId, amountPence / 100, db);
+    try {
+        await recordCreditTransaction(db, referrerId, amountPence / 100, 'raf_reward',
+            'RAF ' + type + ' bonus (tenant ' + tenantId + ') - referred ' + referredId + (gameId ? ' game ' + gameId : ''));
+    } catch (_) {}
+    return true;
+}
+
+// Welcome eval — call after a player's signup is CONFIRMED in a game.
+async function _rafEvalWelcomeOnSignup(referredPlayerId, gameId, db = pool) {
+    try {
+        if (!referredPlayerId || !gameId) return;
+        const pr = await db.query('SELECT referred_by FROM players WHERE id = $1', [referredPlayerId]);
+        const referrerId = pr.rows[0]?.referred_by;
+        if (!referrerId) return;
+        const gr = await db.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+        if (!gr.rows.length) return;
+        const tenantId = gr.rows[0].tenant_id || TF_COVENTRY_TENANT_ID;
+        const cfg = await _getTenantRafConfig(tenantId, db);
+        if (!cfg.enabled || cfg.welcomePence <= 0) return;
+        const paid = await _rafPayout(db, { referrerId, referredId: referredPlayerId, tenantId, type: 'welcome', amountPence: cfg.welcomePence });
+        if (paid) console.log('RAF-V2 welcome paid: ref=' + String(referrerId).slice(0,8) + ' rfd=' + String(referredPlayerId).slice(0,8) + ' tenant=' + String(tenantId).slice(0,8) + ' ' + cfg.welcomePence + 'p');
+    } catch (e) { console.error('_rafEvalWelcomeOnSignup (non-critical):', e.message); }
+}
+
+// Per-game eval — call on game COMPLETION. Pays each confirmed referred player's
+// referrer the tenant per-game bonus, capped at maxGames per (referrer,referred,tenant).
+async function _rafEvalGameOnCompletion(gameId, db = pool) {
+    try {
+        if (!gameId) return;
+        const gr = await db.query("SELECT tenant_id, game_status FROM games WHERE id = $1", [gameId]);
+        if (!gr.rows.length || gr.rows[0].game_status !== 'completed') return;
+        const tenantId = gr.rows[0].tenant_id || TF_COVENTRY_TENANT_ID;
+        const cfg = await _getTenantRafConfig(tenantId, db);
+        if (!cfg.enabled || cfg.perGamePence <= 0) return;
+        const parts = await db.query(
+            `SELECT p.id AS referred_id, p.referred_by AS referrer_id
+               FROM registrations r
+               JOIN players p ON p.id = r.player_id
+              WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.referred_by IS NOT NULL`,
+            [gameId]);
+        for (const row of parts.rows) {
+            const referrerId = row.referrer_id, referredId = row.referred_id;
+            if (!referrerId || referrerId === referredId) continue;
+            if (cfg.maxGames !== -1) {
+                const cnt = await db.query(
+                    `SELECT COUNT(*)::int AS n FROM raf_payouts
+                      WHERE referrer_id=$1 AND referred_id=$2 AND tenant_id=$3 AND payout_type='game' AND status='paid'`,
+                    [referrerId, referredId, tenantId]);
+                if ((cnt.rows[0]?.n || 0) >= cfg.maxGames) continue;
+            }
+            await _rafPayout(db, { referrerId, referredId, tenantId, type: 'game', gameId, amountPence: cfg.perGamePence });
+        }
+    } catch (e) { console.error('_rafEvalGameOnCompletion (non-critical):', e.message); }
+}
+
+// Clawback a single payout (owner action; Wave 4 endpoint). Marks it clawed and
+// deducts from the referrer's tenant bucket (clamped >= 0 by adjustTenantFreeCredits).
+async function _rafClawback(db, payoutId, clawedByPlayerId = null) {
+    const r = await db.query(
+        `UPDATE raf_payouts SET status='clawed', clawed_at=NOW(), clawed_by=$2
+          WHERE id=$1 AND status='paid'
+          RETURNING referrer_id, tenant_id, amount_pence`,
+        [payoutId, clawedByPlayerId]);
+    if (!r.rows.length) return false; // not found or already clawed
+    const row = r.rows[0];
+    await adjustTenantFreeCredits(row.referrer_id, row.tenant_id, -(row.amount_pence / 100), db);
+    try {
+        await recordCreditTransaction(db, row.referrer_id, -(row.amount_pence / 100), 'raf_reward',
+            'RAF clawback (payout ' + payoutId + ')');
+    } catch (_) {}
+    return true;
 }
 
 
@@ -3122,6 +3287,30 @@ const requireTenantAdmin = async (req, res, next) => {
 };
 // ════════════════════════════════════════════════════════════════════════════
 // END FIX-318 middleware
+
+// ── RAF-V2: requireTenantOwner — backfill/clawback/settings gate. Superadmin always
+// passes; otherwise the caller must be the tenant's recorded owner_player_id. Tighter
+// than requireTenantAdmin (tenant_admins/organisers do NOT pass). Resolves the tenant
+// from req.tenant, body.tenant_id, query.tenant_id, else the TF origin tenant.
+const requireTenantOwner = async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Access denied' });
+    const tenantId = (req.tenant && req.tenant.id)
+        || (req.body && req.body.tenant_id)
+        || (req.query && req.query.tenant_id)
+        || TF_COVENTRY_TENANT_ID;
+    if (req.user.role === 'superadmin') { req.rafTenantId = tenantId; return next(); }
+    try {
+        const r = await pool.query('SELECT owner_player_id FROM tenants WHERE id = $1', [tenantId]);
+        if (!r.rows.length || !r.rows[0].owner_player_id || r.rows[0].owner_player_id !== req.user.playerId) {
+            return res.status(403).json({ error: 'Tenant owner access required' });
+        }
+        req.rafTenantId = tenantId;
+        next();
+    } catch (e) {
+        console.error('requireTenantOwner failed:', e.message);
+        return res.status(500).json({ error: 'Authorization error' });
+    }
+};
 // ════════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3252,13 +3441,18 @@ async function getVisibleTenantContext(playerId, currentTenantId = null) {
 // reads pass nothing (use pool).
 async function _fix329GetAllowance(gameTenantId, dbClient = null) {
     const q = dbClient || pool;
-    if (!gameTenantId) {
+    // TF root (null) AND the main TF Coventry tenant are always-unlimited:
+    // TF's own organisers are free ALWAYS. This is the documented intent — TF
+    // Coventry was always meant to behave like TF root — but its games carry a
+    // real tenant_id, so without this they fell through to the DB dials and got
+    // capped. External tenants still read their own configured dials below.
+    if (!gameTenantId || gameTenantId === TF_COVENTRY_TENANT_ID) {
         return {
-            enabled: true,             // TF root: always on (existing behaviour)
-            per_game: -1,              // BUGFIX: organisers free ALWAYS on main TF (-1 = unlimited; was 6)
-            pct_discount: 100,         // existing full comp
-            games_per_week: -1,        // unlimited (existing behaviour)
-            tenant_id: null,
+            enabled: true,
+            per_game: -1,              // unlimited comps per game
+            pct_discount: 100,         // full comp (free)
+            games_per_week: -1,        // unlimited per week
+            tenant_id: gameTenantId || null,
         };
     }
     try {
@@ -6456,7 +6650,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.referred_by,
                     c.balance as credits,
                     -- Option B: free credits are now their own balance column.
-                    COALESCE(c.free_credit_balance, 0) as free_credits,
+                    (COALESCE(c.free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = p.id),0)) as free_credits,
                     u.email,
                     u.role,
                     (SELECT COALESCE(alias, full_name)
@@ -12981,11 +13175,7 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
 
         let realCharged = 0, freeCharged = 0;
         if (!isComped && parseFloat(game.cost_per_player) > 0) {
-            const creditRes = await client.query(
-                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-                   FROM credits WHERE player_id = $1`,
-                [req.user.playerId]
-            );
+            const creditRes = await _spendableForGameRows(client, req.user.playerId, game.id);
             const balance = parseFloat(creditRes.rows[0]?.total_available || 0);
             if (Math.round(balance * 100) < Math.round(effectiveCost * 100)) {
                 await client.query('ROLLBACK');
@@ -14122,11 +14312,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             if (backupType === 'confirmed_backup') {
                 if (!isComped && parseFloat(game.cost_per_player) > 0) {
                     // Option B: affordability = regular balance + free_credit_balance.
-                    const creditResult = await client.query(
-                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-                           FROM credits WHERE player_id = $1`,
-                        [req.user.playerId]
-                    );
+                    const creditResult = await _spendableForGameRows(client, req.user.playerId, game.id);
                     
                     if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].total_available) * 100) < Math.round(effectiveCost * 100)) {
                         await client.query('ROLLBACK');
@@ -14199,11 +14385,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             // Deduct credits (skip for comped organisers and free games)
             if (!isComped && parseFloat(game.cost_per_player) > 0) {
                 // Option B: affordability = regular balance + free_credit_balance.
-                const creditResult = await client.query(
-                    `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-                       FROM credits WHERE player_id = $1`,
-                    [req.user.playerId]
-                );
+                const creditResult = await _spendableForGameRows(client, req.user.playerId, game.id);
                 
                 if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].total_available) * 100) < Math.round(effectiveCost * 100)) {
                     await client.query('ROLLBACK');
@@ -14484,7 +14666,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             // DYNSTAR: review star rating on every confirmed sign-up
             if (status === 'confirmed') await reviewDynamicStarRating(pool, gameId);
             // FIX-101-RAF: trigger 50p game credit for referrer if this is a confirmed self-registration
-            if (status === 'confirmed') await triggerRafGameCredit(req.user.playerId);
+            if (status === 'confirmed') await _rafEvalWelcomeOnSignup(req.user.playerId, gameId, pool);
         });
         
     } catch (error) {
@@ -14782,11 +14964,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
 
         if (effectiveCost > 0) {
             // Option B: affordability = balance + free_credit_balance.
-            const creditResult = await client.query(
-                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-                   FROM credits WHERE player_id = $1`,
-                [playerId]
-            );
+            const creditResult = await _spendableForGameRows(client, playerId, gameId);
             if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].total_available) < effectiveCost) {
                 await client.query('ROLLBACK');
                 client.release();
@@ -15367,10 +15545,7 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
             await recordCreditTransaction(client, refundTargetId, refundAmt, 'refund', `Guest (${guest.guest_name}) removed - refund`);
         }
         if (refundFreeAmt > 0) {
-            await client.query(
-                'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                [refundFreeAmt, refundTargetId]
-            );
+            await _refundFreeToGame(client, refundTargetId, refundFreeAmt, req.params.id);
             await recordCreditTransaction(client, refundTargetId, refundFreeAmt, 'free_credit', `Guest (${guest.guest_name}) removed - free credit restored`);
         }
 
@@ -15646,10 +15821,7 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
         }
         if (refundFreeAmt > 0) {
             // Free-credit refund → free_credit_balance bucket (not real balance).
-            await client.query(
-                'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                [refundFreeAmt, playerId]
-            );
+            await _refundFreeToGame(client, playerId, refundFreeAmt, gameId);
             await recordCreditTransaction(client, playerId, refundFreeAmt, 'free_credit', `Free credit restored — removed ${playerName} from game`);
         }
 
@@ -15735,11 +15907,7 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
         // Check credits — at effective price (honours EB tiers).
         const { price: cost } = getEffectivePrice(game.rows[0]);
         // Option B: affordability = regular balance + free_credit_balance.
-        const creditRes = await client.query(
-            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-               FROM credits WHERE player_id = $1`,
-            [playerId]
-        );
+        const creditRes = await _spendableForGameRows(client, playerId, game.rows[0].id);
         const balance = parseFloat(creditRes.rows[0]?.total_available || 0);
         // BUGFIX: a comped organiser (is_comped=TRUE on their backup row) is never charged on
         // claim (see the !_claimWasComped charge-skip below). Don't block them on affordability —
@@ -16058,11 +16226,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 // Using cost_per_player here blocked players whose balance covered the EB
                 // price but not full price (bug fixed web47).
                 const { price: effectivePrice, tier: priceTier } = getEffectivePrice(game);
-                const creditResult = await client.query(
-                    `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-                       FROM credits WHERE player_id = $1`,
-                    [registeringPlayerId]
-                );
+                const creditResult = await _spendableForGameRows(client, registeringPlayerId, game.id);
                 if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].total_available) * 100) < Math.round(effectivePrice * 100)) {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
@@ -16075,11 +16239,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             status = 'confirmed';
             // Effective price honours early-bird / super-early-bird tiers (bug fixed web47).
             const { price: effectivePrice, tier: priceTier } = getEffectivePrice(game);
-            const creditResult = await client.query(
-                `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-                   FROM credits WHERE player_id = $1`,
-                [registeringPlayerId]
-            );
+            const creditResult = await _spendableForGameRows(client, registeringPlayerId, game.id);
             if (creditResult.rows.length === 0 || Math.round(parseFloat(creditResult.rows[0].total_available) * 100) < Math.round(effectivePrice * 100)) {
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
@@ -16241,7 +16401,7 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             // DYNSTAR: review star rating on every confirmed friend sign-up
             if (status === 'confirmed') await reviewDynamicStarRating(pool, gameId);
             // RAF: trigger 50p game credit for referrer if the friend being registered was referred
-            if (status === 'confirmed') await triggerRafGameCredit(friendPlayerId);
+            if (status === 'confirmed') await _rafEvalWelcomeOnSignup(friendPlayerId, gameId, pool);
         });
 
     } catch (error) {
@@ -16849,7 +17009,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     await recordCreditTransaction(client, refundTargetId, paidAmt, 'refund', refundDesc);
                 }
                 if (freeAmt > 0) {
-                    await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [freeAmt, refundTargetId]);
+                    await _refundFreeToGame(client, refundTargetId, freeAmt, gameId);
                     await recordCreditTransaction(client, refundTargetId, freeAmt, 'free_credit', `Free credit restored — dropped out of game ${droppingReg.id}`);
                 }
             }
@@ -16896,10 +17056,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                     await recordCreditTransaction(client, req.user.playerId, totalGuestRefund, 'refund', `${guestCheck.rows.length} guest(s) removed - dropout refund`);
                 }
                 if (totalGuestFreeRefund > 0) {
-                    await client.query(
-                        'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                        [totalGuestFreeRefund, req.user.playerId]
-                    );
+                    await _refundFreeToGame(client, req.user.playerId, totalGuestFreeRefund, gameId);
                     await recordCreditTransaction(client, req.user.playerId, totalGuestFreeRefund, 'free_credit', `${guestCheck.rows.length} guest(s) removed - dropout free credit restored`);
                 }
                 guestRefunded = { names: guestNames, count: guestCheck.rows.length, amount: totalGuestRefund };
@@ -17023,11 +17180,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 // Loop — check credits for each (gk_backup is unpaid so they need
                 // affordability now). EB-aware via effectiveDebited (bug fixed web47).
                 for (const candidate of gkBackups.rows) {
-                    const creditCheck = await client.query(
-                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-                           FROM credits WHERE player_id = $1`,
-                        [candidate.player_id]
-                    );
+                    const creditCheck = await _spendableForGameRows(client, candidate.player_id, gameId);
                     const balance = creditCheck.rows.length > 0 ? parseFloat(creditCheck.rows[0].total_available) : 0;
                     if (balance >= effectiveDebited) {
                         promotedPlayer = candidate;
@@ -17146,7 +17299,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                             await recordCreditTransaction(client, ob.player_id, obPaid, 'refund', `Organiser comp — promoted from backup for game ${gameId}`);
                         }
                         if (obFree > 0) {
-                            await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [obFree, ob.player_id]);
+                            await _refundFreeToGame(client, ob.player_id, obFree, gameId);
                             await recordCreditTransaction(client, ob.player_id, obFree, 'free_credit', `Free credit restored — organiser comp for game ${gameId}`);
                         }
                     }
@@ -19749,7 +19902,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
                 totalRefunded++;
             }
             if (!useFallback && refundFree > 0) {
-                await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [refundFree, refundTarget]);
+                await _refundFreeToGame(client, refundTarget, refundFree, gameId);
                 await recordCreditTransaction(client, refundTarget, refundFree, 'free_credit', 'Game cancelled - free credit restored');
             }
         }
@@ -19762,7 +19915,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
                 await recordCreditTransaction(client, guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund');
             }
             if (guestFreeRefund > 0) {
-                await client.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [guestFreeRefund, guest.invited_by]);
+                await _refundFreeToGame(client, guest.invited_by, guestFreeRefund, gameId);
                 await recordCreditTransaction(client, guest.invited_by, guestFreeRefund, 'free_credit', 'Game cancelled - +1 guest free credit restored');
             }
         }
@@ -19907,10 +20060,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
                     totalRefunded++;
                 }
                 if (!useFallback && refundFree > 0) {
-                    await client.query(
-                        'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                        [refundFree, refundTarget]
-                    );
+                    await _refundFreeToGame(client, refundTarget, refundFree, gid);
                     await recordCreditTransaction(client, refundTarget, refundFree, 'free_credit', 'Series ' + seriesName + ' cancelled - free credit restored');
                 }
             }
@@ -19931,10 +20081,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
                     await recordCreditTransaction(client, guest.invited_by, guestRefund, 'refund', 'Series ' + seriesName + ' cancelled - +1 guest refund');
                 }
                 if (guestFreeRefund > 0) {
-                    await client.query(
-                        'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                        [guestFreeRefund, guest.invited_by]
-                    );
+                    await _refundFreeToGame(client, guest.invited_by, guestFreeRefund, gid);
                     await recordCreditTransaction(client, guest.invited_by, guestFreeRefund, 'free_credit', 'Series ' + seriesName + ' cancelled - +1 guest free credit restored');
                     guestRefunds++;
                 }
@@ -21739,12 +21886,7 @@ app.post('/api/admin/games/:gameId/unconfirm', authenticateToken, requireGameMan
                             `Removed from game - £${refundPaid.toFixed(2)} refund`);
                     }
                     if (refundFree > 0) {
-                        await client.query(
-                            `UPDATE credits
-                             SET free_credit_balance = free_credit_balance + $1
-                             WHERE player_id = $2`,
-                            [refundFree, playerId]
-                        );
+                        await _refundFreeToGame(client, playerId, refundFree, game.id);
                         await recordCreditTransaction(client, playerId, refundFree, 'free_credit',
                             `Removed from game - £${refundFree.toFixed(2)} free credit restored`);
                     }
@@ -22593,6 +22735,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         // ── A2: Pay £2 cashback to hosts whose guest invite tokens were claimed by NEW users ──
         // Helper handles per-token transactions, pre-migration safety, and idempotency.
         setImmediate(() => { _a2PayPendingCashbacks(gameId).catch(() => {}); });
+        setImmediate(() => { _rafEvalGameOnCompletion(gameId).catch(() => {}); });
 
         // FIX-099: Refund confirmed backups who were never promoted when game completes
         // Runs after COMMIT in setImmediate — uses its own client per player to avoid blocking the response
@@ -22639,10 +22782,7 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
                             }
                             // Restore free-credit portion back to FC pool
                             if (freeAmt > 0) {
-                                await refundClient.query(
-                                    'UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2',
-                                    [freeAmt, refundTarget]
-                                );
+                                await _refundFreeToGame(refundClient, refundTarget, freeAmt, gameId);
                                 await recordCreditTransaction(
                                     refundClient, refundTarget, freeAmt, 'free_credit',
                                     `Confirmed backup unused — free credit restored, game ${gameId}`
@@ -24904,11 +25044,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
         
         // Check/deduct credits — wrapped in transaction to prevent partial failure.
         // Option B: affordability = balance + free_credit_balance.
-        const creditResult = await pool.query(
-            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-               FROM credits WHERE player_id = $1`,
-            [playerId]
-        );
+        const creditResult = await _spendableForGameRows(pool, playerId, gameId);
         
         if (creditResult.rows.length === 0 || parseFloat(creditResult.rows[0].total_available) < cost) {
             return res.status(400).json({ error: 'Player has insufficient credits' });
@@ -25032,11 +25168,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
         }
         
         // Get player credits — Option B: affordability = balance + free_credit_balance.
-        const creditResult = await pool.query(
-            `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-               FROM credits WHERE player_id = $1`,
-            [playerId]
-        );
+        const creditResult = await _spendableForGameRows(pool, playerId, gameId);
         
         if (creditResult.rows.length === 0) {
             return res.status(400).json({ error: 'Player has no credits account' });
@@ -25143,7 +25275,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                 await recordCreditTransaction(pool, refundTargetId, paidAmt, 'refund', refundDesc);
             }
             if (freeAmt > 0) {
-                await pool.query('UPDATE credits SET free_credit_balance = free_credit_balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2', [freeAmt, refundTargetId]);
+                await _refundFreeToGame(pool, refundTargetId, freeAmt, gameId);
                 await recordCreditTransaction(pool, refundTargetId, freeAmt, 'free_credit', `Free credit restored — admin removed from game ${gameId}`);
             }
         }
@@ -25205,10 +25337,7 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                 `, [gameId]);
 
                 for (const candidate of gkBackups.rows) {
-                    const creditCheck = await pool.query(
-                        `SELECT COALESCE(balance, 0) + COALESCE(free_credit_balance, 0) + COALESCE((SELECT SUM(balance) FROM player_tenant_free_credits WHERE player_id = $1),0) AS total_available
-                           FROM credits WHERE player_id = $1`, [candidate.player_id]
-                    );
+                    const creditCheck = await _spendableForGameRows(pool, candidate.player_id, gameId);
                     if (parseFloat(creditCheck.rows[0]?.total_available || 0) >= cost) {
                         promotedPlayer = candidate;
                         break;
@@ -27073,6 +27202,208 @@ app.get('/api/public/raf/status', async (req, res) => {
 });
 
 // GET /api/admin/raf/status — full stats for superadmin
+// ════════════════════ RAF-V2 per-tenant controls (Wave 4) ════════════════════
+// GET settings for one tenant (defaults to TF origin tenant).
+app.get('/api/admin/raf/settings', authenticateToken, requireTenantOwner, async (req, res) => {
+    try {
+        const tid = req.rafTenantId;
+        const r = await pool.query(
+            `SELECT t.id, t.name, t.raf_enabled, t.raf_welcome_pence, t.raf_per_game_pence,
+                    t.raf_max_games_paid, t.owner_player_id,
+                    p.full_name AS owner_name, p.alias AS owner_alias
+               FROM tenants t LEFT JOIN players p ON p.id = t.owner_player_id
+              WHERE t.id = $1`, [tid]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Tenant not found' });
+        res.json(r.rows[0]);
+    } catch (e) { console.error('raf/settings GET:', e.message); res.status(500).json({ error: 'Failed to load RAF settings' }); }
+});
+
+// PUT settings (welcome/per-game/cap/enabled). max_games_paid: -1 = unlimited, 0 = per-game off.
+app.put('/api/admin/raf/settings', authenticateToken, requireTenantOwner, async (req, res) => {
+    try {
+        const tid = req.rafTenantId;
+        const b = req.body || {};
+        const en = (b.raf_enabled === true || b.raf_enabled === 'true');
+        const wp = Math.max(0, parseInt(b.raf_welcome_pence, 10) || 0);
+        const gp = Math.max(0, parseInt(b.raf_per_game_pence, 10) || 0);
+        let mg = parseInt(b.raf_max_games_paid, 10); if (isNaN(mg)) mg = 0; if (mg < -1) mg = -1;
+        await pool.query(
+            `UPDATE tenants SET raf_enabled=$2, raf_welcome_pence=$3, raf_per_game_pence=$4, raf_max_games_paid=$5
+              WHERE id=$1`, [tid, en, wp, gp, mg]);
+        res.json({ success: true, raf_enabled: en, raf_welcome_pence: wp, raf_per_game_pence: gp, raf_max_games_paid: mg });
+    } catch (e) { console.error('raf/settings PUT:', e.message); res.status(500).json({ error: 'Failed to save RAF settings' }); }
+});
+
+// GET aggregated referrals-paid list for a tenant. view=referrers|referees (toggle),
+// optional search filter on name. Each row is a player + their paid total/count.
+app.get('/api/admin/raf/payouts', authenticateToken, requireTenantOwner, async (req, res) => {
+    try {
+        const tid = req.rafTenantId;
+        const view = (req.query.view === 'referees') ? 'referees' : 'referrers';
+        const subjectCol = (view === 'referrers') ? 'referrer_id' : 'referred_id'; // whitelisted identifier
+        const search = (req.query.search || '').trim().toLowerCase();
+        const r = await pool.query(
+            `SELECT rp.${subjectCol} AS player_id, p.full_name, p.alias,
+                    COUNT(*) FILTER (WHERE rp.status='paid')                        AS paid_count,
+                    COALESCE(SUM(rp.amount_pence) FILTER (WHERE rp.status='paid'),0) AS paid_pence,
+                    COUNT(*) FILTER (WHERE rp.status='clawed')                      AS clawed_count
+               FROM raf_payouts rp
+               JOIN players p ON p.id = rp.${subjectCol}
+              WHERE rp.tenant_id = $1
+              GROUP BY rp.${subjectCol}, p.full_name, p.alias
+              ORDER BY paid_pence DESC`, [tid]);
+        let players = r.rows;
+        if (search) players = players.filter(x => ((x.alias||'') + ' ' + (x.full_name||'')).toLowerCase().includes(search));
+        res.json({ view, tenant_id: tid, players });
+    } catch (e) { console.error('raf/payouts GET:', e.message); res.status(500).json({ error: 'Failed to load referrals' }); }
+});
+
+// GET the individual paid instances for one player (on expand). view decides whether
+// player_id is treated as the referrer or the referred party.
+app.get('/api/admin/raf/payouts/instances', authenticateToken, requireTenantOwner, async (req, res) => {
+    try {
+        const tid = req.rafTenantId;
+        const view = (req.query.view === 'referees') ? 'referees' : 'referrers';
+        const playerId = req.query.player_id;
+        if (!playerId) return res.status(400).json({ error: 'player_id required' });
+        const subjectCol = (view === 'referrers') ? 'referrer_id' : 'referred_id'; // whitelisted
+        const otherCol   = (view === 'referrers') ? 'referred_id' : 'referrer_id'; // whitelisted
+        const r = await pool.query(
+            `SELECT rp.id, rp.payout_type, rp.amount_pence, rp.status, rp.paid_at, rp.clawed_at, rp.game_id,
+                    op.full_name AS other_full_name, op.alias AS other_alias,
+                    g.game_date, v.name AS venue_name
+               FROM raf_payouts rp
+               JOIN players op ON op.id = rp.${otherCol}
+               LEFT JOIN games g  ON g.id = rp.game_id
+               LEFT JOIN venues v ON v.id = g.venue_id
+              WHERE rp.tenant_id = $1 AND rp.${subjectCol} = $2
+              ORDER BY rp.paid_at DESC`, [tid, playerId]);
+        res.json({ view, player_id: playerId, instances: r.rows });
+    } catch (e) { console.error('raf/payouts/instances GET:', e.message); res.status(500).json({ error: 'Failed to load instances' }); }
+});
+
+// Recompute ALL qualifying RAF payouts for a tenant into raf_payouts (idempotent —
+// never double-pays). Welcome: once per (referrer,referred) pair with a confirmed
+// signup in this tenant. Per-game: each completed tenant game, oldest first, cap-aware.
+async function _rafBackfillTenant(db, tenantId) {
+    const cfg = await _getTenantRafConfig(tenantId, db);
+    if (!cfg.enabled) return { disabled: true, newly_paid: 0 };
+    const before = await db.query("SELECT COUNT(*)::int AS n FROM raf_payouts WHERE tenant_id=$1 AND status='paid'", [tenantId]);
+    if (cfg.welcomePence > 0) {
+        const pairs = await db.query(
+            `SELECT DISTINCT p.referred_by AS referrer_id, p.id AS referred_id
+               FROM registrations r JOIN players p ON p.id = r.player_id JOIN games g ON g.id = r.game_id
+              WHERE g.tenant_id = $1 AND r.status = 'confirmed' AND p.referred_by IS NOT NULL`, [tenantId]);
+        for (const w of pairs.rows)
+            await _rafPayout(db, { referrerId: w.referrer_id, referredId: w.referred_id, tenantId, type: 'welcome', amountPence: cfg.welcomePence });
+    }
+    if (cfg.perGamePence > 0) {
+        const games = await db.query(
+            "SELECT id FROM games WHERE tenant_id = $1 AND game_status = 'completed' ORDER BY game_date ASC, id ASC", [tenantId]);
+        for (const g of games.rows) await _rafEvalGameOnCompletion(g.id, db);
+    }
+    const after = await db.query("SELECT COUNT(*)::int AS n FROM raf_payouts WHERE tenant_id=$1 AND status='paid'", [tenantId]);
+    return { paid_before: before.rows[0].n, paid_after: after.rows[0].n, newly_paid: after.rows[0].n - before.rows[0].n };
+}
+
+// Same, scoped to ONE (referrer, referred) pair — used after a manual link.
+async function _rafBackfillPair(db, tenantId, referrerId, referredId) {
+    const cfg = await _getTenantRafConfig(tenantId, db);
+    if (!cfg.enabled) return { disabled: true, newly_paid: 0 };
+    const link = await db.query('SELECT referred_by FROM players WHERE id = $1', [referredId]);
+    if (!link.rows.length || link.rows[0].referred_by !== referrerId) return { error: 'not_linked', newly_paid: 0 };
+    const cnt = async () => (await db.query("SELECT COUNT(*)::int AS n FROM raf_payouts WHERE tenant_id=$1 AND referrer_id=$2 AND referred_id=$3 AND status='paid'", [tenantId, referrerId, referredId])).rows[0].n;
+    const before = await cnt();
+    if (cfg.welcomePence > 0) {
+        const has = await db.query(
+            `SELECT 1 FROM registrations r JOIN games g ON g.id = r.game_id
+              WHERE g.tenant_id = $1 AND r.player_id = $2 AND r.status = 'confirmed' LIMIT 1`, [tenantId, referredId]);
+        if (has.rows.length)
+            await _rafPayout(db, { referrerId, referredId, tenantId, type: 'welcome', amountPence: cfg.welcomePence });
+    }
+    if (cfg.perGamePence > 0) {
+        const games = await db.query(
+            `SELECT g.id FROM registrations r JOIN games g ON g.id = r.game_id
+              WHERE g.tenant_id = $1 AND r.player_id = $2 AND r.status = 'confirmed' AND g.game_status = 'completed'
+              ORDER BY g.game_date ASC, g.id ASC`, [tenantId, referredId]);
+        for (const g of games.rows) {
+            if (cfg.maxGames !== -1) {
+                const c = await db.query("SELECT COUNT(*)::int AS n FROM raf_payouts WHERE referrer_id=$1 AND referred_id=$2 AND tenant_id=$3 AND payout_type='game' AND status='paid'", [referrerId, referredId, tenantId]);
+                if (c.rows[0].n >= cfg.maxGames) break;
+            }
+            await _rafPayout(db, { referrerId, referredId, tenantId, type: 'game', gameId: g.id, amountPence: cfg.perGamePence });
+        }
+    }
+    const after = await cnt();
+    return { paid_before: before, paid_after: after, newly_paid: after - before };
+}
+
+// Owner manual link (Manage RAF). Creates the GLOBAL referrer link with self/circular
+// guards and an explicit override prompt when the player already has a referrer.
+app.post('/api/admin/raf/link', authenticateToken, requireTenantOwner, async (req, res) => {
+    try {
+        const { referrer_id, referred_id, override } = req.body || {};
+        if (!referrer_id || !referred_id) return res.status(400).json({ error: 'referrer_id and referred_id are required' });
+        if (referrer_id === referred_id) return res.status(400).json({ error: 'A player cannot refer themselves' });
+        const [rfd, ref] = await Promise.all([
+            pool.query('SELECT id, alias, full_name, referred_by FROM players WHERE id = $1', [referred_id]),
+            pool.query('SELECT id, alias, full_name, referred_by FROM players WHERE id = $1', [referrer_id]),
+        ]);
+        if (!rfd.rows.length) return res.status(404).json({ error: 'Referred player not found' });
+        if (!ref.rows.length) return res.status(404).json({ error: 'Referrer not found' });
+        if (ref.rows[0].referred_by === referred_id)
+            return res.status(400).json({ error: 'That would create a circular referral (these two already point the other way).' });
+        const existing = rfd.rows[0].referred_by;
+        if (existing === referrer_id) return res.json({ success: true, already_linked: true, message: 'Already linked.' });
+        if (existing && existing !== referrer_id && !override) {
+            const cur = await pool.query('SELECT alias, full_name FROM players WHERE id = $1', [existing]);
+            const curName = cur.rows[0]?.alias || cur.rows[0]?.full_name || 'another player';
+            return res.status(409).json({ error: 'already_referred', current_referrer: { id: existing, name: curName },
+                message: 'This player is already referred by ' + curName + '. Override?' });
+        }
+        await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referrer_id, referred_id]);
+        setImmediate(() => auditLog(pool, req.user.playerId, 'referral_set', referred_id,
+            'RAF manual link (owner): ' + referrer_id + ' -> ' + referred_id + (existing ? ' (override of ' + existing + ')' : '')));
+        res.json({ success: true, referrer_id, referred_id, overridden: !!existing });
+    } catch (e) { console.error('raf/link:', e.message); res.status(500).json({ error: 'Failed to link players' }); }
+});
+
+// Clawback a single payout (owner). Verifies it belongs to this tenant + is still paid.
+app.post('/api/admin/raf/payouts/:payoutId/clawback', authenticateToken, requireTenantOwner, async (req, res) => {
+    try {
+        const { payoutId } = req.params;
+        const chk = await pool.query('SELECT tenant_id, status FROM raf_payouts WHERE id = $1', [payoutId]);
+        if (!chk.rows.length) return res.status(404).json({ error: 'Payout not found' });
+        if (chk.rows[0].tenant_id !== req.rafTenantId) return res.status(403).json({ error: 'Payout belongs to another tenant' });
+        if (chk.rows[0].status !== 'paid') return res.status(409).json({ error: 'Payout already clawed back' });
+        const ok = await _rafClawback(pool, payoutId, req.user.playerId);
+        if (!ok) return res.status(409).json({ error: 'Payout could not be clawed (already reversed)' });
+        res.json({ success: true });
+    } catch (e) { console.error('raf/clawback:', e.message); res.status(500).json({ error: 'Failed to claw back payout' }); }
+});
+
+// Universal backfill — whole tenant. confirm:true required (re-awards historical RAF as free credits).
+app.post('/api/admin/raf/backfill/universal', authenticateToken, requireTenantOwner, async (req, res) => {
+    try {
+        if (!(req.body && (req.body.confirm === true || req.body.confirm === 'true')))
+            return res.status(400).json({ error: 'confirm:true required — this re-awards historical RAF payouts as free credits.' });
+        const result = await _rafBackfillTenant(pool, req.rafTenantId);
+        res.json({ success: true, ...result });
+    } catch (e) { console.error('raf/backfill/universal:', e.message); res.status(500).json({ error: 'Backfill failed' }); }
+});
+
+// Player-specific backfill — one (referrer, referred) pair. confirm:true required.
+app.post('/api/admin/raf/backfill/pair', authenticateToken, requireTenantOwner, async (req, res) => {
+    try {
+        const { referrer_id, referred_id, confirm } = req.body || {};
+        if (!(confirm === true || confirm === 'true')) return res.status(400).json({ error: 'confirm:true required.' });
+        if (!referrer_id || !referred_id) return res.status(400).json({ error: 'referrer_id and referred_id required' });
+        const result = await _rafBackfillPair(pool, req.rafTenantId, referrer_id, referred_id);
+        if (result.error === 'not_linked') return res.status(400).json({ error: 'These players are not linked — set the referral first.' });
+        res.json({ success: true, ...result });
+    } catch (e) { console.error('raf/backfill/pair:', e.message); res.status(500).json({ error: 'Backfill failed' }); }
+});
+
 app.get('/api/admin/raf/status', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const [setting, stats] = await Promise.all([
@@ -28215,6 +28546,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
         // ── A2: Pay £2 cashback to hosts whose guest invite tokens were claimed by NEW users ──
         // Same hook as standard /complete — tournament games can have guests too.
         setImmediate(() => { _a2PayPendingCashbacks(gameId).catch(() => {}); });
+        setImmediate(() => { _rafEvalGameOnCompletion(gameId).catch(() => {}); });
 
         // Auto-allocate badges (non-critical, outside transaction)
         for (const playerId of allPlayerIds) {
@@ -44136,8 +44468,8 @@ async function _wonderfulAutoRegister(pmt) {
                 reviewDynamicStarRating(pool, pmt.game_id).catch(e =>
                     console.error('[WF auto-register] star rating review failed:', e.message)
                 );
-                triggerRafGameCredit(pmt.player_id).catch(e =>
-                    console.error('[WF auto-register] RAF game credit failed:', e.message)
+                _rafEvalWelcomeOnSignup(pmt.player_id, pmt.game_id, pool).catch(e =>
+                    console.error('[WF auto-register] RAF welcome failed:', e.message)
                 );
                 // Superadmin email — mirrors /register endpoint at L5611 and the backup
                 // path above. Fire-and-forget — don't block webhook response on email send.
@@ -48536,12 +48868,7 @@ app.post('/api/admin/queue/:id/approve', authenticateToken, requireAdmin, async 
                     `Injury refund — game ${item.game_id} (queue #${queueId})`);
             }
             if (freeRefunded > 0) {
-                await client.query(
-                    `UPDATE credits SET free_credit_balance = free_credit_balance + $1,
-                            last_updated = CURRENT_TIMESTAMP
-                      WHERE player_id = $2`,
-                    [freeRefunded, item.subject_player_id]
-                );
+                await _refundFreeToGame(client, item.subject_player_id, freeRefunded, item.game_id);
                 await recordCreditTransaction(client, item.subject_player_id, freeRefunded, 'free_credit',
                     `Injury refund — game ${item.game_id} (queue #${queueId})`);
             }
