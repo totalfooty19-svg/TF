@@ -33793,7 +33793,7 @@ app.post('/api/admin/templates', authenticateToken, requireSuperAdmin, async (re
     if (!validation.ok) return res.status(400).json({ error: validation.error });
 
     // FIX-220 R16: validate strategy + priority_slot_3 enums
-    const VALID_STRATEGIES = ['slider_driven', 'pair_avoid_priority', 'high_first', 'low_first', 'alternate'];
+    const VALID_STRATEGIES = ['slider_driven', 'pair_avoid_priority', 'high_first', 'low_first', 'alternate', 'super_pair', 'experimental']; // FIX-422: surface the new optimiser strategies
     const VALID_SLOT3      = ['none', 'pair_avoid', 'gk_skill_match', 'def_skill', 'fitness'];
     let strategyVal = 'slider_driven';
     if (strategy !== undefined && strategy !== null) {
@@ -33904,7 +33904,7 @@ app.put('/api/admin/templates/:id', authenticateToken, requireSuperAdmin, async 
     if (!validation.ok) return res.status(400).json({ error: validation.error });
 
     // FIX-220 R16: validate strategy + slot 3 if provided. undefined = preserve.
-    const VALID_STRATEGIES = ['slider_driven', 'pair_avoid_priority', 'high_first', 'low_first', 'alternate'];
+    const VALID_STRATEGIES = ['slider_driven', 'pair_avoid_priority', 'high_first', 'low_first', 'alternate', 'super_pair', 'experimental']; // FIX-422: surface the new optimiser strategies
     const VALID_SLOT3      = ['none', 'pair_avoid', 'gk_skill_match', 'def_skill', 'fitness'];
     let strategyProvided = false;
     let strategyVal = null;
@@ -37251,7 +37251,7 @@ async function _fetchFinanceGames(from, to, scope) {
     const sc = _reportScopeSql(scope, 'g', 3);
     const queryFull = `
         WITH game_set AS (
-            SELECT g.id, g.game_date, g.cost_per_player, g.pitch_cost, g.ref_pay,
+            SELECT g.id, g.game_date, g.cost_per_player, COALESCE(g.pitch_cost, v.default_pitch_cost) AS pitch_cost, g.ref_pay,
                    g.format, g.exclusivity, g.team_selection_type, g.game_status,
                    v.name AS venue_name
             FROM games g LEFT JOIN venues v ON v.id = g.venue_id
