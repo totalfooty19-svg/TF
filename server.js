@@ -505,7 +505,7 @@ And lock in your spot for next week in one tap — RSVP here: {rsvp_link}
 
 View the line-ups here: {view_teams_link}
 
-Make sure you arrive on time — kick-off is {kickoff_time}. See you there! ⚽
+Make sure you arrive on time — kick-off is {kickoff_time}. Big Game! ⚽
 
 — TotalFooty`,
     },
@@ -578,6 +578,15 @@ function _resolvePlaceholders(text, player, game, extras) {
         '{region}':             (game?.venue_region || ''),
         '{series_name}':        (game?.series_name || ''),
     };
+    // FIX-427: no next game to reserve -> drop the whole "reserve next week" line
+    // instead of rendering a dead site-root link (matches the complete-game wizard;
+    // affects game_complete_reserve). {rsvp_link} (current game) is unaffected.
+    if (!nextGameUrl) {
+        text = text.split('\n')
+                   .filter(line => !line.includes('{next_game_rsvp_link}') && !line.includes('{next_game_link}'))
+                   .join('\n')
+                   .replace(/\n{3,}/g, '\n\n');
+    }
     let out = text;
     for (const k of Object.keys(map)) {
         out = out.split(k).join(map[k] || '');
@@ -599,11 +608,80 @@ async function _resolveNextSeriesGameUrl(db, seriesId, afterDate) {
               ORDER BY game_date ASC
               LIMIT 1`,
             [seriesId, afterDate]);
-        return r.rows.length ? r.rows[0].game_url : null;
+        if (r.rows.length) return r.rows[0].game_url;
+        // FIX-427: the series may have been re-created/continued (a new series whose
+        // parent_series_id points back here). Follow to that child series and use its
+        // soonest future game so "reserve next week" still works after a recreate.
+        const child = await db.query(
+            `SELECT g.game_url FROM games g
+               JOIN game_series s ON s.id = g.series_id
+              WHERE s.parent_series_id = $1 AND g.game_date > $2
+                AND g.game_status NOT IN ('completed','cancelled')
+                AND g.game_url IS NOT NULL
+              ORDER BY g.game_date ASC
+              LIMIT 1`,
+            [seriesId, afterDate]);
+        return child.rows.length ? child.rows[0].game_url : null;
     } catch (e) {
         console.error('next-series-game resolve failed (non-fatal):', e.message);
         return null;
     }
+}
+
+// FIX-428 (Messaging Campaigns): unified audience resolver. Merges the two legacy
+// models into one spec so the new /api/admin/campaigns engine can serve broadcast
+// (game-bucket axis, reusing _buildMassMessageAudience) AND claim campaigns
+// (explicit player-id axis, the comms pool-assembled recipients). De-dupes by
+// player id and applies the same exclusions (broadcasts-unsub / messaging-blocked)
+// to both axes. Returns the same recipient shape as _buildMassMessageAudience.
+//   spec = { gameId?, buckets?: string[], playerIds?: uuid[] }
+async function _buildCampaignAudience(client, spec = {}) {
+    const out = new Map(); // player_id -> recipient (dedupe across axes)
+
+    // Axis 1 — game-relationship buckets (delegates to the proven mass-message builder).
+    if (spec.gameId && Array.isArray(spec.buckets) && spec.buckets.length > 0) {
+        const bucketRecips = await _buildMassMessageAudience(client, spec.gameId, spec.buckets);
+        for (const r of bucketRecips) out.set(r.id, r);
+    }
+
+    // Axis 2 — explicit player ids (the comms pools are assembled client-side into ids).
+    if (Array.isArray(spec.playerIds) && spec.playerIds.length > 0) {
+        const r = await client.query(
+            `SELECT p.id, p.first_name, p.full_name, p.alias, p.phone,
+                    u.email,
+                    (SELECT fcm_token FROM fcm_tokens WHERE player_id = p.id ORDER BY last_used_at DESC LIMIT 1) AS fcm_token,
+                    (SELECT g6.game_date FROM registrations r6 JOIN games g6 ON g6.id = r6.game_id
+                      WHERE r6.player_id = p.id AND r6.status = 'confirmed' ORDER BY g6.game_date DESC LIMIT 1) AS last_game_date,
+                    (SELECT v6.name FROM registrations r7 JOIN games g7 ON g7.id = r7.game_id LEFT JOIN venues v6 ON v6.id = g7.venue_id
+                      WHERE r7.player_id = p.id AND r7.status = 'confirmed' ORDER BY g7.game_date DESC LIMIT 1) AS last_game_venue
+               FROM players p
+               LEFT JOIN users u ON u.id = p.user_id
+              WHERE p.id = ANY($1::uuid[])
+                AND p.broadcasts_unsubscribed = FALSE
+                AND NOT (
+                    p.messaging_blocked_at IS NOT NULL
+                    AND (p.messaging_blocked_until IS NULL OR p.messaging_blocked_until > NOW())
+                )`,
+            [spec.playerIds]
+        );
+        for (const row of r.rows) {
+            if (out.has(row.id)) continue;
+            out.set(row.id, {
+                id:              row.id,
+                first_name:      row.first_name || row.alias || '',
+                full_name:       row.full_name || '',
+                alias:           row.alias || '',
+                email:           row.email || null,
+                phone_raw:       row.phone || null,
+                phone_e164:      _normalisePhoneE164(row.phone),
+                has_app:         !!row.fcm_token,
+                last_game_date:  row.last_game_date || null,
+                last_game_venue: row.last_game_venue || null,
+            });
+        }
+    }
+
+    return Array.from(out.values());
 }
 
 // Build the recipient audience for a mass-message. Returns array of
@@ -929,10 +1007,20 @@ function formatPlayerDisplayId(player) {
 // Day-1 graceful degradation: if the tenants table does not exist yet
 // (pre-migration), return 404 cleanly rather than 500. This means the
 // middleware is safe to deploy BEFORE the SQL migration runs.
+// ── Tenant short_id format — SINGLE SOURCE OF TRUTH ──────────────────────────
+// short_ids are generated 5-digit today (10000-99999; see POST /api/admin/tenants).
+// Validation accepts 5-6 digits so a future widening to 6-digit ids does NOT
+// silently break tenant attach / resolve / onboarding. To change the accepted
+// format, edit ONLY this regex (and keep the generator in lockstep).
+const TENANT_SHORT_ID_RE = /^\d{5,6}$/;
+function isValidTenantShortId(s) {
+    return TENANT_SHORT_ID_RE.test(String(s == null ? '' : s).trim());
+}
+
 app.use('/api/t/:tenant_short_id', async (req, res, next) => {
     const shortId = req.params.tenant_short_id;
     // short_id must be exactly 5 numeric digits per A.47
-    if (!shortId || !/^\d{5}$/.test(shortId)) {
+    if (!isValidTenantShortId(shortId)) {
         return res.status(404).json({ error: 'Tenant not found' });
     }
     try {
@@ -1203,6 +1291,90 @@ async function registrationEvent(pool, gameId, playerId, eventType, detail = '')
     }
 }
 
+// ── FIX-423: tenant payout recompute (unit-correct single source of truth) ──
+// Used by BOTH the game-completion path and finance edits, so an edited game's
+// payout always matches a freshly-completed one. gross is in PENCE:
+// registrations.amount_paid is stored in POUNDS, so we *100 here. The pre-FIX-423
+// completion path stored pounds straight into the pence column, understating
+// every tenant payout ~100x and clamping payable to ~0. Only ever touches a
+// status='pending' row — a settled payout is never silently rewritten.
+async function recomputeGamePayout(db, gameId) {
+    try {
+        const gRes = await db.query(
+            `SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.tenant_id,
+                    t.platform_fee_pence, t.mixed_listing_fee_pence
+               FROM games g LEFT JOIN tenants t ON t.id = g.tenant_id
+              WHERE g.id = $1`,
+            [gameId]
+        );
+        if (gRes.rows.length === 0) return { skipped: 'no_game' };
+        const g = gRes.rows[0];
+        // TF Coventry owns itself (no payout to self); untagged games predate FIX-334.
+        if (!g.tenant_id || g.tenant_id === TF_COVENTRY_TENANT_ID) return { skipped: 'self_or_untagged' };
+
+        const isMixedListing = parseInt(g.cost_per_player, 10) === 0;
+        const platformFee = isMixedListing
+            ? parseInt(g.mixed_listing_fee_pence || 5, 10)
+            : parseInt(g.platform_fee_pence || 12, 10);
+        const feeMode = isMixedListing ? 'mixed' : 'full';
+
+        const pRes = await db.query(
+            `SELECT COUNT(*)::int AS n,
+                    COALESCE(SUM(amount_paid), 0)::numeric AS gross_pounds
+               FROM registrations
+              WHERE game_id = $1 AND status = 'confirmed' AND amount_paid > 0`,
+            [gameId]
+        );
+        const paidCount  = pRes.rows[0].n;
+        const grossPence = Math.round(parseFloat(pRes.rows[0].gross_pounds || 0) * 100); // FIX-423: pounds -> pence
+
+        if (paidCount === 0) {
+            // Every paid player removed / converted to free. Zero a *pending* row so
+            // it can't overstate; keep the row for history. Never touch a paid row.
+            const z = await db.query(
+                `UPDATE tenant_payouts_due
+                    SET gross_pence = 0, paid_player_count = 0, total_fee_pence = 0,
+                        payable_pence = 0, updated_at = NOW()
+                  WHERE game_id = $1 AND status = 'pending'`,
+                [gameId]
+            ).catch(() => ({ rowCount: 0 }));
+            return { tenantId: g.tenant_id, gameUrl: g.game_url, grossPence: 0, paidCount: 0,
+                     platformFee, feeMode, payable: 0, updated: (z.rowCount || 0) > 0, zeroed: true };
+        }
+
+        const totalFee = paidCount * platformFee;
+        const payable  = Math.max(0, grossPence - totalFee);
+
+        const up = await db.query(
+            `INSERT INTO tenant_payouts_due
+                (tenant_id, game_id, game_url, game_date, gross_pence, paid_player_count,
+                 platform_fee_pence, fee_mode, total_fee_pence, payable_pence, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+             ON CONFLICT (game_id) DO UPDATE
+                SET gross_pence        = EXCLUDED.gross_pence,
+                    paid_player_count  = EXCLUDED.paid_player_count,
+                    platform_fee_pence = EXCLUDED.platform_fee_pence,
+                    fee_mode           = EXCLUDED.fee_mode,
+                    total_fee_pence    = EXCLUDED.total_fee_pence,
+                    payable_pence      = EXCLUDED.payable_pence,
+                    updated_at         = NOW()
+              WHERE tenant_payouts_due.status = 'pending'
+            RETURNING id`,
+            [g.tenant_id, g.id, g.game_url, g.game_date, grossPence, paidCount,
+             platformFee, feeMode, totalFee, payable]
+        );
+        // rowCount 0 on a conflict means the existing row was already 'paid' (filtered
+        // out by the WHERE) -> we did not rewrite a settled payout.
+        return { tenantId: g.tenant_id, gameUrl: g.game_url, grossPence, paidCount,
+                 platformFee, feeMode, payable,
+                 updated: up.rowCount > 0, alreadyPaid: up.rowCount === 0 };
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return { skipped: 'table_missing' };
+        console.warn('recomputeGamePayout failed for game ' + gameId + ':', e.message);
+        return { error: e.message };
+    }
+}
+
 // ─── Audit tagging — Phase A ────────────────────────────────────────────────
 // Each action code maps to (category, subCategory, actorRole, severity).
 // Used by /api/admin/audit/player/:id and /api/admin/audit/game/:id to
@@ -1271,7 +1443,6 @@ const AUDIT_TAG_TABLE = {
     // FIX-192: Player Team Feedback — pre-game thumbs + post-game slider audit categories.
     // 'feedback' sub-category groups all team-perception/fairness signals from players.
     pregame_feedback_voted:        { cat: 'participation', sub: 'feedback', actor: 'player', sev: 'low' },
-    pregame_feedback_retracted:    { cat: 'participation', sub: 'feedback', actor: 'player', sev: 'low' },
     pregame_feedback_superseded:   { cat: 'participation', sub: 'feedback', actor: 'system', sev: 'low' },
     postgame_feedback_voted:       { cat: 'participation', sub: 'feedback', actor: 'player', sev: 'low' },
     postgame_feedback_retracted:   { cat: 'participation', sub: 'feedback', actor: 'player', sev: 'low' },
@@ -1288,7 +1459,6 @@ const AUDIT_TAG_TABLE = {
     multi_team_voting_closed_admin_early:   { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
     multi_team_winner_overridden:           { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'high' },
     team_setup_fine_tuned:                  { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
-    team_setup_marked_not_fair_reflection:  { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'low'  },
     team_setup_status_changed_manually:     { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
     team_setup_composition_edited:          { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
     multi_candidates_discarded:             { cat: 'ops', sub: 'team_selection', actor: 'admin',  sev: 'med'  },
@@ -1316,7 +1486,6 @@ const AUDIT_TAG_TABLE = {
     teams_generated:          { cat: 'ops', sub: 'teams',    actor: 'admin', sev: 'med' },
     teams_confirmed:          { cat: 'ops', sub: 'teams',    actor: 'admin', sev: 'med' },
     teams_deleted:            { cat: 'ops', sub: 'teams',    actor: 'admin', sev: 'med' },
-    avg_team_ratings:         { cat: 'ops', sub: 'teams',    actor: 'system', sev: 'low' },
     game_confirmed:           { cat: 'ops', sub: 'status',   actor: 'admin', sev: 'med' },
     game_completed:           { cat: 'ops', sub: 'status',   actor: 'admin', sev: 'med' },
     game_deleted:             { cat: 'ops', sub: 'deleted',  actor: 'admin', sev: 'high' },
@@ -1326,7 +1495,6 @@ const AUDIT_TAG_TABLE = {
     motm_finalized:           { cat: 'results', sub: 'motm',    actor: 'admin',  sev: 'med' },
     motm_vote:                { cat: 'results', sub: 'motm',    actor: 'player', sev: 'low' },
     motm_vote_cast:           { cat: 'results', sub: 'motm',    actor: 'player', sev: 'low' },
-    motm_vote_tally:          { cat: 'results', sub: 'motm',    actor: 'system', sev: 'low' },
     motm_received:            { cat: 'results', sub: 'motm',    actor: 'system', sev: 'low' },
     award_vote_cast:          { cat: 'results', sub: 'awards',  actor: 'player', sev: 'low' },
     award_vote_received:      { cat: 'results', sub: 'awards',  actor: 'system', sev: 'low' },
@@ -1361,7 +1529,6 @@ const AUDIT_TAG_TABLE = {
     rsvp_paid:                     { cat: 'participation', sub: 'joined',  actor: 'player', sev: 'low'  },
     rsvp_bumped:                   { cat: 'participation', sub: 'left',    actor: 'system', sev: 'med'  },
     rsvp_warning_sent:             { cat: 'participation', sub: 'joined',  actor: 'system', sev: 'low'  },
-    rsvp_bump_notified:            { cat: 'participation', sub: 'left',    actor: 'system', sev: 'low'  },
     rsvp_accelerator_fired:        { cat: 'participation', sub: 'joined',  actor: 'system', sev: 'med'  },
     rsvp_admin_accelerator_fired:  { cat: 'participation', sub: 'joined',  actor: 'admin',  sev: 'high' },
     rsvp_admin_bump_all:           { cat: 'participation', sub: 'left',    actor: 'admin',  sev: 'high' },
@@ -1375,7 +1542,6 @@ const AUDIT_TAG_TABLE = {
     // broadcast_resubscribed     — admin re-enabled broadcasts for a player.
     mass_msg_sent:                { cat: 'comms', sub: 'mass_message',  actor: 'admin',  sev: 'med'  },
     mass_msg_template_used:       { cat: 'comms', sub: 'mass_message',  actor: 'admin',  sev: 'low'  },
-    mass_msg_recipient_excluded:  { cat: 'comms', sub: 'mass_message',  actor: 'system', sev: 'low'  },
     broadcast_unsubscribed:       { cat: 'comms', sub: 'unsubscribe',   actor: 'player', sev: 'low'  },
     broadcast_resubscribed:       { cat: 'comms', sub: 'unsubscribe',   actor: 'admin',  sev: 'low'  },
 
@@ -1428,17 +1594,17 @@ const AUDIT_TAG_TABLE = {
     pair_suggestion_dismissed:          { cat: 'participation', sub: 'preferences', actor: 'player', sev: 'low'  },
 
     // ─── FINANCE ───────────────────────────────────────────────────────────
-    game_fee:                 { cat: 'finance', sub: 'ledger',   actor: 'player', sev: 'low'  },
-    refund:                   { cat: 'finance', sub: 'ledger',   actor: 'system', sev: 'low'  },
-    free_credit:              { cat: 'finance', sub: 'grants',   actor: 'system', sev: 'low'  },
-    free_credit_grant:        { cat: 'finance', sub: 'grants',   actor: 'admin',  sev: 'med'  },
-    raf_reward:               { cat: 'finance', sub: 'grants',   actor: 'system', sev: 'low'  },
-    shop_order:               { cat: 'finance', sub: 'grants',   actor: 'player', sev: 'low'  },
-    wonderful_initiated:      { cat: 'finance', sub: 'payment',  actor: 'player', sev: 'med'  },
-    wonderful_credited:       { cat: 'finance', sub: 'payment',  actor: 'system', sev: 'med'  },
-    balance_adjustment:       { cat: 'finance', sub: 'admin',    actor: 'admin',  sev: 'high' },
-    credit_adjustment:        { cat: 'finance', sub: 'admin',    actor: 'admin',  sev: 'high' },
-    admin_adjustment:         { cat: 'finance', sub: 'admin',    actor: 'admin',  sev: 'high' },
+    game_fee:                 { cat: 'credits', sub: 'ledger',   actor: 'player', sev: 'low'  },
+    refund:                   { cat: 'credits', sub: 'refund',   actor: 'system', sev: 'low'  },
+    free_credit:              { cat: 'credits', sub: 'grants',   actor: 'system', sev: 'low'  },
+    free_credit_grant:        { cat: 'credits', sub: 'grants',   actor: 'admin',  sev: 'med'  },
+    raf_reward:               { cat: 'credits', sub: 'grants',   actor: 'system', sev: 'low'  },
+    shop_order:               { cat: 'shop', sub: 'order_placed',   actor: 'player', sev: 'low'  },
+    wonderful_initiated:      { cat: 'credits', sub: 'payment',  actor: 'player', sev: 'med'  },
+    wonderful_credited:       { cat: 'credits', sub: 'payment',  actor: 'system', sev: 'med'  },
+    balance_adjustment:       { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
+    credit_adjustment:        { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
+    admin_adjustment:         { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
 
     // ─── REFEREES ──────────────────────────────────────────────────────────
     ref_applied:              { cat: 'refs', sub: 'lifecycle', actor: 'player', sev: 'low' },
@@ -1456,6 +1622,8 @@ const AUDIT_TAG_TABLE = {
 
     // ─── COMMS ─────────────────────────────────────────────────────────────
     comms_campaign_sent:      { cat: 'comms', sub: 'campaigns', actor: 'admin', sev: 'med' },
+    campaign_sent:            { cat: 'comms', sub: 'campaigns', actor: 'admin',  sev: 'med' },  // FIX-428 unified
+    campaign_claimed:         { cat: 'comms', sub: 'campaigns', actor: 'player', sev: 'low' },  // FIX-428 unified
     dm_reported:              { cat: 'comms', sub: 'reports',   actor: 'player', sev: 'med' },
     // FIX-271: messaging restrictions — superadmin mute/unmute + auto-detected
     // spree alerts. NOTE: these MUST also exist in audit.html's LEGACY_TYPE_TAG
@@ -1474,15 +1642,108 @@ const AUDIT_TAG_TABLE = {
     rating_damping_toggled:           { cat: 'feedback', sub: 'managed',       actor: 'admin',  sev: 'high' },
 
     // ─── SERIES ────────────────────────────────────────────────────────────
-    series_recreated:                { cat: 'series', sub: 'managed', actor: 'admin',  sev: 'med' },
-    series_lineup_editors_updated:   { cat: 'series', sub: 'managed', actor: 'admin',  sev: 'low' },
-    series_scoreline_overridden:     { cat: 'series', sub: 'managed', actor: 'admin',  sev: 'med' },
+    series_recreated:                { cat: 'ops', sub: 'series_managed', actor: 'admin',  sev: 'med' },
+    series_lineup_editors_updated:   { cat: 'ops', sub: 'series_managed', actor: 'admin',  sev: 'low' },
+    series_scoreline_overridden:     { cat: 'ops', sub: 'series_managed', actor: 'admin',  sev: 'med' },
     // FIX-273: series-end + auto-finalize-on-recreate events.
     series_auto_finalized_on_recreate:
-                                     { cat: 'series', sub: 'managed', actor: 'system', sev: 'med' },
+                                     { cat: 'ops', sub: 'series_managed', actor: 'system', sev: 'med' },
 
     // ─── ACCESS ────────────────────────────────────────────────────────────
-    page_view:                { cat: 'access', sub: 'views', actor: 'player', sev: 'low' }
+    page_view:                { cat: 'access', sub: 'views', actor: 'player', sev: 'low' },
+
+    // ─── TENANT ADMIN & CUSTOMISATION (FIX-425) ────────────────────────────
+    tenant_created:                  { cat: 'tenant', sub: 'lifecycle', actor: 'admin', sev: 'med' },
+    tenant_updated:                  { cat: 'tenant', sub: 'lifecycle', actor: 'admin', sev: 'med' },
+    tenant_left:                     { cat: 'tenant', sub: 'lifecycle', actor: 'admin', sev: 'high' },
+    tenant_tcs_accepted:             { cat: 'tenant', sub: 'lifecycle', actor: 'admin', sev: 'low' },
+    tenant_admin_granted:            { cat: 'tenant', sub: 'members', actor: 'admin', sev: 'high' },
+    tenant_member_banned:            { cat: 'tenant', sub: 'members', actor: 'admin', sev: 'high' },
+    tenant_member_unbanned:          { cat: 'tenant', sub: 'members', actor: 'admin', sev: 'med' },
+    tenant_branding_updated:         { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_logo_updated:             { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_comms_template_updated:   { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_comms_template_reset:     { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_refund_policy_updated:    { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'med' },
+    tenant_monthly_config:           { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_disabled_awards_updated:  { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_custom_award_created:     { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_custom_award_updated:     { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_custom_award_deleted:     { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'med' },
+    tenant_bank_details_updated:     { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'high' },
+    tenant_credit_adjusted:          { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'high' },
+    tenant_free_credit:              { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'med' },
+    tenant_payout_due_created:       { cat: 'tenant', sub: 'billing', actor: 'system', sev: 'low' },
+    tenant_payout_marked_paid:       { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'high' },
+    tenant_payout_disputed:          { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'med' },
+    tenant_withdraw_request_resolved: { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'high' },
+    invoices_generated:              { cat: 'tenant', sub: 'billing', actor: 'system', sev: 'low' },
+    invoice_issued:                  { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'med' },
+    invoice_marked_paid:             { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'high' },
+    invoice_voided:                  { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'med' },
+    invoice_line_item_added:         { cat: 'tenant', sub: 'billing', actor: 'admin', sev: 'low' },
+    tenant_player_alias:             { cat: 'tenant', sub: 'player_admin', actor: 'admin', sev: 'low' },
+    tenant_player_ban:               { cat: 'tenant', sub: 'player_admin', actor: 'admin', sev: 'high' },
+    tenant_player_unban:             { cat: 'tenant', sub: 'player_admin', actor: 'admin', sev: 'med' },
+    tenant_player_points:            { cat: 'tenant', sub: 'player_admin', actor: 'admin', sev: 'med' },
+    tenant_player_pwreset:           { cat: 'tenant', sub: 'player_admin', actor: 'admin', sev: 'high' },
+    tenant_player_refund:            { cat: 'tenant', sub: 'player_admin', actor: 'admin', sev: 'high' },
+
+    // ─── ORGANISER (FA acquisition) (FIX-425) ──────────────────────────────
+    organiser_granted:               { cat: 'organiser', sub: 'lifecycle', actor: 'admin', sev: 'high' },
+    organiser_revoked:               { cat: 'organiser', sub: 'lifecycle', actor: 'admin', sev: 'high' },
+    organiser_allowance_updated:     { cat: 'organiser', sub: 'lifecycle', actor: 'admin', sev: 'med' },
+    organiser_tcs_accepted:          { cat: 'organiser', sub: 'lifecycle', actor: 'player', sev: 'low' },
+    verified_organiser_override:     { cat: 'organiser', sub: 'override', actor: 'admin', sev: 'high' },
+
+    // ─── LEAGUE / BLOCK N (FIX-425) ────────────────────────────────────────
+    league_created:                  { cat: 'league', sub: 'lifecycle', actor: 'admin', sev: 'med' },
+    league_teams_created:            { cat: 'league', sub: 'lifecycle', actor: 'admin', sev: 'med' },
+    league_fixtures_generated:       { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'med' },
+    league_fixture_postponed:        { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'med' },
+    league_score_confirmed:          { cat: 'league', sub: 'scores', actor: 'admin', sev: 'med' },
+    league_score_reopened:           { cat: 'league', sub: 'scores', actor: 'admin', sev: 'med' },
+    league_share_paid:               { cat: 'league', sub: 'payouts', actor: 'admin', sev: 'high' },
+    league_team_dropped_cancel:      { cat: 'league', sub: 'teams', actor: 'admin', sev: 'med' },
+    league_team_dropped_reshuffle:   { cat: 'league', sub: 'teams', actor: 'admin', sev: 'med' },
+    league_team_replaced:            { cat: 'league', sub: 'teams', actor: 'admin', sev: 'med' },
+
+    // ─── VENUE / FAQ / SHOP / RATING / CREDITS / PRIVACY / MISC (FIX-425) ───
+    venue_verified:                  { cat: 'ops', sub: 'venue', actor: 'admin', sev: 'med' },
+    venue_unverified:                { cat: 'ops', sub: 'venue', actor: 'admin', sev: 'med' },
+    venue_verification_requested:    { cat: 'ops', sub: 'venue', actor: 'player', sev: 'low' },
+    venue_duplicated:                { cat: 'ops', sub: 'venue', actor: 'admin', sev: 'low' },
+    faq_created:                     { cat: 'ops', sub: 'faq', actor: 'admin', sev: 'low' },
+    faq_updated:                     { cat: 'ops', sub: 'faq', actor: 'admin', sev: 'low' },
+    faq_deleted:                     { cat: 'ops', sub: 'faq', actor: 'admin', sev: 'med' },
+    faq_unanswered_resolved:         { cat: 'ops', sub: 'faq', actor: 'admin', sev: 'low' },
+    queue_task_reopened:             { cat: 'ops', sub: 'tasks', actor: 'admin', sev: 'low' },
+    raf_config:                      { cat: 'ops', sub: 'settings', actor: 'admin', sev: 'low' },
+    shop_order_placed:               { cat: 'shop', sub: 'order_placed', actor: 'player', sev: 'low' },
+    shop_order_cancelled:            { cat: 'shop', sub: 'cancelled', actor: 'player', sev: 'med' },
+    shop_squad_claimed:              { cat: 'shop', sub: 'squad_claimed', actor: 'player', sev: 'low' },
+    rating_feedback_pairs_requested: { cat: 'feedback', sub: 'pairs_requested', actor: 'player', sev: 'low' },
+    rating_recalc_forced:            { cat: 'rating', sub: 'auto_recalc', actor: 'admin', sev: 'low' },
+    rating_vote_deleted:             { cat: 'feedback', sub: 'vote_deleted', actor: 'admin', sev: 'med' },
+    suspicion_cleared:               { cat: 'rating', sub: 'suspicion_cleared', actor: 'admin', sev: 'med' },
+    finance_cost_edit:               { cat: 'credits', sub: 'admin_moves', actor: 'admin', sev: 'med' },
+    finance_payment_edit:            { cat: 'credits', sub: 'admin_moves', actor: 'admin', sev: 'high' },
+    wonderful_resolve_by_order_id:   { cat: 'credits', sub: 'payment', actor: 'system', sev: 'low' },
+    dsar_export_admin:               { cat: 'account', sub: 'privacy', actor: 'admin', sev: 'high' },
+    dsar_export_self:                { cat: 'account', sub: 'privacy', actor: 'player', sev: 'med' },
+    player_tcs_accepted:             { cat: 'account', sub: 'profile', actor: 'player', sev: 'low' },
+    player_signup_with_tenant:       { cat: 'account', sub: 'signup_attribution', actor: 'player', sev: 'med' },
+    admin_rsvp_on_behalf:            { cat: 'participation', sub: 'joined', actor: 'admin', sev: 'med' },
+    guest_invite_claimed:            { cat: 'participation', sub: 'joined', actor: 'player', sev: 'low' },
+
+    // ─── SYNTHETIC FEED-ONLY ACTIONS (FIX-426) ─────────────────────────────
+    award_vote:                      { cat: 'results', sub: 'awards', actor: 'player', sev: 'low' },
+    comms_email_sent:                { cat: 'comms', sub: 'campaigns', actor: 'system', sev: 'low' },
+    comms_email_failed:              { cat: 'comms', sub: 'campaigns', actor: 'system', sev: 'med' },
+    comms_claimed:                   { cat: 'comms', sub: 'campaigns', actor: 'player', sev: 'low' },
+    team_gen_constraint_relaxed:     { cat: 'ops', sub: 'teams', actor: 'system', sev: 'med' },
+    team_gen_beef5_widened:          { cat: 'ops', sub: 'teams', actor: 'system', sev: 'low' },
+
 };
 
 // Lookup an audit tag for an action code. Falls back to a generic admin/med tag
@@ -4064,8 +4325,8 @@ function _deriveSignupStats(signupPositions, signupPrimary, signupLevel, signupY
 //      game completion and after every applied recalibration. Sets
 //      players.ovr_suspicion to one of:
 //        null                            — normal
-//        'low_winrate'                   — < 20% w/ ≥3 games OR < 33% w/ ≥10
-//        'high_winrate'                  — > 80% w/ ≥3 games OR > 67% w/ ≥10
+//        'low_winrate'                   — < 30% w/ ≥3 games OR < 40% w/ ≥10  (FIX-412 relaxed)
+//        'high_winrate'                  — > 70% w/ ≥3 games OR > 60% w/ ≥10  (FIX-412 relaxed)
 //        'low_winrate_carrier_inferred'  — flagged by carrier inference
 //        'high_winrate_carrier_inferred' — symmetric for over-performing
 //
@@ -4124,12 +4385,14 @@ async function _recomputeOvrSuspicion(playerId) {
 
         let newFlag = null;
         if (appearances >= 10) {
-            if (effWinPct < 33) newFlag = 'low_winrate';
-            else if (effWinPct > 67) newFlag = 'high_winrate';
+            // FIX-412 (broaden A): relaxed from <33/>67 to widen the flagged
+            // pool so more players become eligible subjects for comparison.
+            if (effWinPct < 40) newFlag = 'low_winrate';
+            else if (effWinPct > 60) newFlag = 'high_winrate';
         } else {
-            // 3..9 appearances — tighter band
-            if (effWinPct < 20) newFlag = 'low_winrate';
-            else if (effWinPct > 80) newFlag = 'high_winrate';
+            // 3..9 appearances — relaxed from <20/>80 to <30/>70.
+            if (effWinPct < 30) newFlag = 'low_winrate';
+            else if (effWinPct > 70) newFlag = 'high_winrate';
         }
 
         // Honour cooldown — won't re-flag in same direction until cooldown clears.
@@ -5502,8 +5765,8 @@ app.post('/api/auth/register', async (req, res) => {
         // never block signup on a bad invite link.
         const _tenantShortIdRaw = req.body.tenant_short_id || req.body.tenantShortId || null;
         let tenantShortId = null;
-        if (typeof _tenantShortIdRaw === 'string' && /^\d{5}$/.test(_tenantShortIdRaw.trim())) {
-            tenantShortId = _tenantShortIdRaw.trim();
+        if (isValidTenantShortId(_tenantShortIdRaw)) {
+            tenantShortId = String(_tenantShortIdRaw).trim();
         }
         // FIX-243: When a cold visitor clicked a specific game tile on
         // games.html, that tile's game_url was stashed in sessionStorage and
@@ -18577,7 +18840,20 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         let _blueTeam_snapshot = null;              // ditto
         let _relaxationsApplied_outer = [];         // ditto
 
+        // FIX-422 (audit): shared request-level time budget for the super_pair search.
+        // ONE deadline across the whole request so multi-mode (N slots) can't stack
+        // N separate caps. Generous — only the admin generates teams and can wait —
+        // but still bounded so the HTTP request can't hang past the platform's
+        // request timeout. Truly long runs would need a background job.
+        const _GEN_TIME_BUDGET_MS = 25000;
+        let _genDeadline = Date.now() + _GEN_TIME_BUDGET_MS;
+
         async function _runOptimiserOnce() {
+            // FIX-422 (audit): give each call a slice of the shared budget so multi-mode
+            // (N sequential slots) can't exceed the total request budget. Standard/regen = full.
+            const _genSlots = (_genMode === 'multi' && Array.isArray(_multiSlotTemplates) && _multiSlotTemplates.length > 0)
+                ? _multiSlotTemplates.length : 1;
+            _genDeadline = Date.now() + Math.floor(_GEN_TIME_BUDGET_MS / _genSlots);
             // FIX-220: Reset all per-run mutable state to fresh copies of the
             // immutable inputs. Standard mode runs this once (behaviour
             // identical to pre-FIX-220). Multi mode runs it N times — the
@@ -18690,7 +18966,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 placedUnitIdx.add(i);
                 pickHigh = !pickHigh;
             }
-        } else if (_strategy === 'pair_avoid_priority') {
+        } else if (_strategy === 'pair_avoid_priority' || _strategy === 'super_pair') {
             // Place units with active pair/avoid prefs first, then fill rest.
             // For each unit, count how many of its members have active prefs.
             const prefCount = (u) => {
@@ -19006,6 +19282,56 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             return false;
         }
 
+        // ── FIX-422: SUPER PAIR strategy ────────────────────────────────────
+        // Lexicographic objective in GAFFA's confirmed order. Each tier only
+        // breaks ties of the tiers above it, so a lower tier is NEVER improved
+        // at the cost of a higher one:
+        //   1 beef5 broken            (hard 0)
+        //   2 overall gap over buffer (hard 0)
+        //   3 GK split violation      (hard 0 — keepers must not stack 2-on-0)
+        //   4 defensive OUTER-CAP breach (hard 0 — balance can't blow past wide band)
+        //   5 pairs broken            (MAXIMISE — the goal)
+        //   6 #soft-stats in relaxed band (min, below pairs → relax 1-2 of 3, not all 3)
+        //   7 avoids broken           (lowest)
+        //   8 fine total dissatisfaction (tiebreak)
+        const _SP_BANDS = { defCountTight: 1, defCountWide: 2, defSumTight: 3, defSumWide: 5, fitTight: 3, fitWide: 5 };
+        function _superPairVector(red, blue) {
+            const d = computeDissatisfaction(red, blue);
+            const overall = Math.max(0, d.overallGap - overallBuffer);
+            const redGK  = red.filter(isDedicatedGK).length;
+            const blueGK = blue.filter(isDedicatedGK).length;
+            const gkViolation = Math.max(0, Math.abs(redGK - blueGK) - 1);  // 1-0 ok, 2-1 ok, 2-0 violates
+            const capBreach =
+                Math.max(0, d.defenderGap - _SP_BANDS.defCountWide) +
+                Math.max(0, d.defSumGap   - _SP_BANDS.defSumWide) +
+                Math.max(0, d.fitSumGap   - _SP_BANDS.fitWide);
+            const pairsBroken = d.brokenB1 + d.brokenB2 + d.brokenB3 + d.brokenB4 + d.brokenMP + d.brokenOwP;
+            const relaxedCount =
+                (d.defenderGap > _SP_BANDS.defCountTight ? 1 : 0) +
+                (d.defSumGap   > _SP_BANDS.defSumTight   ? 1 : 0) +
+                (d.fitSumGap   > _SP_BANDS.fitTight      ? 1 : 0);
+            const avoidsBroken = d.brokenMA + d.brokenOwA;
+            return [d.beef5Broken, overall, gkViolation, capBreach, pairsBroken, relaxedCount, avoidsBroken, d.score];
+        }
+        function trySwapSuperPair(idxR, idxB) {
+            const candR = redTeam[idxR], candB = blueTeam[idxB];
+            if (!candR || !candB) return false;
+            if (candR.is_guest || candB.is_guest) return false;
+            if (beef5MemberIds.has(toStrId(candR.player_id))) return false;
+            if (beef5MemberIds.has(toStrId(candB.player_id))) return false;
+            const guestsR = guestGroups.get(candR.player_id) || [];
+            const guestsB = guestGroups.get(candB.player_id) || [];
+            const strip = (team, mvs) => team.filter(pp => !mvs.some(m => toStrId(m.player_id) === toStrId(pp.player_id)));
+            const nr = strip(redTeam.slice(),  [candR, ...guestsR]); nr.push(candB, ...guestsB);
+            const nb = strip(blueTeam.slice(), [candB, ...guestsB]); nb.push(candR, ...guestsR);
+            if (_vecLess(_superPairVector(nr, nb), _superPairVector(redTeam, blueTeam))) {
+                redTeam.length = 0;  redTeam.push(...nr);
+                blueTeam.length = 0; blueTeam.push(...nb);
+                return true;
+            }
+            return false;
+        }
+
         // FIX-220 R16: Single-swap hill-climb, 50 attempts. Strategy decides
         // which acceptance criterion to use.
         // R16 audit-5: legacy thresholdsMet() only checks overall/defender/
@@ -19026,16 +19352,156 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
             // v = [overall, defender, slot3, def_sum, fit_sum, score]
             return v[2] === 0;
         }
-        for (let attempt = 0; attempt < 50; attempt++) {
-            let improved = false;
-            outer:
-            for (let i = 0; i < redTeam.length; i++) {
-                for (let j = 0; j < blueTeam.length; j++) {
-                    if (_useSwapFn(i, j)) { improved = true; break outer; }
-                }
+        // ── FIX-422: EXPERIMENTAL strategy — rating-scale probe ─────────────
+        // "Free licence to make the teams that teach us the most about bigger
+        // rating gaps." Keeps OVR sums fair (a real test) + GK split + beef5
+        // (playability/social); otherwise IGNORES pairs/avoids/defender/fitness
+        // and MAXIMISES the rating-gap structure (top-player gap + variance
+        // spread) — concentrate the standout vs a balanced collective. The
+        // post-game rating feedback then calibrates whether the gaps are right.
+        function _experimentalVector(red, blue) {
+            const d = computeDissatisfaction(red, blue);
+            const ovr = Math.max(0, d.overallGap - overallBuffer);          // sums stay fair
+            const redGK = red.filter(isDedicatedGK).length;
+            const blueGK = blue.filter(isDedicatedGK).length;
+            const gk = Math.max(0, Math.abs(redGK - blueGK) - 1);           // keepers split
+            const topGap  = Math.abs(_fix276MaxOvr(red) - _fix276MaxOvr(blue));
+            const varDiff = Math.abs(_fix276PopVariance(red.map(p => Number(p.overall_rating) || 0))
+                                   - _fix276PopVariance(blue.map(p => Number(p.overall_rating) || 0)));
+            const probe = -(topGap + varDiff);                              // minimise neg = MAXIMISE the probe
+            return [d.beef5Broken, ovr, gk, probe, d.score];
+        }
+        function trySwapExperimental(idxR, idxB) {
+            const candR = redTeam[idxR], candB = blueTeam[idxB];
+            if (!candR || !candB) return false;
+            if (candR.is_guest || candB.is_guest) return false;
+            if (beef5MemberIds.has(toStrId(candR.player_id))) return false;
+            if (beef5MemberIds.has(toStrId(candB.player_id))) return false;
+            const guestsR = guestGroups.get(candR.player_id) || [];
+            const guestsB = guestGroups.get(candB.player_id) || [];
+            const strip = (team, mvs) => team.filter(pp => !mvs.some(m => toStrId(m.player_id) === toStrId(pp.player_id)));
+            const nr = strip(redTeam.slice(),  [candR, ...guestsR]); nr.push(candB, ...guestsB);
+            const nb = strip(blueTeam.slice(), [candB, ...guestsB]); nb.push(candR, ...guestsR);
+            if (_vecLess(_experimentalVector(nr, nb), _experimentalVector(redTeam, blueTeam))) {
+                redTeam.length = 0;  redTeam.push(...nr);
+                blueTeam.length = 0; blueTeam.push(...nb);
+                return true;
             }
-            if (!improved) break;
-            if (_thresholdsMetForStrategy(redTeam, blueTeam)) break;
+            return false;
+        }
+
+        if (_strategy === 'super_pair') {
+            // FIX-422: multi-restart hill-climb. Hill-climb to a local optimum
+            // under the lexicographic _superPairVector; if any HARD tier or
+            // pairs remain broken, perturb (a few random hard-safe swaps) and
+            // re-climb, keeping the lex-best. Escapes the local optima that
+            // trapped the single-swap greedy and let Phase 8 eat pairs.
+            const _spClimb = () => {
+                for (let attempt = 0; attempt < 300; attempt++) {
+                    if (Date.now() > _genDeadline) break;
+                    let improved = false;
+                    spOuter:
+                    for (let i = 0; i < redTeam.length; i++)
+                        for (let j = 0; j < blueTeam.length; j++)
+                            if (trySwapSuperPair(i, j)) { improved = true; break spOuter; }
+                    if (!improved) break;
+                }
+            };
+            const _spSnap = () => ({ r: redTeam.slice(), b: blueTeam.slice() });
+            const _spRestore = (snap) => {
+                redTeam.length = 0;  redTeam.push(...snap.r);
+                blueTeam.length = 0; blueTeam.push(...snap.b);
+            };
+            const _spPerturb = () => {
+                const tries = 3 + Math.floor(Math.random() * 4);
+                for (let k = 0; k < tries; k++) {
+                    const i = Math.floor(Math.random() * redTeam.length);
+                    const j = Math.floor(Math.random() * blueTeam.length);
+                    const cR = redTeam[i], cB = blueTeam[j];
+                    if (!cR || !cB || cR.is_guest || cB.is_guest) continue;
+                    if (beef5MemberIds.has(toStrId(cR.player_id)) || beef5MemberIds.has(toStrId(cB.player_id))) continue;
+                    const gR = guestGroups.get(cR.player_id) || [];
+                    const gB = guestGroups.get(cB.player_id) || [];
+                    const strip = (t, mv) => t.filter(pp => !mv.some(m => toStrId(m.player_id) === toStrId(pp.player_id)));
+                    const nr = strip(redTeam.slice(),  [cR, ...gR]); nr.push(cB, ...gB);
+                    const nb = strip(blueTeam.slice(), [cB, ...gB]); nb.push(cR, ...gR);
+                    redTeam.length = 0;  redTeam.push(...nr);
+                    blueTeam.length = 0; blueTeam.push(...nb);
+                }
+            };
+            _spClimb();
+            let _spBest = _spSnap();
+            let _spBestVec = _superPairVector(_spBest.r, _spBest.b);
+            const _SP_RESTART_BUDGET = 5000;  // effectively unbounded — the shared _genDeadline governs
+            for (let restart = 0; restart < _SP_RESTART_BUDGET; restart++) {
+                // Stop early once all HARD tiers (1-4) AND pairs (5) are satisfied.
+                if (_spBestVec[0] === 0 && _spBestVec[1] === 0 && _spBestVec[2] === 0 && _spBestVec[3] === 0 && _spBestVec[4] === 0) break;
+                if (Date.now() > _genDeadline) break;
+                _spRestore(_spBest);
+                _spPerturb();
+                _spClimb();
+                const v = _superPairVector(redTeam, blueTeam);
+                if (_vecLess(v, _spBestVec)) { _spBest = _spSnap(); _spBestVec = v; }
+                else { _spRestore(_spBest); }
+            }
+            _spRestore(_spBest);
+        } else if (_strategy === 'experimental') {
+            // FIX-422: same multi-restart engine, experimental objective, full time budget.
+            const _exClimb = () => {
+                for (let attempt = 0; attempt < 300; attempt++) {
+                    if (Date.now() > _genDeadline) break;
+                    let improved = false;
+                    exOuter:
+                    for (let i = 0; i < redTeam.length; i++)
+                        for (let j = 0; j < blueTeam.length; j++)
+                            if (trySwapExperimental(i, j)) { improved = true; break exOuter; }
+                    if (!improved) break;
+                }
+            };
+            const _exSnap = () => ({ r: redTeam.slice(), b: blueTeam.slice() });
+            const _exRestore = (snap) => { redTeam.length = 0; redTeam.push(...snap.r); blueTeam.length = 0; blueTeam.push(...snap.b); };
+            const _exPerturb = () => {
+                const tries = 3 + Math.floor(Math.random() * 4);
+                for (let k = 0; k < tries; k++) {
+                    const i = Math.floor(Math.random() * redTeam.length);
+                    const j = Math.floor(Math.random() * blueTeam.length);
+                    const cR = redTeam[i], cB = blueTeam[j];
+                    if (!cR || !cB || cR.is_guest || cB.is_guest) continue;
+                    if (beef5MemberIds.has(toStrId(cR.player_id)) || beef5MemberIds.has(toStrId(cB.player_id))) continue;
+                    const gR = guestGroups.get(cR.player_id) || [];
+                    const gB = guestGroups.get(cB.player_id) || [];
+                    const strip = (t, mv) => t.filter(pp => !mv.some(m => toStrId(m.player_id) === toStrId(pp.player_id)));
+                    const nr = strip(redTeam.slice(),  [cR, ...gR]); nr.push(cB, ...gB);
+                    const nb = strip(blueTeam.slice(), [cB, ...gB]); nb.push(cR, ...gR);
+                    redTeam.length = 0; redTeam.push(...nr);
+                    blueTeam.length = 0; blueTeam.push(...nb);
+                }
+            };
+            _exClimb();
+            let _exBest = _exSnap();
+            let _exBestVec = _experimentalVector(_exBest.r, _exBest.b);
+            for (let restart = 0; restart < 5000; restart++) {
+                if (Date.now() > _genDeadline) break;   // runs the full budget — "take as much time as you want"
+                _exRestore(_exBest);
+                _exPerturb();
+                _exClimb();
+                const v = _experimentalVector(redTeam, blueTeam);
+                if (_vecLess(v, _exBestVec)) { _exBest = _exSnap(); _exBestVec = v; }
+                else { _exRestore(_exBest); }
+            }
+            _exRestore(_exBest);
+        } else {
+            for (let attempt = 0; attempt < 50; attempt++) {
+                let improved = false;
+                outer:
+                for (let i = 0; i < redTeam.length; i++) {
+                    for (let j = 0; j < blueTeam.length; j++) {
+                        if (_useSwapFn(i, j)) { improved = true; break outer; }
+                    }
+                }
+                if (!improved) break;
+                if (_thresholdsMetForStrategy(redTeam, blueTeam)) break;
+            }
         }
 
         // ── Phase 8: Relax loop ──
@@ -19071,8 +19537,10 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 'team_gen_constraint_relaxed', JSON.stringify(entry)).catch(() => {}));
         }
 
+        // FIX-422: super_pair never relaxes (drops) pairs/avoids — pairs are the
+        // objective and the soft stats have wide caps, so balance can't blow out.
         outerRelax:
-        for (const tier of relaxTiers) {
+        for (const tier of ((_strategy === 'super_pair' || _strategy === 'experimental') ? [] : relaxTiers)) {
             while (tier.arr.length > 0) {
                 if (_thresholdsMetForStrategy(redTeam, blueTeam)) break outerRelax;
                 const idx = Math.floor(Math.random() * tier.arr.length);
@@ -19096,7 +19564,11 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
         }
 
         // Beef 5 buffer widening fallback (if still not met but would be with wider buffers)
-        if (!thresholdsMet(redTeam, blueTeam) && thresholdsMet(redTeam, blueTeam, true)) {
+        // FIX-422: suppress for super_pair/experimental — their soft stats intentionally
+        // sit in the relaxed band, so the legacy thresholdsMet check would emit a spurious
+        // "widened" warning even though nothing went wrong.
+        if (_strategy !== 'super_pair' && _strategy !== 'experimental'
+            && !thresholdsMet(redTeam, blueTeam) && thresholdsMet(redTeam, blueTeam, true)) {
             warnings.push('Defence/fitness sums widened to keep Beef 5 partners together');
             setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId,
                 'team_gen_beef5_widened', JSON.stringify({ widened_to: 5 })).catch(() => {}));
@@ -19125,7 +19597,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 const _l4FlagRes = await pool.query(
                     `SELECT COALESCE(experiment_mode, false) AS em
                        FROM game_series WHERE id = $1`, [_l4SeriesId]);
-                if (_l4FlagRes.rows[0]?.em === true) {
+                if (_l4FlagRes.rows[0]?.em === true && _strategy !== 'super_pair' && _strategy !== 'experimental') {  // FIX-422: L4 skipped for super_pair (no undo) + experimental (already diversifies)
                     // Find most-recent completed game in the series (≠ this one).
                     const _l4PrevRes = await pool.query(`
                         SELECT g.id FROM games g
@@ -22650,80 +23122,19 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
         //   - tenant_payouts_due table missing (pre-FIX-334 migration)
         setImmediate(async () => {
             try {
-                const gRes = await pool.query(
-                    `SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.tenant_id,
-                            t.platform_fee_pence, t.mixed_listing_fee_pence
-                       FROM games g
-                       LEFT JOIN tenants t ON t.id = g.tenant_id
-                      WHERE g.id = $1`,
-                    [gameId]
-                );
-                if (gRes.rows.length === 0) return;
-                const g = gRes.rows[0];
-
-                // Skip TF Coventry (Mitchell owns it; no settlement to self)
-                if (!g.tenant_id || g.tenant_id === TF_COVENTRY_TENANT_ID) return;
-
-                // Mixed-listing detection (Q6): cost_per_player = 0 → mixed mode
-                const isMixedListing = parseInt(g.cost_per_player, 10) === 0;
-                const platformFee = isMixedListing
-                    ? parseInt(g.mixed_listing_fee_pence || 5, 10)
-                    : parseInt(g.platform_fee_pence || 12, 10);
-                const feeMode = isMixedListing ? 'mixed' : 'full';
-
-                // Sum gross + count paid players from registrations
-                // (amount_paid is in pence; backups who weren't promoted got
-                // refunded in the prior setImmediate handler, but their rows
-                // may or may not be flagged yet — to be safe we count only
-                // status='confirmed' rows with amount_paid > 0)
-                const pRes = await pool.query(
-                    `SELECT COUNT(*)::int AS n,
-                            COALESCE(SUM(amount_paid), 0)::bigint AS gross
-                       FROM registrations
-                      WHERE game_id = $1
-                        AND status = 'confirmed'
-                        AND amount_paid > 0`,
-                    [gameId]
-                );
-                const paidCount = pRes.rows[0].n;
-                const gross     = parseInt(pRes.rows[0].gross, 10);
-                if (paidCount === 0) return;  // free game, nothing to settle
-
-                const totalFee = paidCount * platformFee;
-                const payable  = Math.max(0, gross - totalFee);
-
-                await pool.query(
-                    `INSERT INTO tenant_payouts_due
-                        (tenant_id, game_id, game_url, game_date,
-                         gross_pence, paid_player_count,
-                         platform_fee_pence, fee_mode, total_fee_pence, payable_pence,
-                         status)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
-                     ON CONFLICT (game_id) DO UPDATE
-                        SET gross_pence       = EXCLUDED.gross_pence,
-                            paid_player_count = EXCLUDED.paid_player_count,
-                            platform_fee_pence = EXCLUDED.platform_fee_pence,
-                            fee_mode          = EXCLUDED.fee_mode,
-                            total_fee_pence   = EXCLUDED.total_fee_pence,
-                            payable_pence     = EXCLUDED.payable_pence,
-                            updated_at        = NOW()
-                      WHERE tenant_payouts_due.status = 'pending'`,
-                    [g.tenant_id, g.id, g.game_url, g.game_date,
-                     gross, paidCount, platformFee, feeMode, totalFee, payable]
-                );
-
-                // Audit log for Mitchell's records
-                try {
-                    await auditLog(pool, null, 'tenant_payout_due_created', g.tenant_id,
-                        `Game ${g.game_url}: £${(payable / 100).toFixed(2)} owed to tenant (${paidCount} paid × ${feeMode} fee ${platformFee}p)`,
-                        g.tenant_id);
-                } catch (_) { /* audit table missing */ }
-            } catch (e) {
-                if (e && (e.code === '42P01' || e.code === '42703')) {
-                    // tenant_payouts_due table missing — pre-FIX-334 deploy. Skip silently.
-                    return;
+                // FIX-423: payout math factored into recomputeGamePayout (unit-correct,
+                // pounds->pence). Same helper the finance edit panel calls, so a
+                // completed game and an edited game always agree.
+                const r = await recomputeGamePayout(pool, gameId);
+                if (r && r.updated && !r.zeroed && r.payable != null) {
+                    try {
+                        await auditLog(pool, null, 'tenant_payout_due_created', r.tenantId,
+                            `Game ${r.gameUrl}: \u00A3${(r.payable / 100).toFixed(2)} owed to tenant (${r.paidCount} paid \u00D7 ${r.feeMode} fee ${r.platformFee}p)`,
+                            r.tenantId);
+                    } catch (_) { /* audit table missing */ }
                 }
-                console.error('[FIX-334 payout-due computation] failed for game ' + gameId + ':', e.message);
+            } catch (e) {
+                console.error('[FIX-334/423 payout-due computation] failed for game ' + gameId + ':', e.message);
             }
         });
 
@@ -25563,6 +25974,42 @@ const AWARD_MIN_VOTES = { goalscorer: 2, assist_king: 2 };
 // Award is still recorded in game_awards and badge still granted; just no notification spam.
 const SILENT_AWARDS = new Set(['invisible_man','lost']);
 
+// FIX-421: effective per-tenant award catalog — used by voting, grant, and the game page.
+// = the standard 20 minus the tenant's disabled set, PLUS the tenant's active custom awards.
+// Returns keys + per-key min-vote thresholds + custom metadata. tenantId null
+// (TF Coventry legacy games) -> full standard set, no custom. Table/column-missing safe.
+async function getTenantAwardConfig(tenantId) {
+    let disabled = new Set();
+    let custom = [];
+    if (tenantId) {
+        try {
+            const t = await pool.query(`SELECT disabled_awards FROM tenants WHERE id = $1 LIMIT 1`, [tenantId]);
+            if (t.rows[0] && Array.isArray(t.rows[0].disabled_awards)) disabled = new Set(t.rows[0].disabled_awards);
+        } catch (e) { if (e && e.code !== '42703') throw e; }
+        try {
+            const c = await pool.query(
+                `SELECT award_key, label, emoji, polarity, min_votes
+                   FROM tenant_custom_awards
+                  WHERE tenant_id = $1 AND active = TRUE
+                  ORDER BY created_at ASC`,
+                [tenantId]
+            );
+            custom = c.rows;
+        } catch (e) { if (e && e.code !== '42P01') throw e; } // table missing pre-migration
+    }
+    // motm is never disable-able; everything else honours the disabled set.
+    const standardKeys = AWARD_TYPES.filter(k => k === 'motm' || !disabled.has(k));
+    const minVotes = {};
+    for (const k of standardKeys) minVotes[k] = (AWARD_MIN_VOTES[k] ?? MIN_VOTES_REQUIRED);
+    for (const c of custom) minVotes[c.award_key] = c.min_votes;
+    return {
+        disabled, custom, standardKeys,
+        allKeys: standardKeys.concat(custom.map(c => c.award_key)),
+        customKeys: new Set(custom.map(c => c.award_key)),
+        minVotes,
+    };
+}
+
 // Send email to a player for an award win — fire-and-forget, never throws
 async function sendAwardEmail(playerId, awardType, extraData = {}) {
     try {
@@ -25776,21 +26223,8 @@ async function closeAwards(gameId) {
         // awards via tenants.disabled_awards JSONB array of award_type strings.
         // Pre-FIX-334 deploys: empty Set (all awards enabled). TF Coventry:
         // empty by default (Mitchell wants all 17 awards).
-        let disabledAwards = new Set();
-        if (game.tenant_id) {
-            try {
-                const tRes = await pool.query(
-                    `SELECT disabled_awards FROM tenants WHERE id = $1 LIMIT 1`,
-                    [game.tenant_id]
-                );
-                if (tRes.rows.length > 0 && Array.isArray(tRes.rows[0].disabled_awards)) {
-                    disabledAwards = new Set(tRes.rows[0].disabled_awards);
-                }
-            } catch (e) {
-                // disabled_awards column missing pre-migration — treat as empty
-                if (e && e.code !== '42703') throw e;
-            }
-        }
+        // FIX-421: effective award set for this game's tenant (standard minus disabled + active custom).
+        const _awardCfg = await getTenantAwardConfig(game.tenant_id);
 
         // FIX-148: awards_open=false moved to AFTER the loop. Was here previously,
         // which meant if the grant loop failed partway, awards_open was already false
@@ -25816,15 +26250,15 @@ async function closeAwards(gameId) {
 
         const confirmedWinners = [];
 
-        for (const awardType of AWARD_TYPES) {
-            // FIX-334 (ROW Day 26): per-award toggle — skip if tenant disabled this award
-            if (disabledAwards.has(awardType)) continue;
+        for (const awardType of _awardCfg.allKeys) {
+            // FIX-421: iterate the tenant's effective set (standard minus disabled + custom).
+            // Custom awards naturally skip badges/emails/push below (not in those maps).
 
             const nominees = (votesByAward[awardType] || []).sort((a, b) => b.votes - a.votes);
             if (nominees.length === 0) continue;
 
             const maxVotes = nominees[0].votes;
-            const minVotes = AWARD_MIN_VOTES[awardType] ?? MIN_VOTES_REQUIRED;
+            const minVotes = _awardCfg.minVotes[awardType] ?? MIN_VOTES_REQUIRED;
             if (awardType !== 'motm' && maxVotes < minVotes) continue;
 
             // MOTM: only tied top-vote-getters win (fractional split)
@@ -26483,7 +26917,7 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
         const playerId = req.user.playerId;
 
         const gameResult = await pool.query(
-            'SELECT awards_open, awards_close_at, game_status FROM games WHERE id = $1',
+            'SELECT awards_open, awards_close_at, game_status, tenant_id FROM games WHERE id = $1',
             [gameId]
         );
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
@@ -26543,6 +26977,9 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
             }
         }
 
+        // FIX-421: tell the client which awards this tenant offers (hide disabled, surface custom).
+        const _awardCfg = await getTenantAwardConfig(game.tenant_id);
+
         res.json({
             awardsOpen: game.awards_open,
             awardsCloseAt: game.awards_close_at,
@@ -26553,6 +26990,8 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
             playerNames,
             myVotes: myVotes.map(v => ({ awardType: v.award_type, nomineeId: v.nominee_player_id })),
             confirmedAwards: awardsResult.rows,
+            availableAwards: _awardCfg.allKeys,
+            customAwards: _awardCfg.custom.map(c => ({ key: c.award_key, label: c.label, emoji: c.emoji, polarity: c.polarity, min_votes: c.min_votes })),
         });
     } catch (error) {
         console.error('GET awards error:', error);
@@ -26572,27 +27011,32 @@ app.post('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) =
             return res.status(403).json({ error: 'Guests cannot vote for awards' });
         }
 
-        // Validate award type
-        if (!AWARD_TYPES.includes(awardType)) {
-            return res.status(400).json({ error: 'Invalid award type' });
-        }
-
         // Validate nominee ID is a non-empty string
         if (!nomineePlayerId || typeof nomineePlayerId !== 'string') {
             return res.status(400).json({ error: 'Invalid nominee' });
         }
 
-        // Block self-nomination for positive awards
-        if (POSITIVE_AWARDS.includes(awardType) && nomineePlayerId === voterId) {
-            return res.status(400).json({ error: 'You cannot nominate yourself for this award' });
-        }
-
-        // Check awards are open
+        // Check awards are open (+ FIX-421: need tenant_id for the effective award set)
         const gameResult = await pool.query(
-            'SELECT awards_open, awards_close_at FROM games WHERE id = $1',
+            'SELECT awards_open, awards_close_at, tenant_id FROM games WHERE id = $1',
             [gameId]
         );
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+
+        // FIX-421: validate against the tenant's EFFECTIVE set (standard minus disabled + custom).
+        // Rejects disabled standard awards and unknown keys; accepts the tenant's custom keys.
+        const _voteCfg = await getTenantAwardConfig(gameResult.rows[0].tenant_id);
+        if (!_voteCfg.allKeys.includes(awardType)) {
+            return res.status(400).json({ error: 'Invalid award type' });
+        }
+
+        // Block self-nomination for positive awards (standard positives + custom polarity 'positive').
+        const _isPositiveAward = POSITIVE_AWARDS.includes(awardType)
+            || _voteCfg.custom.some(c => c.award_key === awardType && c.polarity === 'positive');
+        if (_isPositiveAward && nomineePlayerId === voterId) {
+            return res.status(400).json({ error: 'You cannot nominate yourself for this award' });
+        }
+
         if (!gameResult.rows[0].awards_open) {
             return res.status(400).json({ error: 'Award voting is not currently open for this game' });
         }
@@ -26669,7 +27113,7 @@ app.get('/api/public/game/:gameUrl/awards', async (req, res) => {
         const { gameUrl } = req.params;
 
         const gameResult = await pool.query(
-            'SELECT id, awards_open, awards_close_at, game_status FROM games WHERE game_url = $1',
+            'SELECT id, awards_open, awards_close_at, game_status, tenant_id FROM games WHERE game_url = $1',
             [gameUrl]
         );
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
@@ -26689,6 +27133,9 @@ app.get('/api/public/game/:gameUrl/awards', async (req, res) => {
             [game.id]
         );
 
+        // FIX-421: custom-award metadata so results pages can label/emoji tenant custom awards.
+        const _awardCfg = await getTenantAwardConfig(game.tenant_id);
+
         res.json({
             awardsOpen: game.awards_open,
             awardsCloseAt: game.awards_close_at,
@@ -26701,6 +27148,7 @@ app.get('/api/public/game/:gameUrl/awards', async (req, res) => {
                 playerId: a.player_id,
                 playerAlias: a.alias || a.full_name,
             })),
+            customAwards: _awardCfg.custom.map(c => ({ key: c.award_key, label: c.label, emoji: c.emoji, polarity: c.polarity, min_votes: c.min_votes })),
         });
     } catch (error) {
         console.error('GET public awards error:', error);
@@ -26726,6 +27174,24 @@ app.get('/api/players/:playerId/awards', authenticateToken, async (req, res) => 
              ORDER BY ga.created_at DESC`,
             [playerId]
         );
+
+        // FIX-421: resolve label/emoji for any tenant CUSTOM awards in the history, so the
+        // profile shows the organiser's name/emoji instead of the raw c_xxxx key. Table-safe.
+        const _customKeys = [...new Set(awardsResult.rows.map(r => r.award_type).filter(t => t && t.startsWith('c_')))];
+        if (_customKeys.length) {
+            try {
+                const cr = await pool.query(
+                    `SELECT award_key, label, emoji FROM tenant_custom_awards WHERE award_key = ANY($1)`,
+                    [_customKeys]
+                );
+                const cmap = {};
+                for (const row of cr.rows) cmap[row.award_key] = row;
+                for (const r of awardsResult.rows) {
+                    const c = cmap[r.award_type];
+                    if (c) { r.award_label = c.label; r.award_emoji = c.emoji; }
+                }
+            } catch (e) { if (e && e.code !== '42P01') throw e; }
+        }
 
         // Also get live streak
         const streakResult = await pool.query(
@@ -31700,31 +32166,14 @@ app.get('/api/admin/audit/feed', authenticateToken, requireAdmin, async (req, re
         return res.status(400).json({ error: 'Invalid before timestamp' });
     }
 
-    // Group → action filter map
-    // FIX-265: GROUP_ACTIONS allowlist extended for shop + feedback events.
-    // Each action string emitted from a server `auditLog(...)` call must appear
-    // in this allowlist for at least one group, otherwise the feed query
-    // (which JOINs audit_logs filtered by action IN (...)) won't return it.
-    const GROUP_ACTIONS = {
-        players:    ['player_created','player_updated','player_deleted','account_updated','stats_updated','tier_recalculated','badges_updated','badge_auto_awarded','badge_auto_removed'],
-        games:      ['game_created','game_confirmed','game_completed','game_locked','game_unlocked','teams_generated','teams_confirmed','teams_deleted','type_converted','team_gen_constraint_relaxed','team_gen_beef5_widened','series_recreated'],
-        finance:    ['balance_adjustment','wonderful_initiated','wonderful_credited'],
-        registrations: ['admin_player_added','admin_player_removed','guest_added','guest_removed','guest_stats_overridden','guest_stats_reset'],
-        referees:   ['ref_applied','ref_confirmed','ref_withdrawn','ref_unconfirmed','ref_review_received','ref_review_updated','ref_review_comment','ref_score_updated','ref_score_finalised','referee_invite_created'],
-        moderation: ['dm_reported','discipline_added','player_unbanned'],
-        admins:     ['admin_added','admin_removed','ref_admin_added'],
-        motm:       ['motm_voting_started','motm_vote','motm_finalized'],
-        awards:     ['award_vote'],
-        comms:      ['comms_campaign_sent','comms_email_sent','comms_email_failed','comms_claimed'], // FIX-104
-        // FIX-265: shop + feedback groups (extended with FIX-268a audit actions + FIX-268b/d additions)
-        shop:       ['shop_order_placed','shop_order_cancelled','shop_order_admin_cancelled','shop_status_changed','shop_squad_claimed'],
-        feedback:   ['rating_vote_cast','rating_vote_skipped','rating_vote_deleted','suspicion_cleared','rating_recalc_forced','rating_recalibrated_via_feedback','rating_recalibration_stalled','rating_reference_pushed','rating_suspicion_redirected','rating_feedback_pairs_requested'],
-        // FIX-277: admin action queue events.
-        injury:     ['injury_reported','injury_refund_approved','injury_refund_rejected'],
-        // FIX-276: team-balance calibration events.
-        calibration:['calibration_experiment_recorded','calibration_backfill_run','calibration_experiment_mode_toggled',
-                     'fine_tune_suggestion_engine_run','pair_suggestion_accepted','pair_suggestion_dismissed'],
-    };
+    // FIX-426: feed groups are DERIVED from AUDIT_TAG_TABLE (single source of truth),
+    // so the feed self-tracks the taxonomy instead of a hand-maintained allowlist that
+    // drifts every release. Synthetic feed-only actions (award_vote, comms_*) are tagged
+    // in the table above so they land in the right group here.
+    const GROUP_ACTIONS = {};
+    for (const [a, m] of Object.entries(AUDIT_TAG_TABLE)) {
+        (GROUP_ACTIONS[m.cat] = GROUP_ACTIONS[m.cat] || []).push(a);
+    }
 
     const allGroups = Object.keys(GROUP_ACTIONS);
     const filterActions = group && GROUP_ACTIONS[group] ? GROUP_ACTIONS[group] : null;
@@ -36798,7 +37247,8 @@ function _parseFinanceRange(req) {
 
 // Shared helper — fetches per-game finance rows for a date range.
 // Returns the same object shape that /api/admin/finance/games sends.
-async function _fetchFinanceGames(from, to) {
+async function _fetchFinanceGames(from, to, scope) {
+    const sc = _reportScopeSql(scope, 'g', 3);
     const queryFull = `
         WITH game_set AS (
             SELECT g.id, g.game_date, g.cost_per_player, g.pitch_cost, g.ref_pay,
@@ -36807,7 +37257,7 @@ async function _fetchFinanceGames(from, to) {
             FROM games g LEFT JOIN venues v ON v.id = g.venue_id
             WHERE g.game_status = 'completed'
               AND g.game_date >= $1::date
-              AND g.game_date < ($2::date + INTERVAL '1 day')
+              AND g.game_date < ($2::date + INTERVAL '1 day')${sc.clause}
         ),
         reg_agg AS (
             SELECT r.game_id,
@@ -36875,7 +37325,7 @@ async function _fetchFinanceGames(from, to) {
 
     let rows;
     try {
-        rows = (await pool.query(queryFull, [from, to])).rows;
+        rows = (await pool.query(queryFull, [from, to, ...sc.params])).rows;
     } catch (err) {
         // Pre-migration fallback — strip pitch_cost / pay_amount / dropped_no_refund references
         if (err.code === '42703' || err.code === '42P01') {
@@ -36899,10 +37349,10 @@ async function _fetchFinanceGames(from, to) {
                 FROM games g LEFT JOIN venues v ON v.id = g.venue_id
                 WHERE g.game_status = 'completed'
                   AND g.game_date >= $1::date
-                  AND g.game_date < ($2::date + INTERVAL '1 day')
+                  AND g.game_date < ($2::date + INTERVAL '1 day')${sc.clause}
                 ORDER BY g.game_date DESC
             `;
-            rows = (await pool.query(queryLite, [from, to])).rows;
+            rows = (await pool.query(queryLite, [from, to, ...sc.params])).rows;
         } else throw err;
     }
 
@@ -37001,10 +37451,10 @@ async function _fetchFinanceGames(from, to) {
     });
 }
 
-app.get('/api/admin/finance/games', authenticateToken, requireSuperAdmin, async (req, res) => {
+app.get('/api/admin/finance/games', authenticateToken, requireReportAccess, async (req, res) => {
     try {
         const { from, to } = _parseFinanceRange(req);
-        const games = await _fetchFinanceGames(from, to);
+        const games = await _fetchFinanceGames(from, to, req.reportScope);
         res.json({ from, to, count: games.length, games });
     } catch (error) {
         console.error('Finance games report error:', error);
@@ -37012,10 +37462,10 @@ app.get('/api/admin/finance/games', authenticateToken, requireSuperAdmin, async 
     }
 });
 
-app.get('/api/admin/finance/summary', authenticateToken, requireSuperAdmin, async (req, res) => {
+app.get('/api/admin/finance/summary', authenticateToken, requireReportAccess, async (req, res) => {
     try {
         const { from, to } = _parseFinanceRange(req);
-        const games = await _fetchFinanceGames(from, to);
+        const games = await _fetchFinanceGames(from, to, req.reportScope);
 
         const agg = {
             game_count:      games.length,
@@ -37071,9 +37521,259 @@ app.get('/api/admin/finance/summary', authenticateToken, requireSuperAdmin, asyn
     }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// FIX-423 — Editable finance panel (superadmin only). Surfaces pitch cost,
+// lets Mitchell add/edit venue (pitch) + ref cost, edit per-player payments,
+// and convert a real payment to free (relabel real->free, no refund). Every
+// edit is audited against the GAME (game_audit_log) and the PLAYER
+// (registration_events + audit_logs), and player-payment edits recompute the
+// tenant payout. Money/state path — RULE 5.
+// ════════════════════════════════════════════════════════════════════════════
 
-app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) => {
+// Editable detail for one game: costs + confirmed players + payout status.
+app.get('/api/admin/finance/games/:gameId/detail', authenticateToken, requireReportAccess, async (req, res) => {
+    if (req.user.role !== 'superadmin') return res.status(403).json({ error: 'Superadmin only' });
+    const { gameId } = req.params;
     try {
+        const gRes = await pool.query(
+            `SELECT g.id, g.game_url, g.game_date, g.format, g.cost_per_player,
+                    g.pitch_cost, g.ref_pay, g.tenant_id, v.name AS venue_name
+               FROM games g LEFT JOIN venues v ON v.id = g.venue_id
+              WHERE g.id = $1`,
+            [gameId]
+        );
+        if (gRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const g = gRes.rows[0];
+
+        const pRes = await pool.query(
+            `SELECT r.id AS registration_id, r.player_id,
+                    COALESCE(NULLIF(pl.full_name, ''), pl.alias, 'Player') AS player_name,
+                    COALESCE(r.amount_paid, 0)      AS amount_paid,
+                    COALESCE(r.amount_paid_free, 0) AS amount_paid_free,
+                    COALESCE(r.is_comped, false)    AS is_comped
+               FROM registrations r
+               LEFT JOIN players pl ON pl.id = r.player_id
+              WHERE r.game_id = $1 AND r.status = 'confirmed'
+              ORDER BY player_name ASC`,
+            [gameId]
+        );
+
+        // Payout status so the UI can warn that edits won't move an already-paid run.
+        let payout = null;
+        try {
+            const payRes = await pool.query(
+                `SELECT status, gross_pence, payable_pence FROM tenant_payouts_due WHERE game_id = $1`,
+                [gameId]
+            );
+            if (payRes.rows.length) payout = payRes.rows[0];
+        } catch (_) { /* tenant_payouts_due missing pre-FIX-334 */ }
+
+        res.json({
+            game: {
+                id: g.id, game_url: g.game_url, game_date: g.game_date, format: g.format,
+                venue_name: g.venue_name,
+                cost_per_player: parseFloat(g.cost_per_player || 0),
+                pitch_cost: g.pitch_cost != null ? parseFloat(g.pitch_cost) : null,
+                ref_pay:    g.ref_pay    != null ? parseFloat(g.ref_pay)    : null,
+                tenant_id: g.tenant_id
+            },
+            players: pRes.rows.map(r => ({
+                registration_id: r.registration_id,
+                player_id: r.player_id,
+                player_name: r.player_name,
+                amount_paid: parseFloat(r.amount_paid),
+                amount_paid_free: parseFloat(r.amount_paid_free),
+                is_comped: r.is_comped
+            })),
+            payout
+        });
+    } catch (error) {
+        console.error('Finance game detail error:', error);
+        res.status(500).json({ error: 'Failed to load game detail', detail: error.message });
+    }
+});
+
+// Edit pitch (venue) cost and/or ref cost. Only the fields provided are touched;
+// pass null to clear. Costs do NOT affect the tenant payout (payout = player
+// payments minus platform fee), so no recompute here — only revenue/profit shifts.
+app.patch('/api/admin/finance/games/:gameId/costs', authenticateToken, requireReportAccess, async (req, res) => {
+    if (req.user.role !== 'superadmin') return res.status(403).json({ error: 'Superadmin only' });
+    const { gameId } = req.params;
+    const body = req.body || {};
+    const norm = (v) => {
+        if (v === undefined) return { provided: false, value: null };
+        if (v === null || v === '')  return { provided: true, value: null };  // explicit clear
+        const n = parseFloat(v);
+        if (!isFinite(n) || n < 0) return { invalid: true };
+        return { provided: true, value: n };
+    };
+    const pc = norm(body.pitch_cost), rp = norm(body.ref_pay);
+    if (pc.invalid || rp.invalid) return res.status(400).json({ error: 'Costs must be non-negative numbers' });
+    if (!pc.provided && !rp.provided) return res.status(400).json({ error: 'Nothing to update' });
+    try {
+        const cur = await pool.query(`SELECT pitch_cost, ref_pay FROM games WHERE id = $1`, [gameId]);
+        if (cur.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const before = {
+            pitch_cost: cur.rows[0].pitch_cost != null ? parseFloat(cur.rows[0].pitch_cost) : null,
+            ref_pay:    cur.rows[0].ref_pay    != null ? parseFloat(cur.rows[0].ref_pay)    : null
+        };
+        const newPitch = pc.provided ? pc.value : before.pitch_cost;
+        const newRef   = rp.provided ? rp.value : before.ref_pay;
+        await pool.query(`UPDATE games SET pitch_cost = $1, ref_pay = $2 WHERE id = $3`,
+            [newPitch, newRef, gameId]);
+        await gameAuditLog(pool, gameId, req.user.playerId, 'finance_cost_edit',
+            JSON.stringify({ before, after: { pitch_cost: newPitch, ref_pay: newRef } }));
+        res.json({ ok: true, pitch_cost: newPitch, ref_pay: newRef });
+    } catch (error) {
+        console.error('Finance cost edit error:', error);
+        res.status(500).json({ error: 'Failed to update costs', detail: error.message });
+    }
+});
+
+// Edit one player's payment, or convert a real payment to free (relabel, no refund).
+// Body: { action:'set', amount_paid, amount_paid_free, is_comped? } | { action:'convert_to_free' }
+app.patch('/api/admin/finance/registrations/:registrationId/payment', authenticateToken, requireReportAccess, async (req, res) => {
+    if (req.user.role !== 'superadmin') return res.status(403).json({ error: 'Superadmin only' });
+    const { registrationId } = req.params;
+    const action = (req.body || {}).action;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const rRes = await client.query(
+            `SELECT r.id, r.game_id, r.player_id, r.status,
+                    COALESCE(r.amount_paid, 0)      AS amount_paid,
+                    COALESCE(r.amount_paid_free, 0) AS amount_paid_free,
+                    COALESCE(r.is_comped, false)    AS is_comped,
+                    g.game_url
+               FROM registrations r
+               JOIN games g ON g.id = r.game_id
+              WHERE r.id = $1
+              FOR UPDATE OF r`,
+            [registrationId]
+        );
+        if (rRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Registration not found' }); }
+        const reg = rRes.rows[0];
+        const before = {
+            amount_paid:      parseFloat(reg.amount_paid),
+            amount_paid_free: parseFloat(reg.amount_paid_free),
+            is_comped:        reg.is_comped
+        };
+
+        let after;
+        if (action === 'convert_to_free') {
+            // Relabel real -> free. No real refund. Game cash revenue drops, FC rises.
+            after = { amount_paid: 0,
+                      amount_paid_free: before.amount_paid_free + before.amount_paid,
+                      is_comped: before.is_comped };
+        } else if (action === 'set') {
+            const ap  = parseFloat((req.body || {}).amount_paid);
+            const apf = parseFloat((req.body || {}).amount_paid_free);
+            if (!isFinite(ap) || ap < 0 || !isFinite(apf) || apf < 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'Amounts must be non-negative numbers' });
+            }
+            const comp = (req.body || {}).is_comped === undefined ? before.is_comped : !!(req.body || {}).is_comped;
+            after = { amount_paid: ap, amount_paid_free: apf, is_comped: comp };
+        } else {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Unknown action (expected set | convert_to_free)' });
+        }
+
+        await client.query(
+            `UPDATE registrations SET amount_paid = $1, amount_paid_free = $2, is_comped = $3 WHERE id = $4`,
+            [after.amount_paid, after.amount_paid_free, after.is_comped, registrationId]
+        );
+
+        // Audit: game-level + player-level (both, per requirement). All inside the txn.
+        const detail = JSON.stringify({ action, registration_id: registrationId, player_id: reg.player_id, before, after });
+        await gameAuditLog(client, reg.game_id, req.user.playerId, 'finance_payment_edit', detail);
+        await registrationEvent(client, reg.game_id, reg.player_id, 'finance_payment_edit',
+            `${action}: cash \u00A3${before.amount_paid.toFixed(2)}->\u00A3${after.amount_paid.toFixed(2)}, free \u00A3${before.amount_paid_free.toFixed(2)}->\u00A3${after.amount_paid_free.toFixed(2)}` +
+            (after.is_comped !== before.is_comped ? `, comped ${before.is_comped}->${after.is_comped}` : ''));
+        await auditLog(client, req.user.playerId, 'finance_payment_edit', reg.player_id, detail);
+
+        await client.query('COMMIT');
+
+        // Player payments changed -> payout must follow. After commit, via pool, so it
+        // reads committed rows. Won't rewrite a settled (paid) payout.
+        let payout = null;
+        try { payout = await recomputeGamePayout(pool, reg.game_id); } catch (_) {}
+
+        res.json({ ok: true, before, after, payout, game_url: reg.game_url });
+    } catch (error) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        console.error('Finance payment edit error:', error);
+        res.status(500).json({ error: 'Failed to update payment', detail: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+
+// ── FIX-419: reporting tenant-scoping ───────────────────────────────────────
+// Reporting was global + admin/superadmin only. Now:
+//   • superadmin / admin → optional ?tenant_ids=uuid,uuid (multi-select compare);
+//     none = Everyone (all tenants).
+//   • tenant_admin       → forced to their own active tenant(s); query param ignored.
+// Selecting TF Coventry also pulls its legacy untagged (tenant_id IS NULL) games, so
+// "TF" isn't missing pre-FIX-334 rows. req.reportScope is set by requireReportAccess:
+//   { mode:'all' } | { mode:'tenants', ids:[uuid...], includeUntagged:bool }.
+async function _reportScope(req) {
+    const role = req.user && req.user.role;
+    if (role === 'superadmin' || role === 'admin') {
+        const raw = String((req.query && req.query.tenant_ids) || '').trim();
+        if (!raw) return { mode: 'all' };
+        const ids = raw.split(',').map(s => s.trim()).filter(s => isValidUuid(s));
+        if (!ids.length) return { mode: 'all' };
+        return { mode: 'tenants', ids, includeUntagged: ids.includes(TF_COVENTRY_TENANT_ID) };
+    }
+    // Non-(super)admin: must be a tenant_admin somewhere; lock to those tenant(s).
+    try {
+        const r = await pool.query(
+            `SELECT tenant_id FROM player_tenants
+              WHERE player_id = $1 AND role = 'tenant_admin' AND status = 'active'`,
+            [req.user.playerId]);
+        const ids = r.rows.map(x => x.tenant_id).filter(Boolean);
+        if (!ids.length) return { mode: 'forbidden' };
+        return { mode: 'tenants', ids, includeUntagged: ids.includes(TF_COVENTRY_TENANT_ID) };
+    } catch (e) {
+        if (e && e.code === '42P01') return { mode: 'forbidden' };  // player_tenants missing
+        throw e;
+    }
+}
+
+// Express gate for the /api/reports/* endpoints. Attaches req.reportScope, or 403s
+// a caller who is neither (super)admin nor a tenant_admin anywhere.
+const requireReportAccess = async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Access denied' });
+    try {
+        const scope = await _reportScope(req);
+        if (scope.mode === 'forbidden') return res.status(403).json({ error: 'Reporting access required' });
+        req.reportScope = scope;
+        next();
+    } catch (e) {
+        console.error('FIX-419 report scope failed:', e.message);
+        return res.status(500).json({ error: 'Authorization error' });
+    }
+};
+
+// SQL fragment scoping a games alias to req.reportScope. Returns { clause, params }
+// where clause begins ' AND ...' (or '' for mode:'all'). startIdx = the next
+// positional-param index in the calling query. Every report query that touches
+// games MUST apply this on its games alias so a tenant only ever sees its own
+// universe (RULE 5 — data isolation).
+function _reportScopeSql(scope, gameAlias, startIdx) {
+    if (!scope || scope.mode === 'all') return { clause: '', params: [] };
+    const col = `${gameAlias}.tenant_id`;
+    if (scope.includeUntagged) {
+        return { clause: ` AND (${col} = ANY($${startIdx}) OR ${col} IS NULL)`, params: [scope.ids] };
+    }
+    return { clause: ` AND ${col} = ANY($${startIdx})`, params: [scope.ids] };
+}
+
+app.get('/api/reports/games', authenticateToken, requireReportAccess, async (req, res) => {
+    try {
+        const sc = _reportScopeSql(req.reportScope, 'g', 1);
         const result = await pool.query(`
             SELECT g.id, g.game_date, g.format, g.exclusivity, g.max_players, g.cost_per_player,
                 g.game_status, g.winning_team, g.game_url, g.team_selection_type,
@@ -37099,12 +37799,33 @@ app.get('/api/reports/games', authenticateToken, requireAdmin, async (req, res) 
                 COALESCE((SELECT COUNT(*) FROM game_awards ga WHERE ga.game_id = g.id), 0) as awards_total,
                 p.alias as motm_winner
             FROM games g LEFT JOIN venues v ON v.id = g.venue_id LEFT JOIN players p ON p.id = g.motm_winner_id
+            WHERE 1=1${sc.clause}
             ORDER BY g.game_date DESC
-        `);
+        `, sc.params);
         res.json(result.rows);
     } catch (error) { console.error('Reports games error:', error); res.status(500).json({ error: 'Failed to load games report' }); }
 });
 
+
+// FIX-419: report access descriptor — lets reporting.html configure itself without
+// guessing from /api/auth/me (which doesn't expose tenant-admin status). superadmin/
+// admin get the tenant list for the multi-select; tenant_admin is locked to its own
+// tenant(s), so the client hides the cross-tenant selector AND the player-aggregate
+// tabs (players / player x game), which remain superadmin/admin only for now.
+app.get('/api/reports/access', authenticateToken, requireReportAccess, async (req, res) => {
+    try {
+        const isGlobal = (req.user.role === 'superadmin' || req.user.role === 'admin');
+        let tenants = [];
+        if (isGlobal) {
+            const t = await pool.query('SELECT id, name FROM tenants ORDER BY name ASC NULLS LAST');
+            tenants = t.rows;
+        }
+        res.json({ tier: isGlobal ? req.user.role : 'tenant_admin', locked: !isGlobal, tenants });
+    } catch (e) {
+        console.error('FIX-419 reports/access failed:', e.message);
+        res.status(500).json({ error: 'Failed to load report access' });
+    }
+});
 
 app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res) => {
     try {
@@ -40181,6 +40902,20 @@ const MONTHLY_METRIC_LABELS = {
     24: 'Assist King', 28: 'Best Ref', 29: 'Worst Ref'
 };
 const MONTHLY_STARTER_METRIC_IDS = [9, 5, 1, 2]; // Goal Scorer, Appearances, Win %, MOTM
+// FIX-414: per-tenant (Layer 1) and per-venue (Layer 2) monthly-trophy generation.
+// These layers write rows that share the (year,month,region,metric_id,calculation_type)
+// key with the universal layer, so they ONLY coexist safely once the monthly_trophies
+// unique key includes tenant_id + venue_id. That widened unique index ships in the SQL
+// batch as monthly_trophies_scope_uniq (COALESCE-sentinel). With it applied:
+//   • PER-TENANT is ON — external ROW tenants generate their own awards per their
+//     tenant_monthly_config. Layer 1 already skips TF Coventry, so TF stays on the
+//     universal layer (all 16 metrics) and is unaffected.
+//   • PER-VENUE stays OFF — not requested. Flip to true only if you also want
+//     per-venue trophies (the widened unique index already supports them).
+// DEPLOY ORDER: the SQL widening MUST be applied before/with this deploy, or Layer 1
+// collides with the universal layer again and the month 500s.
+const MONTHLY_TROPHY_PER_TENANT_LAYER = true;
+const MONTHLY_TROPHY_PER_VENUE_LAYER  = false;
 const MONTHLY_METRICS = [
     // (metric_id, calc_type, min_games, min_awards)
     { metric_id: 1,  calc_type: 'most', min_games: 4, min_awards: 0 },  // Win %         — keeps % primary
@@ -40229,10 +40964,53 @@ const MONTHLY_REGIONS = [
 // per-tenant cron pass.
 //
 // Returns array of: { player_id, player_name, appearances, primary_stat, supporting_stat }
+// FIX-415: monthly leaderboard now honours calc_type. _calcMonthlyRaw (below)
+// computes the raw per-player aggregate (primary_stat + appearances) for the metric;
+// this wrapper applies the chosen method and returns the ranked list (caller takes
+// top 3). Existing callers pass calc_type='most', so output is unchanged for them.
+//
+// Supported monthly methods: most, least, most_per_game, least_per_game.
+// 'most_consecutive' needs per-game streak data the aggregates don't carry and is
+// marginal over a ~4-8 game month — it is NOT supported in the monthly window yet,
+// so the monthly config UI must not offer it (MONTHLY_SUPPORTED_CALC_TYPES gates that).
+// Tie-break is implicit and unchanged: appearances desc, then player_id asc.
+const MONTHLY_SUPPORTED_CALC_TYPES = ['most', 'least', 'most_per_game', 'least_per_game'];
+
+function _rankMonthlyByCalc(rows, calcType) {
+    const ct = MONTHLY_SUPPORTED_CALC_TYPES.includes(calcType) ? calcType : 'most';
+    const perGame = (ct === 'most_per_game' || ct === 'least_per_game');
+    const asc     = (ct === 'least' || ct === 'least_per_game');
+    const valueOf = (r) => {
+        const p = Number(r.primary_stat) || 0;
+        const a = Number(r.appearances) || 0;
+        return perGame ? (a > 0 ? p / a : 0) : p;
+    };
+    return rows.slice().sort((x, y) => {
+        const vx = valueOf(x), vy = valueOf(y);
+        if (vx !== vy) return asc ? (vx - vy) : (vy - vx);
+        // implicit tie-break: more appearances first, then player_id (deterministic)
+        const ax = Number(x.appearances) || 0, ay = Number(y.appearances) || 0;
+        if (ax !== ay) return ay - ax;
+        return String(x.player_id).localeCompare(String(y.player_id));
+    });
+}
+
 async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, minGames, minAwards = 0, tenantScope = 'tf_root') {
+    const rows = await _calcMonthlyRaw(year, month, region, metricId, calcType, minGames, minAwards, tenantScope);
+    return _rankMonthlyByCalc(rows, calcType);
+}
+
+async function _calcMonthlyRaw(year, month, region, metricId, calcType, minGames, minAwards = 0, tenantScope = 'tf_root') {
     const id = parseInt(metricId);
     const cfg = METRIC_CONFIG[id];
     if (!cfg) return [];
+
+    // FIX-416: universal monthly floor — every award requires >= 3 appearances
+    // this month (for ref metrics 28/29 this becomes >= 3 reviewed games, since
+    // their min unit is reviewed games). Raises any sub-3 configured min_games to
+    // 3; higher configured values (e.g. Win% = 4) are preserved. A single floor
+    // here covers every metric branch below, which all gate on minGames.
+    minGames = Math.max(3, parseInt(minGames) || 0);
 
     // Build the scope filter — used in every CTE/subquery below.
     // Parameters:
@@ -40344,7 +41122,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             ${minGamesFilter}
             ${minGamesFilter ? minAwardsClause : (minAwards > 0 ? 'WHERE ' + minAwardsClause.slice(4) : '')}
             ORDER BY primary_stat DESC NULLS LAST, ac.appearances DESC, ac.player_id ASC
-            LIMIT 10`, params);
+            LIMIT 500`, params);
         return r.rows;
     }
 
@@ -40368,7 +41146,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             WHERE COALESCE(pm.motm_count,0) >= ${motmThreshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC
-            LIMIT 10`, params);
+            LIMIT 500`, params);
         return r.rows;
     }
 
@@ -40395,7 +41173,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             WHERE COALESCE(pw3.win_count,0) >= ${winsThreshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC
-            LIMIT 10`, params);
+            LIMIT 500`, params);
         return r.rows;
     }
 
@@ -40409,7 +41187,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             FROM app_counts
             ${minGames > 0 ? `WHERE appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY appearances DESC, player_id ASC
-            LIMIT 10`, params);
+            LIMIT 500`, params);
         return r.rows;
     }
 
@@ -40447,7 +41225,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             WHERE COALESCE(pa.award_count,0) >= ${threshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC
-            LIMIT 10`, params);
+            LIMIT 500`, params);
         return r.rows;
     }
 
@@ -40472,7 +41250,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             WHERE COALESCE(pdisc.disc_total,0) >= ${ptsThreshold}
               ${minGames > 0 ? `AND ac.appearances >= ${parseInt(minGames)}` : ''}
             ORDER BY primary_stat DESC, ac.appearances DESC, ac.player_id ASC
-            LIMIT 10`, params);
+            LIMIT 500`, params);
         return r.rows;
     }
 
@@ -40512,7 +41290,7 @@ async function calcMonthlyLeaderboard(year, month, region, metricId, calcType, m
             GROUP BY rg.player_id, COALESCE(p.alias, p.full_name)
             HAVING COUNT(*) >= ${minReviewedGames}
             ORDER BY primary_stat ${sortDir}, COUNT(*) DESC, rg.player_id ASC
-            LIMIT 10`, params);
+            LIMIT 500`, params);
         return r.rows;
     }
 
@@ -40615,7 +41393,7 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
             //
             // Pre-FIX-334 deploy: tenants table missing entirely → catch 42P01.
             let activeTenants = [];
-            try {
+            if (MONTHLY_TROPHY_PER_TENANT_LAYER) try {
                 const tRes = await client.query(
                     `SELECT t.id, t.short_id, t.name
                        FROM tenants t
@@ -40636,49 +41414,15 @@ async function runMonthlyTrophyJob(year, month, { force = false } = {}) {
             }
 
             for (const tenant of activeTenants) {
-                // FIX-399: per-tenant monthly-awards config. Skip if disabled; otherwise run
-                // the tenant's chosen metrics (no config row → all metrics = prior behaviour).
-                const _mCfg = await getMonthlyConfigForTenant(tenant.id, client);
-                if (!_mCfg.enabled) continue;
-                const _tenantMetrics = _mCfg.metricIds
-                    ? MONTHLY_METRICS.filter(m => _mCfg.metricIds.includes(m.metric_id))
-                    : MONTHLY_METRICS;
-                for (const region of MONTHLY_REGIONS) {
-                    for (const m of _tenantMetrics) {
-                        const leaderboard = await calcMonthlyLeaderboard(
-                            year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards,
-                            tenant.id  // per-tenant pass
-                        );
-                        if (!leaderboard || leaderboard.length === 0) continue;
-                        const trophyRow = await client.query(
-                            `INSERT INTO monthly_trophies
-                             (year, month, region, metric_id, calculation_type,
-                              eligibility_min_games, eligibility_min_awards, tenant_id)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                             RETURNING id`,
-                            [year, month, region, m.metric_id, m.calc_type,
-                             m.min_games, m.min_awards || 0, tenant.id]
-                        );
-                        const trophyId = trophyRow.rows[0].id;
-                        for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
-                            const row = leaderboard[i];
-                            await client.query(
-                                `INSERT INTO monthly_trophy_results
-                                 (trophy_id, player_id, rank, primary_stat, supporting_stat, games_played)
-                                 VALUES ($1, $2, $3, $4, $5, $6)`,
-                                [trophyId, row.player_id, i + 1, row.primary_stat, row.supporting_stat, row.appearances]
-                            );
-                        }
-                        trophiesCreated++;
-                    }
-                }
+                // FIX-417: per-tenant award × method generation (shared helper).
+                trophiesCreated += await _generateTenantMonthlyTrophies(client, tenant.id, year, month);
             }
 
             // ── Layer 2: Per-venue trophies ──────────────────────────────────
             // Active venues with completed games this month, all tenants.
             // Region scope = 'ALL' since the venue itself implies geography.
             let activeVenues = [];
-            try {
+            if (MONTHLY_TROPHY_PER_VENUE_LAYER) try {
                 const vRes = await client.query(
                     `SELECT DISTINCT v.id, v.name
                        FROM venues v
@@ -40817,20 +41561,27 @@ app.get('/api/games/:gameUrl/rating-feedback-pair', authenticateToken, async (re
         //    ±4 and mark the pair half-weight (0.5) — direction still counts, the
         //    magnitude of influence is dampened (per the "halfway" rule).
         function _posCats(signupCsv, legacyPos) {
-            const s = String(signupCsv || '').toLowerCase();
-            const cats = [];
-            if (s) {
-                if (s.includes('gk'))  cats.push('gk');
-                if (s.includes('def')) cats.push('def');
-                if (s.includes('mid')) cats.push('mid');
-                if (s.includes('att')) cats.push('att');
+            // FIX-412: mirror the UI label's keeper logic EXACTLY so display and
+            // matching can never disagree — that disagreement was the root of the
+            // GK-vs-OF bug (a keeper labelled "GK" but matched as outfield, then
+            // paired against an outfielder: the Hasan-GK vs Payne-OF case).
+            // A player is treated as a keeper for matching iff they would be
+            // DISPLAYED as a pure keeper: signup_positions is gk-only, OR signup
+            // has no usable tokens and players.position is a goalkeeper. A keeper
+            // only ever matches another keeper (handled by _posCompatible's gk
+            // branch). A gk+outfield hybrid is rated on its outfield position(s),
+            // exactly as the label shows it ("GK / DEF").
+            const tokens = String(signupCsv || '').toLowerCase()
+                .split(',').map(t => t.trim())
+                .filter(t => ['gk','def','mid','att'].includes(t));
+            if (tokens.length > 0) {
+                const outfield = tokens.filter(t => t !== 'gk');
+                return outfield.length === 0 ? ['gk'] : outfield; // gk-only = keeper
             }
-            if (cats.length === 0) {
-                // Legacy fallback: only GK vs outfield is known.
-                const lp = String(legacyPos || '').toUpperCase().trim();
-                return lp === 'GK' ? ['gk'] : ['outfield'];
-            }
-            return cats;
+            // No usable signup tokens — fall back to canonical position.
+            const lp = String(legacyPos || '').toLowerCase().trim();
+            if (lp === 'goalkeeper' || lp === 'gk' || lp === 'keeper') return ['gk'];
+            return ['outfield'];
         }
         // Two categories are comparable if they share a cat, or are adjacent
         // (def-mid, mid-att). gk only with gk. outfield (legacy) matches any
@@ -45881,6 +46632,296 @@ app.post('/api/admin/comms/send', authenticateToken, requireAdmin, async (req, r
     }
 });
 
+// ============================================================================
+// FIX-428 — Messaging Campaigns unified SEND router.
+//   type 'broadcast'                 -> multi-channel (push/email/whatsapp/vcf/csv), no claim
+//   type 'game_signup'|'credit_grant'-> email + claim token (money path; claimed via Stage 3)
+// Audience via _buildCampaignAudience({gameId,buckets,playerIds}). Reuses the proven
+// mass-message + comms helpers; writes to messaging_campaigns / messaging_recipients.
+// Legacy /mass-message/* and /comms/* endpoints remain as a fallback.
+// ============================================================================
+app.post('/api/admin/campaigns/send', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { type, gameId, buckets, playerIds, subject, bodyTemplate, channels,
+                templateId, expiryDays, giftAmount, giftGameId } = req.body || {};
+        if (!['broadcast','game_signup','credit_grant'].includes(type)) {
+            return res.status(400).json({ error: 'Invalid campaign type' });
+        }
+
+        const audienceSpec = {
+            gameId:    (gameId && isValidUuid(String(gameId))) ? String(gameId) : null,
+            buckets:   Array.isArray(buckets) ? buckets : [],
+            playerIds: Array.isArray(playerIds) ? playerIds.filter(id => isValidUuid(String(id))) : [],
+        };
+        const recipients = await _buildCampaignAudience(client, audienceSpec);
+        if (recipients.length === 0)   return res.status(400).json({ error: 'No recipients match the selected audience' });
+        if (recipients.length > 500)   return res.status(400).json({ error: 'Maximum 500 recipients per campaign' });
+
+        // ───────────────────────── BROADCAST ─────────────────────────
+        if (type === 'broadcast') {
+            const VALID = new Set(['push','email','whatsapp','vcf','csv']);
+            const selectedChannels = (Array.isArray(channels) ? channels : []).filter(c => VALID.has(c));
+            if (selectedChannels.length === 0) return res.status(400).json({ error: 'Select at least one channel' });
+            const tmpl = (templateId && MASS_MESSAGE_TEMPLATES[templateId]) ? MASS_MESSAGE_TEMPLATES[templateId] : null;
+            const body = (typeof bodyTemplate === 'string' && bodyTemplate.trim().length >= 5) ? bodyTemplate.trim()
+                       : (tmpl ? tmpl.body_template : null);
+            if (!body) return res.status(400).json({ error: 'Message body too short' });
+            const subj = (typeof subject === 'string' && subject.trim()) ? subject.trim()
+                       : (tmpl ? tmpl.subject_template : 'TotalFooty');
+
+            let game = null;
+            if (audienceSpec.gameId) {
+                const gRes = await client.query(`
+                    SELECT g.id, g.game_url, g.game_date, g.format, g.cost_per_player, g.max_players, g.series_id,
+                           v.name AS venue_name, v.region AS venue_region, gs.series_name,
+                           ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed','rsvp'))
+                            + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))::int AS current_players
+                      FROM games g
+                      LEFT JOIN venues v ON v.id = g.venue_id
+                      LEFT JOIN game_series gs ON gs.id = g.series_id
+                     WHERE g.id = $1`, [audienceSpec.gameId]);
+                game = gRes.rows[0] || null;
+                if (game) game.next_game_url = await _resolveNextSeriesGameUrl(client, game.series_id, game.game_date);
+            }
+
+            const campRes = await client.query(`
+                INSERT INTO messaging_campaigns
+                    (campaign_type, created_by, subject, body_template, channels, game_id, audience_spec, recipient_count)
+                VALUES ('broadcast', $1, $2, $3, $4, $5, $6, $7)
+                RETURNING id`,
+                [req.user.playerId, subj, body, selectedChannels, audienceSpec.gameId,
+                 JSON.stringify(audienceSpec), recipients.length]);
+            const campaignId = campRes.rows[0].id;
+
+            for (const r of recipients) {
+                await client.query(
+                    `INSERT INTO messaging_recipients (campaign_id, player_id, email_to, channel)
+                     VALUES ($1, $2, $3, $4)`,
+                    [campaignId, r.id, r.email || null, selectedChannels.join(',')]);
+            }
+
+            let push_status=null, email_status=null, whatsapp_status=null, vcf_status=null, csv_status=null;
+            let whatsapp_links=[], vcf_url=null, csv_url=null;
+            const subjResolved = _resolvePlaceholders(subj, { first_name:'there' }, game || {});
+
+            if (selectedChannels.includes('push')) {
+                const pr = recipients.filter(r => r.has_app);
+                push_status = pr.length === 0 ? { sent:0, failed:0, skipped:'no recipients with app' }
+                    : await _sendMassPush(pr, subjResolved || 'TotalFooty',
+                        _resolvePlaceholders(body, { first_name:'there' }, game || {}).slice(0,240),
+                        { gameId: audienceSpec.gameId });
+            }
+            if (selectedChannels.includes('email')) {
+                const er = recipients.filter(r => !!r.email);
+                email_status = { sent:0, failed:0, failed_ids:[], queued: er.length };
+                (async () => {
+                    for (const r of er) {
+                        try {
+                            const pBody = _resolvePlaceholders(body, r, game || {});
+                            const pSubj = _resolvePlaceholders(subj, r, game || {}) || 'TotalFooty';
+                            const htmlInner = '<div style="color:#fff;font-size:15px;line-height:1.65;white-space:pre-wrap;">' +
+                                pBody.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>';
+                            await emailTransporter.sendMail({
+                                from: '"TotalFooty" <totalfooty19@gmail.com>', to: r.email, subject: pSubj,
+                                html: wrapEmailHtml(htmlInner, { unsubToken: _signUnsubToken(r.id) }),
+                            });
+                            email_status.sent++;
+                            await pool.query("UPDATE messaging_recipients SET email_sent_at=NOW(), email_status='sent' WHERE campaign_id=$1 AND player_id=$2", [campaignId, r.id]).catch(()=>{});
+                        } catch (e) {
+                            email_status.failed++; email_status.failed_ids.push(r.id);
+                            await pool.query("UPDATE messaging_recipients SET email_status='failed', email_send_error=$1 WHERE campaign_id=$2 AND player_id=$3", [String(e.message).slice(0,200), campaignId, r.id]).catch(()=>{});
+                        }
+                        await new Promise(rs => setTimeout(rs, 100));
+                    }
+                })();
+            }
+            if (selectedChannels.includes('whatsapp')) {
+                whatsapp_links = recipients.filter(r => r.phone_e164).map(r => ({
+                    id: r.id, name: (r.alias || r.full_name || ''),
+                    url: `https://wa.me/${String(r.phone_e164).replace(/[^0-9]/g,'')}?text=${encodeURIComponent(_resolvePlaceholders(body, r, game || {}))}`,
+                }));
+                whatsapp_status = { links_generated: whatsapp_links.length };
+            }
+            if (selectedChannels.includes('vcf')) {
+                const tok = _stashDownload(_generateVCF(recipients), 'text/vcard; charset=utf-8', 'totalfooty-broadcast.vcf');
+                vcf_url = `/api/admin/mass-message/download/${tok}`;
+                vcf_status = { generated:true, recipient_count: recipients.filter(r=>!!r.phone_e164).length, download_url: vcf_url };
+            }
+            if (selectedChannels.includes('csv')) {
+                const tok = _stashDownload(_generateCSV(recipients), 'text/csv; charset=utf-8', 'totalfooty-broadcast.csv');
+                csv_url = `/api/admin/mass-message/download/${tok}`;
+                csv_status = { generated:true, recipient_count: recipients.length, download_url: csv_url };
+            }
+
+            await auditLog(pool, req.user.playerId, 'campaign_sent', null,
+                `Campaign #${campaignId} (broadcast) — ${recipients.length} recipients via [${selectedChannels.join(',')}]`).catch(()=>{});
+
+            return res.json({ ok:true, campaignId, campaign_type:'broadcast', recipient_count:recipients.length,
+                channels_used:selectedChannels, push_status, email_status, whatsapp_status, vcf_status, csv_status,
+                whatsapp_links, vcf_url, csv_url });
+        }
+
+        // ──────────────── CLAIM TYPES (game_signup / credit_grant) ────────────────
+        // Money path — mirrors the comms /send guarantees, writing to the unified tables.
+        if (!subject || typeof subject !== 'string' || subject.trim().length < 3)
+            return res.status(400).json({ error: 'Subject is required (min 3 chars)' });
+        if (!bodyTemplate || typeof bodyTemplate !== 'string' || bodyTemplate.trim().length < 10)
+            return res.status(400).json({ error: 'Message body is required (min 10 chars)' });
+        const days = parseInt(expiryDays);
+        if (!Number.isFinite(days) || days < 1 || days > 90)
+            return res.status(400).json({ error: 'Expiry must be between 1 and 90 days' });
+
+        let amt = null, gameRow = null;
+        if (type === 'credit_grant') {
+            amt = parseFloat(giftAmount);
+            if (!Number.isFinite(amt) || amt <= 0 || amt > 50)
+                return res.status(400).json({ error: 'Gift amount must be between £0.01 and £50' });
+        } else { // game_signup
+            const gid = String(giftGameId || '');
+            if (!isValidUuid(gid)) return res.status(400).json({ error: 'Valid game UUID required for game_signup' });
+            const gc = await client.query(`
+                SELECT g.id, g.max_players, g.team_selection_type, g.game_status, g.game_date,
+                       ((SELECT COUNT(*) FROM registrations WHERE game_id=g.id AND status IN ('confirmed','rsvp'))
+                        + (SELECT COUNT(*) FROM game_guests WHERE game_id=g.id))::int AS current_players
+                  FROM games g WHERE g.id=$1`, [gid]);
+            if (gc.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+            gameRow = gc.rows[0];
+            if (['tournament','vs_external'].includes(gameRow.team_selection_type))
+                return res.status(400).json({ error: 'Tournament + vs_external games cannot be used for free-game campaigns.' });
+            if (!['available','confirmed'].includes(gameRow.game_status))
+                return res.status(400).json({ error: 'Game is not currently accepting signups.' });
+            if (gameRow.current_players >= gameRow.max_players)
+                return res.status(400).json({ error: 'Game is already full.' });
+            if (new Date(gameRow.game_date).getTime() < Date.now())
+                return res.status(400).json({ error: 'Game is in the past.' });
+        }
+
+        const emailRecipients = recipients.filter(r => !!r.email);
+        if (emailRecipients.length === 0) return res.status(400).json({ error: 'No recipients with valid emails' });
+
+        await client.query('BEGIN');
+        const expiresAt = new Date(Date.now() + days*24*60*60*1000);
+        const campRes = await client.query(`
+            INSERT INTO messaging_campaigns
+                (campaign_type, created_by, subject, body_template, channels, gift_amount, game_id, expires_at, audience_spec, recipient_count)
+            VALUES ($1,$2,$3,$4,'{email}',$5,$6,$7,$8,$9)
+            RETURNING id`,
+            [type, req.user.playerId, subject.trim(), bodyTemplate.trim(), amt,
+             type==='game_signup' ? gameRow.id : null, expiresAt, JSON.stringify(audienceSpec), emailRecipients.length]);
+        const campaignId = campRes.rows[0].id;
+
+        const toSend = [];
+        for (const r of emailRecipients) {
+            const token = _generateClaimToken();
+            await client.query(
+                `INSERT INTO messaging_recipients (campaign_id, player_id, email_to, channel, claim_token)
+                 VALUES ($1,$2,$3,'email',$4)`, [campaignId, r.id, r.email, token]);
+            toSend.push({ r, token });
+        }
+        await client.query('COMMIT');
+
+        const sendErrors = [];
+        const expiryStr = expiresAt.toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long' });
+        for (const { r, token } of toSend) {
+            const claimUrl = `https://totalfooty.co.uk/?claim=${token}`;
+            const firstName = (r.alias || r.full_name || '').split(' ')[0] || 'there';
+            const renderedBody = _renderCommsBody(bodyTemplate, firstName, claimUrl, expiryStr);
+            try {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>', to: r.email, subject: subject,
+                    html: wrapEmailHtml(`
+                        <div style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 24px;">${renderedBody}</div>
+                        <a href="${claimUrl}" style="display:block;text-align:center;padding:14px;background:#00cc66;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;letter-spacing:1px;margin:0 0 12px;">CLAIM YOUR ${type === 'credit_grant' ? '£'+amt.toFixed(2)+' CREDIT' : 'FREE GAME'} →</a>
+                        <p style="color:#666;font-size:11px;margin:16px 0 0;text-align:center;">This offer expires on ${expiryStr}.</p>
+                    `),
+                });
+                await pool.query("UPDATE messaging_recipients SET email_sent_at=NOW(), email_status='sent' WHERE claim_token=$1", [token]);
+            } catch (e) {
+                sendErrors.push({ playerId: r.id, error: e.message });
+                await pool.query("UPDATE messaging_recipients SET email_status='failed', email_send_error=$1 WHERE claim_token=$2", [String(e.message).slice(0,200), token]).catch(()=>{});
+            }
+        }
+
+        await auditLog(pool, req.user.playerId, 'campaign_sent', null,
+            `Campaign #${campaignId} (${type}) — ${toSend.length} recipients, ${sendErrors.length} failed`).catch(()=>{});
+
+        return res.json({ ok:true, campaignId, campaign_type:type, recipient_count:toSend.length,
+            sendErrors:sendErrors.length, sendErrorDetails:sendErrors.slice(0,10) });
+    } catch (error) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        console.error('Campaign send error:', error);
+        return res.status(500).json({ error: 'Failed to send campaign' });
+    } finally {
+        client.release();
+    }
+});
+
+// FIX-428: combined Messaging Campaigns history (unified table; covers migrated comms
+// + new unified campaigns). Legacy-only campaigns sent via the old /comms endpoint after
+// migration are not shown here (rare fallback path) — they remain in /api/admin/comms/campaigns.
+// FIX-428: unified audience PREVIEW — counts + per-channel reach for the composer.
+app.post('/api/admin/campaigns/preview', authenticateToken, requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { gameId, buckets, playerIds } = req.body || {};
+        const spec = {
+            gameId:    (gameId && isValidUuid(String(gameId))) ? String(gameId) : null,
+            buckets:   Array.isArray(buckets) ? buckets : [],
+            playerIds: Array.isArray(playerIds) ? playerIds.filter(id => isValidUuid(String(id))) : [],
+        };
+        const recipients = await _buildCampaignAudience(client, spec);
+        const reach = {
+            total:    recipients.length,
+            push:     recipients.filter(r => r.has_app).length,
+            email:    recipients.filter(r => !!r.email).length,
+            whatsapp: recipients.filter(r => !!r.phone_e164).length,
+        };
+        const warnings = [];
+        if (recipients.length === 0) warnings.push('No players match the selected audience.');
+        else if (reach.email < recipients.length) warnings.push(`${recipients.length - reach.email} player(s) have no email on file.`);
+        return res.json({
+            reach, warnings,
+            recipients: recipients.map(r => ({
+                id: r.id, name: (r.alias || r.full_name || r.first_name || ''),
+                has_email: !!r.email, has_phone: !!r.phone_e164, has_app: r.has_app,
+            })),
+        });
+    } catch (e) {
+        console.error('Campaign preview error:', e);
+        return res.status(500).json({ error: 'Preview failed: ' + e.message });
+    } finally { client.release(); }
+});
+
+// FIX-428: combined campaign HISTORY (unified table = both legacy systems post-migration).
+app.get('/api/admin/campaigns', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT mc.id, mc.campaign_type, mc.subject, mc.channels, mc.gift_amount, mc.game_id,
+                   mc.expires_at, mc.recipient_count, mc.claim_count, mc.legacy_source, mc.created_at,
+                   p.alias AS created_by_alias, p.full_name AS created_by_name,
+                   (SELECT COUNT(*) FROM messaging_recipients mr WHERE mr.campaign_id = mc.id AND mr.email_status = 'sent')::int     AS emails_sent,
+                   (SELECT COUNT(*) FROM messaging_recipients mr WHERE mr.campaign_id = mc.id AND mr.email_status = 'failed')::int   AS emails_failed,
+                   (SELECT COUNT(*) FROM messaging_recipients mr WHERE mr.campaign_id = mc.id AND mr.claimed_at IS NOT NULL)::int    AS claimed
+              FROM messaging_campaigns mc
+              LEFT JOIN players p ON p.id = mc.created_by
+             ORDER BY mc.created_at DESC
+             LIMIT 100
+        `);
+        return res.json({ campaigns: r.rows.map(c => ({
+            id: c.id, type: c.campaign_type, subject: c.subject, channels: c.channels,
+            giftAmount: c.gift_amount != null ? parseFloat(c.gift_amount) : null, gameId: c.game_id,
+            expiresAt: c.expires_at, recipientCount: c.recipient_count, claimCount: c.claim_count,
+            claimed: c.claimed, emailsSent: c.emails_sent, emailsFailed: c.emails_failed,
+            createdBy: c.created_by_alias || c.created_by_name || 'system',
+            createdAt: c.created_at, legacySource: c.legacy_source,
+        })) });
+    } catch (e) {
+        console.error('Campaign history error:', e);
+        return res.status(500).json({ error: 'Failed to load campaigns' });
+    }
+});
+
 // GET /api/admin/comms/campaigns — list past campaigns with claim stats.
 app.get('/api/admin/comms/campaigns', authenticateToken, requireAdmin, async (req, res) => {
     try {
@@ -45909,10 +46950,12 @@ app.get('/api/comms/claim/:token', async (req, res) => {
     try {
         const { token } = req.params;
         if (!token || token.length < 16) return res.status(400).json({ error: 'Invalid claim token' });
-        const result = await pool.query(`
+        // FIX-428: dual-read — unified tables first, legacy comms as fallback.
+        // gameCol differs (messaging_campaigns.game_id vs comms_campaigns.gift_game_id).
+        const _claimLookup = (recT, campT, gameCol) => pool.query(`
             SELECT cr.id, cr.player_id, cr.email_to, cr.claimed_at, cr.claim_outcome,
                    cc.id AS campaign_id, cc.campaign_type, cc.subject, cc.gift_amount,
-                   cc.gift_game_id, cc.expires_at,
+                   cc.${gameCol} AS gift_game_id, cc.expires_at,
                    g.format AS game_format, v.name AS game_venue,
                    g.game_date AS game_date, g.max_players,
                    CASE WHEN g.id IS NOT NULL THEN
@@ -45920,13 +46963,17 @@ app.get('/api/comms/claim/:token', async (req, res) => {
                       + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id))::int
                    ELSE NULL END AS current_players,
                    g.game_status, p.alias AS player_alias, p.full_name AS player_name
-              FROM comms_recipients cr
-              JOIN comms_campaigns cc ON cc.id = cr.campaign_id
-              LEFT JOIN games g ON g.id = cc.gift_game_id
+              FROM ${recT} cr
+              JOIN ${campT} cc ON cc.id = cr.campaign_id
+              LEFT JOIN games g ON g.id = cc.${gameCol}
               LEFT JOIN venues v ON v.id = g.venue_id
               LEFT JOIN players p ON p.id = cr.player_id
              WHERE cr.claim_token = $1
         `, [token]);
+        let result = { rows: [] };
+        try { result = await _claimLookup('messaging_recipients', 'messaging_campaigns', 'game_id'); }
+        catch (e) { result = { rows: [] }; }  // unified tables may not exist yet — fall back
+        if (result.rows.length === 0) result = await _claimLookup('comms_recipients', 'comms_campaigns', 'gift_game_id');
         if (result.rows.length === 0) return res.status(404).json({ error: 'Claim link not found' });
         const r = result.rows[0];
         const expired = new Date(r.expires_at).getTime() < Date.now();
@@ -45966,14 +47013,40 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
         if (!token || token.length < 16) return res.status(400).json({ error: 'Invalid claim token' });
 
         await client.query('BEGIN');
-        const lookupResult = await client.query(`
-            SELECT cr.id, cr.player_id, cr.claimed_at, cr.claim_outcome,
-                   cc.campaign_type, cc.gift_amount, cc.gift_game_id, cc.expires_at, cc.id AS campaign_id
-              FROM comms_recipients cr
-              JOIN comms_campaigns cc ON cc.id = cr.campaign_id
-             WHERE cr.claim_token = $1
-             FOR UPDATE
-        `, [token]);
+        // FIX-428: resolve the token against the UNIFIED tables first, then fall back
+        // to legacy comms. messaging-first makes the unified row the single authoritative
+        // row for any migrated token (same claim_token in both), so read + write stay on
+        // one row and a re-claim can't double up; FOR UPDATE serialises concurrent claims.
+        let recTable = 'messaging_recipients', campTable = 'messaging_campaigns';
+        let lookupResult = { rows: [] };
+        try {
+            await client.query('SAVEPOINT msg_lookup');
+            lookupResult = await client.query(`
+                SELECT mr.id, mr.player_id, mr.claimed_at, mr.claim_outcome,
+                       mc.campaign_type, mc.gift_amount, mc.game_id AS gift_game_id, mc.expires_at, mc.id AS campaign_id
+                  FROM messaging_recipients mr
+                  JOIN messaging_campaigns mc ON mc.id = mr.campaign_id
+                 WHERE mr.claim_token = $1 AND mc.campaign_type IN ('game_signup','credit_grant')
+                 FOR UPDATE
+            `, [token]);
+            await client.query('RELEASE SAVEPOINT msg_lookup');
+        } catch (e) {
+            // Unified tables may not exist yet (deploy landed before the migration) —
+            // roll back to the savepoint so the tx stays usable, then fall back to comms.
+            await client.query('ROLLBACK TO SAVEPOINT msg_lookup').catch(() => {});
+            lookupResult = { rows: [] };
+        }
+        if (lookupResult.rows.length === 0) {
+            recTable = 'comms_recipients'; campTable = 'comms_campaigns';
+            lookupResult = await client.query(`
+                SELECT cr.id, cr.player_id, cr.claimed_at, cr.claim_outcome,
+                       cc.campaign_type, cc.gift_amount, cc.gift_game_id, cc.expires_at, cc.id AS campaign_id
+                  FROM comms_recipients cr
+                  JOIN comms_campaigns cc ON cc.id = cr.campaign_id
+                 WHERE cr.claim_token = $1
+                 FOR UPDATE
+            `, [token]);
+        }
         if (lookupResult.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Claim link not found' });
@@ -46000,7 +47073,7 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
         // Expiry check — soft expiry: link still resolves, just refuses the claim.
         if (new Date(r.expires_at).getTime() < Date.now()) {
             await client.query(
-                "UPDATE comms_recipients SET claimed_at = NOW(), claim_outcome = 'expired' WHERE id = $1",
+                `UPDATE ${recTable} SET claimed_at = NOW(), claim_outcome = 'expired' WHERE id = $1`,
                 [r.id]
             );
             await client.query('COMMIT');
@@ -46028,14 +47101,15 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
             await recordCreditTransaction(client, req.user.playerId, amt, 'free_credit',
                 `Comms campaign #${r.campaign_id} — claim`);
             await client.query(
-                "UPDATE comms_recipients SET claimed_at = NOW(), claim_outcome = 'credited' WHERE id = $1",
+                `UPDATE ${recTable} SET claimed_at = NOW(), claim_outcome = 'credited' WHERE id = $1`,
                 [r.id]
             );
             await client.query(
-                'UPDATE comms_campaigns SET claim_count = claim_count + 1 WHERE id = $1',
+                `UPDATE ${campTable} SET claim_count = claim_count + 1 WHERE id = $1`,
                 [r.campaign_id]
             );
             await client.query('COMMIT');
+            await auditLog(pool, req.user.playerId, 'campaign_claimed', null, `Claimed credit £${amt.toFixed(2)} (campaign #${r.campaign_id})`).catch(() => {});
             return res.json({ outcome: 'credited', amount: amt,
                 message: `£${amt.toFixed(2)} added to your balance.` });
         }
@@ -46061,7 +47135,7 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
             const g = gameLock.rows[0];
             if (g.game_status === 'completed' || g.game_status === 'cancelled') {
                 await client.query(
-                    "UPDATE comms_recipients SET claimed_at = NOW(), claim_outcome = 'expired' WHERE id = $1",
+                    `UPDATE ${recTable} SET claimed_at = NOW(), claim_outcome = 'expired' WHERE id = $1`,
                     [r.id]
                 );
                 await client.query('COMMIT');
@@ -46069,7 +47143,7 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
             }
             if (g.teams_generated && g.team_selection_type !== 'draft_memory') {
                 await client.query(
-                    "UPDATE comms_recipients SET claimed_at = NOW(), claim_outcome = 'expired' WHERE id = $1",
+                    `UPDATE ${recTable} SET claimed_at = NOW(), claim_outcome = 'expired' WHERE id = $1`,
                     [r.id]
                 );
                 await client.query('COMMIT');
@@ -46077,7 +47151,7 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
             }
             if (g.current_players >= g.max_players) {
                 await client.query(
-                    "UPDATE comms_recipients SET claimed_at = NOW(), claim_outcome = 'game_full' WHERE id = $1",
+                    `UPDATE ${recTable} SET claimed_at = NOW(), claim_outcome = 'game_full' WHERE id = $1`,
                     [r.id]
                 );
                 await client.query('COMMIT');
@@ -46090,7 +47164,7 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
             );
             if (existingReg.rows.length > 0) {
                 await client.query(
-                    "UPDATE comms_recipients SET claimed_at = NOW(), claim_outcome = 'duplicate' WHERE id = $1",
+                    `UPDATE ${recTable} SET claimed_at = NOW(), claim_outcome = 'duplicate' WHERE id = $1`,
                     [r.id]
                 );
                 await client.query('COMMIT');
@@ -46110,16 +47184,17 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
                 VALUES ($1, $2, 'confirmed', TRUE, 0, 0, 'outfield')
             `, [gid, req.user.playerId]);
             await client.query(
-                "UPDATE comms_recipients SET claimed_at = NOW(), claim_outcome = 'registered' WHERE id = $1",
+                `UPDATE ${recTable} SET claimed_at = NOW(), claim_outcome = 'registered' WHERE id = $1`,
                 [r.id]
             );
             await client.query(
-                'UPDATE comms_campaigns SET claim_count = claim_count + 1 WHERE id = $1',
+                `UPDATE ${campTable} SET claim_count = claim_count + 1 WHERE id = $1`,
                 [r.campaign_id]
             );
             await client.query('COMMIT');
             // DYNSTAR: comms-claim inserts directly as 'confirmed' — trigger star review
             reviewDynamicStarRating(pool, gid).catch(() => {});
+            await auditLog(pool, req.user.playerId, 'campaign_claimed', null, `Claimed free game (campaign #${r.campaign_id}, game ${gid})`).catch(() => {});
             return res.json({ outcome: 'registered', gameId: gid,
                 message: "You're confirmed for the game!" });
         }
@@ -50639,8 +51714,8 @@ app.get('/api/players/me/tenants', authenticateToken, async (req, res) => {
 // 'active' and reset joined_at. If status='banned', refuse. Otherwise insert.
 app.post('/api/players/me/tenants', authenticateToken, async (req, res) => {
     const shortId = String(req.body?.tenant_short_id || '').trim();
-    if (!/^\d{5}$/.test(shortId)) {
-        return res.status(400).json({ error: 'tenant_short_id must be exactly 5 digits' });
+    if (!isValidTenantShortId(shortId)) {
+        return res.status(400).json({ error: 'tenant_short_id is invalid' });
     }
 
     let client;
@@ -51146,6 +52221,13 @@ app.patch('/api/admin/tenants/:id', authenticateToken, requireSuperAdmin, async 
             // Status whitelist (FIX-398: 'pilot' is a valid lifecycle state)
             if (f === 'status' && v !== null && !['active','pilot','paused','exited'].includes(v)) {
                 return res.status(400).json({ error: 'status must be active/pilot/paused/exited' });
+            }
+            // FIX-418 (audit): mirror the CREATE-path hex check (server.js ~51031) so the
+            // edit form can't store a non-hex primary_color. Empty/null clears it (allowed);
+            // any non-empty value must be a #hex. primary_color flows into CSS accents on
+            // web + app, so an unvalidated string would leak into styling.
+            if (f === 'primary_color' && v !== null && v !== '' && !/^#[0-9a-fA-F]{3,8}$/.test(v)) {
+                return res.status(400).json({ error: 'primary_color must be a hex code like #ff0066' });
             }
             updates.push(`${f} = $${idx++}`);
             values.push(v);
@@ -51943,7 +53025,7 @@ app.get('/api/admin/players/:id/dsar-export', authenticateToken, requireSuperAdm
 // Does NOT leak feature toggles, financial config, or admin emails.
 app.get('/api/onboarding/preview/:tenant_short_id', publicEndpointLimiter, async (req, res) => {
     const shortId = req.params.tenant_short_id;
-    if (!/^\d{5}$/.test(shortId)) return res.status(404).json({ error: 'Tenant not found' });
+    if (!isValidTenantShortId(shortId)) return res.status(404).json({ error: 'Tenant not found' });
 
     try {
         const r = await pool.query(
@@ -52012,8 +53094,8 @@ app.post('/api/onboarding/check-email-for-attach', emailEnumLimiter, async (req,
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         return res.status(400).json({ error: 'email is required' });
     }
-    if (!/^\d{5}$/.test(shortId)) {
-        return res.status(400).json({ error: 'tenant_short_id must be 5 digits' });
+    if (!isValidTenantShortId(shortId)) {
+        return res.status(400).json({ error: 'tenant_short_id is invalid' });
     }
 
     try {
@@ -52112,7 +53194,7 @@ app.post('/api/onboarding/check-email-for-attach', emailEnumLimiter, async (req,
 
 app.post('/api/onboarding/join', authenticateToken, async (req, res) => {
     const shortId = String(req.body?.tenant_short_id || '').trim();
-    if (!/^\d{5}$/.test(shortId)) return res.status(400).json({ error: 'tenant_short_id must be 5 digits' });
+    if (!isValidTenantShortId(shortId)) return res.status(400).json({ error: 'tenant_short_id is invalid' });
 
     let client;
     try {
@@ -52715,6 +53797,110 @@ app.post('/api/admin/players/:id/verified-override',
         }
     }
 );
+
+// ──────────────────────────────────────────────────────────────────
+// FIX-421: tenant-defined CUSTOM AWARDS (vote-only; count toward stats; NO badge).
+// Tenants add their own post-game vote awards: label, emoji, polarity
+// (positive|banter), min_votes. Stored in tenant_custom_awards; merged into the
+// effective award set by getTenantAwardConfig() (voting + grant + game page +
+// per-player /awards counts). requireTenantAdmin: scoped tenant admins manage
+// their own; superadmin (with a :tenant_short_id) manages any tenant's.
+// ──────────────────────────────────────────────────────────────────
+function _validateCustomAward(body) {
+    const label    = (body && typeof body.label === 'string') ? body.label.trim() : '';
+    const emoji    = (body && typeof body.emoji === 'string' && body.emoji.trim()) ? body.emoji.trim() : '\u{1F3C6}';
+    const polarity = (body && body.polarity === 'banter') ? 'banter' : 'positive';
+    let minVotes = parseInt(body && body.min_votes, 10);
+    if (!Number.isFinite(minVotes)) minVotes = 3;
+    if (label.length < 2 || label.length > 40) return { error: 'label must be 2-40 characters' };
+    if (emoji.length > 8) return { error: 'emoji too long' };
+    if (minVotes < 1 || minVotes > 20) return { error: 'min_votes must be between 1 and 20' };
+    return { label, emoji, polarity, minVotes };
+}
+
+app.get('/api/t/:tenant_short_id/admin/custom-awards',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            const r = await pool.query(
+                `SELECT id, award_key, label, emoji, polarity, min_votes, active, created_at
+                   FROM tenant_custom_awards WHERE tenant_id = $1 ORDER BY created_at ASC`,
+                [req.tenant.id]
+            );
+            res.json({ custom_awards: r.rows });
+        } catch (e) {
+            if (e && e.code === '42P01') return res.json({ custom_awards: [] }); // pre-migration
+            console.error('FIX-421 list custom awards failed:', e.message);
+            res.status(500).json({ error: 'Failed to fetch custom awards' });
+        }
+    });
+
+app.post('/api/t/:tenant_short_id/admin/custom-awards',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const v = _validateCustomAward(req.body);
+        if (v.error) return res.status(400).json({ error: v.error });
+        const awardKey = 'c_' + Math.random().toString(36).slice(2, 10);
+        if (AWARD_TYPES.includes(awardKey)) return res.status(409).json({ error: 'key collision, retry' });
+        try {
+            const r = await pool.query(
+                `INSERT INTO tenant_custom_awards (tenant_id, award_key, label, emoji, polarity, min_votes)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 RETURNING id, award_key, label, emoji, polarity, min_votes, active, created_at`,
+                [req.tenant.id, awardKey, v.label, v.emoji, v.polarity, v.minVotes]
+            );
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_custom_award_created',
+                req.tenant.id, `${v.label} (${v.polarity}, min ${v.minVotes})`, req.tenant.id).catch(() => {}));
+            res.json({ custom_award: r.rows[0] });
+        } catch (e) {
+            if (e && e.code === '42P01') return res.status(503).json({ error: 'Custom awards not yet provisioned (run migration)' });
+            if (e && e.code === '23505') return res.status(409).json({ error: 'Duplicate award key, retry' });
+            console.error('FIX-421 create custom award failed:', e.message);
+            res.status(500).json({ error: 'Failed to create custom award' });
+        }
+    });
+
+app.patch('/api/t/:tenant_short_id/admin/custom-awards/:id',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        const v = _validateCustomAward(req.body);
+        if (v.error) return res.status(400).json({ error: v.error });
+        const active = (req.body && typeof req.body.active === 'boolean') ? req.body.active : true;
+        try {
+            const r = await pool.query(
+                `UPDATE tenant_custom_awards
+                    SET label = $1, emoji = $2, polarity = $3, min_votes = $4, active = $5
+                  WHERE id = $6 AND tenant_id = $7
+                  RETURNING id, award_key, label, emoji, polarity, min_votes, active, created_at`,
+                [v.label, v.emoji, v.polarity, v.minVotes, active, req.params.id, req.tenant.id]
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Custom award not found' });
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_custom_award_updated',
+                req.tenant.id, `${v.label} (${v.polarity}, min ${v.minVotes}, active ${active})`, req.tenant.id).catch(() => {}));
+            res.json({ custom_award: r.rows[0] });
+        } catch (e) {
+            if (e && e.code === '42P01') return res.status(503).json({ error: 'Custom awards not yet provisioned' });
+            console.error('FIX-421 update custom award failed:', e.message);
+            res.status(500).json({ error: 'Failed to update custom award' });
+        }
+    });
+
+app.delete('/api/t/:tenant_short_id/admin/custom-awards/:id',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+        try {
+            // Past winners in game_awards keep the award_key (stats preserved). Deleting the
+            // definition only stops future voting/granting and hides the label in admin.
+            const r = await pool.query(
+                `DELETE FROM tenant_custom_awards WHERE id = $1 AND tenant_id = $2 RETURNING award_key, label`,
+                [req.params.id, req.tenant.id]
+            );
+            if (r.rows.length === 0) return res.status(404).json({ error: 'Custom award not found' });
+            setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_custom_award_deleted',
+                req.tenant.id, `${r.rows[0].label}`, req.tenant.id).catch(() => {}));
+            res.json({ deleted: true, award_key: r.rows[0].award_key });
+        } catch (e) {
+            if (e && e.code === '42P01') return res.status(503).json({ error: 'Custom awards not yet provisioned' });
+            console.error('FIX-421 delete custom award failed:', e.message);
+            res.status(500).json({ error: 'Failed to delete custom award' });
+        }
+    });
 
 // GET /api/t/:tenant_short_id/admin/disabled-awards
 //
@@ -53365,18 +54551,34 @@ app.get('/api/t/:tenant_short_id/admin/organiser-reviews',
 app.get('/api/t/:tenant_short_id/admin/organisers',
     authenticateToken, requireTenantAdmin, async (req, res) => {
         try {
-            const r = await pool.query(
-                `SELECT pt.player_id, pt.role, pt.joined_at,
-                        p.full_name, p.alias, u.email, p.phone, p.photo_url
-                   FROM player_tenants pt
-                   JOIN players p ON p.id = pt.player_id
-                   JOIN users   u ON u.id = p.user_id
-                  WHERE pt.tenant_id = $1
-                    AND pt.status = 'active'
-                    AND pt.role IN ('organiser', 'tenant_admin')
-                  ORDER BY pt.role DESC, p.full_name ASC`,
-                [req.tenant.id]
-            );
+            // FIX: when this IS the Original/Coventry tenant, also surface global
+            // organisers (players.is_organiser=TRUE), deduped vs role-based ones.
+            const _isCov = (req.tenant.id === TF_COVENTRY_TENANT_ID);
+            let _orgSql = `
+                SELECT pt.player_id, pt.role, pt.joined_at,
+                       p.full_name, p.alias, u.email, p.phone, p.photo_url,
+                       'tenant_role'::text AS source
+                  FROM player_tenants pt
+                  JOIN players p ON p.id = pt.player_id
+                  JOIN users   u ON u.id = p.user_id
+                 WHERE pt.tenant_id = $1 AND pt.status = 'active'
+                   AND pt.role IN ('organiser', 'tenant_admin')`;
+            if (_isCov) {
+                _orgSql += `
+                UNION ALL
+                SELECT p.id AS player_id, 'organiser'::text AS role, covpt.joined_at,
+                       p.full_name, p.alias, u.email, p.phone, p.photo_url,
+                       'global'::text AS source
+                  FROM players p
+                  JOIN users u ON u.id = p.user_id
+             LEFT JOIN player_tenants covpt ON covpt.player_id = p.id AND covpt.tenant_id = $1
+                 WHERE COALESCE(p.is_organiser, FALSE) = TRUE
+                   AND NOT EXISTS (SELECT 1 FROM player_tenants x
+                                    WHERE x.player_id = p.id AND x.tenant_id = $1
+                                      AND x.status = 'active' AND x.role IN ('organiser','tenant_admin'))`;
+            }
+            _orgSql += ` ORDER BY role DESC, full_name ASC`;
+            const r = await pool.query(_orgSql, [req.tenant.id]);
             res.json({ organisers: r.rows });
         } catch (e) {
             console.error('FIX-329 list organisers failed:', e.message);
@@ -53484,30 +54686,58 @@ app.delete('/api/t/:tenant_short_id/admin/organisers/:player_id',
 // per-tenant endpoints above (/api/t/:short_id/admin/organisers).
 app.get('/api/admin/organisers', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
+        const COV = TF_COVENTRY_TENANT_ID;
         const tenantFilter = (typeof req.query.tenant_id === 'string' && isValidUuid(req.query.tenant_id))
             ? req.query.tenant_id : null;
+        // FIX: surface the Original/Coventry global organisers (players.is_organiser=TRUE),
+        // which are NOT stored as player_tenants.role='organiser'. Only when viewing All
+        // tenants or the Coventry tenant; deduped against any Coventry role-based organiser.
+        const includeCoventryGlobal = (!tenantFilter) || (tenantFilter === COV);
         const params = [];
         let where = "pt.status = 'active' AND pt.role IN ('organiser','tenant_admin')";
         if (tenantFilter) { params.push(tenantFilter); where += ` AND pt.tenant_id = $${params.length}`; }
-
+        let unionSql = '';
+        if (includeCoventryGlobal) {
+            params.push(COV);
+            const ci = params.length;
+            unionSql = `
+            UNION ALL
+            SELECT p.id AS player_id, 'organiser'::text AS role, $${ci}::uuid AS tenant_id, covpt.joined_at,
+                   p.full_name, p.alias, p.photo_url,
+                   covt.name AS tenant_name, covt.short_id AS tenant_short_id,
+                   rv.avg_rating, COALESCE(rv.review_count, 0) AS review_count,
+                   'global'::text AS source
+              FROM players p
+         LEFT JOIN tenants covt ON covt.id = $${ci}::uuid
+         LEFT JOIN player_tenants covpt ON covpt.player_id = p.id AND covpt.tenant_id = $${ci}::uuid
+         LEFT JOIN rv ON rv.organiser_player_id = p.id
+             WHERE COALESCE(p.is_organiser, FALSE) = TRUE
+               AND NOT EXISTS (SELECT 1 FROM player_tenants x
+                                WHERE x.player_id = p.id AND x.tenant_id = $${ci}::uuid
+                                  AND x.status = 'active' AND x.role IN ('organiser','tenant_admin'))`;
+        }
         const r = await pool.query(
-            `SELECT pt.player_id, pt.role, pt.tenant_id, pt.joined_at,
-                    p.full_name, p.alias, p.photo_url,
-                    t.name AS tenant_name, t.short_id AS tenant_short_id,
-                    COALESCE(rv.avg_rating, NULL) AS avg_rating,
-                    COALESCE(rv.review_count, 0)  AS review_count
-               FROM player_tenants pt
-               JOIN players p ON p.id = pt.player_id
-          LEFT JOIN tenants t ON t.id = pt.tenant_id
-          LEFT JOIN (
-                    SELECT organiser_player_id,
-                           ROUND(AVG(rating)::numeric,1) AS avg_rating,
-                           COUNT(*)::int                 AS review_count
-                      FROM organiser_reviews
-                     GROUP BY organiser_player_id
-               ) rv ON rv.organiser_player_id = pt.player_id
-              WHERE ${where}
-              ORDER BY t.name NULLS LAST, pt.role DESC, p.full_name ASC`,
+            `WITH rv AS (
+                SELECT organiser_player_id,
+                       ROUND(AVG(rating)::numeric,1) AS avg_rating,
+                       COUNT(*)::int                 AS review_count
+                  FROM organiser_reviews
+                 GROUP BY organiser_player_id
+             )
+             SELECT * FROM (
+                SELECT pt.player_id, pt.role, pt.tenant_id, pt.joined_at,
+                       p.full_name, p.alias, p.photo_url,
+                       t.name AS tenant_name, t.short_id AS tenant_short_id,
+                       rv.avg_rating, COALESCE(rv.review_count, 0) AS review_count,
+                       'tenant_role'::text AS source
+                  FROM player_tenants pt
+                  JOIN players p ON p.id = pt.player_id
+             LEFT JOIN tenants t ON t.id = pt.tenant_id
+             LEFT JOIN rv ON rv.organiser_player_id = pt.player_id
+                 WHERE ${where}
+                ${unionSql}
+             ) q
+             ORDER BY tenant_name NULLS LAST, role DESC, full_name ASC`,
             params
         );
         res.json({ organisers: r.rows });
@@ -56618,15 +57848,34 @@ app.post('/api/t/:tenant_short_id/admin/players/:playerId/points', authenticateT
 // ──────────────────────────────────────────────────────────────────────────
 app.get('/api/t/:tenant_short_id/admin/monthly-config', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
-        const cfg = await getMonthlyConfigForTenant(req.tenant.id, pool);
-        const all = MONTHLY_METRICS.map(m => ({
+        // FIX-417: return the full award × method matrix + this tenant's selections.
+        const base = await getMonthlyConfigForTenant(req.tenant.id, pool);
+        let selPairs = [];
+        try {
+            const r = await pool.query(
+                'SELECT metric_id, calculation_type FROM tenant_monthly_awards WHERE tenant_id = $1', [req.tenant.id]);
+            selPairs = r.rows;
+        } catch (_) { selPairs = []; }
+        const selByMetric = {};
+        if (selPairs.length) {
+            for (const p of selPairs) {
+                const mid = parseInt(p.metric_id);
+                (selByMetric[mid] = selByMetric[mid] || []).push(String(p.calculation_type || 'most'));
+            }
+        } else {
+            // Legacy fallback: metric_ids (or all) at 'most'.
+            const ids = base.metricIds || MONTHLY_METRICS.map(m => m.metric_id);
+            for (const id of ids) selByMetric[parseInt(id)] = ['most'];
+        }
+        const awards = MONTHLY_METRICS.map(m => ({
             metric_id: m.metric_id,
             label: MONTHLY_METRIC_LABELS[m.metric_id] || ('Metric ' + m.metric_id),
-            selected: cfg.metricIds ? cfg.metricIds.includes(m.metric_id) : true
+            methods: _monthlyMethodsFor(m.metric_id),       // available methods for this award
+            selected: selByMetric[m.metric_id] || []        // tenant's chosen methods
         }));
-        res.json({ enabled: cfg.enabled, metrics: all, all_selected: !cfg.metricIds });
+        res.json({ enabled: base.enabled, awards });
     } catch (e) {
-        console.error('FIX-399 get monthly-config failed:', e.message);
+        console.error('FIX-417 get monthly-config failed:', e.message);
         res.status(500).json({ error: 'Failed to load config' });
     }
 });
@@ -56634,36 +57883,63 @@ app.get('/api/t/:tenant_short_id/admin/monthly-config', authenticateToken, requi
 app.patch('/api/t/:tenant_short_id/admin/monthly-config', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
         const b = req.body || {};
-        const validIds = new Set(MONTHLY_METRICS.map(m => m.metric_id));
-        let metricIds = null;
-        if (Array.isArray(b.metric_ids)) {
-            metricIds = b.metric_ids.map(n => parseInt(n)).filter(n => validIds.has(n));
-            if (!metricIds.length) metricIds = null; // empty selection = all (avoids zero-trophy tenants)
-        }
         const enabled = b.enabled === undefined ? true : !!b.enabled;
+        // FIX-417: accept (metric, method) pairs via b.awards; fall back to legacy
+        // b.metric_ids (treated as 'most'). Validate each against the metric's offered
+        // monthly methods; drop anything invalid/unsupported.
+        let raw = [];
+        if (Array.isArray(b.awards)) {
+            raw = b.awards.map(a => ({ metric_id: parseInt(a.metric_id), calc_type: String(a.calc_type || a.calculation_type || 'most') }));
+        } else if (Array.isArray(b.metric_ids)) {
+            raw = b.metric_ids.map(n => ({ metric_id: parseInt(n), calc_type: 'most' }));
+        }
+        const seen = new Set();
+        const valid = [];
+        for (const p of raw) {
+            const methods = _monthlyMethodsFor(p.metric_id);
+            if (!methods.length || !methods.includes(p.calc_type)) continue;
+            const k = p.metric_id + ':' + p.calc_type;
+            if (seen.has(k)) continue; seen.add(k);
+            valid.push({ metric_id: p.metric_id, calc_type: p.calc_type });
+        }
+        // Persist the on/off flag (tenant_monthly_config). metric_ids is retired in
+        // favour of tenant_monthly_awards, so null it to avoid a stale legacy fallback.
         await pool.query(`
             INSERT INTO tenant_monthly_config (tenant_id, enabled, metric_ids, updated_at, updated_by)
-            VALUES ($1, $2, $3, NOW(), $4)
+            VALUES ($1, $2, NULL, NOW(), $3)
             ON CONFLICT (tenant_id) DO UPDATE
-               SET enabled = $2, metric_ids = $3, updated_at = NOW(), updated_by = $4`,
-            [req.tenant.id, enabled, metricIds, req.user.userId]);
+               SET enabled = $2, metric_ids = NULL, updated_at = NOW(), updated_by = $3`,
+            [req.tenant.id, enabled, req.user.userId]);
+        // Replace the tenant's (metric, method) selections atomically.
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            await client.query('DELETE FROM tenant_monthly_awards WHERE tenant_id = $1', [req.tenant.id]);
+            for (const v of valid) {
+                await client.query(
+                    `INSERT INTO tenant_monthly_awards (tenant_id, metric_id, calculation_type)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (tenant_id, metric_id, calculation_type) DO NOTHING`,
+                    [req.tenant.id, v.metric_id, v.calc_type]);
+            }
+            await client.query('COMMIT');
+        } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw e;
+        } finally { client.release(); }
         await auditLog(pool, req.user.playerId, 'tenant_monthly_config', req.tenant.id,
-            `enabled=${enabled} metrics=${metricIds ? metricIds.join(',') : 'ALL'}`);
-
-        // Instant + backfill: regenerate THIS TENANT's current-month trophies now so the
-        // change is visible immediately — tenant-scoped so other tenants' trophies are never
-        // touched (avoids the whole-month all-tenant wipe of runMonthlyTrophyJob).
+            `enabled=${enabled} awards=${valid.map(v => v.metric_id + ':' + v.calc_type).join(',') || 'NONE'}`);
+        // Instant regen of the current month so the change shows immediately.
         const now = new Date();
         const yy = now.getUTCFullYear(), mm = now.getUTCMonth() + 1;
         const _regenTenantId = req.tenant.id;
         setImmediate(() => {
             regenerateTenantMonth(_regenTenantId, yy, mm)
-                .catch(e => console.error('FIX-399 monthly regen failed:', e.message));
+                .catch(e => console.error('FIX-417 monthly regen failed:', e.message));
         });
-
-        res.json({ success: true, enabled, metric_ids: metricIds, regenerating: true });
+        res.json({ success: true, enabled, awards: valid, regenerating: true });
     } catch (e) {
-        console.error('FIX-399 patch monthly-config failed:', e.message);
+        console.error('FIX-417 patch monthly-config failed:', e.message);
         res.status(500).json({ error: 'Failed to save config' });
     }
 });
@@ -57696,6 +58972,7 @@ async function bootstrapOrganiserColumns() {
 // TF-owned (owner_tenant_id IS NULL = TotalFooty root) + verified. Idempotent.
 async function bootstrapVenueOwnership() {
     const cols = [
+        ['is_active',                'BOOLEAN NOT NULL DEFAULT TRUE'],  // archive/restore — was an external p5-migration; bootstrap so DELETE/archive can't 503
         ['owner_tenant_id',          'UUID'],
         ['duplicated_from_venue_id', 'UUID'],
         ['verification_status',      "TEXT NOT NULL DEFAULT 'none'"],  // none|requested|verified
@@ -57933,35 +59210,8 @@ async function regenerateTenantMonth(tenantId, year, month) {
         await client.query(
             `DELETE FROM monthly_trophies WHERE year = $1 AND month = $2 AND tenant_id = $3`,
             [year, month, tenantId]);
-        // Rebuild from current config (skip if disabled).
-        const cfg = await getMonthlyConfigForTenant(tenantId, client);
-        if (cfg.enabled) {
-            const metrics = cfg.metricIds
-                ? MONTHLY_METRICS.filter(m => cfg.metricIds.includes(m.metric_id))
-                : MONTHLY_METRICS;
-            for (const region of MONTHLY_REGIONS) {
-                for (const m of metrics) {
-                    const leaderboard = await calcMonthlyLeaderboard(
-                        year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards, tenantId);
-                    if (!leaderboard || leaderboard.length === 0) continue;
-                    const trophyRow = await client.query(
-                        `INSERT INTO monthly_trophies
-                         (year, month, region, metric_id, calculation_type,
-                          eligibility_min_games, eligibility_min_awards, tenant_id)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-                        [year, month, region, m.metric_id, m.calc_type, m.min_games, m.min_awards || 0, tenantId]);
-                    const trophyId = trophyRow.rows[0].id;
-                    for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
-                        const row = leaderboard[i];
-                        await client.query(
-                            `INSERT INTO monthly_trophy_results
-                             (trophy_id, player_id, rank, primary_stat, supporting_stat, games_played)
-                             VALUES ($1, $2, $3, $4, $5, $6)`,
-                            [trophyId, row.player_id, i + 1, row.primary_stat, row.supporting_stat, row.appearances]);
-                    }
-                }
-            }
-        }
+        // Rebuild from current config (FIX-417: shared award × method helper).
+        await _generateTenantMonthlyTrophies(client, tenantId, year, month);
         await client.query('COMMIT');
     } catch (e) {
         await client.query('ROLLBACK').catch(() => {});
@@ -57970,6 +59220,91 @@ async function regenerateTenantMonth(tenantId, year, month) {
         client.release();
         _tenantRegenLocks.delete(lockKey);
     }
+}
+
+// ── FIX-417: per-tenant award × method resolution + shared generation ───────
+// METRIC_CONFIG gives each metric's valid calc methods; the monthly engine supports
+// MONTHLY_SUPPORTED_CALC_TYPES, so a metric's OFFERED methods are the intersection.
+// tenant_monthly_awards stores the (metric, method) pairs a tenant has chosen; if a
+// tenant has no rows we fall back to the legacy metric_ids (all at 'most') so nothing
+// regresses. min_games/min_awards come from MONTHLY_METRICS (FIX-416 then floors games
+// to >= 3 inside the engine).
+const _MONTHLY_METRIC_BY_ID = Object.fromEntries(MONTHLY_METRICS.map(m => [m.metric_id, m]));
+
+function _monthlyMethodsFor(metricId) {
+    const id = parseInt(metricId);
+    const cfg = METRIC_CONFIG[id];
+    if (!cfg || !_MONTHLY_METRIC_BY_ID[id]) return [];           // not a monthly-supported metric
+    return (cfg.validCalcTypes || []).filter(c => MONTHLY_SUPPORTED_CALC_TYPES.includes(c));
+}
+
+// Returns { enabled, awards: [{metric_id, calc_type, min_games, min_awards}] }.
+async function _getTenantMonthlyAwards(tenantId, db = pool) {
+    const base = await getMonthlyConfigForTenant(tenantId, db);  // { enabled, metricIds }
+    const out = { enabled: base.enabled, awards: [] };
+    if (!out.enabled) return out;
+    let pairs = [];
+    try {
+        const r = await db.query(
+            'SELECT metric_id, calculation_type FROM tenant_monthly_awards WHERE tenant_id = $1', [tenantId]);
+        pairs = r.rows;
+    } catch (e) {
+        if (!(e && (e.code === '42P01' || e.code === '42703'))) console.error('_getTenantMonthlyAwards read:', e.message);
+        pairs = [];
+    }
+    const mk = (metric_id, calc_type) => {
+        const m = _MONTHLY_METRIC_BY_ID[metric_id];
+        if (!m) return null;
+        const methods = _monthlyMethodsFor(metric_id);
+        if (!methods.length) return null;
+        const ct = methods.includes(calc_type) ? calc_type : (methods.includes('most') ? 'most' : methods[0]);
+        return { metric_id, calc_type: ct, min_games: m.min_games, min_awards: m.min_awards || 0 };
+    };
+    if (pairs.length) {
+        const seen = new Set();
+        for (const p of pairs) {
+            const a = mk(parseInt(p.metric_id), String(p.calculation_type || 'most'));
+            if (!a) continue;
+            const k = a.metric_id + ':' + a.calc_type;
+            if (seen.has(k)) continue; seen.add(k);
+            out.awards.push(a);
+        }
+    } else {
+        const ids = base.metricIds || MONTHLY_METRICS.map(m => m.metric_id);
+        for (const id of ids) { const a = mk(parseInt(id), 'most'); if (a) out.awards.push(a); }
+    }
+    return out;
+}
+
+// Generate ONE tenant's Layer-1 monthly trophies. Caller owns the transaction.
+async function _generateTenantMonthlyTrophies(client, tenantId, year, month) {
+    const cfg = await _getTenantMonthlyAwards(tenantId, client);
+    if (!cfg.enabled) return 0;
+    let created = 0;
+    for (const region of MONTHLY_REGIONS) {
+        for (const aw of cfg.awards) {
+            const leaderboard = await calcMonthlyLeaderboard(
+                year, month, region, aw.metric_id, aw.calc_type, aw.min_games, aw.min_awards, tenantId);
+            if (!leaderboard || leaderboard.length === 0) continue;
+            const trophyRow = await client.query(
+                `INSERT INTO monthly_trophies
+                 (year, month, region, metric_id, calculation_type,
+                  eligibility_min_games, eligibility_min_awards, tenant_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+                [year, month, region, aw.metric_id, aw.calc_type, aw.min_games, aw.min_awards || 0, tenantId]);
+            const trophyId = trophyRow.rows[0].id;
+            for (let i = 0; i < Math.min(leaderboard.length, 3); i++) {
+                const row = leaderboard[i];
+                await client.query(
+                    `INSERT INTO monthly_trophy_results
+                     (trophy_id, player_id, rank, primary_stat, supporting_stat, games_played)
+                     VALUES ($1, $2, $3, $4, $5, $6)`,
+                    [trophyId, row.player_id, i + 1, row.primary_stat, row.supporting_stat, row.appearances]);
+            }
+            created++;
+        }
+    }
+    return created;
 }
 
 // Resolve a tenant's monthly-awards config. Returns { enabled, metricIds | null }.
