@@ -37744,7 +37744,7 @@ async function _reportScope(req) {
 
 // Express gate for the /api/reports/* endpoints. Attaches req.reportScope, or 403s
 // a caller who is neither (super)admin nor a tenant_admin anywhere.
-const requireReportAccess = async (req, res, next) => {
+async function requireReportAccess(req, res, next) {
     if (!req.user) return res.status(401).json({ error: 'Access denied' });
     try {
         const scope = await _reportScope(req);
