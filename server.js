@@ -5634,6 +5634,190 @@ async function _aggregateRatingFeedback(subjectPlayerId) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-413 — Peer calibration for UNFLAGGED subjects ("calibrate everyone").
+// ═══════════════════════════════════════════════════════════════════════════
+// _aggregateRatingFeedback only ever moves a FLAGGED player and uses the flag
+// to pick the direction. Once the comparison pool was broadened (FIX-413
+// subject query) so any settled player can be a subject, votes on those
+// unflagged subjects were stored and then IGNORED. This helper is the missing
+// consumer: it moves an unflagged subject's OVR by NET VOTE CONSENSUS, reusing
+// the SAME guardrails as the flagged path (global overcorrection damping via
+// _fix275ClampMagnitude, the stat-picker, auto-apply/suggestion routing, and
+// the recalibration-history + audit trail), plus two extra brakes because there
+// was no prior suspicion to justify the move:
+//   • movement is HARD-CAPPED at ±FIX413_MAX_STEP OVR per aggregation, and
+//   • it requires a clear consensus margin (matching side must beat the counter
+//     side by >= FIX413_CONSENSUS_MARGIN_X) on top of the existing vote/voter
+//     thresholds in _fix268MovementMagnitude.
+// FIX413_CALIBRATE_UNFLAGGED is the kill-switch — set it false to disable peer
+// calibration instantly; the flagged path is fully independent and unaffected.
+const FIX413_CALIBRATE_UNFLAGGED = true;  // master switch for peer calibration
+const FIX413_MAX_STEP            = 1;     // hard cap: never move unflagged OVR by >1 per run
+const FIX413_CONSENSUS_MARGIN_X  = 2;     // matching weighted votes must be >= 2x counter
+async function _aggregateUnflaggedCalibration(subjectPlayerId) {
+    if (!FIX413_CALIBRATE_UNFLAGGED) return { applied: false, reason: 'calibration_disabled' };
+    const client = await pool.connect();
+    let inTxn = false;
+    try {
+        await client.query('BEGIN');
+        inTxn = true;
+        const subjR = await client.query(
+            `SELECT id, alias, position, overall_rating, ovr_suspicion,
+                    total_appearances, recalibration_stability,
+                    defending_rating, strength_rating, fitness_rating,
+                    pace_rating, decisions_rating, assisting_rating,
+                    shooting_rating, goalkeeper_rating, reliability_tier
+             FROM players WHERE id = $1 FOR UPDATE`,
+            [subjectPlayerId]
+        );
+        if (subjR.rows.length === 0) { await client.query('ROLLBACK'); inTxn = false; return { applied: false, reason: 'subject_not_found' }; }
+        const subj = subjR.rows[0];
+        // FLAGGED subjects belong to _aggregateRatingFeedback — never double-move.
+        if (subj.ovr_suspicion) { await client.query('ROLLBACK'); inTxn = false; return { applied: false, reason: 'is_flagged' }; }
+
+        // Unconsumed real votes (skips excluded), oldest first.
+        const votesR = await client.query(
+            `SELECT id, voter_player_id, reference_player_id, delta_vote,
+                    COALESCE(applied_amount, 0) AS applied_amount,
+                    COALESCE(weight, 1.0) AS weight, created_at
+             FROM player_rating_feedback
+             WHERE subject_player_id = $1 AND fully_consumed = false
+                   AND delta_vote IS NOT NULL
+             ORDER BY created_at ASC`,
+            [subjectPlayerId]
+        );
+        const votes = votesR.rows;
+        if (votes.length === 0) { await client.query('ROLLBACK'); inTxn = false; return { applied: false, reason: 'no_votes' }; }
+
+        // Direction = sign of the NET weighted consensus (no flag to lean on).
+        // delta>0 => subject more effective than reference => underrated => move UP.
+        const _wsum = arr => Math.round(arr.reduce((s, v) => s + (Number(v.weight) || 1), 0) * 100) / 100;
+        const net = votes.reduce((s, v) => s + (Number(v.weight) || 1) * Math.sign(v.delta_vote), 0);
+        const calibDir = Math.sign(net);
+        if (calibDir === 0) { await client.query('ROLLBACK'); inTxn = false; return { applied: false, reason: 'no_consensus' }; }
+
+        const matchingVotes  = votes.filter(v => Math.sign(v.delta_vote) === calibDir);
+        const counterVotes   = votes.filter(v => Math.sign(v.delta_vote) === -calibDir);
+        const matchingCount  = _wsum(matchingVotes);
+        const matchingVoters = new Set(matchingVotes.map(v => v.voter_player_id)).size;
+        const counterCount   = _wsum(counterVotes);
+
+        // Brake #1: require a clear consensus margin (skip when the room is split).
+        if (matchingCount < counterCount * FIX413_CONSENSUS_MARGIN_X) {
+            await client.query('ROLLBACK'); inTxn = false;
+            return { applied: false, reason: 'consensus_too_split', matching: matchingCount, counter: counterCount };
+        }
+
+        const apps        = parseInt(subj.total_appearances || 0, 10);
+        const isNewPlayer = apps < FIX268_NEW_PLAYER_CUTOFF;
+        const movementMag = _fix268MovementMagnitude(matchingCount, matchingVoters, isNewPlayer);
+        if (movementMag <= 0) { await client.query('ROLLBACK'); inTxn = false; return { applied: false, reason: 'threshold_not_met' }; }
+
+        // Brake #2: hard-cap movement at ±FIX413_MAX_STEP regardless of tier.
+        const cappedMag      = Math.min(movementMag, FIX413_MAX_STEP);
+        const signedShiftRaw = cappedMag * calibDir;
+        const oldOvr         = parseInt(subj.overall_rating, 10) || 0;
+
+        // Reuse substantiation + the global damping clamp so peer calibration is
+        // throttled by the same overcorrection damping as the flagged path.
+        const substantiation = await _computeSubstantiation(subjectPlayerId, matchingVotes);
+        const clamp          = await _fix275ClampMagnitude(subj, signedShiftRaw, substantiation.score);
+        const signedShift    = clamp.clampedDelta;
+        if (signedShift === 0) { await client.query('ROLLBACK'); inTxn = false; return { applied: false, reason: 'clamped_to_zero' }; }
+
+        const pick     = _fix268PickStatChange(subj, signedShift);
+        const absorbed = signedShift - pick.shortfall;
+        if (absorbed === 0) { await client.query('ROLLBACK'); inTxn = false; return { applied: false, reason: 'stat_floor_ceiling' }; }
+
+        const matchingVoterIds = [...new Set(matchingVotes.map(v => String(v.voter_player_id)))];
+        const autoApply = await _ratingAutoApplyEnabled();
+
+        if (!autoApply) {
+            // Suggestion mode — queue for admin review, no OVR move, no vote consume.
+            try {
+                const existR = await client.query(
+                    `SELECT id FROM rating_recalibration_history
+                      WHERE subject_player_id = $1 AND status = 'pending'
+                      ORDER BY created_at DESC LIMIT 1`,
+                    [subjectPlayerId]
+                );
+                if (existR.rows.length === 0) {
+                    await _recordRecalibrationHistory(client, {
+                        subjectId: subjectPlayerId, deltaOvr: absorbed,
+                        statChanges: pick.changes, voterIds: matchingVoterIds,
+                        suspicionFlag: null, movementMag, substantiationScore: substantiation.score,
+                        status: 'pending', source: 'peer_calibration', appearancesAtRecal: apps,
+                    });
+                }
+            } catch (e) { console.warn('[FIX-413] pending write failed (non-fatal):', e.message); }
+            await client.query('COMMIT'); inTxn = false;
+            return { applied: false, reason: 'queued_for_admin_review', proposed_delta: absorbed };
+        }
+
+        // Auto-apply: consume votes (4 magnitude per OVR unit), then move OVR + stats.
+        const remaining = matchingVotes.map(v => ({ ...v, remainMag: Math.abs(v.delta_vote) - v.applied_amount }));
+        let magToConsume = Math.abs(absorbed) * 4;
+        for (const v of remaining) {
+            if (magToConsume <= 0) break;
+            const take = Math.min(v.remainMag, magToConsume);
+            const newApplied = v.applied_amount + take;
+            const fully = newApplied >= Math.abs(v.delta_vote);
+            await client.query(
+                `UPDATE player_rating_feedback SET applied_amount = $1, fully_consumed = $2 WHERE id = $3`,
+                [newApplied, fully, v.id]
+            );
+            magToConsume -= take;
+        }
+
+        const newOvr   = oldOvr + absorbed;
+        const setParts = ['overall_rating = $1', 'last_ovr_change_at = NOW()'];
+        const params   = [newOvr];
+        let pi = 2;
+        for (const ch of pick.changes) { setParts.push(`${ch.column} = $${pi++}`); params.push(ch.newVal); }
+        params.push(subjectPlayerId);
+        await client.query(`UPDATE players SET ${setParts.join(', ')} WHERE id = $${pi}`, params);
+
+        const newStats = { ...subj };
+        for (const ch of pick.changes) newStats[ch.column] = ch.newVal;
+        await client.query(
+            `INSERT INTO player_stat_history
+              (player_id, changed_by, overall_rating, defending_rating, strength_rating,
+               fitness_rating, pace_rating, decisions_rating, assisting_rating,
+               shooting_rating, goalkeeper_rating, reliability_tier, created_at)
+             VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
+            [subjectPlayerId, newOvr,
+             newStats.defending_rating, newStats.strength_rating, newStats.fitness_rating,
+             newStats.pace_rating, newStats.decisions_rating, newStats.assisting_rating,
+             newStats.shooting_rating, newStats.goalkeeper_rating, subj.reliability_tier]
+        );
+        await _recordRecalibrationHistory(client, {
+            subjectId: subjectPlayerId, deltaOvr: absorbed,
+            statChanges: pick.changes, voterIds: matchingVoterIds,
+            suspicionFlag: null, movementMag, substantiationScore: substantiation.score,
+            status: 'applied', source: 'peer_calibration', appearancesAtRecal: apps,
+        });
+        await client.query(
+            `INSERT INTO audit_logs (action, target_id, detail, created_at) VALUES ($1, $2, $3, NOW())`,
+            ['rating_peer_calibrated', subjectPlayerId, JSON.stringify({
+                old_ovr: oldOvr, new_ovr: newOvr, delta: absorbed, calib_dir: calibDir,
+                matching_votes: matchingCount, matching_voters: matchingVoters,
+                counter_votes: counterCount, movement_magnitude: movementMag,
+                capped_step: FIX413_MAX_STEP, source: 'peer_calibration',
+            })]
+        );
+        await client.query('COMMIT'); inTxn = false;
+        console.log(`[FIX-413 peer-calibration] player ${subjectPlayerId}: ${oldOvr} -> ${newOvr} (dir=${calibDir}, voters=${matchingVoters})`);
+        return { applied: true, deltaOvr: absorbed, oldOvr, newOvr, reason: 'peer_calibrated' };
+    } catch (e) {
+        if (inTxn) { try { await client.query('ROLLBACK'); } catch (_) {} }
+        console.error('[FIX-413 peer-calibration] failed for subject', subjectPlayerId, e);
+        return { applied: false, reason: 'error', error: e.message };
+    } finally {
+        client.release();
+    }
+}
+
 // Carrier inference — when a flagged player gets vindicated by votes, look
 // at the games they actually LOST (if low_winrate) or WON (if high_winrate)
 // and find the highest-OVR teammate who appeared most often as "highest
@@ -6627,11 +6811,29 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
+// VERSION-AUDIT: parse + sanitise the client identity sent on login (app/web).
+// Never trusts client strings: platform allowlisted, version/build length-capped
+// and stripped to a safe charset. Returns a display string for the audit detail.
+function _parseClientInfo(c) {
+    const okPlat = { ios: 'ios', android: 'android', web: 'web' };
+    let platform = null, version = null, build = null;
+    if (c && typeof c === 'object') {
+        platform = okPlat[String(c.platform || '').toLowerCase()] || null;
+        if (c.version != null) version = (String(c.version).trim().slice(0, 32).replace(/[^0-9A-Za-z.+-]/g, '')) || null;
+        if (c.build   != null) build   = (String(c.build).trim().slice(0, 16).replace(/[^0-9A-Za-z.+-]/g, '')) || null;
+    }
+    let display = platform || 'unknown';
+    if (version) display += ' ' + version;
+    if (build)   display += ' (' + build + ')';
+    return { platform, version, build, display };
+}
+
 app.post('/api/auth/login', async (req, res) => {
     try {
         // FIX-008: Guard against empty/null body
         const { email, password } = req.body || {};
         if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+        const _ci = _parseClientInfo(req.body && req.body.client); // VERSION-AUDIT
 
         const userResult = await pool.query(
             'SELECT id, email, password_hash, role, token_version, force_password_change FROM users WHERE email = $1',
@@ -6746,9 +6948,17 @@ app.post('/api/auth/login', async (req, res) => {
             }
         });
 
-        // Audit login event (non-critical, after response)
-        setImmediate(() => auditLog(pool, player.id, 'login', player.id,
-            `email:${user.email} role:${user.role}`).catch(() => {}));
+        // Audit login event + client-version telemetry (non-critical, after response)
+        setImmediate(() => {
+            auditLog(pool, player.id, 'login', player.id,
+                `email:${user.email} role:${user.role} client:${_ci.display}`).catch(() => {});
+            if (_ci.platform || _ci.version) {
+                pool.query(
+                    `UPDATE players SET last_client_version = $1, last_client_platform = $2, last_client_seen = now() WHERE id = $3`,
+                    [_ci.version, _ci.platform, player.id]
+                ).catch(() => {}); // VERSION-AUDIT: telemetry only; 42703-tolerant pre-migration
+            }
+        });
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed' });
@@ -7220,6 +7430,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
             SELECT 
                 p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.player_number_text, p.photo_url, /* FIX-302 */
                 p.reliability_tier, p.phone,
+                p.last_client_version, p.last_client_platform, p.last_client_seen, /* VERSION-AUDIT */
                 p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
                 p.goalkeeper_rating,
@@ -37329,9 +37540,13 @@ async function _fetchFinanceGames(from, to, scope) {
     } catch (err) {
         // Pre-migration fallback — strip pitch_cost / pay_amount / dropped_no_refund references
         if (err.code === '42703' || err.code === '42P01') {
+            // VISIBILITY: queryFull failed on a missing column/table — do NOT swallow silently;
+            // the lite path degrades pitch/ref/DNR. Log the exact cause so it can't hide again.
+            console.error('[finance/games] queryFull failed (code=' + err.code + '): ' + err.message +
+                ' — using LITE fallback. Run the dropped_no_refund + game_referees.pay_amount migration to restore full costs.');
             const queryLite = `
                 SELECT g.id, g.game_date, g.format, g.exclusivity, v.name AS venue_name,
-                       g.cost_per_player, NULL::numeric AS pitch_cost, g.ref_pay, g.team_selection_type,
+                       g.cost_per_player, COALESCE(g.pitch_cost, v.default_pitch_cost) AS pitch_cost, g.ref_pay, g.team_selection_type,
                        COALESCE((SELECT COUNT(*)::int FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed'), 0)         AS confirmed_count,
                        COALESCE((SELECT COUNT(*)::int FROM registrations r WHERE r.game_id = g.id AND r.status = 'confirmed' AND r.is_comped = TRUE), 0) AS comped_count,
                        COALESCE((SELECT SUM(CASE WHEN NOT is_comped THEN COALESCE(amount_paid, 0) ELSE 0 END) FROM registrations WHERE game_id = g.id AND status = 'confirmed'), 0) AS reg_real,
@@ -41526,10 +41741,14 @@ app.get('/api/games/:gameUrl/rating-feedback-pair', authenticateToken, async (re
         );
         if (vR.rows.length === 0) return res.status(403).json({ error: 'voter_not_in_game' });
 
-        // Subjects: flagged players in this game, that voter hasn't already
-        // voted on (whether the prior vote was a real vote OR a "skip" —
-        // unique index treats skip and vote identically per spec).
-        // RANDOM() for the order so voters see different pairs each request.
+        // FIX-413 (broaden B / "calibrate everyone"): subjects are no longer
+        // flagged-only. They are flagged players OR any settled player (>=5
+        // appearances), so a voter gets ~5 comparisons instead of the 0-1
+        // flagged ones, and "request more" has a deep pool of fresh pairs.
+        // Flagged players are surfaced FIRST (targeted suspicion feedback),
+        // then settled players (peer calibration). The GK-vs-GK guard and the
+        // already-voted exclusion are unchanged. Votes on the new (unflagged)
+        // subjects are consumed by _aggregateUnflaggedCalibration (FIX-413).
         const subjR = await pool.query(
             `SELECT p.id, p.alias, p.first_name, p.position, p.overall_rating,
                     p.signup_positions
@@ -41537,7 +41756,7 @@ app.get('/api/games/:gameUrl/rating-feedback-pair', authenticateToken, async (re
                JOIN players p ON p.id = r.player_id
               WHERE r.game_id = $1
                 AND r.status = 'confirmed'
-                AND p.ovr_suspicion IS NOT NULL
+                AND (p.ovr_suspicion IS NOT NULL OR p.total_appearances >= 5)
                 AND p.id != $2
                 AND NOT EXISTS (
                     SELECT 1 FROM player_rating_feedback prf
@@ -41545,7 +41764,7 @@ app.get('/api/games/:gameUrl/rating-feedback-pair', authenticateToken, async (re
                        AND prf.voter_player_id   = $2
                        AND prf.game_id           = $1
                 )
-              ORDER BY RANDOM()`,
+              ORDER BY (p.ovr_suspicion IS NOT NULL) DESC, RANDOM()`,
             [gameId, voterId]
         );
         if (subjR.rows.length === 0) return res.json({ none: true, reason: 'no_subjects' });
@@ -41742,6 +41961,12 @@ app.post('/api/games/:gameUrl/rating-feedback', authenticateToken, async (req, r
         let recalibration = null;
         if (!isSkip) {
             recalibration = await _aggregateRatingFeedback(subjectPlayerId);
+            // FIX-413: subject isn't flagged → the suspicion aggregator no-ops
+            // ('not_flagged'). Run peer calibration so broadened (settled-player)
+            // votes actually move OVR by consensus instead of being discarded.
+            if (recalibration && recalibration.reason === 'not_flagged') {
+                recalibration = await _aggregateUnflaggedCalibration(subjectPlayerId);
+            }
         }
 
         return res.json({
