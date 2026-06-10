@@ -38580,13 +38580,15 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
         // Has the calling player already given feedback?
         let playerRegistered = false;
         let playerFeedbackGiven = false;
+        let playerNeedsReconfirm = false;
         if (req.user) {
             const preg = await pool.query(
-                `SELECT id FROM coaching_registrations
+                `SELECT id, needs_reconfirm FROM coaching_registrations
                  WHERE session_id=$1 AND player_id=$2 AND status='registered'`,
                 [session.id, req.user.playerId]
             );
             playerRegistered = preg.rows.length > 0;
+            playerNeedsReconfirm = preg.rows.length > 0 && preg.rows[0].needs_reconfirm === true;
             const pfb = await pool.query(
                 `SELECT id FROM coaching_feedback WHERE session_id=$1 AND player_id=$2`,
                 [session.id, req.user.playerId]
@@ -38633,6 +38635,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
             registrations: regResult.rows,
             feedback: feedbackResult.rows,
             player_registered: playerRegistered,
+            player_needs_reconfirm: playerNeedsReconfirm,
             player_feedback_given: playerFeedbackGiven,
             registered_count: regResult.rows.length
         });
@@ -38959,6 +38962,9 @@ app.get('/api/coaching/sessions/:id/edit-data', authenticateToken, async (req, r
             coach_player_id: s.coach_player_id,
             coach_name: s.coach_name,
             max_players: s.max_players,
+            price_override: s.price_override,   // FIX-433: per-player override (null = auto)
+            min_price: s.min_price,
+            max_price: s.max_price,
             candidate_venue_ids: candidateVenueIds,
             candidate_venues: candidateVenues
         });
@@ -38978,7 +38984,7 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
     const { activity_type, group_type, duration_hours, venue_ids,
-            session_date, session_notes, assigned_coach_player_id } = req.body;
+            session_date, session_notes, assigned_coach_player_id, price_override } = req.body;
 
     const VALID_ACTIVITIES = ['fitness','ball_control','defending','shooting','positioning','goalkeeping','various'];
     const VALID_GROUPS     = ['one_to_one','small_group','large_group'];
@@ -39000,6 +39006,14 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
         return res.status(400).json({ error: 'session_notes too long (max 1000 chars)' });
     if (session_date && isNaN(Date.parse(session_date)))
         return res.status(400).json({ error: 'Invalid session_date' });
+    // FIX-433: optional per-player price override (blank/null = automatic pricing)
+    let priceOverride = null;
+    if (price_override !== undefined && price_override !== null && price_override !== '') {
+        priceOverride = Number(price_override);
+        if (!Number.isFinite(priceOverride) || priceOverride < 0 || priceOverride > 500)
+            return res.status(400).json({ error: 'Price per player must be between £0 and £500' });
+        priceOverride = Math.round(priceOverride * 100) / 100;
+    }
 
     const client = await pool.connect();
     try {
@@ -39007,9 +39021,10 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
 
         // Fetch current session
         const sRes = await client.query(
-            `SELECT id, coach_player_id, status, coach_confirmed, confirmed_venue_id,
-                    activity_type, group_type, duration_hours, session_date, session_time,
-                    min_price_per_player, max_price_per_player, notes, session_url
+            // FIX-432: this snapshot only needs these 5 columns; the previous list
+            // referenced non-existent columns (min_price_per_player / max_price_per_player /
+            // notes / session_time) which threw 42703 → every save 500'd ("cannot save").
+            `SELECT id, coach_player_id, status, coach_confirmed, confirmed_venue_id
              FROM coaching_sessions WHERE id = $1 FOR UPDATE`,
             [id]
         );
@@ -39071,15 +39086,18 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
             newCoachId = assigned_coach_player_id;
         }
 
-        // Detect coach change → reset coach_confirmed
-        const coachChanged = newCoachId !== session.coach_player_id;
-        let newCoachConfirmed = coachChanged ? false : session.coach_confirmed;
+        // FIX-435: ANY edit re-opens the session — superadmin must re-confirm the
+        // coach + venue, and registered players must re-confirm (flagged below).
+        const newCoachConfirmed = false;
 
         // Recalculate max_players + prices
         const maxPlayers = GROUP_MAX[group_type];
         const coachRateRes = await client.query('SELECT coach_min_hourly_rate FROM players WHERE id = $1', [newCoachId]);
         const coachRate = parseFloat(coachRateRes.rows[0]?.coach_min_hourly_rate || 0);
         const { minPrice, maxPrice } = calcSessionPriceRange(venueResult.rows, coachRate, duration_hours, maxPlayers);
+        // FIX-433: a manual per-player override collapses the range to that single price.
+        const effMin = priceOverride != null ? priceOverride : minPrice;
+        const effMax = priceOverride != null ? priceOverride : maxPrice;
 
         // Replace candidate venues atomically
         await client.query('DELETE FROM coaching_session_venues WHERE session_id = $1', [id]);
@@ -39087,18 +39105,17 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
             await client.query('INSERT INTO coaching_session_venues (session_id, venue_id) VALUES ($1, $2)', [id, vid]);
         }
 
-        // Clear confirmed_venue_id if it is no longer a candidate
-        let newConfirmedVenueId = session.confirmed_venue_id;
-        if (newConfirmedVenueId && !venue_ids.includes(String(newConfirmedVenueId))) {
-            newConfirmedVenueId = null;
-        }
+        // FIX-435: edit clears the confirmed venue and re-opens the session.
+        const newConfirmedVenueId = null;
+        const newStatus = 'open';
 
-        // Recalculate status
-        let newStatus = 'open';
-        if (newConfirmedVenueId && newCoachConfirmed) newStatus = 'venue_confirmed';
-        else if (newCoachConfirmed) newStatus = 'coach_confirmed';
-        // Preserve finalised
-        if (session.status === 'finalised') newStatus = 'finalised';
+        // FIX-436: recompute is_full against the (possibly changed) max_players.
+        // Editing group_type changes capacity, so a stale is_full would wrongly
+        // block registration (widened session) or allow over-subscription (narrowed).
+        const regCountRes = await client.query(
+            `SELECT COUNT(*)::int AS cnt FROM coaching_registrations
+             WHERE session_id = $1 AND status = 'registered'`, [id]);
+        const newIsFull = regCountRes.rows[0].cnt >= maxPlayers;
 
         await client.query(
             `UPDATE coaching_sessions SET
@@ -39114,14 +39131,21 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
                 coach_confirmed   = $10,
                 confirmed_venue_id = $11,
                 status            = $12,
+                price_override    = $13,
+                is_full           = $14,
                 updated_at        = NOW()
-             WHERE id = $13`,
+             WHERE id = $15`,
             [activity_type, group_type, duration_hours,
              session_date || null, session_notes || null,
-             maxPlayers, minPrice, maxPrice,
+             maxPlayers, effMin, effMax,
              newCoachId, newCoachConfirmed, newConfirmedVenueId,
-             newStatus, id]
+             newStatus, priceOverride, newIsFull, id]
         );
+
+        // FIX-435: registered players must re-confirm the changed session.
+        await client.query(
+            `UPDATE coaching_registrations SET needs_reconfirm = TRUE
+             WHERE session_id = $1 AND status = 'registered'`, [id]);
 
         await client.query('COMMIT');
 
@@ -39129,6 +39153,18 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
         await logCoachingAudit(id, null, req.user.playerId, 'session_edited',
             `Edited by ${editorRole} — activity: ${activity_type}, group: ${group_type}, duration: ${duration_hours}h`
         ).catch(() => {});
+
+        // FIX-435: ask registered players to re-confirm (fire-and-forget).
+        try {
+            const regPlayers = await pool.query(
+                `SELECT player_id FROM coaching_registrations WHERE session_id=$1 AND status='registered'`, [id]);
+            const ids = regPlayers.rows.map(r => r.player_id);
+            if (ids.length) {
+                await sendCoachingEmail(ids, 'Coaching Session Updated — Please Re-confirm',
+                    `<p style="color:#888">A coaching session you're registered for has been updated by the ${editorRole}. Please log in and re-confirm your spot, or drop out if you can no longer attend.</p>`
+                ).catch(() => {});
+            }
+        } catch (_) {}
 
         res.json({ ok: true });
     } catch (e) {
@@ -39259,6 +39295,29 @@ app.delete('/api/coaching/sessions/:id/register', authenticateToken, registratio
     } catch (e) {
         console.error('DELETE /api/coaching/sessions/:id/register:', e.message);
         res.status(500).json({ error: 'Failed to drop out' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUTH: POST /api/coaching/sessions/:id/reconfirm   (FIX-435)
+// A registered player re-confirms their spot after the session was edited.
+// ══════════════════════════════════════════════════════════════
+app.post('/api/coaching/sessions/:id/reconfirm', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
+    try {
+        const upd = await pool.query(
+            `UPDATE coaching_registrations SET needs_reconfirm = FALSE
+             WHERE session_id=$1 AND player_id=$2 AND status='registered'
+             RETURNING id`,
+            [id, req.user.playerId]
+        );
+        if (upd.rows.length === 0) return res.status(404).json({ error: 'No active registration to re-confirm' });
+        await logCoachingAudit(id, null, req.user.playerId, 'player_reconfirmed', 'Player re-confirmed after session edit.').catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('POST /api/coaching/sessions/:id/reconfirm:', e.message);
+        res.status(500).json({ error: 'Failed to re-confirm' });
     }
 });
 
@@ -39399,7 +39458,7 @@ app.post('/api/admin/coaching/sessions/:id/confirm', authenticateToken, requireS
 
     const sessionResult = await pool.query(
         `SELECT id, coach_player_id, coach_confirmed, confirmed_venue_id, status,
-                activity_type, duration_hours, group_type, max_players
+                activity_type, duration_hours, group_type, max_players, price_override
          FROM coaching_sessions WHERE id=$1`,
         [id]
     );
@@ -39440,8 +39499,9 @@ app.post('/api/admin/coaching/sessions/:id/confirm', authenticateToken, requireS
     if (newVenueId && newCoachConfirmed) newStatus = 'venue_confirmed';
     else if (newCoachConfirmed) newStatus = 'coach_confirmed';
 
-    // Recalculate price with confirmed venue
-    if (confirm_venue_id) {
+    // Recalculate price with confirmed venue — but NEVER overwrite a coach's manual
+    // per-player override (FIX-433): the override must survive venue confirmation.
+    if (confirm_venue_id && session.price_override == null) {
         const vResult = await pool.query(
             `SELECT coaching_cost_per_hour, pay_and_play_coach_hourly, pay_and_play_player_hourly
              FROM venues WHERE id=$1`,
@@ -39804,9 +39864,10 @@ app.get('/api/coaching/manage', authenticateToken, async (req, res) => {
                    p.full_name AS player_name, p.id AS player_id
             FROM coaching_requests cr
             JOIN players p ON p.id = cr.player_id
-            WHERE cr.status = 'pending'
+            WHERE (cr.status = 'pending'
+                   OR (cr.status = 'approved' AND cr.created_at > NOW() - INTERVAL '30 days'))
               AND (cr.coach_player_id = $1 OR cr.coach_player_id IS NULL OR $2)
-            ORDER BY cr.created_at ASC
+            ORDER BY (cr.status = 'pending') DESC, cr.created_at ASC
         `, [coachId, isSuperadmin]);
 
         // All my sessions grouped by status
@@ -39825,7 +39886,8 @@ app.get('/api/coaching/manage', authenticateToken, async (req, res) => {
                        'player_id', cr.player_id,
                        'player_name', p2.full_name,
                        'start_time', cr.start_time,
-                       'activity_focus', cr.activity_focus
+                       'activity_focus', cr.activity_focus,
+                       'needs_reconfirm', cr.needs_reconfirm
                    ))
                     FROM coaching_registrations cr
                     JOIN players p2 ON p2.id = cr.player_id
