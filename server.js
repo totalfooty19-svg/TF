@@ -8,6 +8,8 @@ const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const cookieParser = require('cookie-parser');
+const { authenticator } = require('otplib'); // FIX-444: TOTP 2FA (web admin logins)
+authenticator.options = { window: 1 }; // accept ±1 time-step for clock drift
 require('dotenv').config();
 
 // Nodemailer Gmail setup for password reset emails
@@ -19,6 +21,26 @@ const emailTransporter = nodemailer.createTransport({
         pass: process.env.GMAIL_APP_PASSWORD,
     },
 });
+
+// FIX-446: Security alert email — fires to SUPERADMIN_EMAIL on sensitive auth
+// events (superadmin login, account lockout). Fire-and-forget: never throws,
+// never blocks the request path. wrapEmailHtml is hoisted (function decl).
+function _securityAlertEmail(subject, bodyHtml) {
+    const to = process.env.SUPERADMIN_EMAIL;
+    if (!to) return; // not configured — silently skip
+    setImmediate(async () => {
+        try {
+            await emailTransporter.sendMail({
+                from: '"TotalFooty Security" <totalfooty19@gmail.com>',
+                to,
+                subject: `[TF Security] ${subject}`,
+                html: (typeof wrapEmailHtml === 'function') ? wrapEmailHtml(bodyHtml) : bodyHtml,
+            });
+        } catch (e) {
+            console.error('[FIX-446] security alert email failed:', e.message);
+        }
+    });
+}
 
 
 
@@ -67,6 +89,35 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
+// FIX-443: Cloudflare edge attestation. The CSP worker (and/or a Transform Rule)
+// injects X-TF-Edge: <secret> on requests proxied through api.totalfooty.co.uk.
+// Requests arriving straight at the Render origin (totalfooty-api.onrender.com)
+// lack the header — meaning they bypassed the Cloudflare WAF/rate-limit layer.
+// ROLLOUT: log-only until EDGE_ENFORCE=true. Do NOT enforce until (a) the worker
+// route covers api.totalfooty.co.uk/* with EDGE_SHARED_SECRET set, and (b) the
+// app build calling onrender.com directly has drained (check players.last_client_version).
+const EDGE_SHARED_SECRET = process.env.EDGE_SHARED_SECRET || null;
+const EDGE_ENFORCE = process.env.EDGE_ENFORCE === 'true';
+let _edgeLastWarn = 0;
+app.use('/api', (req, res, next) => {
+    if (!EDGE_SHARED_SECRET) return next(); // feature off until secret configured
+    if (req.method === 'OPTIONS') return next();
+    // FIX-453: third-party payment webhooks are registered against the direct
+    // Render URL on every historic pay-link, and Wonderful posts straight to
+    // origin (observed in live logs). They are server-side verified + rate
+    // limited already — never block them at the edge gate.
+    if (req.path.startsWith('/webhooks/')) return next();
+    if (req.headers['x-tf-edge'] === EDGE_SHARED_SECRET) return next();
+    if (EDGE_ENFORCE) return res.status(403).json({ error: 'Forbidden' });
+    // log-only: sample at most one warning per 60s so logs don't flood
+    const now = Date.now();
+    if (now - _edgeLastWarn > 60000) {
+        _edgeLastWarn = now;
+        console.warn(`[FIX-443] direct-origin request (no edge header): ${req.method} ${req.path} ua=${(req.headers['user-agent'] || '').slice(0, 60)}`);
+    }
+    next();
+});
+
 // FIX-010: Rate limiting on auth routes
 const rateLimit = require('express-rate-limit');
 const authLimiter = rateLimit({
@@ -106,6 +157,17 @@ const emailEnumLimiter = rateLimit({
     windowMs: 60 * 60 * 1000, // 1 hour
     max: 20,
     message: { error: 'Too many attempts, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
+});
+// FIX-439: payment webhook limiter — the endpoint is unauthenticated by nature
+// (Wonderful posts to it) and each request can trigger outbound verification
+// calls. 60/min absorbs any legitimate burst; forged-webhook spam gets clamped.
+const webhookLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    message: { error: 'Too many requests' },
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => req.method === 'OPTIONS',
@@ -1649,6 +1711,18 @@ const AUDIT_TAG_TABLE = {
     series_auto_finalized_on_recreate:
                                      { cat: 'ops', sub: 'series_managed', actor: 'system', sev: 'med' },
 
+    // ─── TRAINING & EXTERNAL LEAGUES (FIX-460/461c/462/463) ───────────────
+    tenant_self_created:              { cat: 'ops', sub: 'tenants',  actor: 'player', sev: 'high' }, // FIX-460 public link
+    training_created:                 { cat: 'ops', sub: 'training', actor: 'admin',  sev: 'low'  }, // FIX-462
+    training_confirmed:               { cat: 'ops', sub: 'training', actor: 'admin',  sev: 'low'  },
+    training_completed:               { cat: 'ops', sub: 'training', actor: 'admin',  sev: 'med'  },
+    training_reg_approved:            { cat: 'ops', sub: 'training', actor: 'admin',  sev: 'med'  }, // charge moment
+    training_reg_denied:              { cat: 'ops', sub: 'training', actor: 'admin',  sev: 'low'  },
+    ext_league_created:               { cat: 'ops', sub: 'ext_league', actor: 'admin', sev: 'med' }, // FIX-463
+    ext_fixture_created:              { cat: 'ops', sub: 'ext_league', actor: 'admin', sev: 'low' },
+    ext_stats_saved:                  { cat: 'ops', sub: 'ext_league', actor: 'admin', sev: 'low' },
+    opponent_created:                 { cat: 'ops', sub: 'ext_league', actor: 'admin', sev: 'low' }, // tenant quick-add
+
     // ─── ACCESS ────────────────────────────────────────────────────────────
     page_view:                { cat: 'access', sub: 'views', actor: 'player', sev: 'low' },
 
@@ -2835,6 +2909,20 @@ const _teamEmailTimers = new Map(); // gameId -> setTimeout handle
 // calls. Keyed by wpId, value = timestamp of last failed attempt. Entries
 // expire after 5 minutes via the cleanup interval below.
 const _reverseLookupFailCache = new Map(); // wpId -> Date.now() of last failure
+
+// FIX-452: dedupe for "paid webhook we couldn't credit" superadmin alerts.
+// One email per wpId per 6 hours — Wonderful fires multiple paid webhooks.
+const _wfPaidAlertSent = new Map(); // wpId -> Date.now()
+function _alertUnresolvedPaidWebhook(wpId, detailHtml) {
+    const last = _wfPaidAlertSent.get(wpId);
+    if (last && (Date.now() - last) < 6 * 60 * 60 * 1000) return;
+    _wfPaidAlertSent.set(wpId, Date.now());
+    if (_wfPaidAlertSent.size > 200) _wfPaidAlertSent.clear(); // bound memory
+    _securityAlertEmail('💸 PAID Wonderful webhook NOT credited',
+        `<p>A webhook with status <strong>paid</strong> arrived for order <strong>${wpId}</strong> but could not be safely credited automatically.</p>` +
+        detailHtml +
+        `<p><strong>Action:</strong> check the Wonderful dashboard for this order, match it to the player by amount/time, and credit via the CRM manual-credit path. The abort-then-retry case (FIX-450 log) looks exactly like this.</p>`);
+}
 setInterval(() => {
     const cutoff = Date.now() - (5 * 60 * 1000);
     for (const [wpId, ts] of _reverseLookupFailCache) {
@@ -3227,6 +3315,18 @@ const wonderfulInitiateLimiter = rateLimit({
     max: 5,
     message: { error: 'Too many payment requests. Please wait a few minutes.' },
     keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// FIX-460: public self-serve tenant creation — tight per-IP cap. Tenant
+// creation is the heaviest public write on the platform; 3/hour/IP is plenty
+// for genuine organisers clicking a social link and starves bulk abuse.
+const startTenantLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 3,
+    message: { error: 'Too many requests from this connection. Please try again in an hour.' },
+    keyGenerator: (req) => req.ip,
     standardHeaders: true,
     legacyHeaders: false,
 });
@@ -6132,7 +6232,7 @@ app.post('/api/auth/register', async (req, res) => {
         }
 
         // Hash password
-        const passwordHash = await bcrypt.hash(password, 10);
+        const passwordHash = await bcrypt.hash(password, 12);
 
         // MED-2: All new accounts start as 'player' — superadmin must be set directly in DB
         const role = 'player';
@@ -6836,7 +6936,7 @@ app.post('/api/auth/login', async (req, res) => {
         const _ci = _parseClientInfo(req.body && req.body.client); // VERSION-AUDIT
 
         const userResult = await pool.query(
-            'SELECT id, email, password_hash, role, token_version, force_password_change FROM users WHERE email = $1',
+            'SELECT id, email, password_hash, role, token_version, force_password_change, totp_enabled, totp_secret FROM users WHERE email = $1', // FIX-444 (migration SECURITY-2FA.sql must run first)
             [email.toLowerCase()]
         );
         if (userResult.rows.length === 0) {
@@ -6876,7 +6976,34 @@ app.post('/api/auth/login', async (req, res) => {
                     END
             `, [user.id]);
             console.warn(`Failed login: ${email.toLowerCase()} at ${new Date().toISOString()}`);
+            // FIX-446: alert superadmin when an account crosses the lockout threshold
+            try {
+                const lockRow = await pool.query('SELECT failed_count, locked_until FROM login_failures WHERE user_id = $1', [user.id]);
+                const lr = lockRow.rows[0];
+                if (lr && lr.locked_until && new Date(lr.locked_until) > new Date() && lr.failed_count === 10) {
+                    _securityAlertEmail('Account locked out',
+                        `<p><strong>${email.toLowerCase()}</strong> has been locked for 15 minutes after ${lr.failed_count} failed login attempts.</p>` +
+                        `<p>Time: ${new Date().toISOString()}<br/>IP: ${req.ip || 'unknown'}</p>`);
+                }
+            } catch (_e) { console.error('[FIX-446] lockout alert check failed:', _e.message); }
             return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        // FIX-444: TOTP challenge — WEB logins only, by design (GAFFA 10/06/26: app has
+        // no admin controls and no TOTP screen; gating on client.platform keeps app
+        // logins password-only). RESIDUAL RISK accepted: a caller who claims a non-web
+        // platform skips the challenge. Enable TOTP via /api/auth/totp/setup + /confirm.
+        if (user.totp_enabled === true && _ci.platform === 'web') {
+            const totpCode = String((req.body || {}).totp_code || '').trim();
+            if (!totpCode) {
+                return res.status(401).json({ requires_totp: true, error: 'Two-factor code required' });
+            }
+            let totpOk = false;
+            try { totpOk = authenticator.verify({ token: totpCode, secret: user.totp_secret }); } catch (_) { totpOk = false; }
+            if (!totpOk) {
+                console.warn(`[FIX-444] invalid TOTP for ${email.toLowerCase()}`);
+                return res.status(401).json({ requires_totp: true, error: 'Invalid two-factor code' });
+            }
         }
 
         // MED-4: Successful login — clear failure record
@@ -6948,6 +7075,15 @@ app.post('/api/auth/login', async (req, res) => {
             }
         });
 
+        // FIX-446: superadmin login alert — you should know every time your own
+        // account authenticates. Sent post-response; never blocks login.
+        if (user.role === 'superadmin') {
+            _securityAlertEmail('Superadmin login',
+                `<p>Superadmin login for <strong>${user.email}</strong>.</p>` +
+                `<p>Client: ${_ci.display}<br/>IP: ${req.ip || 'unknown'}<br/>Time: ${new Date().toISOString()}</p>` +
+                `<p>If this wasn't you: change the password immediately, then POST /api/auth/logout-all (or bump users.token_version in psql) to kill all sessions.</p>`);
+        }
+
         // Audit login event + client-version telemetry (non-critical, after response)
         setImmediate(() => {
             auditLog(pool, player.id, 'login', player.id,
@@ -6962,6 +7098,96 @@ app.post('/api/auth/login', async (req, res) => {
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed' });
+    }
+});
+
+// FIX-444: TOTP 2FA enrolment — admin/superadmin accounts, web flow only.
+// Step 1: /totp/setup generates a pending secret + otpauth URL (render as QR client-side).
+// Step 2: /totp/confirm verifies a live code and flips totp_enabled.
+// Disable: /totp/disable requires current password AND a valid code.
+// RECOVERY (lost authenticator): no backup codes in v1 — disable via psql:
+//   UPDATE users SET totp_enabled = FALSE, totp_secret = NULL WHERE email = '<email>';
+app.post('/api/auth/totp/setup', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const u = await pool.query('SELECT u.id, u.email, u.totp_enabled FROM users u JOIN players p ON p.user_id = u.id WHERE p.id = $1', [req.user.playerId]);
+        if (u.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+        if (u.rows[0].totp_enabled === true) return res.status(400).json({ error: 'Two-factor authentication is already enabled. Disable it first to re-enrol.' });
+        const secret = authenticator.generateSecret();
+        await pool.query('UPDATE users SET totp_pending_secret = $1 WHERE id = $2', [secret, u.rows[0].id]);
+        const otpauthUrl = authenticator.keyuri(u.rows[0].email, 'TotalFooty', secret);
+        res.json({ secret, otpauthUrl });
+    } catch (error) {
+        console.error('TOTP setup error:', error);
+        res.status(500).json({ error: 'Failed to start two-factor setup' });
+    }
+});
+
+app.post('/api/auth/totp/confirm', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const code = String((req.body || {}).code || '').trim();
+        if (!/^[0-9]{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from your authenticator app' });
+        const u = await pool.query('SELECT u.id, u.email, u.totp_pending_secret FROM users u JOIN players p ON p.user_id = u.id WHERE p.id = $1', [req.user.playerId]);
+        if (u.rows.length === 0 || !u.rows[0].totp_pending_secret) return res.status(400).json({ error: 'No pending two-factor setup. Start again.' });
+        let ok = false;
+        try { ok = authenticator.verify({ token: code, secret: u.rows[0].totp_pending_secret }); } catch (_) { ok = false; }
+        if (!ok) return res.status(400).json({ error: 'Code did not match. Check your authenticator app and try again.' });
+        await pool.query('UPDATE users SET totp_secret = totp_pending_secret, totp_pending_secret = NULL, totp_enabled = TRUE WHERE id = $1', [u.rows[0].id]);
+        _securityAlertEmail('Two-factor enabled', `<p>TOTP 2FA was <strong>enabled</strong> for ${u.rows[0].email} at ${new Date().toISOString()}.</p>`);
+        setImmediate(() => auditLog(pool, req.user.playerId, 'totp_enabled', req.user.playerId, 'TOTP 2FA enabled').catch(() => {}));
+        res.json({ enabled: true });
+    } catch (error) {
+        console.error('TOTP confirm error:', error);
+        res.status(500).json({ error: 'Failed to confirm two-factor setup' });
+    }
+});
+
+app.post('/api/auth/totp/disable', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { password } = req.body || {};
+        const code = String((req.body || {}).code || '').trim();
+        if (!password || !/^[0-9]{6}$/.test(code)) return res.status(400).json({ error: 'Password and current 6-digit code are required' });
+        const u = await pool.query('SELECT u.id, u.email, u.password_hash, u.totp_enabled, u.totp_secret FROM users u JOIN players p ON p.user_id = u.id WHERE p.id = $1', [req.user.playerId]);
+        if (u.rows.length === 0 || u.rows[0].totp_enabled !== true) return res.status(400).json({ error: 'Two-factor authentication is not enabled' });
+        const validPassword = await bcrypt.compare(password, u.rows[0].password_hash);
+        let codeOk = false;
+        try { codeOk = authenticator.verify({ token: code, secret: u.rows[0].totp_secret }); } catch (_) { codeOk = false; }
+        if (!validPassword || !codeOk) return res.status(401).json({ error: 'Password or code incorrect' });
+        await pool.query('UPDATE users SET totp_enabled = FALSE, totp_secret = NULL, totp_pending_secret = NULL WHERE id = $1', [u.rows[0].id]);
+        _securityAlertEmail('Two-factor DISABLED', `<p>TOTP 2FA was <strong>disabled</strong> for ${u.rows[0].email} at ${new Date().toISOString()}. If this wasn't you, treat the account as compromised.</p>`);
+        setImmediate(() => auditLog(pool, req.user.playerId, 'totp_disabled', req.user.playerId, 'TOTP 2FA disabled').catch(() => {}));
+        res.json({ enabled: false });
+    } catch (error) {
+        console.error('TOTP disable error:', error);
+        res.status(500).json({ error: 'Failed to disable two-factor authentication' });
+    }
+});
+
+// FIX-447: Log out all devices — bumps users.token_version so every issued JWT
+// fails the SEC-016 revocation check on its next request (web cookies AND app
+// Bearer tokens). Also clears this browser's cookie.
+app.post('/api/auth/logout-all', authenticateToken, async (req, res) => {
+    try {
+        await pool.query('UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = (SELECT user_id FROM players WHERE id = $1)', [req.user.playerId]);
+        res.clearCookie('tf_token', { httpOnly: true, secure: true, sameSite: 'lax' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'logout_all', req.user.playerId, 'All sessions revoked (token_version bump)').catch(() => {}));
+        res.json({ message: 'Logged out everywhere. All devices will need to sign in again.' });
+    } catch (error) {
+        console.error('logout-all error:', error);
+        res.status(500).json({ error: 'Failed to log out all devices' });
+    }
+});
+
+// FIX-447: Superadmin force-logout for any player — kills all their sessions.
+// No UI yet; callable from CRM later or via curl.
+app.post('/api/admin/players/:id/force-logout', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query('UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = (SELECT user_id FROM players WHERE id = $1) RETURNING id', [req.params.id]);
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+        setImmediate(() => auditLog(pool, req.user.playerId, 'force_logout', req.params.id, 'Superadmin revoked all sessions for player').catch(() => {}));
+        res.json({ message: 'All sessions revoked for player' });
+    } catch (error) {
+        console.error('force-logout error:', error);
+        res.status(500).json({ error: 'Failed to revoke sessions' });
     }
 });
 
@@ -6986,6 +7212,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
             `SELECT p.id, p.full_name, p.alias, p.squad_number, p.referral_code, u.role,
              COALESCE(p.is_clm_admin, false) as is_clm_admin,
              COALESCE(p.is_organiser, false) as is_organiser,
+             COALESCE(u.totp_enabled, false) as totp_enabled,
              u.force_password_change
              FROM players p
              JOIN users u ON u.id = p.user_id
@@ -7007,6 +7234,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
             role: player.role,
             isCLMAdmin: player.is_clm_admin || false,
             isOrganiser: player.is_organiser || false,
+            totpEnabled: player.totp_enabled === true, // FIX-444
             mustChangePassword: player.force_password_change === true
         });
     } catch (error) {
@@ -7420,7 +7648,7 @@ app.get('/api/admin/players/search', authenticateToken, requireAdmin, async (req
         res.json({ players: result.rows });
     } catch (e) {
         console.error('GET /api/admin/players/search error:', e);
-        res.status(500).json({ error: 'server_error', detail: e.message });
+        res.status(500).json({ error: 'server_error' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -7711,7 +7939,7 @@ app.get('/api/players/:playerId/ref-stats', authenticateToken, async (req, res) 
 
 
 // Must be defined before /api/players/:id to avoid route collision
-app.get('/api/players/superadmin-id', authenticateToken, async (req, res) => {
+app.get('/api/players/superadmin-id', authenticateToken, requireAdmin, async (req, res) => { // FIX-440: was readable by any player
     try {
         const result = await pool.query(
             `SELECT p.id FROM players p JOIN users u ON u.id = p.user_id WHERE u.role = 'superadmin' LIMIT 1`
@@ -9193,8 +9421,15 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
                 hitVisibilityWall = true;
             } else {
                 // Probe: does ANY game exist in this region BEYOND the tier window?
-                const probeParams = [...baseParams];
-                const probeRegion = (region === 'ALL') ? '' : 'AND v.region = $2';
+                // FIX-454: the old probe reused baseParams ([playerId] or
+                // [playerId, region]) against SQL that never referenced $1 —
+                // ALL-region passed 1 param into 0 placeholders (08P01), regional
+                // passed $2 with no $1 (42P18). Live-log proven, both branches
+                // broken since the probe shipped. The probe needs ONLY the region;
+                // badgeFilter is literal-only and effectiveHoursAhead is a
+                // server-set integer (tier table), never user input.
+                const probeParams = (region === 'ALL') ? [] : [region];
+                const probeRegion = (region === 'ALL') ? '' : 'AND v.region = $1';
                 const probe = await pool.query(`
                     SELECT 1
                     FROM games g
@@ -9204,7 +9439,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
                       ${probeRegion}
                       ${badgeFilter}
                     LIMIT 1
-                `, probeParams.slice(0, region === 'ALL' ? 1 : 2));
+                `, probeParams);
                 hitVisibilityWall = probe.rows.length > 0;
             }
         }
@@ -9469,6 +9704,15 @@ async (req, res) => {
             return res.status(400).json({ error: 'No photo data provided' });
         }
 
+        // FIX-461c: file-based photos — accept a strictly-whitelisted assets URL
+        // (written by tf-upload.php) and store it directly. The base64 branch
+        // below is UNCHANGED so the React Native app keeps working as-is.
+        if (/^https:\/\/totalfooty\.co\.uk\/assets\/players\/[a-z0-9][a-z0-9-]{0,60}\.(jpg|png|webp)$/.test(photoData)) {
+            await pool.query('UPDATE players SET photo_url = $1 WHERE id = $2', [photoData, req.user.playerId]);
+            setImmediate(() => auditLog(pool, req.user.playerId, 'photo_uploaded', req.user.playerId, 'Player updated profile photo (file-based)'));
+            return res.json({ message: 'Photo uploaded successfully' });
+        }
+
         // FIX-015: Guard against huge base64 payloads
         if (photoData.length > 2_000_000) {
             return res.status(400).json({ error: 'Photo too large. Max ~1.5MB.' });
@@ -9517,6 +9761,12 @@ async (req, res) => {
     try {
         const { id } = req.params;
         const { photoData } = req.body;
+        // FIX-461c: same whitelisted-URL branch as /api/players/me/photo.
+        if (photoData && /^https:\/\/totalfooty\.co\.uk\/assets\/players\/[a-z0-9][a-z0-9-]{0,60}\.(jpg|png|webp)$/.test(photoData)) {
+            await pool.query('UPDATE players SET photo_url = $1 WHERE id = $2', [photoData, id]);
+            setImmediate(() => auditLog(pool, req.user.playerId, 'photo_uploaded', id, 'Admin updated player photo (file-based)'));
+            return res.json({ message: 'Photo uploaded successfully' });
+        }
 
         if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid player ID' });
         if (!photoData) return res.status(400).json({ error: 'No photo data provided' });
@@ -10761,6 +11011,49 @@ app.get('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req, re
 });
 
 // POST — create venue
+// FIX-461: venue image upload — short-lived HMAC token for the Namecheap
+// uploader (tf-upload.php). The PHP shares TF_UPLOAD_SECRET via its config
+// line; tokens are '<unix-ts>.<hmac-sha256(ts)>', valid 10 min, admin-only.
+// No file ever touches Render (ephemeral disk) — images live where they
+// always have: totalfooty.co.uk/assets/venues/.
+app.get('/api/admin/venue-upload-token', authenticateToken, requireAdmin, async (req, res) => {
+    const secret = process.env.TF_UPLOAD_SECRET;
+    if (!secret) return res.status(503).json({ error: 'Upload not configured (TF_UPLOAD_SECRET env missing)' });
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = require('crypto').createHmac('sha256', secret).update(ts).digest('hex');
+    res.json({ token: ts + '.' + sig, expires_in: 600 });
+});
+
+// FIX-461b: same token, tenant-scoped gate — lets a tenant_admin (who is NOT
+// role=admin) upload their tenant logo from the My Tenant panel. The PHP's kind
+// whitelist confines what any token can write (venue/logo/player/external only).
+app.get('/api/t/:tenant_short_id/admin/upload-token', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const secret = process.env.TF_UPLOAD_SECRET;
+    if (!secret) return res.status(503).json({ error: 'Upload not configured (TF_UPLOAD_SECRET env missing)' });
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = require('crypto').createHmac('sha256', secret).update(ts).digest('hex');
+    res.json({ token: ts + '.' + sig, expires_in: 600 });
+});
+
+// FIX-461c: any logged-in PLAYER can mint a token for their own profile photo
+// (kind=player). Rate-limited; the PHP kind whitelist + image validation bound
+// the exposure to exactly what the old base64 endpoint already allowed.
+const tfPlayerUploadLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 12,
+    message: { error: 'Too many photo uploads — try again in a few minutes.' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.get('/api/players/me/upload-token', authenticateToken, tfPlayerUploadLimiter, async (req, res) => {
+    const secret = process.env.TF_UPLOAD_SECRET;
+    if (!secret) return res.status(503).json({ error: 'Upload not configured (TF_UPLOAD_SECRET env missing)' });
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = require('crypto').createHmac('sha256', secret).update(ts).digest('hex');
+    res.json({ token: ts + '.' + sig, expires_in: 600 });
+});
+
 app.post('/api/admin/venues', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const v = validateVenuePayload(req.body);
@@ -10821,7 +11114,7 @@ app.post('/api/admin/venues', authenticateToken, requireAdmin, async (req, res) 
         res.json({ ok: true, id: newVenue.id, name: newVenue.name });
     } catch (error) {
         console.error('Create venue error:', error);
-        res.status(500).json({ error: 'Failed to create venue', detail: error.message });
+        res.status(500).json({ error: 'Failed to create venue' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -10887,7 +11180,7 @@ app.put('/api/admin/venues/:id', authenticateToken, requireAdmin, async (req, re
         res.json({ ok: true, id });
     } catch (error) {
         console.error('Update venue error:', error);
-        res.status(500).json({ error: 'Failed to update venue', detail: error.message });
+        res.status(500).json({ error: 'Failed to update venue' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -10975,7 +11268,7 @@ app.post('/api/admin/venues/:id/duplicate', authenticateToken, requireAdmin, asy
     } catch (error) {
         if (error.code === 'MIGRATION_NEEDED') return res.status(503).json({ error: error.message });
         console.error('Duplicate venue error:', error);
-        res.status(500).json({ error: 'Failed to duplicate venue', detail: error.message });
+        res.status(500).json({ error: 'Failed to duplicate venue' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -14095,10 +14388,10 @@ app.post('/api/admin/games/:id/rsvp-pulse/bump-all', authenticateToken, requireA
             await pool.query(
                 `UPDATE registrations SET bumped_notified_at = NOW() WHERE id = ANY($1::uuid[])`,
                 [bumped.rows.map(r => r.id)]
-            ).catch(() => {});
+            ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE registrations (L14281):', _ce && _ce.message); });
         }
         await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_admin_bump_all',
-            `Admin emergency-bumped ${bumped.rows.length} RSVP(s); ${promoted.length} confirmed_backup(s) promoted`).catch(() => {});
+            `Admin emergency-bumped ${bumped.rows.length} RSVP(s); ${promoted.length} confirmed_backup(s) promoted`).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE registrations (L14284):', _ce && _ce.message); });
 
         return res.json({ ok: true, bumped: bumped.rows.length, promoted: promoted.length });
     } catch (err) {
@@ -14164,7 +14457,7 @@ app.post('/api/admin/mass-message/preview', authenticateToken, requireAdmin, asy
         });
     } catch (e) {
         console.error('[FIX-316] preview error:', e);
-        return res.status(500).json({ error: 'Preview failed: ' + e.message });
+        return res.status(500).json({ error: 'Preview failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -14369,7 +14662,7 @@ app.post('/api/admin/mass-message/send', authenticateToken, requireAdmin, async 
         });
     } catch (e) {
         console.error('[FIX-316] send error:', e);
-        return res.status(500).json({ error: 'Send failed: ' + e.message });
+        return res.status(500).json({ error: 'Send failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -20101,7 +20394,7 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                 try { await client.query('ROLLBACK'); } catch (_) {}
                 console.error('[generate-teams multi] persistence failed:', txErr);
                 client.release();
-                return res.status(500).json({ error: 'Multi-mode generation succeeded but persistence failed: ' + txErr.message });
+                return res.status(500).json({ error: 'Multi-mode generation succeeded but persistence failed' }); // FIX-438: txErr logged above
             } finally {
                 try { client.release(); } catch (_) {}
             }
@@ -20811,7 +21104,17 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
         const parsedPitchCostEdit = pitch_cost === undefined
             ? null   // sentinel: COALESCE keeps existing
             : (pitch_cost === null || pitch_cost === '' ? null : parseFloat(pitch_cost));
-        const pitchCostUpdateMode = pitch_cost === undefined ? 'unchanged' : (parsedPitchCostEdit !== null && !isNaN(parsedPitchCostEdit) && parsedPitchCostEdit >= 0 ? 'set' : 'invalid');
+        // FIX-459: contract repair. The edit modal's UI promises "leave blank to
+        // keep current", but the client sent NULL for a blank (or absent) field and
+        // this line classified null as 'invalid' -> the WHOLE settings save failed
+        // with 400 "Pitch cost must be a number >= 0" (on modal variants without
+        // the pitch input, EVERY save failed). That is why pitch costs "never
+        // saved" and never reached finance profit. null/'' now = unchanged, same
+        // as undefined (clearing a cost remains a finance-panel capability, where
+        // the PATCH supports explicit clear). Genuinely invalid input still 400s.
+        const pitchCostUpdateMode = (pitch_cost === undefined || pitch_cost === null || pitch_cost === '')
+            ? 'unchanged'
+            : ((parsedPitchCostEdit !== null && !isNaN(parsedPitchCostEdit) && parsedPitchCostEdit >= 0) ? 'set' : 'invalid');
         if (pitchCostUpdateMode === 'invalid') {
             return res.status(400).json({ error: 'Pitch cost must be a number ≥ 0' });
         }
@@ -21243,7 +21546,7 @@ app.get('/api/admin/games/:gameId/revenue-breakdown', authenticateToken, require
         });
     } catch (error) {
         console.error('Revenue breakdown error:', error);
-        res.status(500).json({ error: 'Failed to load revenue breakdown', detail: error.message });
+        res.status(500).json({ error: 'Failed to load revenue breakdown' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -21434,7 +21737,7 @@ app.get('/api/admin/games/:gameId/finance', authenticateToken, requireSuperAdmin
         });
     } catch (error) {
         console.error('Game finance error:', error);
-        res.status(500).json({ error: 'Failed to load finance', detail: error.message });
+        res.status(500).json({ error: 'Failed to load finance' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -21499,7 +21802,7 @@ app.post('/api/admin/games/:gameId/registrations/:regId/drop-no-refund', authent
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('Admin drop-no-refund error:', error);
-        res.status(500).json({ error: 'Failed to record drop-no-refund', detail: error.message });
+        res.status(500).json({ error: 'Failed to record drop-no-refund' });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -24226,6 +24529,9 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.tournament_team_count, g.tournament_results_finalised, g.series_id,
                    g.regularity, g.star_rating, g.star_rating_locked, g.min_rating_enabled,
                    g.position_type,
+                   g.external_league_id, g.is_home, g.away_venue_name, g.away_postcode,
+                   g.away_pitch_pin, g.away_parking_pin, g.away_pitch_type,
+                   g.assigned_coach_player_id, g.ext_tf_score, g.ext_opp_score,
                    g.teams_generated,
                    g.refs_required, g.ref_pay, g.ref_review_ends,
                    g.is_venue_clash, g.venue_clash_team1_name, g.venue_clash_team2_name,
@@ -24392,6 +24698,40 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             } catch (e) { if (e.code !== '42P01') console.error('FIX-405 league block:', e.message); }
         }
 
+            // FIX-463: external-league extras. Away fixtures substitute the manual
+            // away-venue details into the standard venue_* fields so every surface
+            // (web game page, app) renders them with zero render changes.
+            let _extLeague = null, _extStats = [], _extCanManage = false;
+            if (game.external_league_id) {
+                try {
+                    const _xl = await pool.query(
+                        `SELECT id, kind, name, parent_league_name, public_slug, external_website_url
+                           FROM external_leagues WHERE id = $1`, [game.external_league_id]);
+                    _extLeague = _xl.rows[0] || null;
+                    const _xs = await pool.query(
+                        `SELECT s.player_id, s.goals, s.assists, p.alias, p.full_name
+                           FROM ext_league_player_stats s JOIN players p ON p.id = s.player_id
+                          WHERE s.game_id = $1 ORDER BY s.goals DESC, s.assists DESC`, [game.id]);
+                    _extStats = _xs.rows;
+                    if (req.user) _extCanManage = await _extLeagueCanManage(req, game.tenant_id, game.assigned_coach_player_id);
+                    if (_extCanManage) { // squad for the goals/assists entry UI
+                        const _sq = await pool.query(
+                            `SELECT DISTINCT p.id AS player_id, p.alias, p.full_name
+                               FROM registrations r JOIN players p ON p.id = r.player_id
+                              WHERE r.game_id = $1 AND r.status IN ('confirmed','confirmed_backup')
+                              ORDER BY p.alias`, [game.id]);
+                        game._ext_squad = _sq.rows;
+                    }
+                } catch (_) {}
+                if (game.is_home === false) {
+                    game.venue_name        = game.away_venue_name || game.venue_name;
+                    game.venue_postcode    = game.away_postcode || null;
+                    game.venue_pitch_pin   = game.away_pitch_pin || null;
+                    game.venue_parking_pin = game.away_parking_pin || null;
+                    game.venue_pitch_location = game.away_pitch_type || game.venue_pitch_location;
+                    game.venue_address     = null;
+                }
+            }
         res.json({
             id: game.id,
             game_url: game.game_url,
@@ -24399,6 +24739,19 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
             // FIX-386 (Block C): effective cancellation policy for the Refunds section.
             // Explicitly listed here per the "/details must list every field" rule.
             cancellation_policy: _cancelPolicy,
+            // FIX-463: external league block — explicit per the /details field rule
+            external_league: _extLeague ? {
+                id: _extLeague.id, kind: _extLeague.kind, name: _extLeague.name,
+                parent_league_name: _extLeague.parent_league_name,
+                public_slug: _extLeague.public_slug,
+                external_website_url: _extLeague.external_website_url
+            } : null,
+            is_home: game.is_home,
+            ext_tf_score: game.ext_tf_score,
+            ext_opp_score: game.ext_opp_score,
+            ext_stats: _extStats,
+            ext_can_manage: _extCanManage,
+            ext_squad: game._ext_squad || [],
             game_date: game.game_date,
             venue_id: game.venue_id,
             venue_name: game.venue_name,
@@ -24705,8 +25058,17 @@ app.get('/api/public/game/:gameUrl/players', async (req, res) => {
 // Powers the games.html landing page: live counts + recent activity for
 // social proof. Public, no auth, cached by Cloudflare via standard headers.
 // All counts derived from current DB state — no hardcoded numbers.
+// FIX-457: landing-stats served 2.5MB responses (motm photo_url can hold
+// base64 data-URIs) and its 6-query Promise.all starved the pool under ad
+// bursts (live pool-connect timeout, 10/06/26). Stats are marketing numbers —
+// a 5-minute server-side cache turns N concurrent hits into 1 query burst.
+let _landingStatsCache = { ts: 0, body: null };
 app.get('/api/public/landing-stats', async (req, res) => {
     try {
+        if (_landingStatsCache.body && (Date.now() - _landingStatsCache.ts) < 5 * 60 * 1000) {
+            res.set('Cache-Control', 'public, max-age=60');
+            return res.json(_landingStatsCache.body);
+        }
         const [
             activePlayersRes,
             gamesThisWeekRes,
@@ -24783,20 +25145,24 @@ app.get('/api/public/landing-stats', async (req, res) => {
             venue_name:     r.venue_name,
             venue_region:   r.venue_region,
             motm_name:      r.motm_alias || r.motm_full_name || null,
-            motm_photo:     r.motm_photo || null,
+            // FIX-457: pass real URLs only — base64 data-URIs in photo_url were
+            // the 2.5MB payload. Frontend already handles null (initials avatar).
+            motm_photo:     (r.motm_photo && /^https?:\/\//i.test(r.motm_photo)) ? r.motm_photo : null,
         }));
 
         // Light cache — landing page traffic can hammer this; 60s freshness
         // is fine for stats that change every few minutes at most.
         res.set('Cache-Control', 'public, max-age=60');
-        res.json({
+        const _lsBody = {
             active_players:      parseInt(activePlayersRes.rows[0].cnt) || 0,
             games_this_week:     parseInt(gamesThisWeekRes.rows[0].cnt) || 0,
             venues_count:        parseInt(venuesRes.rows[0].cnt) || 0,
             total_games_played:  parseInt(totalGamesPlayedRes.rows[0].cnt) || 0,
             regions:             regionsRes.rows.map(r => r.region),
             recent_games:        recentGames,
-        });
+        };
+        _landingStatsCache = { ts: Date.now(), body: _lsBody }; // FIX-457
+        res.json(_lsBody);
     } catch (error) {
         console.error('Landing stats error:', error);
         // Fail soft — landing page should not 500 on missing stats. Return
@@ -28275,7 +28641,7 @@ app.post('/api/admin/raf/backfill', authenticateToken, requireSuperAdmin, async 
         });
     } catch (e) {
         console.error('RAF backfill error:', e.message);
-        res.status(500).json({ error: 'Backfill failed: ' + e.message });
+        res.status(500).json({ error: 'Backfill failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -30605,7 +30971,7 @@ app.get('/api/admin/messaging/blocked', authenticateToken, requireSuperAdmin, as
         res.json({ blocked: result.rows });
     } catch (e) {
         console.error('GET /api/admin/messaging/blocked error:', e);
-        res.status(500).json({ error: 'server_error', detail: e.message });
+        res.status(500).json({ error: 'server_error' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -30665,7 +31031,7 @@ app.post('/api/admin/messaging/block/:playerId', authenticateToken, requireSuper
         });
     } catch (e) {
         console.error('POST /api/admin/messaging/block error:', e);
-        res.status(500).json({ error: 'server_error', detail: e.message });
+        res.status(500).json({ error: 'server_error' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -30693,7 +31059,7 @@ app.post('/api/admin/messaging/unblock/:playerId', authenticateToken, requireSup
         res.json({ ok: true });
     } catch (e) {
         console.error('POST /api/admin/messaging/unblock error:', e);
-        res.status(500).json({ error: 'server_error', detail: e.message });
+        res.status(500).json({ error: 'server_error' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -30722,7 +31088,7 @@ app.get('/api/admin/messaging/spree-history', authenticateToken, requireSuperAdm
         res.json({ days, rows: result.rows });
     } catch (e) {
         console.error('GET /api/admin/messaging/spree-history error:', e);
-        res.status(500).json({ error: 'server_error', detail: e.message });
+        res.status(500).json({ error: 'server_error' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -30822,7 +31188,7 @@ app.post('/api/admin/test-push', authenticateToken, requireSuperAdmin, async (re
         res.json(result);
     } catch (error) {
         console.error('Test push error:', error);
-        res.status(500).json({ error: 'Test push failed', detail: error.message });
+        res.status(500).json({ error: 'Test push failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -31148,11 +31514,7 @@ app.delete('/api/admin/discipline/:recordId', authenticateToken, requireAdmin, a
             errorDetail: error.detail,
             errorStack: error.stack
         });
-        res.status(500).json({
-            error: 'Failed to remove discipline record',
-            detail: error.message,
-            code: error.code || null
-        });
+        res.status(500).json({ error: 'Failed to remove discipline record' }); // FIX-438: details logged above (incl. stack)
     } finally {
         client.release();
     }
@@ -37061,7 +37423,7 @@ app.post('/api/games/:gameId/messages', authenticateToken, gameChatLimiter, asyn
         });
     } catch (error) {
         console.error('Post message error — scope:', resolvedScope, 'gameId:', gameId, 'error:', error.message);
-        res.status(500).json({ error: 'Failed to post message', detail: error.message });
+        res.status(500).json({ error: 'Failed to post message' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -37209,7 +37571,7 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
         const valid = await bcrypt.compare(currentPassword, userResult.rows[0].password_hash);
         if (!valid) return res.status(403).json({ error: 'Current password is incorrect' });
 
-        const hash = await bcrypt.hash(newPassword, 10);
+        const hash = await bcrypt.hash(newPassword, 12);
         // HIGH-2: Bump token_version — all previously issued JWTs are now invalid
         await pool.query(
             'UPDATE users SET password_hash = $1, token_version = token_version + 1, force_password_change = FALSE WHERE id = $2',
@@ -37242,7 +37604,7 @@ app.post('/api/auth/force-change-password', authenticateToken, async (req, res) 
             return res.status(403).json({ error: 'No password change required' });
         }
 
-        const hash = await bcrypt.hash(newPassword, 10);
+        const hash = await bcrypt.hash(newPassword, 12);
         await pool.query(
             'UPDATE users SET password_hash = $1, force_password_change = FALSE, token_version = token_version + 1 WHERE id = $2',
             [hash, req.user.userId]
@@ -37289,7 +37651,7 @@ app.post('/api/admin/players/:playerId/reset-password', authenticateToken, requi
         if (playerRow.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
         const { user_id, display_name } = playerRow.rows[0];
 
-        const hash = await bcrypt.hash('Totalfooty1', 10);
+        const hash = await bcrypt.hash('Totalfooty1', 12);
         await pool.query(
             'UPDATE users SET password_hash = $1, force_password_change = TRUE, token_version = token_version + 1 WHERE id = $2',
             [hash, user_id]
@@ -37334,7 +37696,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
         if (new Date() > new Date(resetToken.expires_at)) return res.status(400).json({ error: 'This reset link has expired' });
 
         // Update password on users table
-        const passwordHash = await bcrypt.hash(newPassword, 10);
+        const passwordHash = await bcrypt.hash(newPassword, 12);
 
         await pool.query(
             `UPDATE users SET password_hash = $1 WHERE id = (SELECT user_id FROM players WHERE id = $2)`,
@@ -37673,7 +38035,7 @@ app.get('/api/admin/finance/games', authenticateToken, requireReportAccess, asyn
         res.json({ from, to, count: games.length, games });
     } catch (error) {
         console.error('Finance games report error:', error);
-        res.status(500).json({ error: 'Failed to load finance games report', detail: error.message });
+        res.status(500).json({ error: 'Failed to load finance games report' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -37720,6 +38082,43 @@ app.get('/api/admin/finance/summary', authenticateToken, requireReportAccess, as
             if (g.pitch_cost_missing) agg.games_missing_pitch++;
             if (g.ref_missing_pay)    agg.games_with_ref_missing_pay++;
         }
+        // FIX-464: training + coaching session income (TF: "add training to
+        // finance calculation. Coaching too"). Sessions are coaching_sessions
+        // rows; money sits on coaching_registrations (amount_paid_real/free,
+        // populated by FIX-462 trainings — coaching marketplace payments flow
+        // in automatically if they ever use the same columns). Completed
+        // sessions in range only, mirroring the games rule. Real/free kept
+        // separate to respect the cash-only meaning of total_revenue.
+        // 42703-tolerant: pre-TRAINING.sql the finance panel keeps working.
+        agg.training_sessions = 0; agg.training_real = 0; agg.training_free = 0;
+        agg.coaching_sessions = 0; agg.coaching_real = 0; agg.coaching_free = 0;
+        try {
+            const sess = await pool.query(`
+                SELECT COALESCE(cs.session_kind, 'coaching') AS kind,
+                       COUNT(DISTINCT cs.id) AS n,
+                       COALESCE(SUM(cr.amount_paid_real), 0) AS real_sum,
+                       COALESCE(SUM(cr.amount_paid_free), 0) AS free_sum
+                  FROM coaching_sessions cs
+                  JOIN coaching_registrations cr
+                    ON cr.session_id = cs.id
+                   AND cr.status IN ('registered', 'dropped_out') /* FIX-464 audit: dropped_out rows carry KEPT (non-refunded) fees; refunded drops hold 0 */
+                 WHERE cs.status = 'completed'
+                   AND cs.session_date >= $1 AND cs.session_date <= $2
+                 GROUP BY COALESCE(cs.session_kind, 'coaching')`, [from, to]);
+            for (const row of sess.rows) {
+                const real = parseFloat(row.real_sum) || 0, free = parseFloat(row.free_sum) || 0;
+                if (row.kind === 'training') {
+                    agg.training_sessions = parseInt(row.n); agg.training_real = real; agg.training_free = free;
+                } else {
+                    agg.coaching_sessions = parseInt(row.n); agg.coaching_real = real; agg.coaching_free = free;
+                }
+            }
+            agg.total_real    += agg.training_real + agg.coaching_real;
+            agg.total_free    += agg.training_free + agg.coaching_free;
+            agg.total_revenue += agg.training_real + agg.coaching_real;
+        } catch (e) {
+            if (!(e && e.code === '42703')) throw e; // pre-migration: sessions contribute zero
+        }
         const summary = {
             ...agg,
             gross_profit:        agg.total_real - agg.total_cost,
@@ -37732,7 +38131,7 @@ app.get('/api/admin/finance/summary', authenticateToken, requireReportAccess, as
         res.json({ from, to, summary });
     } catch (error) {
         console.error('Finance summary error:', error);
-        res.status(500).json({ error: 'Failed to load finance summary', detail: error.message });
+        res.status(500).json({ error: 'Failed to load finance summary' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -37804,7 +38203,7 @@ app.get('/api/admin/finance/games/:gameId/detail', authenticateToken, requireRep
         });
     } catch (error) {
         console.error('Finance game detail error:', error);
-        res.status(500).json({ error: 'Failed to load game detail', detail: error.message });
+        res.status(500).json({ error: 'Failed to load game detail' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -37841,7 +38240,7 @@ app.patch('/api/admin/finance/games/:gameId/costs', authenticateToken, requireRe
         res.json({ ok: true, pitch_cost: newPitch, ref_pay: newRef });
     } catch (error) {
         console.error('Finance cost edit error:', error);
-        res.status(500).json({ error: 'Failed to update costs', detail: error.message });
+        res.status(500).json({ error: 'Failed to update costs' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -37918,7 +38317,7 @@ app.patch('/api/admin/finance/registrations/:registrationId/payment', authentica
     } catch (error) {
         try { await client.query('ROLLBACK'); } catch (_) {}
         console.error('Finance payment edit error:', error);
-        res.status(500).json({ error: 'Failed to update payment', detail: error.message });
+        res.status(500).json({ error: 'Failed to update payment' });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -38500,7 +38899,8 @@ app.get('/api/coaching/sessions', optionalAuth, publicEndpointLimiter, async (re
             LEFT JOIN players p ON p.id = cs.coach_player_id
             LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
             LEFT JOIN coaching_feedback cf ON cf.coach_player_id = cs.coach_player_id
-            WHERE cs.status IN ('open','coach_confirmed','venue_confirmed','finalised')
+            WHERE cs.session_kind = 'coaching' /* FIX-463 audit: trainings must not leak into the coaching marketplace (requires TRAINING.sql first — runbook 1.4b) */
+              AND cs.status IN ('open','coach_confirmed','venue_confirmed','finalised')
               AND (cs.session_date IS NULL OR cs.session_date > NOW())
             GROUP BY cs.id, p.id, v.id
             ORDER BY cs.session_date ASC NULLS LAST
@@ -38530,6 +38930,8 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                    p.id AS coach_id, p.full_name AS coach_name,
                    p.alias AS coach_alias, p.photo_url AS coach_photo,
                    p.coach_certifications, p.coaching_appearances,
+                   cs.session_kind, cs.tenant_id, cs.title, cs.fee, cs.recurs_weekly,
+                   cs.discipline_affects_tiers, tn.name AS tenant_name,
                    COALESCE(avg_sub.avg_rating, 0) AS coach_avg_rating,
                    v.id AS venue_id, v.name AS venue_name, v.address AS venue_address,
                    v.postcode AS venue_postcode, v.parking_pin AS venue_parking_pin,
@@ -38539,6 +38941,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
             FROM coaching_sessions cs
             LEFT JOIN players p ON p.id = cs.coach_player_id
             LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+            LEFT JOIN tenants tn ON tn.id = cs.tenant_id
             LEFT JOIN (
                 SELECT coach_player_id, AVG(rating)::NUMERIC(3,2) AS avg_rating
                 FROM coaching_feedback GROUP BY coach_player_id
@@ -38548,6 +38951,40 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
 
         if (sResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
         const session = sResult.rows[0];
+
+        // FIX-462: trainings get their own payload and return EARLY — the
+        // coaching-marketplace response below stays untouched.
+        if (session.session_kind === 'training') {
+            const tRegs = await pool.query(`
+                SELECT cr.id, cr.status, cr.attendance,
+                       (cr.amount_paid_real + cr.amount_paid_free) AS amount_paid,
+                       p.id AS player_id, p.alias, p.full_name AS player_name, p.photo_url
+                  FROM coaching_registrations cr
+                  JOIN players p ON p.id = cr.player_id
+                 WHERE cr.session_id = $1 AND cr.status IN ('registered','pending')
+                 ORDER BY cr.registered_at ASC`, [session.id]);
+            let viewerReg = null, canManage = false;
+            if (req.user) {
+                const vr = await pool.query(
+                    `SELECT id, status, attendance, (amount_paid_real + amount_paid_free) AS amount_paid
+                       FROM coaching_registrations WHERE session_id = $1 AND player_id = $2`,
+                    [session.id, req.user.playerId]);
+                viewerReg = vr.rows[0] || null;
+                canManage = await _trainingCanManage(req, session);
+            }
+            return res.json({
+                session_kind: 'training', id: session.id, session_url: session.session_url,
+                title: session.title, tenant_name: session.tenant_name, status: session.status,
+                session_date: session.session_date, duration_hours: session.duration_hours,
+                fee: session.fee, recurs_weekly: session.recurs_weekly,
+                discipline_affects_tiers: session.discipline_affects_tiers,
+                session_notes: session.session_notes, coach_name: session.coach_name,
+                coach_alias: session.coach_alias, coach_photo: session.coach_photo,
+                venue_name: session.venue_name, venue_address: session.venue_address,
+                registrations: tRegs.rows, viewer_registration: viewerReg,
+                viewer_can_manage: canManage, viewer_logged_in: !!req.user
+            });
+        }
 
         // Registered players (only show names + start times if finalised)
         const regResult = await pool.query(`
@@ -38689,6 +39126,7 @@ app.get('/api/coaching/coach/:id/profile', optionalAuth, publicEndpointLimiter, 
             FROM coaching_sessions cs
             LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
             WHERE cs.coach_player_id = $1
+              AND cs.session_kind = 'coaching' /* FIX-463 audit: marketplace leak guard */
               AND cs.status IN ('open','coach_confirmed','venue_confirmed','finalised')
               AND (cs.session_date IS NULL OR cs.session_date > NOW())
             ORDER BY cs.session_date ASC NULLS LAST
@@ -39313,7 +39751,7 @@ app.post('/api/coaching/sessions/:id/reconfirm', authenticateToken, async (req, 
             [id, req.user.playerId]
         );
         if (upd.rows.length === 0) return res.status(404).json({ error: 'No active registration to re-confirm' });
-        await logCoachingAudit(id, null, req.user.playerId, 'player_reconfirmed', 'Player re-confirmed after session edit.').catch(() => {});
+        await logCoachingAudit(id, null, req.user.playerId, 'player_reconfirmed', 'Player re-confirmed after session edit.').catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE coaching_registrations (L39495):', _ce && _ce.message); });
         res.json({ ok: true });
     } catch (e) {
         console.error('POST /api/coaching/sessions/:id/reconfirm:', e.message);
@@ -39747,6 +40185,676 @@ app.post('/api/coaching/sessions/:id/feedback', authenticateToken, registrationL
 // ADMIN: GET /api/admin/coaching/sessions
 // All sessions across all coaches (admin view)
 // ══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════
+// FIX-463 — EXTERNAL LEAGUES & CUPS. The tenant's team campaigns in an
+// OUTSIDE competition. Fixtures are normal vs_external games (full RSVP/
+// payment machinery reused) tagged with external_league_id; opponent set
+// per fixture; home = a venue from the tenant's list (league default),
+// away = manually-entered venue details. NO series scoreline — results +
+// goals/assists live in the separate ext backend (ext_tf_score/opp_score
+// on the game + ext_league_player_stats), saved post-completion by the
+// assigned coach or a tenant admin on game.html. Public page per league:
+// fixtures, results, badges, top scorers/assists, and a TABLE button that
+// links out to the competition's own website. Cups: kind='cup' + names.
+// Soft cap: games confirm/complete under cap; extras = existing backup
+// system + admin raising max_players (no new money machinery).
+// ════════════════════════════════════════════════════════════════════════
+async function _extLeagueCanManage(req, tenantId, assignedCoachId) {
+    if (!req.user) return false;
+    if (req.user.role === 'superadmin' || req.user.role === 'admin') return true;
+    if (assignedCoachId && req.user.playerId === assignedCoachId) return true;
+    if (!tenantId) return false;
+    const m = await pool.query(
+        `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2
+          AND role = 'tenant_admin' AND status = 'active'`, [req.user.playerId, tenantId]);
+    return m.rows.length > 0;
+}
+
+// FIX-463: scoped opponents LIST — the global GET /api/opponents is CLM-admin
+// gated, which 403s tenant admins; the fixture form needs this read.
+app.get('/api/t/:tenant_short_id/admin/opponents', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query('SELECT id, name, logo_url, social_website FROM opponents ORDER BY name ASC LIMIT 500');
+        res.json({ opponents: r.rows });
+    } catch (e) {
+        console.error('FIX-463 opp list:', e.message);
+        res.status(500).json({ error: 'Could not load opponents' });
+    }
+});
+
+// FIX-463: tenant-admin opponent quick-create (opponents are a global pool;
+// tenant admins can add by name+website here; badge upload stays on the admin
+// Add Opponent flow which already has the FIX-461 uploader).
+app.post('/api/t/:tenant_short_id/admin/opponents', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const name = String((req.body || {}).name || '').trim();
+        if (name.length < 2 || name.length > 60) return res.status(400).json({ error: 'Opponent name must be 2-60 characters' });
+        const site = (req.body || {}).website ? String(req.body.website).slice(0, 300) : null;
+        const r = await pool.query(
+            'INSERT INTO opponents (name, logo_url, star_rating, social_instagram, social_twitter, social_website) VALUES ($1,NULL,NULL,NULL,NULL,$2) RETURNING id, name',
+            [name, site]);
+        await auditLog(pool, req.user.playerId, 'opponent_created', null, `"${name}" (tenant quick-add)`, req.tenant.id).catch(() => {});
+        res.status(201).json(r.rows[0]);
+    } catch (e) {
+        if (e.code === '23505') return res.status(409).json({ error: 'Opponent name already exists' });
+        console.error('FIX-463 opp quick-add:', e.message);
+        res.status(500).json({ error: 'Could not add opponent' });
+    }
+});
+
+// CREATE league/cup
+app.post('/api/t/:tenant_short_id/admin/ext-leagues', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const name = String(b.name || '').trim();
+        if (name.length < 3 || name.length > 80) return res.status(400).json({ error: 'Name must be 3-80 characters' });
+        const kind = b.kind === 'cup' ? 'cup' : 'league';
+        const slug = 'xl-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30)
+            + '-' + Math.random().toString(36).slice(2, 7);
+        if (b.default_venue_id) {
+            const v = await pool.query('SELECT 1 FROM venues WHERE id = $1', [b.default_venue_id]);
+            if (!v.rows.length) return res.status(400).json({ error: 'Unknown venue' });
+        }
+        const id = require('crypto').randomUUID();
+        await pool.query(`
+            INSERT INTO external_leagues
+              (id, tenant_id, kind, name, parent_league_name, external_website_url, public_slug,
+               default_venue_id, default_coach_player_id, series_awards_enabled, game_awards_enabled, created_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+            [id, req.tenant.id, kind, name,
+             b.parent_league_name ? String(b.parent_league_name).slice(0, 80) : null,
+             b.external_website_url ? String(b.external_website_url).slice(0, 300) : null,
+             slug, b.default_venue_id || null, b.default_coach_player_id || null,
+             b.series_awards_enabled !== false, b.game_awards_enabled !== false, req.user.playerId]);
+        await auditLog(pool, req.user.playerId, 'ext_league_created', null,
+            `${kind} "${name}"`, req.tenant.id).catch(() => {});
+        res.status(201).json({ ok: true, id, public_slug: slug,
+            public_link: 'https://totalfooty.co.uk/ext-league.html?l=' + slug });
+    } catch (e) {
+        console.error('FIX-463 create league error:', e.message);
+        res.status(500).json({ error: 'Could not create' });
+    }
+});
+
+// LIST leagues
+app.get('/api/t/:tenant_short_id/admin/ext-leagues', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT xl.*, p.alias AS default_coach_alias, v.name AS default_venue_name,
+                   COUNT(g.id) AS fixture_count,
+                   COUNT(g.id) FILTER (WHERE g.game_status = 'completed') AS completed_count
+              FROM external_leagues xl
+              LEFT JOIN players p ON p.id = xl.default_coach_player_id
+              LEFT JOIN venues v ON v.id = xl.default_venue_id
+              LEFT JOIN games g ON g.external_league_id = xl.id
+             WHERE xl.tenant_id = $1
+             GROUP BY xl.id, p.alias, v.name
+             ORDER BY xl.created_at DESC`, [req.tenant.id]);
+        res.json({ leagues: r.rows });
+    } catch (e) {
+        console.error('FIX-463 list error:', e.message);
+        res.status(500).json({ error: 'Could not load' });
+    }
+});
+
+// EDIT league (name/urls/defaults/flags/status)
+app.patch('/api/t/:tenant_short_id/admin/ext-leagues/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const own = await pool.query('SELECT id FROM external_leagues WHERE id = $1 AND tenant_id = $2',
+            [req.params.id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'League not found' });
+        const b = req.body || {};
+        const sets = [], vals = []; let n = 1;
+        const put = (col, val) => { sets.push(col + ' = $' + (n++)); vals.push(val); };
+        if (b.name !== undefined) { const nm = String(b.name).trim(); if (nm.length < 3) return res.status(400).json({ error: 'Name too short' }); put('name', nm.slice(0, 80)); }
+        if (b.parent_league_name !== undefined) put('parent_league_name', b.parent_league_name ? String(b.parent_league_name).slice(0, 80) : null);
+        if (b.external_website_url !== undefined) put('external_website_url', b.external_website_url ? String(b.external_website_url).slice(0, 300) : null);
+        if (b.default_venue_id !== undefined) put('default_venue_id', b.default_venue_id || null);
+        if (b.default_coach_player_id !== undefined) put('default_coach_player_id', b.default_coach_player_id || null);
+        if (b.series_awards_enabled !== undefined) put('series_awards_enabled', b.series_awards_enabled === true);
+        if (b.game_awards_enabled !== undefined) put('game_awards_enabled', b.game_awards_enabled === true);
+        if (b.status !== undefined) put('status', b.status === 'archived' ? 'archived' : 'active');
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(req.params.id);
+        await pool.query(`UPDATE external_leagues SET ${sets.join(', ')} WHERE id = $${n}`, vals);
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-463 edit error:', e.message);
+        res.status(500).json({ error: 'Could not update' });
+    }
+});
+
+// ADD FIXTURE — pick a date on the calendar, set the opponent, create the game.
+// Inserts a normal vs_external game (RSVP/payments work as standard) + ext fields.
+app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fixtures', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const xl = await pool.query(
+            `SELECT id, name, default_venue_id, default_coach_player_id FROM external_leagues
+              WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        const L = xl.rows[0];
+        const b = req.body || {};
+        const when = new Date(b.game_date);
+        if (isNaN(when.getTime())) return res.status(400).json({ error: 'Valid fixture date/time required' });
+        if (!b.opponent_id) return res.status(400).json({ error: 'Opponent is required for every fixture' });
+        const opp = await pool.query('SELECT id, name FROM opponents WHERE id = $1', [b.opponent_id]);
+        if (!opp.rows.length) return res.status(400).json({ error: 'Unknown opponent' });
+        const isHome = b.is_home !== false;
+        let venueId = null;
+        if (isHome) {
+            venueId = b.venue_id || L.default_venue_id;
+            if (!venueId) return res.status(400).json({ error: 'Home fixture needs a venue (set a league default or pick one)' });
+        } else {
+            if (!b.away_venue_name || !String(b.away_venue_name).trim()) return res.status(400).json({ error: 'Away fixture needs a venue name' });
+            // FIX-463 audit: games.venue_id nullability is unconfirmed on live. Away
+            // fixtures carry the league's default venue id as a harmless placeholder
+            // (the /details endpoint substitutes the manual away_* fields for ALL
+            // display surfaces, so the placeholder never renders). NULL would be
+            // cleaner but risks a 23502 on a NOT NULL constraint.
+            venueId = L.default_venue_id || null;
+        }
+        const maxPlayers = parseInt(b.max_players) > 0 ? parseInt(b.max_players) : 16;
+        const cost = b.cost_per_player === undefined || b.cost_per_player === '' ? 0 : parseFloat(b.cost_per_player);
+        if (isNaN(cost) || cost < 0 || cost > 500) return res.status(400).json({ error: 'Cost must be 0-500' });
+        const coachId = b.assigned_coach_player_id || L.default_coach_player_id || null;
+        const gameUrl = 'xg-' + Math.random().toString(36).slice(2, 10);
+        const ins = await pool.query(`
+            INSERT INTO games (
+                venue_id, game_date, max_players, cost_per_player, format, regularity,
+                exclusivity, position_type, game_url,
+                team_selection_type, external_opponent, opponent_id,
+                refs_required, ref_pay, requires_organiser,
+                star_rating, star_rating_locked, tenant_id,
+                external_league_id, is_home, away_venue_name, away_postcode,
+                away_pitch_pin, away_parking_pin, away_pitch_type, assigned_coach_player_id,
+                pitch_cost
+            ) VALUES ($1,$2,$3,$4,$5,'one-off','everyone','outfield_gk',$6,
+                      'vs_external',$7,$8,0,0,false,0,false,$9,
+                      $10,$11,$12,$13,$14,$15,$16,$17,$18)
+            RETURNING id, game_url`,
+            [venueId, when.toISOString(), maxPlayers, cost,
+             b.format ? String(b.format).slice(0, 20) : '11-a-side',
+             gameUrl, opp.rows[0].name, opp.rows[0].id, req.tenant.id,
+             L.id, isHome,
+             isHome ? null : String(b.away_venue_name).trim().slice(0, 100),
+             isHome ? null : (b.away_postcode ? String(b.away_postcode).trim().slice(0, 12) : null),
+             isHome ? null : (b.away_pitch_pin ? String(b.away_pitch_pin).trim().slice(0, 200) : null),
+             isHome ? null : (b.away_parking_pin ? String(b.away_parking_pin).trim().slice(0, 200) : null),
+             isHome ? null : (b.away_pitch_type ? String(b.away_pitch_type).trim().slice(0, 30) : null),
+             coachId,
+             // FIX-463 audit: away fixtures pin pitch_cost to 0 so the placeholder
+             // home venue's default cannot leak phantom costs into finance.
+             // Home fixtures stay NULL -> venue default, editable in Finance.
+             isHome ? null : 0]);
+        await auditLog(pool, req.user.playerId, 'ext_fixture_created', null,
+            `${L.name}: vs ${opp.rows[0].name} ${when.toISOString()} (${isHome ? 'H' : 'A'})`, req.tenant.id).catch(() => {});
+        res.status(201).json({ ok: true, game_id: ins.rows[0].id, game_url: ins.rows[0].game_url,
+            game_link: 'https://api.totalfooty.co.uk/g/' + ins.rows[0].game_url });
+    } catch (e) {
+        console.error('FIX-463 fixture error:', e.message);
+        res.status(500).json({ error: 'Could not create fixture' });
+    }
+});
+
+// SAVE RESULT + GOALS/ASSISTS (assigned coach or tenant admin), post-completion.
+app.put('/api/ext-league/games/:gameId/stats', authenticateToken, async (req, res) => {
+    try {
+        const g = await pool.query(
+            `SELECT id, tenant_id, external_league_id, assigned_coach_player_id, game_status
+               FROM games WHERE id = $1 AND external_league_id IS NOT NULL`, [req.params.gameId]);
+        if (!g.rows.length) return res.status(404).json({ error: 'Not an external-league fixture' });
+        const game = g.rows[0];
+        if (!(await _extLeagueCanManage(req, game.tenant_id, game.assigned_coach_player_id)))
+            return res.status(403).json({ error: 'Not allowed' });
+        const b = req.body || {};
+        const tf = b.tf_score === undefined || b.tf_score === null || b.tf_score === '' ? null : parseInt(b.tf_score);
+        const op = b.opp_score === undefined || b.opp_score === null || b.opp_score === '' ? null : parseInt(b.opp_score);
+        if ((tf !== null && (isNaN(tf) || tf < 0 || tf > 99)) || (op !== null && (isNaN(op) || op < 0 || op > 99)))
+            return res.status(400).json({ error: 'Scores must be 0-99' });
+        if (tf !== null || op !== null) {
+            await pool.query('UPDATE games SET ext_tf_score = $1, ext_opp_score = $2 WHERE id = $3',
+                [tf, op, game.id]);
+        }
+        const entries = Array.isArray(b.entries) ? b.entries.slice(0, 40) : [];
+        for (const e of entries) {
+            if (!e.player_id) continue;
+            const goals = Math.max(0, Math.min(20, parseInt(e.goals) || 0));
+            const assists = Math.max(0, Math.min(20, parseInt(e.assists) || 0));
+            if (goals === 0 && assists === 0) {
+                await pool.query('DELETE FROM ext_league_player_stats WHERE game_id = $1 AND player_id = $2',
+                    [game.id, e.player_id]);
+            } else {
+                await pool.query(`
+                    INSERT INTO ext_league_player_stats (id, external_league_id, game_id, player_id, goals, assists)
+                    VALUES ($1,$2,$3,$4,$5,$6)
+                    ON CONFLICT (game_id, player_id) DO UPDATE SET goals = $5, assists = $6`,
+                    [require('crypto').randomUUID(), game.external_league_id, game.id, e.player_id, goals, assists]);
+            }
+        }
+        await auditLog(pool, req.user.playerId, 'ext_stats_saved', null,
+            `fixture ${game.id} score ${tf ?? '-'}-${op ?? '-'} (${entries.length} stat rows)`, game.tenant_id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-463 stats error:', e.message);
+        res.status(500).json({ error: 'Could not save stats' });
+    }
+});
+
+// PUBLIC league page: fixtures + results + badges + leaderboards + table link.
+app.get('/api/public/ext-league/:slug', optionalAuth, publicEndpointLimiter, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT xl.id, xl.kind, xl.name, xl.parent_league_name, xl.external_website_url,
+                   xl.public_slug, xl.series_awards_enabled, xl.game_awards_enabled, xl.status,
+                   t.name AS tenant_name, p.alias AS default_coach_alias
+              FROM external_leagues xl
+              JOIN tenants t ON t.id = xl.tenant_id
+              LEFT JOIN players p ON p.id = xl.default_coach_player_id
+             WHERE xl.public_slug = $1`, [req.params.slug]);
+        if (!r.rows.length) return res.status(404).json({ error: 'League not found' });
+        const L = r.rows[0];
+        const fx = await pool.query(`
+            SELECT g.id, g.game_url, g.game_date, g.game_status, g.is_home,
+                   g.ext_tf_score, g.ext_opp_score, g.max_players, g.cost_per_player,
+                   g.away_venue_name, g.away_postcode, g.away_pitch_type,
+                   o.name AS opponent_name, o.logo_url AS opponent_logo, o.social_website AS opponent_website,
+                   v.name AS home_venue_name,
+                   cp.alias AS coach_alias
+              FROM games g
+              LEFT JOIN opponents o ON o.id = g.opponent_id
+              LEFT JOIN venues v ON v.id = g.venue_id
+              LEFT JOIN players cp ON cp.id = g.assigned_coach_player_id
+             WHERE g.external_league_id = $1
+             ORDER BY g.game_date ASC`, [L.id]);
+        const lb = await pool.query(`
+            SELECT p.id AS player_id, p.alias, p.full_name, p.photo_url,
+                   SUM(s.goals)::int AS goals, SUM(s.assists)::int AS assists,
+                   COUNT(*) FILTER (WHERE s.goals > 0 OR s.assists > 0)::int AS games_with_contribution
+              FROM ext_league_player_stats s
+              JOIN players p ON p.id = s.player_id
+             WHERE s.external_league_id = $1
+             GROUP BY p.id, p.alias, p.full_name, p.photo_url
+             HAVING SUM(s.goals) > 0 OR SUM(s.assists) > 0
+             ORDER BY SUM(s.goals) DESC, SUM(s.assists) DESC
+             LIMIT 30`, [L.id]);
+        res.json({ league: L, fixtures: fx.rows, leaderboard: lb.rows });
+    } catch (e) {
+        console.error('FIX-463 public error:', e.message);
+        res.status(500).json({ error: 'Could not load league' });
+    }
+});
+// FIX-462 — TENANT TRAINING SESSIONS (the Spond play: a tenant is a team).
+// Training = coaching_sessions row with session_kind='training'. Casual-game
+// rules: NO cap, NO team gen, NO stats, NO awards. Lifecycle for coaches:
+// CREATE (status 'open', signups open) -> CONFIRM (status 'finalised', late
+// signups become 'pending' for coach approve/deny on session.html) ->
+// COMPLETE (attendance marked; discipline strikes if enabled; weekly series
+// auto-spawns next occurrence). Fee >= 0; wallet free-credits-first via
+// applyGameFee inside a tx; real/free split stored at signup for exact
+// refunds (Web47 rule); drop-out refunds follow the tenant's
+// refund_cutoff_hours policy, never over-refunding (games approximation).
+// Discipline: strikes recorded in coaching_audit_log only when BOTH the
+// tenant master switch and the per-session toggle are on. Tier auto-demotion
+// is deliberately NOT wired — the strike ledger is the v1 effect; demotion
+// rules need TF's ladder definition.
+// ════════════════════════════════════════════════════════════════════════
+async function _trainingCanManage(req, session) {
+    if (!req.user) return false;
+    if (req.user.role === 'superadmin' || req.user.role === 'admin') return true;
+    if (session.coach_player_id && req.user.playerId === session.coach_player_id) return true;
+    if (!session.tenant_id) return false;
+    const m = await pool.query(
+        `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2
+          AND role = 'tenant_admin' AND status = 'active'`,
+        [req.user.playerId, session.tenant_id]);
+    return m.rows.length > 0;
+}
+async function _trainingLoad(id) {
+    const r = await pool.query(
+        `SELECT id, session_url, session_kind, tenant_id, title, fee, recurs_weekly,
+                series_id, discipline_affects_tiers, status, session_date, duration_hours,
+                session_notes, coach_player_id, max_players
+           FROM coaching_sessions WHERE id = $1 AND session_kind = 'training'`, [id]);
+    return r.rows[0] || null;
+}
+
+// FIX-465: APP PARITY — player-facing training discovery. Upcoming + recent
+// trainings across every tenant the player belongs to, with their own
+// registration status. Read-only; no manage data. (Manage stays web-only.)
+app.get('/api/players/me/trainings', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(`
+            SELECT cs.id, cs.session_url, cs.title, cs.fee, cs.recurs_weekly, cs.status,
+                   cs.session_date, cs.duration_hours, t.name AS tenant_name,
+                   COUNT(cr2.id) FILTER (WHERE cr2.status = 'registered') AS registered_count,
+                   my.status AS my_status
+              FROM coaching_sessions cs
+              JOIN tenants t ON t.id = cs.tenant_id
+              JOIN player_tenants pt ON pt.tenant_id = cs.tenant_id
+                   AND pt.player_id = $1 AND pt.status = 'active'
+              LEFT JOIN coaching_registrations cr2 ON cr2.session_id = cs.id
+              LEFT JOIN coaching_registrations my ON my.session_id = cs.id AND my.player_id = $1
+             WHERE cs.session_kind = 'training'
+               AND cs.session_date > NOW() - INTERVAL '7 days'
+             GROUP BY cs.id, t.name, my.status
+             ORDER BY cs.session_date ASC
+             LIMIT 60`, [req.user.playerId]);
+        res.json({ trainings: r.rows });
+    } catch (e) {
+        console.error('FIX-465 trainings list:', e.message);
+        res.status(500).json({ error: 'Could not load trainings' });
+    }
+});
+
+// CREATE (tenant admins; superadmin passes requireTenantAdmin too)
+app.post('/api/t/:tenant_short_id/admin/trainings', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const title = String(b.title || '').trim();
+        if (title.length < 3 || title.length > 80) return res.status(400).json({ error: 'Title must be 3-80 characters' });
+        const when = new Date(b.session_date);
+        if (isNaN(when.getTime())) return res.status(400).json({ error: 'Valid session date/time required' });
+        const fee = b.fee === undefined || b.fee === null || b.fee === '' ? 0 : parseFloat(b.fee);
+        if (isNaN(fee) || fee < 0 || fee > 500) return res.status(400).json({ error: 'Fee must be 0-500' });
+        const duration = parseFloat(b.duration_hours) > 0 ? parseFloat(b.duration_hours) : 1;
+        const recurs = b.recurs_weekly === true;
+        let disciplineToggle = b.discipline_affects_tiers === true;
+        if (disciplineToggle) { // per-session toggle only meaningful when tenant master switch is on
+            const t = await pool.query('SELECT discipline_enabled FROM tenants WHERE id = $1', [req.tenant.id]);
+            if (!t.rows.length || t.rows[0].discipline_enabled !== true) disciplineToggle = false;
+        }
+        let coachId = b.coach_player_id || null;
+        if (coachId) {
+            const cm = await pool.query(
+                `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'`,
+                [coachId, req.tenant.id]);
+            if (!cm.rows.length) return res.status(400).json({ error: 'Coach must be a member of this tenant' });
+        }
+        const sessionUrl = 'tr-' + title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24)
+            + '-' + Math.random().toString(36).slice(2, 8);
+        const seriesId = recurs ? require('crypto').randomUUID() : null;
+        const ins = await pool.query(`
+            INSERT INTO coaching_sessions
+              (session_url, session_kind, tenant_id, title, fee, recurs_weekly, series_id,
+               discipline_affects_tiers, coach_player_id, created_by, duration_hours,
+               activity_type, group_type, max_players, session_date, session_notes, status)
+            VALUES ($1,'training',$2,$3,$4,$5,$6,$7,$8,$9,$10,'training','training',NULL,$11,$12,'open')
+            RETURNING id, session_url`,
+            [sessionUrl, req.tenant.id, title, fee, recurs, seriesId, disciplineToggle,
+             coachId, req.user.playerId, duration, when.toISOString(), b.notes ? String(b.notes).slice(0, 1000) : null]);
+        await auditLog(pool, req.user.playerId, 'training_created', null,
+            `Training "${title}" ${when.toISOString()} fee £${fee}${recurs ? ' (weekly)' : ''}`, req.tenant.id).catch(() => {});
+        res.status(201).json({ ok: true, id: ins.rows[0].id, session_url: ins.rows[0].session_url,
+            link: 'https://totalfooty.co.uk/session.html?url=' + ins.rows[0].session_url });
+    } catch (e) {
+        console.error('FIX-462 create error:', e.message);
+        res.status(500).json({ error: 'Could not create training session' });
+    }
+});
+
+// LIST (tenant admin panel)
+app.get('/api/t/:tenant_short_id/admin/trainings', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const rows = await pool.query(`
+            SELECT cs.id, cs.session_url, cs.title, cs.fee, cs.recurs_weekly, cs.status,
+                   cs.session_date, cs.duration_hours, cs.discipline_affects_tiers,
+                   p.alias AS coach_alias,
+                   COUNT(cr.id) FILTER (WHERE cr.status = 'registered') AS registered_count,
+                   COUNT(cr.id) FILTER (WHERE cr.status = 'pending')    AS pending_count
+              FROM coaching_sessions cs
+              LEFT JOIN players p ON p.id = cs.coach_player_id
+              LEFT JOIN coaching_registrations cr ON cr.session_id = cs.id
+             WHERE cs.tenant_id = $1 AND cs.session_kind = 'training'
+             GROUP BY cs.id, p.alias
+             ORDER BY cs.session_date DESC
+             LIMIT 100`, [req.tenant.id]);
+        const t = await pool.query('SELECT discipline_enabled FROM tenants WHERE id = $1', [req.tenant.id]);
+        res.json({ trainings: rows.rows, discipline_enabled: !!(t.rows[0] && t.rows[0].discipline_enabled) });
+    } catch (e) {
+        console.error('FIX-462 list error:', e.message);
+        res.status(500).json({ error: 'Could not load trainings' });
+    }
+});
+
+// CONFIRM: open -> finalised (label CONFIRMED in UI). Late signups then queue.
+app.post('/api/training/:id/confirm', authenticateToken, async (req, res) => {
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) return res.status(404).json({ error: 'Training not found' });
+        if (!(await _trainingCanManage(req, s))) return res.status(403).json({ error: 'Not allowed' });
+        if (s.status !== 'open') return res.status(400).json({ error: 'Only an open session can be confirmed' });
+        await pool.query(`UPDATE coaching_sessions SET status = 'finalised' WHERE id = $1`, [s.id]);
+        await auditLog(pool, req.user.playerId, 'training_confirmed', null, `Training "${s.title}" confirmed`, s.tenant_id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-462 confirm error:', e.message);
+        res.status(500).json({ error: 'Could not confirm' });
+    }
+});
+
+// REGISTER: open -> charge now, 'registered'. finalised -> 'pending', NO charge
+// (money is only taken once the coach approves — never charge undelivered).
+app.post('/api/training/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) { client.release(); return res.status(404).json({ error: 'Training not found' }); }
+        if (s.status !== 'open' && s.status !== 'finalised') {
+            client.release(); return res.status(400).json({ error: 'This session is not taking signups' });
+        }
+        const existing = await pool.query(
+            `SELECT id, status FROM coaching_registrations WHERE session_id = $1 AND player_id = $2`,
+            [s.id, req.user.playerId]);
+        const prior = existing.rows[0] || null;
+        if (prior && (prior.status === 'registered' || prior.status === 'pending')) {
+            client.release(); return res.status(409).json({ error: 'Already signed up' });
+        }
+        const late = s.status === 'finalised';
+        const fee = parseFloat(s.fee) || 0;
+        await client.query('BEGIN');
+        let paid = { realCharged: 0, freeCharged: 0 };
+        let newStatus = 'pending';
+        if (!late) {
+            if (fee > 0) paid = await applyGameFee(client, req.user.playerId, fee, `Training: ${s.title}`, s.tenant_id, null);
+            newStatus = 'registered';
+        }
+        if (prior) {
+            await client.query(
+                `UPDATE coaching_registrations
+                    SET status = $1, amount_paid_real = $2, amount_paid_free = $3,
+                        paid_method = $4, attendance = NULL
+                  WHERE id = $5`,
+                [newStatus, paid.realCharged, paid.freeCharged, fee > 0 && !late ? 'wallet' : null, prior.id]);
+        } else {
+            await client.query(
+                `INSERT INTO coaching_registrations
+                   (session_id, player_id, status, amount_paid_real, amount_paid_free, paid_method)
+                 VALUES ($1,$2,$3,$4,$5,$6)`,
+                [s.id, req.user.playerId, newStatus, paid.realCharged, paid.freeCharged,
+                 fee > 0 && !late ? 'wallet' : null]);
+        }
+        await client.query('COMMIT');
+        res.status(201).json({ ok: true, status: newStatus,
+            message: newStatus === 'pending' ? 'Request sent — the coach will approve or deny it.' : 'You\'re in.' });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.message === 'INSUFFICIENT_CREDITS') {
+            return res.status(400).json({ error: 'Insufficient wallet balance — top up first.' });
+        }
+        console.error('FIX-462 register error:', e.message);
+        res.status(500).json({ error: 'Could not sign up' });
+    } finally {
+        client.release();
+    }
+});
+
+// DROP OUT: refund per tenant refund_cutoff_hours (default 2). Real portion back
+// to balance, free portion via refundFreeCredits — the games never-over-refund rule.
+app.delete('/api/training/:id/register', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) { client.release(); return res.status(404).json({ error: 'Training not found' }); }
+        const r = await pool.query(
+            `SELECT id, status, amount_paid_real, amount_paid_free FROM coaching_registrations
+              WHERE session_id = $1 AND player_id = $2`, [s.id, req.user.playerId]);
+        const reg = r.rows[0];
+        if (!reg || (reg.status !== 'registered' && reg.status !== 'pending')) {
+            client.release(); return res.status(400).json({ error: 'You are not signed up' });
+        }
+        let cutoff = 2;
+        if (s.tenant_id) {
+            const t = await pool.query('SELECT refund_cutoff_hours FROM tenants WHERE id = $1', [s.tenant_id]);
+            if (t.rows.length && t.rows[0].refund_cutoff_hours != null) cutoff = parseInt(t.rows[0].refund_cutoff_hours, 10);
+        }
+        const hoursUntil = (new Date(s.session_date).getTime() - Date.now()) / 3600000;
+        const refundable = reg.status === 'registered' && hoursUntil > cutoff && s.status !== 'completed';
+        const real = parseFloat(reg.amount_paid_real) || 0;
+        const free = parseFloat(reg.amount_paid_free) || 0;
+        await client.query('BEGIN');
+        let refunded = 0;
+        if (refundable && (real > 0 || free > 0)) {
+            if (real > 0) {
+                await client.query(
+                    `UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`,
+                    [real, req.user.playerId]);
+                await recordCreditTransaction(client, req.user.playerId, real, 'refund', `Training drop-out: ${s.title}`);
+            }
+            if (free > 0) await refundFreeCredits(req.user.playerId, free, null, client);
+            refunded = real + free;
+        }
+        // FIX-464 audit: zero the paid amounts ONLY when a refund was actually
+        // issued. A post-cutoff drop-out's fee is KEPT by the tenant and must
+        // keep counting as training revenue (finance sums dropped_out rows too).
+        if (refunded > 0) {
+            await client.query(
+                `UPDATE coaching_registrations
+                    SET status = 'dropped_out', amount_paid_real = 0, amount_paid_free = 0
+                  WHERE id = $1`, [reg.id]);
+        } else {
+            await client.query(
+                `UPDATE coaching_registrations SET status = 'dropped_out' WHERE id = $1`, [reg.id]);
+        }
+        await client.query('COMMIT');
+        res.json({ ok: true, refunded,
+            message: refunded > 0 ? `You're out — £${refunded.toFixed(2)} refunded to your wallet.`
+                : (real + free > 0 ? 'You\'re out — past the refund cutoff, no refund due.' : 'You\'re out.') });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-462 dropout error:', e.message);
+        res.status(500).json({ error: 'Could not drop out' });
+    } finally {
+        client.release();
+    }
+});
+
+// APPROVE / DENY a pending late registration. Approval is the charge moment.
+app.post('/api/training/:id/registrations/:rid/decide', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) { client.release(); return res.status(404).json({ error: 'Training not found' }); }
+        if (!(await _trainingCanManage(req, s))) { client.release(); return res.status(403).json({ error: 'Not allowed' }); }
+        const r = await pool.query(
+            `SELECT id, player_id, status FROM coaching_registrations WHERE id = $1 AND session_id = $2`,
+            [req.params.rid, s.id]);
+        const reg = r.rows[0];
+        if (!reg || reg.status !== 'pending') { client.release(); return res.status(400).json({ error: 'No pending request found' }); }
+        const approve = req.body && req.body.approve === true;
+        const fee = parseFloat(s.fee) || 0;
+        await client.query('BEGIN');
+        if (approve) {
+            let paid = { realCharged: 0, freeCharged: 0 };
+            if (fee > 0) paid = await applyGameFee(client, reg.player_id, fee, `Training: ${s.title}`, s.tenant_id, null);
+            await client.query(
+                `UPDATE coaching_registrations
+                    SET status = 'registered', amount_paid_real = $1, amount_paid_free = $2, paid_method = $3
+                  WHERE id = $4`,
+                [paid.realCharged, paid.freeCharged, fee > 0 ? 'wallet' : null, reg.id]);
+        } else {
+            await client.query(`UPDATE coaching_registrations SET status = 'denied' WHERE id = $1`, [reg.id]);
+        }
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, approve ? 'training_reg_approved' : 'training_reg_denied',
+            reg.player_id, `Training "${s.title}"`, s.tenant_id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.message === 'INSUFFICIENT_CREDITS') {
+            return res.status(400).json({ error: 'Player has insufficient wallet balance — they should top up, then approve again.' });
+        }
+        console.error('FIX-462 decide error:', e.message);
+        res.status(500).json({ error: 'Could not process the request' });
+    } finally {
+        client.release();
+    }
+});
+
+// COMPLETE: mark attendance; discipline strikes (when enabled both levels);
+// weekly series spawns next week's session.
+app.post('/api/training/:id/complete', authenticateToken, async (req, res) => {
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) return res.status(404).json({ error: 'Training not found' });
+        if (!(await _trainingCanManage(req, s))) return res.status(403).json({ error: 'Not allowed' });
+        if (s.status === 'completed' || s.status === 'cancelled') return res.status(400).json({ error: 'Session already closed' });
+        const marks = Array.isArray(req.body && req.body.attendance) ? req.body.attendance : [];
+        let disciplineLive = false;
+        if (s.discipline_affects_tiers && s.tenant_id) {
+            const t = await pool.query('SELECT discipline_enabled FROM tenants WHERE id = $1', [s.tenant_id]);
+            disciplineLive = !!(t.rows.length && t.rows[0].discipline_enabled === true);
+        }
+        let noShows = 0;
+        for (const m of marks) {
+            const att = m.attendance === 'attended' ? 'attended' : (m.attendance === 'no_show' ? 'no_show' : null);
+            if (!att || !m.registration_id) continue;
+            const u = await pool.query(
+                `UPDATE coaching_registrations SET attendance = $1
+                  WHERE id = $2 AND session_id = $3 AND status = 'registered'
+                  RETURNING player_id`, [att, m.registration_id, s.id]);
+            if (att === 'no_show' && u.rows.length && disciplineLive) {
+                noShows++;
+                await pool.query(
+                    `INSERT INTO coaching_audit_log (session_id, actor_player_id, action, detail)
+                     VALUES ($1, $2, 'training_no_show_strike', $3)`,
+                    [s.id, req.user.playerId, `player:${u.rows[0].player_id} training:"${s.title}"`]).catch(() => {});
+            }
+        }
+        await pool.query(`UPDATE coaching_sessions SET status = 'completed' WHERE id = $1`, [s.id]);
+        // Weekly series: spawn next occurrence if none exists yet
+        let nextLink = null;
+        if (s.recurs_weekly && s.series_id) {
+            const future = await pool.query(
+                `SELECT 1 FROM coaching_sessions WHERE series_id = $1 AND session_date > $2 LIMIT 1`,
+                [s.series_id, s.session_date]);
+            if (!future.rows.length) {
+                const nextUrl = 'tr-' + (s.title || 'training').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 24)
+                    + '-' + Math.random().toString(36).slice(2, 8);
+                const nd = new Date(new Date(s.session_date).getTime() + 7 * 24 * 3600 * 1000);
+                const nx = await pool.query(`
+                    INSERT INTO coaching_sessions
+                      (session_url, session_kind, tenant_id, title, fee, recurs_weekly, series_id,
+                       discipline_affects_tiers, coach_player_id, created_by, duration_hours,
+                       activity_type, group_type, max_players, session_date, session_notes, status)
+                    SELECT $1, 'training', tenant_id, title, fee, TRUE, series_id,
+                           discipline_affects_tiers, coach_player_id, created_by, duration_hours,
+                           'training', 'training', NULL, $2, session_notes, 'open'
+                      FROM coaching_sessions WHERE id = $3
+                    RETURNING session_url`, [nextUrl, nd.toISOString(), s.id]);
+                if (nx.rows.length) nextLink = 'https://totalfooty.co.uk/session.html?url=' + nx.rows[0].session_url;
+            }
+        }
+        await auditLog(pool, req.user.playerId, 'training_completed', null,
+            `Training "${s.title}" completed${noShows ? ` (${noShows} no-show strike${noShows > 1 ? 's' : ''})` : ''}`,
+            s.tenant_id).catch(() => {});
+        res.json({ ok: true, next_session_link: nextLink });
+    } catch (e) {
+        console.error('FIX-462 complete error:', e.message);
+        res.status(500).json({ error: 'Could not complete the session' });
+    }
+});
+
 app.get('/api/admin/coaching/sessions', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -42336,7 +43444,7 @@ app.post('/api/t/:tenant_short_id/admin/leagues/:id/teams', authenticateToken, r
 
 // ─── PUBLIC / CAPTAIN (global) ───────────────────────────────────────────
 // Claim-page context (no auth — the page shows league + team, then prompts login).
-app.get('/api/leagues/teams/by-slug/:slug', async (req, res) => {
+app.get('/api/leagues/teams/by-slug/:slug', publicEndpointLimiter, async (req, res) => {
     try {
         const r = await pool.query(
             `SELECT lt.id, lt.name, lt.bib_colour, lt.status, lt.claimed_at,
@@ -43091,7 +44199,7 @@ app.get('/api/leagues/teams/:id/manage', authenticateToken, async (req, res) => 
 });
 
 // Public join-page context (by invite slug).
-app.get('/api/leagues/teams/invite/:invite_slug', async (req, res) => {
+app.get('/api/leagues/teams/invite/:invite_slug', publicEndpointLimiter, async (req, res) => {
     try {
         const r = await pool.query(
             `SELECT lt.id, lt.name, lt.bib_colour, lt.status,
@@ -43734,7 +44842,7 @@ app.post('/api/games/:gameUrl/rating-feedback/more', authenticateToken, async (r
         });
     } catch (e) {
         console.error('POST /api/games/:gameUrl/rating-feedback/more error:', e);
-        return res.status(500).json({ error: 'server_error', detail: e.message });
+        return res.status(500).json({ error: 'server_error' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -43789,7 +44897,7 @@ app.get('/api/games/:gameUrl/rating-feedback/voter-context/:playerId', authentic
         });
     } catch (e) {
         console.error('GET /api/games/:gameUrl/rating-feedback/voter-context error:', e);
-        return res.status(500).json({ error: 'server_error', detail: e.message });
+        return res.status(500).json({ error: 'server_error' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -43826,12 +44934,15 @@ app.get('/api/games/:gameUrl/rating-feedback-summary', authenticateToken, async 
         // historical audit row has a non-UUID target_id (e.g. an integer ID
         // string from pre-UUID days). Filter by regex first; cast only the
         // matching rows. ~ is faster than regexp_match() and Postgres-stable.
+        // FIX-456: ::text before the regex — live audit_logs.target_id is uuid,
+        // and uuid has no ~ operator (live error 42883, 10/06/26). ::text::uuid
+        // is valid whichever type the column is.
         const recalR = await pool.query(
             `SELECT COUNT(DISTINCT al.target_id)::int AS subjects_recalibrated
              FROM audit_logs al
              WHERE al.action = 'rating_recalibrated_via_feedback'
-               AND al.target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-               AND al.target_id::uuid IN (
+               AND al.target_id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               AND al.target_id::text::uuid IN (
                   SELECT DISTINCT subject_player_id FROM player_rating_feedback
                   WHERE game_id = $1
                )`,
@@ -43958,8 +45069,8 @@ app.get('/api/players/:playerId/rating-feedback-summary', authenticateToken, asy
             `SELECT detail, created_at
              FROM audit_logs
              WHERE action = 'rating_recalibrated_via_feedback'
-               AND target_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-               AND target_id::uuid = $1::uuid
+               AND target_id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               AND target_id::text::uuid = $1::uuid
              ORDER BY created_at DESC
              LIMIT 3`,
             [playerId]
@@ -44057,7 +45168,7 @@ async function tickMonthlyTrophyCron() {
 // GET /api/monthly-trophies/list-months
 // Returns distinct (year, month) pairs that have any trophies recorded.
 // For the admin UI's "select a month" dropdown.
-app.get('/api/monthly-trophies/list-months', async (req, res) => {
+app.get('/api/monthly-trophies/list-months', publicEndpointLimiter, async (req, res) => {
     try {
         const r = await pool.query(`
             SELECT DISTINCT year, month
@@ -44073,7 +45184,7 @@ app.get('/api/monthly-trophies/list-months', async (req, res) => {
 // GET /api/monthly-trophies/:year/:month?region=...
 // Returns all trophies for a given (year, month, region). Public-readable.
 // If region omitted, returns all 6 regions in one payload.
-app.get('/api/monthly-trophies/:year/:month', async (req, res) => {
+app.get('/api/monthly-trophies/:year/:month', publicEndpointLimiter, async (req, res) => {
     try {
         const year = parseInt(req.params.year);
         const month = parseInt(req.params.month);
@@ -44910,7 +46021,7 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
                 payment_description: paymentDescription,
                 amount:      amountPence,
                 redirect_url: `https://totalfooty.co.uk/?wonderful_payment_id=${merchantRef}`,
-                webhook_url: `https://totalfooty-api.onrender.com/api/webhooks/wonderful`,
+                webhook_url: `https://api.totalfooty.co.uk/api/webhooks/wonderful`, // FIX-453: through Cloudflare (domain already live-serving; old links still post to onrender — exempted from edge gate)
             });
         } catch (wErr) {
             // Mark row as init_failed so the reconciler skips it. If Wonderful
@@ -44920,18 +46031,26 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
             await pool.query(
                 `UPDATE wonderful_payments SET status = 'init_failed' WHERE id = $1`,
                 [pmtRowId]
-            ).catch(() => {});
+            ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L45102):', _ce && _ce.message); });
             console.error(`[WF initiate] Wonderful API call failed for ref ${merchantRef}:`, wErr.message);
             return res.status(500).json({ error: 'Failed to create payment. Please try again.' });
         }
 
         const wpId    = wonderfulRes.data?.id || null;
         const payLink = wonderfulRes.data?.pay_link || null;
+        // FIX-450: webhooks reference Wonderful's ORDER id, which never matches the
+        // quick-pay LINK id we store as wonderful_payment_id (observed 10/06/26:
+        // 100% of webhooks failed id-match). If the initiate response carries the
+        // order id, capture it so webhook matching becomes deterministic. The key
+        // dump (names only, no values/PII) tells us from ONE live payment whether
+        // Wonderful exposes it here — check Render logs after deploy.
+        const wfOrderId = wonderfulRes.data?.order_id || wonderfulRes.data?.order?.id || wonderfulRes.data?.payment?.order_id || null;
+        console.log('[WF initiate] response keys:', Object.keys(wonderfulRes.data || {}).join(','), '· order_id:', wfOrderId || 'NOT PRESENT');
         if (!payLink) {
             await pool.query(
                 `UPDATE wonderful_payments SET status = 'init_failed' WHERE id = $1`,
                 [pmtRowId]
-            ).catch(() => {});
+            ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L45113):', _ce && _ce.message); });
             console.error(`[WF initiate] Wonderful returned no pay_link for ref ${merchantRef}`);
             return res.status(500).json({ error: 'Failed to create payment. Please try again.' });
         }
@@ -44944,6 +46063,15 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
             [wpId, payLink, pmtRowId]
         );
         console.log(`[WF initiate] ref ${merchantRef} → pending · wpId ${wpId || 'NULL'} · pay_link returned`);
+        // FIX-450: separate, tolerant write — NOT folded into the critical update
+        // above, so a missing column (pre-migration WONDERFUL-ORDER-ID.sql) can
+        // never break payment initiation. 42703-tolerant, same pattern as VERSION-AUDIT.
+        if (wfOrderId) {
+            pool.query(
+                `UPDATE wonderful_payments SET wonderful_order_id = $1 WHERE id = $2`,
+                [wfOrderId, pmtRowId]
+            ).catch((e) => console.warn('[FIX-450] order_id write skipped (run WONDERFUL-ORDER-ID.sql):', e.message));
+        }
 
         await auditLog(pool, playerId, 'wonderful_initiated', playerId,
             `Wonderful payment initiated: £${pounds.toFixed(2)} · Ref: ${merchantRef}`);
@@ -45176,7 +46304,7 @@ async function _wonderfulVerifyStatus(pmt) {
                     await pool.query(
                         `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
                         [resolvedWpId, pmt.id]
-                    ).catch(() => {});
+                    ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L45358):', _ce && _ce.message); });
                     console.log('[WF verify] filtered lookup resolved', pmt.merchant_reference,
                         '→ wpId', resolvedWpId, '· status', verified,
                         matches.length > 1 ? `(chose best of ${matches.length} attempts)` : '');
@@ -45217,7 +46345,7 @@ async function _wonderfulVerifyStatus(pmt) {
                     await pool.query(
                         `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
                         [resolvedWpId, pmt.id]
-                    ).catch(() => {});
+                    ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L45399):', _ce && _ce.message); });
                 }
             }
         } catch (e) {
@@ -45704,7 +46832,7 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
                     `UPDATE wonderful_payments SET notified_at = NULL WHERE id = $1`,
                     [freshPmt.id]
                 );
-            } catch (_) {}
+            } catch (_) { console.error('[FIX-442] swallowed error in creditAndAutoRegisterWonderful:', _ && _.message); }
         }
     });
 
@@ -45735,12 +46863,14 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
 // Security: NEVER trust the payload alone — always re-verify via GET.
 // Reliability: if this webhook is lost (cold start, transient error, network),
 // the background reconciler (below) will pick it up within ~5 minutes.
-app.post('/api/webhooks/wonderful', async (req, res) => {
+app.post('/api/webhooks/wonderful', webhookLimiter, async (req, res) => {
     // Ack immediately so Wonderful doesn't retry
     res.json({ received: true });
 
     try {
-        console.log('[WF webhook] body:', JSON.stringify(req.body));
+        // FIX-439 (was MED-5): full raw body no longer logged to stdout — payment refs/PII
+        // stay out of the Render log stream. The complete payload is still persisted to the
+        // wonderful_webhook_log audit table (raw_payload) for CRM diagnostics.
 
         // Extract Wonderful's payment ID — cover all known field name variants
         const wpId = req.body?.id
@@ -45774,6 +46904,19 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                 `SELECT * FROM wonderful_payments WHERE wonderful_payment_id = $1`, [wpId]
             );
             pmt = byId.rows[0] || null;
+            // FIX-450: the webhook id is Wonderful's ORDER id — try the dedicated
+            // column. Own try/catch: pre-migration this logs once and moves on.
+            if (!pmt) {
+                try {
+                    const byOrder = await pool.query(
+                        `SELECT * FROM wonderful_payments WHERE wonderful_order_id = $1`, [wpId]
+                    );
+                    pmt = byOrder.rows[0] || null;
+                    if (pmt) console.log('[WF webhook] matched via wonderful_order_id (FIX-450):', wpId, '→ ref', pmt.merchant_reference);
+                } catch (e) {
+                    console.warn('[FIX-450] order_id lookup skipped (run WONDERFUL-ORDER-ID.sql):', e.message);
+                }
+            }
         }
         if (!pmt && webhookRef) {
             const byRef = await pool.query(
@@ -45837,10 +46980,13 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                     );
                     pmt = byRef.rows[0] || null;
                     if (pmt && wpId !== pmt.wonderful_payment_id) {
+                        // FIX-450: store the webhook id in wonderful_order_id — overwriting
+                        // wonderful_payment_id destroyed the LINK id, the only identifier
+                        // the direct-GET verify fallback can actually query.
                         await pool.query(
-                            `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
+                            `UPDATE wonderful_payments SET wonderful_order_id = $1 WHERE id = $2`,
                             [wpId, pmt.id]
-                        ).catch(() => {});
+                        ).catch((_ce) => { console.warn('[FIX-450] order_id persist skipped (run WONDERFUL-ORDER-ID.sql):', _ce && _ce.message); });
                         console.log('[WF webhook] resolved order_id → merchant_reference via list-search:', wpId, '→', ref);
                     }
                 } else {
@@ -45875,9 +47021,13 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                             _reverseLookupFailCache.delete(wpId);
                         }
                         console.log('[WF webhook] list-search did not match wpId', wpId, '— trying reverse lookup against pending rows');
+                        // FIX-451: 'cancelled' added — abort-then-retry inside the same
+                        // Wonderful page marks our row cancelled via the link's status,
+                        // then the PAID retry arrives and the old pending-only scan
+                        // skipped the very row it belonged to (John, 10/06/26, £7).
                         const pendingRows = await pool.query(
                             `SELECT * FROM wonderful_payments
-                              WHERE status IN ('init_pending','pending')
+                              WHERE status IN ('init_pending','pending','cancelled')
                                 AND created_at > NOW() - INTERVAL '24 hours'
                               ORDER BY created_at DESC
                               LIMIT 20`
@@ -45897,10 +47047,12 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                                 if (match) {
                                     pmt = candidate;
                                     matched = true;
+                                    // FIX-450: same preservation rule as above — order id goes
+                                    // in its own column, the link id stays GETtable.
                                     await pool.query(
-                                        `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
+                                        `UPDATE wonderful_payments SET wonderful_order_id = $1 WHERE id = $2`,
                                         [wpId, pmt.id]
-                                    ).catch(() => {});
+                                    ).catch((_ce) => { console.warn('[FIX-450] order_id persist skipped (run WONDERFUL-ORDER-ID.sql):', _ce && _ce.message); });
                                     console.log('[WF webhook] reverse-lookup matched wpId', wpId, '→ ref', candidate.merchant_reference);
                                     break;
                                 }
@@ -45943,6 +47095,28 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
                 failReason:    'no matching payment record after all lookup paths',
                 rawPayload:    req.body || null
             }).catch(() => {});
+            // FIX-452: a PAID webhook we can't place = money in the Wonderful account
+            // with no credit issued. Silent until now — a player had to complain.
+            // Alert superadmin with the open candidates so it's a 2-minute manual fix.
+            if (_wfStatus === 'paid' || _wfStatus === 'accepted') {
+                try {
+                    const cand = await pool.query(
+                        `SELECT wp.merchant_reference, wp.status, wp.amount_pence, wp.created_at, p.alias
+                         FROM wonderful_payments wp LEFT JOIN players p ON p.id = wp.player_id
+                         WHERE wp.status NOT IN ('credited','credited_manually')
+                           AND wp.created_at > NOW() - INTERVAL '24 hours'
+                         ORDER BY wp.created_at DESC LIMIT 10`
+                    );
+                    const rows = cand.rows.map(r =>
+                        `<li>${r.merchant_reference} · ${r.status} · £${(r.amount_pence / 100).toFixed(2)} · ${r.alias || '?'} · ${new Date(r.created_at).toISOString()}</li>`
+                    ).join('');
+                    _alertUnresolvedPaidWebhook(wpId,
+                        `<p>No DB row matched after all lookup paths (id, order_id, ref, list-search, reverse lookup).</p>` +
+                        `<p>Open/uncredited rows in the last 24h:</p><ul>${rows || '<li>(none)</li>'}</ul>`);
+                } catch (e) {
+                    console.error('[FIX-452] unmatched-paid alert failed:', e.message);
+                }
+            }
             return console.warn('[WF webhook] no matching payment record (reconciler will retry) — wpId:', wpId, 'ref:', webhookRef);
         }
         if (pmt.status === 'credited' || pmt.status === 'credited_manually') {
@@ -45983,18 +47157,36 @@ app.post('/api/webhooks/wonderful', async (req, res) => {
         const { verified, resolvedWpId } = await _wonderfulVerifyStatus(pmt);
         console.log('[WF webhook] verify status:', verified, '| ref:', pmt.merchant_reference);
 
+        const _wfClaimsPaid = (() => { const s = String(req.body?.status || req.body?.data?.status || '').toLowerCase(); return s === 'paid' || s === 'accepted'; })();
+
         if (!verified) {
             // Verify failed — do not touch status. Reconciler retries every 5 min.
+            // FIX-452: if the webhook claims PAID and we can't verify it at all,
+            // that's the John-class blind spot — alert so it's never silent.
+            if (_wfClaimsPaid) {
+                _alertUnresolvedPaidWebhook(wpId,
+                    `<p>Row matched (ref <strong>${pmt.merchant_reference}</strong>, db status ${pmt.status}, £${(pmt.amount_pence / 100).toFixed(2)}) but Wonderful verification returned nothing. Reconciler keeps retrying.</p>`);
+            }
             return console.error('[WF webhook] could not verify (reconciler will retry) — ref:', pmt.merchant_reference);
         }
 
         if (verified !== 'paid' && verified !== 'accepted') {
+            // FIX-452: webhook says PAID but verification sees a non-paid state.
+            // Observed cause: abort-then-retry — the stored LINK id reports the
+            // aborted first attempt forever while the ORDER actually got paid.
+            // Do NOT downgrade the row (that's what stranded it last time);
+            // leave it for the reconciler and alert superadmin.
+            if (_wfClaimsPaid) {
+                _alertUnresolvedPaidWebhook(wpId,
+                    `<p>Webhook says <strong>paid</strong> but verification returned <strong>${verified}</strong> for ref <strong>${pmt.merchant_reference}</strong> (£${(pmt.amount_pence / 100).toFixed(2)}, db status ${pmt.status}). Status NOT downgraded. Check the Wonderful dashboard — likely an abort-then-retry where the link id is blind to the paid retry.</p>`);
+                return console.warn('[WF webhook] paid claim unverified (verify said', verified, ') — status untouched, alerted — ref:', pmt.merchant_reference);
+            }
             // Record Wonderful's state without crediting. Guard against overwriting
             // a 'credited_manually' status with a transient Wonderful state.
             await pool.query(
                 `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
                 [verified, resolvedWpId, pmt.id]
-            ).catch(() => {});
+            ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L46178):', _ce && _ce.message); });
             return;
         }
 
@@ -46052,7 +47244,7 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
                 await pool.query(
                     `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
                     [verified, resolvedWpId, p.id]
-                ).catch(() => {});
+                ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L46236):', _ce && _ce.message); });
             }
         }
 
@@ -46111,7 +47303,7 @@ app.post('/api/admin/payments/wonderful/reconcile/:ref', authenticateToken, requ
             });
         } catch (e) {
             console.error('Reconcile credit failed:', e.message);
-            return res.status(500).json({ error: 'Reconcile failed: ' + e.message });
+            return res.status(500).json({ error: 'Reconcile failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
         }
     } catch (e) {
         console.error('Reconcile endpoint error:', e.message);
@@ -46185,11 +47377,11 @@ app.post('/api/admin/payments/wonderful/manual-credit', authenticateToken, requi
                 auto_register_reason: result.autoRegister.reason
             });
         } catch (e) {
-            return res.status(500).json({ error: 'Credit transaction failed: ' + e.message });
+            return res.status(500).json({ error: 'Credit transaction failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
         }
     } catch (e) {
         console.error('Manual Wonderful credit error:', e.message);
-        res.status(500).json({ error: 'Server error: ' + e.message });
+        res.status(500).json({ error: 'Server error' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -46224,7 +47416,7 @@ app.post('/api/admin/payments/wonderful/:id/force-verify', authenticateToken, re
         });
     } catch (e) {
         console.error('[FIX-364] force-verify failed:', e.message);
-        res.status(500).json({ error: 'force-verify failed: ' + e.message });
+        res.status(500).json({ error: 'force-verify failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -46273,10 +47465,13 @@ app.post('/api/admin/payments/wonderful/resolve-by-order-id', authenticateToken,
         // webhooks for this payment hit directly.
         const foundWpId = match.id || match.order_id || match.payment_id || null;
         if (foundWpId && foundWpId !== pmt.wonderful_payment_id) {
+            // FIX-450 (instance 3, found in audit): this id usually comes back as the
+            // ORDER id — persist it in wonderful_order_id so future webhooks hit
+            // directly, WITHOUT destroying the GETtable link id. 42703-tolerant.
             await pool.query(
-                `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
+                `UPDATE wonderful_payments SET wonderful_order_id = $1 WHERE id = $2`,
                 [foundWpId, pmt.id]
-            );
+            ).catch((e) => console.warn('[FIX-450] order_id persist skipped (run WONDERFUL-ORDER-ID.sql):', e.message));
         }
         // Also log this manual resolution to the webhook log for the audit trail
         _logWonderfulWebhookAttempt({
@@ -46288,7 +47483,7 @@ app.post('/api/admin/payments/wonderful/resolve-by-order-id', authenticateToken,
             resolvedVia:   'admin_resolve_by_order_id',
             failReason:    null,
             rawPayload:    match
-        }).catch(() => {});
+        }).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L46472):', _ce && _ce.message); });
         await auditLog(pool, req.user.playerId, 'wonderful_resolve_by_order_id', String(pmt.id),
             `Admin linked order_id=${order_id} → payment_row=${pmt.id} ref=${ref} (Wonderful status: ${match.status || 'unknown'})`);
         res.json({
@@ -46303,7 +47498,7 @@ app.post('/api/admin/payments/wonderful/resolve-by-order-id', authenticateToken,
         });
     } catch (e) {
         console.error('[FIX-364] resolve-by-order-id failed:', e.message);
-        res.status(500).json({ error: 'resolve-by-order-id failed: ' + e.message });
+        res.status(500).json({ error: 'resolve-by-order-id failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -46337,7 +47532,7 @@ app.get('/api/admin/payments/wonderful/:id/webhook-log', authenticateToken, requ
         });
     } catch (e) {
         console.error('[FIX-364] webhook-log fetch failed:', e.message);
-        res.status(500).json({ error: 'webhook-log fetch failed: ' + e.message });
+        res.status(500).json({ error: 'webhook-log fetch failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -46395,7 +47590,7 @@ app.get('/api/admin/payments/wonderful/:id/inspect', authenticateToken, requireS
         res.json({ ok: true, inspection });
     } catch (e) {
         console.error('[FIX-364] inspect failed:', e.message);
-        res.status(500).json({ error: 'inspect failed: ' + e.message });
+        res.status(500).json({ error: 'inspect failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -47176,7 +48371,7 @@ app.post('/api/admin/campaigns/preview', authenticateToken, requireAdmin, async 
         });
     } catch (e) {
         console.error('Campaign preview error:', e);
-        return res.status(500).json({ error: 'Preview failed: ' + e.message });
+        return res.status(500).json({ error: 'Preview failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally { client.release(); }
 });
 
@@ -47233,10 +48428,11 @@ app.get('/api/admin/comms/campaigns', authenticateToken, requireAdmin, async (re
 // GET /api/comms/claim/:token — public lookup so the claim landing page can
 // render the right info before the player commits. Returns campaign metadata
 // (type, gift amount/game, expiry status) without performing the claim.
-app.get('/api/comms/claim/:token', async (req, res) => {
+app.get('/api/comms/claim/:token', publicEndpointLimiter, async (req, res) => {
     try {
         const { token } = req.params;
-        if (!token || token.length < 16) return res.status(400).json({ error: 'Invalid claim token' });
+        // FIX-439: strict charset+length validation (new tokens: 32-char base64url; legacy: hex)
+        if (!token || !/^[A-Za-z0-9_-]{16,64}$/.test(token)) return res.status(400).json({ error: 'Invalid claim token' });
         // FIX-428: dual-read — unified tables first, legacy comms as fallback.
         // gameCol differs (messaging_campaigns.game_id vs comms_campaigns.gift_game_id).
         const _claimLookup = (recT, campT, gameCol) => pool.query(`
@@ -47297,7 +48493,8 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
         const { token } = req.params;
-        if (!token || token.length < 16) return res.status(400).json({ error: 'Invalid claim token' });
+        // FIX-439: strict charset+length validation (new tokens: 32-char base64url; legacy: hex)
+        if (!token || !/^[A-Za-z0-9_-]{16,64}$/.test(token)) return res.status(400).json({ error: 'Invalid claim token' });
 
         await client.query('BEGIN');
         // FIX-428: resolve the token against the UNIFIED tables first, then fall back
@@ -48140,7 +49337,7 @@ app.post('/api/shop/order', authenticateToken, async (req, res) => {
     } catch (e) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('POST /api/shop/order error:', e);
-        res.status(500).json({ error: 'Failed to place order', detail: e.message, code: e.code });
+        res.status(500).json({ error: 'Failed to place order' , code: e.code });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -48220,7 +49417,7 @@ app.post('/api/shop/orders/:id/cancel', authenticateToken, async (req, res) => {
     } catch (e) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('POST /api/shop/orders/:id/cancel error:', e);
-        res.status(500).json({ error: 'Failed to cancel order', detail: e.message, code: e.code });
+        res.status(500).json({ error: 'Failed to cancel order' , code: e.code });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -48303,7 +49500,7 @@ app.post('/api/admin/shop/products', authenticateToken, requireSuperAdmin, async
         res.json({ ok: true, product: r.rows[0] });
     } catch (e) {
         console.error('POST /api/admin/shop/products error:', e);
-        res.status(500).json({ error: 'Failed to create product', detail: e.message });
+        res.status(500).json({ error: 'Failed to create product' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48352,7 +49549,7 @@ app.put('/api/admin/shop/products/:id', authenticateToken, requireSuperAdmin, as
         res.json({ ok: true, product: r.rows[0] });
     } catch (e) {
         console.error('PUT /api/admin/shop/products error:', e);
-        res.status(500).json({ error: 'Failed to update product', detail: e.message });
+        res.status(500).json({ error: 'Failed to update product' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48377,7 +49574,7 @@ app.post('/api/admin/shop/products/:id/variants', authenticateToken, requireSupe
         res.json({ ok: true, variant: r.rows[0] });
     } catch (e) {
         console.error('POST /api/admin/shop/products/:id/variants error:', e);
-        res.status(500).json({ error: 'Failed to create variant', detail: e.message });
+        res.status(500).json({ error: 'Failed to create variant' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48412,7 +49609,7 @@ app.put('/api/admin/shop/variants/:id', authenticateToken, requireSuperAdmin, as
         res.json({ ok: true, variant: r.rows[0] });
     } catch (e) {
         console.error('PUT /api/admin/shop/variants error:', e);
-        res.status(500).json({ error: 'Failed to update variant', detail: e.message });
+        res.status(500).json({ error: 'Failed to update variant' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48458,7 +49655,7 @@ app.get('/api/admin/shop/designs', authenticateToken, requireSuperAdmin, async (
         res.json({ designs: r.rows });
     } catch (e) {
         console.error('GET /api/admin/shop/designs error:', e);
-        res.status(500).json({ error: 'Failed to load designs', detail: e.message });
+        res.status(500).json({ error: 'Failed to load designs' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48491,7 +49688,7 @@ app.post('/api/admin/shop/designs', authenticateToken, requireSuperAdmin, async 
             return res.status(409).json({ error: 'A design with that name already exists' });
         }
         console.error('POST /api/admin/shop/designs error:', e);
-        res.status(500).json({ error: 'Failed to create design', detail: e.message });
+        res.status(500).json({ error: 'Failed to create design' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48559,7 +49756,7 @@ app.put('/api/admin/shop/designs/:id', authenticateToken, requireSuperAdmin, asy
             return res.status(409).json({ error: 'A design with that name already exists' });
         }
         console.error('PUT /api/admin/shop/designs/:id error:', e);
-        res.status(500).json({ error: 'Failed to update design', detail: e.message });
+        res.status(500).json({ error: 'Failed to update design' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48772,7 +49969,7 @@ app.put('/api/admin/shop/orders/:id/status', authenticateToken, requireSuperAdmi
     } catch (e) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('PUT /api/admin/shop/orders/:id/status error:', e);
-        res.status(500).json({ error: 'Failed to update status', detail: e.message, code: e.code });
+        res.status(500).json({ error: 'Failed to update status' , code: e.code });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -48845,7 +50042,7 @@ app.get('/api/admin/rating-feedback/summary', authenticateToken, requireSuperAdm
         res.json({ players: r.rows });
     } catch (e) {
         console.error('GET /api/admin/rating-feedback/summary error:', e);
-        res.status(500).json({ error: 'Failed to load summary', detail: e.message });
+        res.status(500).json({ error: 'Failed to load summary' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48909,7 +50106,7 @@ app.get('/api/admin/rating-feedback/votes', authenticateToken, requireSuperAdmin
         res.json({ votes: r.rows });
     } catch (e) {
         console.error('GET /api/admin/rating-feedback/votes error:', e);
-        res.status(500).json({ error: 'Failed to load votes', detail: e.message });
+        res.status(500).json({ error: 'Failed to load votes' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -48983,7 +50180,7 @@ app.get('/api/admin/players/:id/rating-feedback', authenticateToken, requireSupe
         });
     } catch (e) {
         console.error('GET /api/admin/players/:id/rating-feedback error:', e);
-        res.status(500).json({ error: 'Failed to load player feedback', detail: e.message });
+        res.status(500).json({ error: 'Failed to load player feedback' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49011,7 +50208,7 @@ app.post('/api/admin/players/:id/clear-suspicion', authenticateToken, requireSup
         res.json({ ok: true, player: r.rows[0] });
     } catch (e) {
         console.error('POST /api/admin/players/:id/clear-suspicion error:', e);
-        res.status(500).json({ error: 'Failed to clear suspicion', detail: e.message });
+        res.status(500).json({ error: 'Failed to clear suspicion' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49049,7 +50246,7 @@ app.delete('/api/admin/rating-feedback/votes/:id', authenticateToken, requireSup
         res.json({ ok: true, deleted: v });
     } catch (e) {
         console.error('DELETE /api/admin/rating-feedback/votes/:id error:', e);
-        res.status(500).json({ error: 'Failed to delete vote', detail: e.message });
+        res.status(500).json({ error: 'Failed to delete vote' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49071,7 +50268,7 @@ app.post('/api/admin/players/:id/rating-feedback/recalc', authenticateToken, req
         res.json({ ok: true, result });
     } catch (e) {
         console.error('POST /api/admin/players/:id/rating-feedback/recalc error:', e);
-        res.status(500).json({ error: 'Failed to recalculate', detail: e.message });
+        res.status(500).json({ error: 'Failed to recalculate' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49087,7 +50284,7 @@ app.get('/api/admin/rating-feedback/settings', authenticateToken, requireAdmin, 
         res.json({ rating_auto_apply_enabled: autoApply });
     } catch (e) {
         console.error('GET /api/admin/rating-feedback/settings error:', e);
-        res.status(500).json({ error: 'Failed to load settings', detail: e.message });
+        res.status(500).json({ error: 'Failed to load settings' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49104,7 +50301,7 @@ app.put('/api/admin/rating-feedback/settings', authenticateToken, requireSuperAd
         res.json({ ok: true, rating_auto_apply_enabled: v });
     } catch (e) {
         console.error('PUT /api/admin/rating-feedback/settings error:', e);
-        res.status(500).json({ error: 'Failed to save settings', detail: e.message });
+        res.status(500).json({ error: 'Failed to save settings' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49166,7 +50363,7 @@ app.get('/api/admin/rating-feedback/suggestions', authenticateToken, requireAdmi
         res.json({ count: suggestions.length, suggestions });
     } catch (e) {
         console.error('GET /api/admin/rating-feedback/suggestions error:', e);
-        res.status(500).json({ error: 'Failed to load suggestions', detail: e.message });
+        res.status(500).json({ error: 'Failed to load suggestions' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49264,7 +50461,7 @@ app.post('/api/admin/rating-feedback/suggestions/:id/approve', authenticateToken
     } catch (e) {
         if (inTxn) await client.query('ROLLBACK').catch(() => {});
         console.error('POST /api/admin/rating-feedback/suggestions/:id/approve error:', e);
-        res.status(500).json({ error: 'Failed to approve suggestion', detail: e.message });
+        res.status(500).json({ error: 'Failed to approve suggestion' });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -49312,7 +50509,7 @@ app.post('/api/admin/rating-feedback/suggestions/:id/reject', authenticateToken,
         res.json({ ok: true, votes_consumed: consumeVotes ? voterIds.length : 0 });
     } catch (e) {
         console.error('POST /api/admin/rating-feedback/suggestions/:id/reject error:', e);
-        res.status(500).json({ error: 'Failed to reject suggestion', detail: e.message });
+        res.status(500).json({ error: 'Failed to reject suggestion' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49398,7 +50595,7 @@ app.post('/api/admin/rating-feedback/recalibration/:id/reverse', authenticateTok
     } catch (e) {
         if (inTxn) await client.query('ROLLBACK').catch(() => {});
         console.error('POST /api/admin/rating-feedback/recalibration/:id/reverse error:', e);
-        res.status(500).json({ error: 'Failed to reverse recalibration', detail: e.message });
+        res.status(500).json({ error: 'Failed to reverse recalibration' });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -49426,7 +50623,7 @@ app.get('/api/admin/rating-feedback/voter-reliability', authenticateToken, requi
         res.json({ count: r.rows.length, voters: r.rows });
     } catch (e) {
         console.error('GET /api/admin/rating-feedback/voter-reliability error:', e);
-        res.status(500).json({ error: 'Failed to load voter reliability', detail: e.message });
+        res.status(500).json({ error: 'Failed to load voter reliability' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49453,7 +50650,7 @@ app.get('/api/admin/rating-feedback/recalibration-history', authenticateToken, r
         res.json({ days, count: r.rows.length, history: r.rows });
     } catch (e) {
         console.error('GET /api/admin/rating-feedback/recalibration-history error:', e);
-        res.status(500).json({ error: 'Failed to load history', detail: e.message });
+        res.status(500).json({ error: 'Failed to load history' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49502,7 +50699,7 @@ app.get('/api/admin/rating-feedback/overcorrection-overview', authenticateToken,
         });
     } catch (e) {
         console.error('GET /api/admin/rating-feedback/overcorrection-overview error:', e);
-        res.status(500).json({ error: 'Failed to load overcorrection overview', detail: e.message });
+        res.status(500).json({ error: 'Failed to load overcorrection overview' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49519,7 +50716,7 @@ app.post('/api/admin/rating-feedback/recompute-damping', authenticateToken, requ
         res.json({ ok: true, ...result });
     } catch (e) {
         console.error('POST /api/admin/rating-feedback/recompute-damping error:', e);
-        res.status(500).json({ error: 'Failed to recompute', detail: e.message });
+        res.status(500).json({ error: 'Failed to recompute' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49535,7 +50732,7 @@ app.put('/api/admin/rating-feedback/damping-settings', authenticateToken, requir
         res.json({ ok: true, damping_enabled: enabled });
     } catch (e) {
         console.error('PUT /api/admin/rating-feedback/damping-settings error:', e);
-        res.status(500).json({ error: 'Failed to save', detail: e.message });
+        res.status(500).json({ error: 'Failed to save' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49566,7 +50763,7 @@ app.get('/api/admin/rating-feedback/player-stability', authenticateToken, requir
         res.json({ count: r.rows.length, players: r.rows });
     } catch (e) {
         console.error('GET /api/admin/rating-feedback/player-stability error:', e);
-        res.status(500).json({ error: 'Failed to load stability', detail: e.message });
+        res.status(500).json({ error: 'Failed to load stability' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49730,7 +50927,7 @@ app.get('/api/admin/queue/pending', authenticateToken, requireAdmin, async (req,
         res.json({ count: r.rows.length, items: r.rows });
     } catch (e) {
         console.error('GET /api/admin/queue/pending error:', e);
-        res.status(500).json({ error: 'Failed to load pending queue', detail: e.message });
+        res.status(500).json({ error: 'Failed to load pending queue' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -49863,7 +51060,7 @@ app.post('/api/admin/tasks', authenticateToken, requireAdmin, async (req, res) =
         res.status(201).json({ task: ret.rows[0] });
     } catch (e) {
         console.error('POST /api/admin/tasks error:', e);
-        res.status(500).json({ error: 'Failed to create task', detail: e.message });
+        res.status(500).json({ error: 'Failed to create task' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50011,7 +51208,7 @@ app.put('/api/admin/tasks/:id', authenticateToken, requireAdmin, async (req, res
         res.json({ task: ret.rows[0] });
     } catch (e) {
         console.error('PUT /api/admin/tasks/:id error:', e);
-        res.status(500).json({ error: 'Failed to update task', detail: e.message });
+        res.status(500).json({ error: 'Failed to update task' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50049,7 +51246,7 @@ app.delete('/api/admin/tasks/:id', authenticateToken, requireAdmin, async (req, 
         res.json({ ok: true });
     } catch (e) {
         console.error('DELETE /api/admin/tasks/:id error:', e);
-        res.status(500).json({ error: 'Failed to delete task', detail: e.message });
+        res.status(500).json({ error: 'Failed to delete task' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50070,7 +51267,7 @@ app.get('/api/admin/tasks/assignable', authenticateToken, requireAdmin, async (r
         res.json({ assignable: r.rows });
     } catch (e) {
         console.error('GET /api/admin/tasks/assignable error:', e);
-        res.status(500).json({ error: 'Failed to fetch assignable players', detail: e.message });
+        res.status(500).json({ error: 'Failed to fetch assignable players' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50097,7 +51294,7 @@ app.get('/api/admin/tasks/pending-count', authenticateToken, requireAdmin, async
         res.json(r.rows[0] || { total: 0, overdue: 0, due_today: 0 });
     } catch (e) {
         console.error('GET /api/admin/tasks/pending-count error:', e);
-        res.status(500).json({ error: 'Failed to count tasks', detail: e.message });
+        res.status(500).json({ error: 'Failed to count tasks' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50131,7 +51328,7 @@ app.get('/api/admin/queue/resolved', authenticateToken, requireAdmin, async (req
         res.json({ days, count: r.rows.length, items: r.rows });
     } catch (e) {
         console.error('GET /api/admin/queue/resolved error:', e);
-        res.status(500).json({ error: 'Failed to load resolved queue', detail: e.message });
+        res.status(500).json({ error: 'Failed to load resolved queue' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50315,7 +51512,7 @@ app.post('/api/admin/queue/:id/approve', authenticateToken, requireAdmin, async 
     } catch (e) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('POST /api/admin/queue/:id/approve error:', e);
-        res.status(500).json({ error: 'Failed to approve queue item', detail: e.message });
+        res.status(500).json({ error: 'Failed to approve queue item' });  // FIX-438: internals scrubbed from client response (logged server-side)
     } finally {
         client.release();
     }
@@ -50371,7 +51568,7 @@ app.post('/api/admin/queue/:id/reject', authenticateToken, requireAdmin, async (
         res.json({ ok: true, queueId });
     } catch (e) {
         console.error('POST /api/admin/queue/:id/reject error:', e);
-        res.status(500).json({ error: 'Failed to reject queue item', detail: e.message });
+        res.status(500).json({ error: 'Failed to reject queue item' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50614,7 +51811,7 @@ app.post('/api/admin/queue/:id/reopen', authenticateToken, requireAdmin, async (
         res.json({ ok: true, task: upd.rows[0] });
     } catch (e) {
         console.error('FIX-354b reopen failed:', e.message);
-        res.status(500).json({ error: 'Failed to reopen task', detail: e.message });
+        res.status(500).json({ error: 'Failed to reopen task' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50664,7 +51861,7 @@ app.get('/api/admin/calibration/summary', authenticateToken, requireSuperAdmin, 
         });
     } catch (e) {
         console.error('GET /api/admin/calibration/summary error:', e);
-        res.status(500).json({ error: 'Failed to load calibration summary', detail: e.message });
+        res.status(500).json({ error: 'Failed to load calibration summary' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50695,7 +51892,7 @@ app.get('/api/admin/calibration/experiments', authenticateToken, requireSuperAdm
         res.json({ days, count: r.rows.length, experiments: r.rows });
     } catch (e) {
         console.error('GET /api/admin/calibration/experiments error:', e);
-        res.status(500).json({ error: 'Failed to load experiments', detail: e.message });
+        res.status(500).json({ error: 'Failed to load experiments' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50741,7 +51938,7 @@ app.get('/api/admin/calibration/ovr-rung-spacing', authenticateToken, requireSup
         res.json({ days, bins: r.rows });
     } catch (e) {
         console.error('GET /api/admin/calibration/ovr-rung-spacing error:', e);
-        res.status(500).json({ error: 'Failed to load rung spacing', detail: e.message });
+        res.status(500).json({ error: 'Failed to load rung spacing' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50787,7 +51984,7 @@ app.get('/api/admin/calibration/variance-vs-even', authenticateToken, requireSup
         res.json({ days, bins: r.rows });
     } catch (e) {
         console.error('GET /api/admin/calibration/variance-vs-even error:', e);
-        res.status(500).json({ error: 'Failed to load variance analysis', detail: e.message });
+        res.status(500).json({ error: 'Failed to load variance analysis' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50830,7 +52027,7 @@ app.post('/api/admin/calibration/backfill', authenticateToken, requireSuperAdmin
         res.json({ ok: true, candidates: r.rows.length, processed, inserted, skipped, failed });
     } catch (e) {
         console.error('POST /api/admin/calibration/backfill error:', e);
-        res.status(500).json({ error: 'Backfill failed', detail: e.message });
+        res.status(500).json({ error: 'Backfill failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -50857,7 +52054,7 @@ app.put('/api/admin/series/:id/experiment-mode', authenticateToken, requireAdmin
         res.json({ ok: true, series: r.rows[0] });
     } catch (e) {
         console.error('PUT /api/admin/series/:id/experiment-mode error:', e);
-        res.status(500).json({ error: 'Failed to toggle experiment mode', detail: e.message });
+        res.status(500).json({ error: 'Failed to toggle experiment mode' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -51301,7 +52498,7 @@ app.post('/api/admin/fine-tune-intent/run', authenticateToken, requireAdmin, asy
         res.json({ ok: true, days, counts });
     } catch (e) {
         console.error('POST /api/admin/fine-tune-intent/run error:', e);
-        res.status(500).json({ error: 'Engine run failed', detail: e.message });
+        res.status(500).json({ error: 'Engine run failed' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -51682,7 +52879,7 @@ app.get('/api/admin/fine-tune-intent/summary', authenticateToken, requireAdmin, 
         });
     } catch (e) {
         console.error('GET /api/admin/fine-tune-intent/summary error:', e);
-        res.status(500).json({ error: 'Failed to load intent summary', detail: e.message });
+        res.status(500).json({ error: 'Failed to load intent summary' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -51878,7 +53075,7 @@ app.get('/api/admin/players/feedback-diagnostic', authenticateToken, requireSupe
         res.json({ players });
     } catch (e) {
         console.error('GET /api/admin/players/feedback-diagnostic error:', e);
-        res.status(500).json({ error: 'Failed to load diagnostic', detail: e.message });
+        res.status(500).json({ error: 'Failed to load diagnostic' });  // FIX-438: internals scrubbed from client response (logged server-side)
     }
 });
 
@@ -52337,6 +53534,175 @@ async function _fix322UniqueSlug(baseSlug, excludeTenantId = null) {
 
 // POST /api/admin/tenants — create new tenant. Generates short_id with
 // collision retry (per Q2 acceptance — up to 5 attempts).
+// ════════════════════════════════════════════════════════════════════════
+// FIX-460 — PUBLIC SELF-SERVE TENANT CREATION ("share one link on social").
+// POST /api/public/start-tenant  (no auth; startTenantLimiter; kill-switch
+// env PUBLIC_TENANT_SIGNUP='off' -> 503). Powers start.html.
+//
+// Flow: { tenant_name, first_name, last_name, alias?, email, password, phone? }
+//   - email NEW      -> create users + players row (mirrors signup column set)
+//   - email EXISTS   -> bcrypt-verify password against the existing account
+//                       (wrong password = 401; right password = reuse account)
+//   - create tenant  -> EXACT mirror of the superadmin create loop below
+//                       (slugify + unique slug, 5-attempt short_id retry with
+//                       constraint differentiation, starter-4 awards seed)
+//   - membership     -> player_tenants role 'tenant_admin' (ON CONFLICT upgrade)
+//   - auto-login     -> same JWT + cookie as /api/auth/login, UNLESS the
+//                       existing account has TOTP enabled (never bypass 2FA:
+//                       those get needs_login:true and sign in normally)
+//   - alert          -> superadmin email on EVERY creation + audit log, so
+//                       TF sees each new tenant the moment it's born.
+// Money path: none. State path: tenant + membership — both audited.
+// ════════════════════════════════════════════════════════════════════════
+app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
+    if (String(process.env.PUBLIC_TENANT_SIGNUP || 'on').toLowerCase() === 'off') {
+        return res.status(503).json({ error: 'New tenant signup is temporarily closed.' });
+    }
+    const b = req.body || {};
+    const tenantName = String(b.tenant_name || '').trim();
+    const firstName  = String(b.first_name  || '').trim();
+    const lastName   = String(b.last_name   || '').trim();
+    const alias      = String(b.alias || firstName || '').trim().slice(0, 30);
+    const email      = String(b.email || '').trim().toLowerCase();
+    const password   = String(b.password || '');
+    const phone      = b.phone ? String(b.phone).trim().slice(0, 20) : null;
+
+    if (tenantName.length < 3 || tenantName.length > 60) return res.status(400).json({ error: 'Organisation name must be 3–60 characters' });
+    if (!firstName || !lastName) return res.status(400).json({ error: 'First and last name are required' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+
+    try {
+        // ── Resolve or create the account ─────────────────────────────────
+        let user, player, existingAccount = false;
+        const uRes = await pool.query(
+            'SELECT id, email, password_hash, role, totp_enabled FROM users WHERE email = $1', [email]
+        ).catch(e => { // pre-2FA-migration tolerance
+            if (e.code === '42703') return pool.query('SELECT id, email, password_hash, role, FALSE AS totp_enabled FROM users WHERE email = $1', [email]);
+            throw e;
+        });
+        if (uRes.rows.length > 0) {
+            user = uRes.rows[0];
+            existingAccount = true;
+            const ok = await bcrypt.compare(password, user.password_hash || '');
+            if (!ok) return res.status(401).json({ error: 'An account with this email already exists and the password doesn\'t match. Log in at totalfooty.co.uk first, or use the correct password.' });
+            const pRes = await pool.query('SELECT id, alias, is_clm_admin, is_organiser, token_version FROM players WHERE user_id = $1', [user.id]);
+            if (pRes.rows.length === 0) return res.status(409).json({ error: 'Account exists but has no player profile — contact support.' });
+            player = pRes.rows[0];
+        } else {
+            const passwordHash = await bcrypt.hash(password, 12);
+            const nu = await pool.query(
+                'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role',
+                [email, passwordHash, 'player']
+            );
+            user = nu.rows[0]; user.totp_enabled = false;
+            const np = await pool.query(
+                `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone,
+                                      position, reliability_tier,
+                                      goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+                                      pace_rating, decisions_rating, assisting_rating, shooting_rating,
+                                      overall_rating)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'Midfielder', 'gold', 50, 65, 65, 65, 65, 65, 65, 65, 65)
+                 RETURNING id, alias, is_clm_admin, is_organiser, token_version`,
+                [user.id, (firstName + ' ' + lastName).trim(), firstName, lastName, alias || firstName, phone]
+            );
+            player = np.rows[0];
+        }
+
+        // ── Create the tenant — mirror of the superadmin loop (FIX-333) ──
+        const baseSlug = _fix322Slugify(tenantName);
+        if (!baseSlug) return res.status(400).json({ error: 'Organisation name must contain letters or numbers' });
+        let workingSlug = await _fix322UniqueSlug(baseSlug);
+        let tenant = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const shortId = String(Math.floor(Math.random() * 90000) + 10000);
+            try {
+                const r = await pool.query(
+                    `INSERT INTO tenants (short_id, name, slug, logo_url, primary_color, reply_to_email, status)
+                     VALUES ($1, $2, $3, NULL, NULL, $4, 'active')
+                     RETURNING id, short_id, name, slug`,
+                    [shortId, tenantName, workingSlug, email]
+                );
+                tenant = r.rows[0];
+                try { // FIX-399 starter-4 seed (same as superadmin create)
+                    await pool.query(
+                        `INSERT INTO tenant_monthly_config (tenant_id, enabled, metric_ids)
+                         VALUES ($1, TRUE, $2) ON CONFLICT (tenant_id) DO NOTHING`,
+                        [tenant.id, MONTHLY_STARTER_METRIC_IDS]);
+                } catch (seedErr) {
+                    if (!(seedErr && (seedErr.code === '42P01' || seedErr.code === '42703')))
+                        console.error('FIX-460 starter-4 seed failed (non-fatal):', seedErr.message);
+                }
+                break;
+            } catch (e) {
+                if (e && e.code === '23505') {
+                    if (e.constraint && e.constraint.includes('slug')) {
+                        workingSlug = workingSlug + '-' + Date.now().toString(36).slice(-4);
+                    }
+                    continue; // short_id collision -> new random id next loop
+                }
+                throw e;
+            }
+        }
+        if (!tenant) return res.status(503).json({ error: 'Could not allocate a tenant id — please try again.' });
+
+        // ── Founder membership: tenant_admin ──────────────────────────────
+        await pool.query(
+            `INSERT INTO player_tenants (player_id, tenant_id, role, status, joined_at,
+                                         show_in_dashboard, allow_tenant_contact)
+             VALUES ($1, $2, 'tenant_admin', 'active', NOW(), TRUE, TRUE)
+             ON CONFLICT (player_id, tenant_id)
+             DO UPDATE SET role = 'tenant_admin', status = 'active'`,
+            [player.id, tenant.id]
+        );
+
+        // ── Audit + superadmin alert (fire-and-forget) ────────────────────
+        await auditLog(pool, player.id, 'tenant_self_created', null,
+            `Public link: tenant "${tenantName}" (${tenant.short_id}) by ${email}${existingAccount ? ' (existing account)' : ' (new account)'}`,
+            tenant.id).catch(() => {});
+        setImmediate(() => notifyAdmin('\uD83C\uDFDB\uFE0F New tenant via public link — ' + tenantName, [
+            ['Tenant',   tenantName + ' (' + tenant.short_id + ')'],
+            ['Slug',     tenant.slug],
+            ['Founder',  (firstName + ' ' + lastName).trim()],
+            ['Email',    email],
+            ['Account',  existingAccount ? 'existing' : 'new'],
+        ]).catch(() => {}));
+
+        const signupLink = 'https://totalfooty.co.uk/?flow=signup&tenant_short_id=' + tenant.short_id;
+
+        // ── Auto-login (never bypass 2FA) ─────────────────────────────────
+        if (user.totp_enabled === true) {
+            return res.status(201).json({
+                ok: true, needs_login: true,
+                tenant: { short_id: tenant.short_id, name: tenant.name, slug: tenant.slug },
+                signup_link: signupLink, crm_link: 'https://totalfooty.co.uk/crm.html',
+                message: 'Tenant created. Your account uses two-factor — log in normally to manage it.'
+            });
+        }
+        const token = jwt.sign(
+            {
+                userId: user.id, playerId: player.id, email: user.email, role: user.role,
+                isCLMAdmin: player.is_clm_admin || false,
+                isOrganiser: player.is_organiser || false,
+                tokenVersion: player.token_version || 0
+            },
+            JWT_SECRET, { expiresIn: '7d' }
+        );
+        res.cookie('tf_token', token, {
+            httpOnly: true, secure: true, sameSite: 'lax',
+            maxAge: 7 * 24 * 60 * 60 * 1000
+        });
+        return res.status(201).json({
+            ok: true, needs_login: false, token,
+            tenant: { short_id: tenant.short_id, name: tenant.name, slug: tenant.slug },
+            signup_link: signupLink, crm_link: 'https://totalfooty.co.uk/crm.html'
+        });
+    } catch (e) {
+        console.error('FIX-460 start-tenant error:', e.message);
+        return res.status(500).json({ error: 'Could not create your tenant. Please try again.' });  // internals scrubbed
+    }
+});
+
 app.post('/api/admin/tenants', authenticateToken, requireSuperAdmin, async (req, res) => {
     const body = req.body || {};
     const name = String(body.name || '').trim();
@@ -58010,7 +59376,7 @@ app.post('/api/t/:tenant_short_id/admin/players/:playerId/reset-password', authe
         const { playerId } = req.params;
         if (!(await _tenantHasMember(req.tenant.id, playerId))) return res.status(404).json({ error: 'Not a member of your tenant' });
         const temp = 'TF-' + Math.random().toString(36).slice(2, 8).toUpperCase();
-        const hash = await bcrypt.hash(temp, 10);
+        const hash = await bcrypt.hash(temp, 12);
         const u = await pool.query(
             `UPDATE users SET password_hash = $1, token_version = token_version + 1, force_password_change = TRUE
               WHERE id = (SELECT user_id FROM players WHERE id = $2) RETURNING id`,
@@ -60456,9 +61822,14 @@ app.listen(PORT, () => {
             // We INCLUDE init_pending rows because a stuck init_pending might be one
             // where the DB INSERT succeeded but the subsequent Wonderful call failed
             // to return cleanly — _wonderfulVerifyStatus will list-search and resolve.
+            // FIX-451: cancelled rows stay in the sweep for 48h. A cancel can be a
+            // first ABORTED attempt whose retry got PAID under the same order —
+            // _wonderfulVerifyStatus's multi-attempt pick (paid > cancelled) will
+            // resurrect it the moment Wonderful exposes the paid record.
             const pending = await pool.query(
                 `SELECT * FROM wonderful_payments
-                 WHERE status NOT IN ('credited', 'credited_manually', 'failed', 'cancelled', 'expired', 'init_failed')
+                 WHERE (status NOT IN ('credited', 'credited_manually', 'failed', 'cancelled', 'expired', 'init_failed')
+                        OR (status = 'cancelled' AND created_at > NOW() - INTERVAL '48 hours'))
                    ${scope.whereClause}
                  ORDER BY created_at ASC
                  LIMIT 30`
@@ -60486,7 +61857,7 @@ app.listen(PORT, () => {
                             await pool.query(
                                 `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
                                 [verified, resolvedWpId, pmt.id]
-                            ).catch(() => {});
+                            ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L60672):', _ce && _ce.message); });
                         }
                         stillPending++;
                     }
@@ -60632,11 +62003,11 @@ app.listen(PORT, () => {
             for (const row of due.rows) {
                 try {
                     const gd = await getGameDataForNotification(row.game_id);
-                    _sendRsvpEmail('warning', row.player_id, gd, { deadline: row.rsvp_deadline }).catch(() => {});
+                    _sendRsvpEmail('warning', row.player_id, gd, { deadline: row.rsvp_deadline }).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE registrations (L60818):', _ce && _ce.message); });
                     sendNotification('rsvp_warning', row.player_id, {
                         ...gd,
                         deadline_short: _rsvpFormatDeadline(row.rsvp_deadline)
-                    }).catch(() => {});
+                    }).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE registrations (L60822):', _ce && _ce.message); });
                     await gameAuditLog(pool, row.game_id, null, 'rsvp_warning_sent',
                         `Auto 48h warning sent to player ${row.player_id}`).catch(() => {});
                 } catch (e) {
@@ -60705,7 +62076,7 @@ app.listen(PORT, () => {
                     await pool.query(
                         `UPDATE registrations SET bumped_notified_at = NOW() WHERE id = ANY($1::uuid[])`,
                         [bumped.rows.map(r => r.id)]
-                    ).catch(() => {});
+                    ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE registrations (L60891):', _ce && _ce.message); });
 
                     console.log(`⏰ [FIX-315] RSVP bump for game ${gRow.game_id}: ${bumped.rows.length} bumped, ${promoted.length} promoted`);
                 } catch (e) {
