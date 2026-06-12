@@ -24835,11 +24835,11 @@ app.get('/api/public/game/:gameUrl/series', async (req, res) => {
 
         // Get the current game's series_id
         const gameResult = await pool.query(
-            'SELECT id, series_id, venue_id, regularity, game_date FROM games WHERE game_url = $1',
+            'SELECT id, series_id, venue_id, regularity, game_date, external_league_id FROM games WHERE game_url = $1',
             [gameUrl]
         );
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
-        const { id: gameId, series_id, venue_id, regularity } = gameResult.rows[0];
+        const { id: gameId, series_id, venue_id, regularity, external_league_id } = gameResult.rows[0];
 
         // If no series_id but game is weekly recurring, group by venue + regularity as a fallback
         let seriesResult;
@@ -24854,6 +24854,20 @@ app.get('/api/public/game/:gameUrl/series', async (req, res) => {
                 WHERE g.series_id = $1
                 ORDER BY g.game_date ASC
             `, [series_id]);
+        } else if (external_league_id) {
+            // FIX-467: external-league fixtures scroll as a season — siblings by
+            // league, ordered by date. League name fronts the nav. NO series
+            // table involvement (the no-series-scoreline rule holds).
+            seriesResult = await pool.query(`
+                SELECT g.id, g.game_url, g.game_date, g.game_status, g.max_players,
+                       xl.name AS series_name,
+                       ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed')
+                        + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players
+                FROM games g
+                JOIN external_leagues xl ON xl.id = g.external_league_id
+                WHERE g.external_league_id = $1
+                ORDER BY g.game_date ASC
+            `, [external_league_id]);
         } else if (regularity === 'weekly' && venue_id) {
             // Legacy weekly games without a series_id — group by venue
             seriesResult = await pool.query(`
