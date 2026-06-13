@@ -38945,7 +38945,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                    p.alias AS coach_alias, p.photo_url AS coach_photo,
                    p.coach_certifications, p.coaching_appearances,
                    cs.session_kind, cs.tenant_id, cs.title, cs.fee, cs.recurs_weekly,
-                   cs.discipline_affects_tiers, tn.name AS tenant_name,
+                   cs.discipline_affects_tiers, tn.name AS tenant_name, tn.short_id AS tenant_short_id,
                    COALESCE(avg_sub.avg_rating, 0) AS coach_avg_rating,
                    v.id AS venue_id, v.name AS venue_name, v.address AS venue_address,
                    v.postcode AS venue_postcode, v.parking_pin AS venue_parking_pin,
@@ -38988,13 +38988,22 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
             }
             return res.json({
                 session_kind: 'training', id: session.id, session_url: session.session_url,
-                title: session.title, tenant_name: session.tenant_name, status: session.status,
+                title: session.title, tenant_name: session.tenant_name, tenant_short_id: session.tenant_short_id, status: session.status,
                 session_date: session.session_date, duration_hours: session.duration_hours,
                 fee: session.fee, recurs_weekly: session.recurs_weekly,
                 discipline_affects_tiers: session.discipline_affects_tiers,
-                session_notes: session.session_notes, coach_name: session.coach_name,
+                session_notes: session.session_notes,
+                /* FIX-470: full coach profile block for the session page */
+                coach_id: session.coach_id, coach_name: session.coach_name,
                 coach_alias: session.coach_alias, coach_photo: session.coach_photo,
-                venue_name: session.venue_name, venue_address: session.venue_address,
+                coach_certifications: session.coach_certifications,
+                coach_appearances: session.coaching_appearances,
+                coach_avg_rating: session.coach_avg_rating,
+                /* FIX-470: full venue block */
+                venue_id: session.venue_id, venue_name: session.venue_name,
+                venue_address: session.venue_address, venue_postcode: session.venue_postcode,
+                venue_pitch_pin: session.venue_pitch_pin, venue_parking_pin: session.venue_parking_pin,
+                venue_pitch_name: session.venue_pitch_name,
                 registrations: tRegs.rows, viewer_registration: viewerReg,
                 viewer_can_manage: canManage, viewer_logged_in: !!req.user
             });
@@ -40628,6 +40637,179 @@ app.get('/api/admin/wizard-tenant', authenticateToken, requireCLMAdmin, async (r
     }
 });
 
+// ── FIX-470: training coach + venue pickers and post-create editing ───────
+// The create wizard now allocates a coach and a venue; both stay editable from
+// the session page (coach controls). Venue is the single-confirmed model, like
+// a normal game. Coach dropdown shows Coach-badge holders first, with a
+// "see more" that lists all tenant members and lets an admin grant the badge.
+
+// Coach picker: badge-holders in this tenant + (optional) all active members.
+app.get('/api/t/:tenant_short_id/admin/training-coaches', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const all = req.query.all === 'true';
+        // Coach-badge holders who are active members of THIS tenant.
+        const coaches = await pool.query(`
+            SELECT DISTINCT p.id, p.alias, p.full_name, p.photo_url, TRUE AS is_coach
+              FROM players p
+              JOIN player_badges pb ON pb.player_id = p.id
+              JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
+              JOIN player_tenants pt ON pt.player_id = p.id AND pt.tenant_id = $1 AND pt.status = 'active'
+             ORDER BY p.alias ASC NULLS LAST, p.full_name ASC`, [req.tenant.id]);
+        let members = [];
+        if (all) {
+            // "See more": every active member of the tenant, flagged whether they already hold the badge.
+            const m = await pool.query(`
+                SELECT p.id, p.alias, p.full_name, p.photo_url,
+                       EXISTS (SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
+                                WHERE pb.player_id = p.id AND b.name = 'Coach') AS is_coach
+                  FROM players p
+                  JOIN player_tenants pt ON pt.player_id = p.id AND pt.tenant_id = $1 AND pt.status = 'active'
+                 ORDER BY p.alias ASC NULLS LAST, p.full_name ASC`, [req.tenant.id]);
+            members = m.rows;
+        }
+        res.json({ coaches: coaches.rows, members });
+    } catch (e) {
+        console.error('FIX-470 training-coaches:', e.message);
+        res.status(500).json({ error: 'Could not load coaches' });
+    }
+});
+
+// Grant the Coach badge to a tenant member (from the "see more" picker).
+app.post('/api/t/:tenant_short_id/admin/grant-coach', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const pid = (req.body || {}).player_id;
+        if (!pid) return res.status(400).json({ error: 'player_id required' });
+        const mem = await pool.query(
+            `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'`,
+            [pid, req.tenant.id]);
+        if (!mem.rows.length) return res.status(400).json({ error: 'Player is not a member of this tenant' });
+        const badge = await pool.query("SELECT id FROM badges WHERE name = 'Coach'");
+        if (!badge.rows.length) return res.status(500).json({ error: 'Coach badge not configured' });
+        await pool.query('INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+            [pid, badge.rows[0].id]);
+        await auditLog(pool, req.user.playerId, 'badges_updated', pid, 'Granted Coach badge (training allocation)', req.tenant.id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-470 grant-coach:', e.message);
+        res.status(500).json({ error: 'Could not grant coach badge' });
+    }
+});
+
+// Venue picker for trainings: every venue (single-confirmed model). Mirrors the
+// normal game venue dropdown source. requireTenantAdmin gate keeps it scoped.
+app.get('/api/t/:tenant_short_id/admin/training-venues', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, name, address, postcode FROM venues
+              WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY name ASC`).catch(async (err) => {
+            if (err.code === '42703') return await pool.query('SELECT id, name, address FROM venues ORDER BY name ASC');
+            throw err;
+        });
+        res.json({ venues: r.rows });
+    } catch (e) {
+        console.error('FIX-470 training-venues:', e.message);
+        res.status(500).json({ error: 'Could not load venues' });
+    }
+});
+
+// FIX-470: coach options for the session-page editor (id-keyed; manage-gated).
+app.get('/api/training/:id/coach-options', authenticateToken, async (req, res) => {
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) return res.status(404).json({ error: 'Training not found' });
+        if (!await _trainingCanManage(req, s)) return res.status(403).json({ error: 'Not allowed' });
+        const all = req.query.all === 'true';
+        const coaches = await pool.query(`
+            SELECT DISTINCT p.id, p.alias, p.full_name
+              FROM players p
+              JOIN player_badges pb ON pb.player_id = p.id
+              JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
+              JOIN player_tenants pt ON pt.player_id = p.id AND pt.tenant_id = $1 AND pt.status = 'active'
+             ORDER BY p.alias ASC NULLS LAST, p.full_name ASC`, [s.tenant_id]);
+        let members = [];
+        if (all) {
+            const m = await pool.query(`
+                SELECT p.id, p.alias, p.full_name
+                  FROM players p
+                  JOIN player_tenants pt ON pt.player_id = p.id AND pt.tenant_id = $1 AND pt.status = 'active'
+                 ORDER BY p.alias ASC NULLS LAST, p.full_name ASC`, [s.tenant_id]);
+            members = m.rows;
+        }
+        res.json({ coaches: coaches.rows, members });
+    } catch (e) { console.error('FIX-470 coach-options:', e.message); res.status(500).json({ error: 'Could not load coaches' }); }
+});
+
+// FIX-470: venue options for the session-page editor.
+app.get('/api/training/:id/venue-options', authenticateToken, async (req, res) => {
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) return res.status(404).json({ error: 'Training not found' });
+        if (!await _trainingCanManage(req, s)) return res.status(403).json({ error: 'Not allowed' });
+        const r = await pool.query(
+            `SELECT id, name, postcode FROM venues WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY name ASC`).catch(async (err) => {
+            if (err.code === '42703') return await pool.query('SELECT id, name FROM venues ORDER BY name ASC');
+            throw err;
+        });
+        res.json({ venues: r.rows });
+    } catch (e) { console.error('FIX-470 venue-options:', e.message); res.status(500).json({ error: 'Could not load venues' }); }
+});
+
+// FIX-470: grant Coach badge from the session-page editor (id-keyed).
+app.post('/api/training/:id/grant-coach', authenticateToken, async (req, res) => {
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) return res.status(404).json({ error: 'Training not found' });
+        if (!await _trainingCanManage(req, s)) return res.status(403).json({ error: 'Not allowed' });
+        const pid = (req.body || {}).player_id;
+        if (!pid) return res.status(400).json({ error: 'player_id required' });
+        const mem = await pool.query(`SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'`, [pid, s.tenant_id]);
+        if (!mem.rows.length) return res.status(400).json({ error: 'Player is not a member of this tenant' });
+        const badge = await pool.query("SELECT id FROM badges WHERE name = 'Coach'");
+        if (!badge.rows.length) return res.status(500).json({ error: 'Coach badge not configured' });
+        await pool.query('INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [pid, badge.rows[0].id]);
+        await auditLog(pool, req.user.playerId, 'badges_updated', pid, 'Granted Coach badge (training)', s.tenant_id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) { console.error('FIX-470 training grant-coach:', e.message); res.status(500).json({ error: 'Could not grant badge' }); }
+});
+
+// EDIT coach/venue on an existing training (coach controls; editable anytime).
+// Auth: _trainingCanManage (tenant admin OR the assigned coach OR superadmin).
+app.patch('/api/training/:id/details', authenticateToken, async (req, res) => {
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) return res.status(404).json({ error: 'Training not found' });
+        if (!await _trainingCanManage(req, s)) return res.status(403).json({ error: 'Not allowed to edit this session' });
+        const b = req.body || {};
+        const sets = [], vals = []; let i = 1;
+        if (Object.prototype.hasOwnProperty.call(b, 'coach_player_id')) {
+            const cid = b.coach_player_id || null;
+            if (cid) {
+                const cm = await pool.query(
+                    `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'`,
+                    [cid, s.tenant_id]);
+                if (!cm.rows.length) return res.status(400).json({ error: 'Coach must be a member of this tenant' });
+            }
+            sets.push('coach_player_id = $' + i++); vals.push(cid);
+        }
+        if (Object.prototype.hasOwnProperty.call(b, 'confirmed_venue_id')) {
+            const vid = b.confirmed_venue_id || null;
+            if (vid) {
+                const vq = await pool.query('SELECT id FROM venues WHERE id = $1', [vid]);
+                if (!vq.rows.length) return res.status(400).json({ error: 'Venue not found' });
+            }
+            sets.push('confirmed_venue_id = $' + i++); vals.push(vid);
+        }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(s.id);
+        await pool.query(`UPDATE coaching_sessions SET ${sets.join(', ')} WHERE id = $${i}`, vals);
+        await auditLog(pool, req.user.playerId, 'training_created', null, `Training "${s.title}" details updated`, s.tenant_id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-470 training details edit:', e.message);
+        res.status(500).json({ error: 'Could not update session' });
+    }
+});
+
 // CREATE (tenant admins; superadmin passes requireTenantAdmin too)
 app.post('/api/t/:tenant_short_id/admin/trainings', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
@@ -40655,15 +40837,24 @@ app.post('/api/t/:tenant_short_id/admin/trainings', authenticateToken, requireTe
         const sessionUrl = 'tr-' + title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24)
             + '-' + Math.random().toString(36).slice(2, 8);
         const seriesId = recurs ? require('crypto').randomUUID() : null;
+        // FIX-470: optional confirmed venue at creation (single-venue model, like a normal game)
+        let venueId = b.confirmed_venue_id || null;
+        if (venueId) {
+            const vq = await pool.query('SELECT id FROM venues WHERE id = $1', [venueId]);
+            if (!vq.rows.length) return res.status(400).json({ error: 'Venue not found' });
+        }
+        // FIX-470: max_players kept NULL (uncapped) — DB NOT NULL was dropped for trainings.
         const ins = await pool.query(`
             INSERT INTO coaching_sessions
               (session_url, session_kind, tenant_id, title, fee, recurs_weekly, series_id,
                discipline_affects_tiers, coach_player_id, created_by, duration_hours,
-               activity_type, group_type, max_players, session_date, session_notes, status)
-            VALUES ($1,'training',$2,$3,$4,$5,$6,$7,$8,$9,$10,'training','training',NULL,$11,$12,'open')
+               activity_type, group_type, max_players, session_date, session_notes, status,
+               confirmed_venue_id)
+            VALUES ($1,'training',$2,$3,$4,$5,$6,$7,$8,$9,$10,'training','training',NULL,$11,$12,'open',$13)
             RETURNING id, session_url`,
             [sessionUrl, req.tenant.id, title, fee, recurs, seriesId, disciplineToggle,
-             coachId, req.user.playerId, duration, when.toISOString(), b.notes ? String(b.notes).slice(0, 1000) : null]);
+             coachId, req.user.playerId, duration, when.toISOString(),
+             b.notes ? String(b.notes).slice(0, 1000) : null, venueId]);
         await auditLog(pool, req.user.playerId, 'training_created', null,
             `Training "${title}" ${when.toISOString()} fee £${fee}${recurs ? ' (weekly)' : ''}`, req.tenant.id).catch(() => {});
         res.status(201).json({ ok: true, id: ins.rows[0].id, session_url: ins.rows[0].session_url,
