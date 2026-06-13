@@ -39370,7 +39370,38 @@ app.post('/api/coaching/sessions', authenticateToken, async (req, res) => {
 // Fetch all fields needed to pre-populate the edit modal
 // Accessible by session coach or superadmin only
 // ══════════════════════════════════════════════════════════════
-app.get('/api/coaching/sessions/:id/edit-data', authenticateToken, async (req, res) => {
+// ── FIX-469: kind guard for per-id coaching endpoints ─────────────────────
+// ROOT: coaching_sessions is shared by the coaching marketplace AND FIX-462
+// trainings, but only the LIST queries were kind-guarded (FIX-463 audit). Every
+// per-id coaching mutation would happily operate on a TRAINING row by id:
+//   • POST /api/coaching/sessions/:id/register → joins a PAID training with NO
+//     charge (bypasses applyGameFee entirely);
+//   • DELETE …/register → drops a paid training player with NO refund and the
+//     wrong status value ('dropped' vs 'dropped_out');
+//   • the coaching confirm/reconfirm/finalise/complete/cancel machines would
+//     corrupt the training state machine (no attendance, no weekly spawn).
+// One root, N instances → one shared middleware on every per-id coaching route.
+// Trainings have their own endpoints (/api/training/:id/*). Deliberately NOT
+// applied to DELETE /api/admin/coaching/sessions/:id — that hard delete is the
+// only delete path for ANY session kind (superadmin escape hatch).
+const rejectTrainingSession = async (req, res, next) => {
+    const id = req.params && req.params.id;
+    if (!id) return next();
+    try {
+        const r = await pool.query('SELECT session_kind FROM coaching_sessions WHERE id = $1', [id]);
+        if (r.rows.length && r.rows[0].session_kind === 'training') {
+            return res.status(400).json({ error: 'This is a training session — use the training endpoints' });
+        }
+        return next();
+    } catch (e) {
+        // Invalid uuid (22P02) or pre-migration missing column (42703): fall
+        // through — the route's own handler produces its normal error. The guard
+        // must never take coaching itself down.
+        return next();
+    }
+};
+
+app.get('/api/coaching/sessions/:id/edit-data', authenticateToken, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
     try {
@@ -39431,7 +39462,7 @@ app.get('/api/coaching/sessions/:id/edit-data', authenticateToken, async (req, r
 // Update core fields of an existing coaching session
 // Accessible by session coach or superadmin only
 // ══════════════════════════════════════════════════════════════
-app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
+app.put('/api/coaching/sessions/:id', authenticateToken, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
@@ -39632,7 +39663,7 @@ app.put('/api/coaching/sessions/:id', authenticateToken, async (req, res) => {
 // AUTH: POST /api/coaching/sessions/:id/register
 // Player signs up for a coaching session
 // ══════════════════════════════════════════════════════════════
-app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
+app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationLimiter, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
@@ -39705,7 +39736,7 @@ app.post('/api/coaching/sessions/:id/register', authenticateToken, registrationL
 // AUTH: DELETE /api/coaching/sessions/:id/register
 // Player drops out of a coaching session
 // ══════════════════════════════════════════════════════════════
-app.delete('/api/coaching/sessions/:id/register', authenticateToken, registrationLimiter, async (req, res) => {
+app.delete('/api/coaching/sessions/:id/register', authenticateToken, registrationLimiter, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
@@ -39754,7 +39785,7 @@ app.delete('/api/coaching/sessions/:id/register', authenticateToken, registratio
 // AUTH: POST /api/coaching/sessions/:id/reconfirm   (FIX-435)
 // A registered player re-confirms their spot after the session was edited.
 // ══════════════════════════════════════════════════════════════
-app.post('/api/coaching/sessions/:id/reconfirm', authenticateToken, async (req, res) => {
+app.post('/api/coaching/sessions/:id/reconfirm', authenticateToken, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
     try {
@@ -39901,7 +39932,7 @@ app.post('/api/coaching/requests/:id/respond', authenticateToken, async (req, re
 // SUPERADMIN: POST /api/admin/coaching/sessions/:id/confirm
 // Confirm venue and/or coach for a session
 // ══════════════════════════════════════════════════════════════
-app.post('/api/admin/coaching/sessions/:id/confirm', authenticateToken, requireSuperAdmin, async (req, res) => {
+app.post('/api/admin/coaching/sessions/:id/confirm', authenticateToken, requireSuperAdmin, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     const { confirm_venue_id, confirm_coach, pitch_number } = req.body;
     if (!id || !/^[0-9a-f-]{36}$/.test(id)) return res.status(400).json({ error: 'Invalid session ID' });
@@ -40088,14 +40119,14 @@ async function handleFinalise(req, res) {
     }
 }
 
-app.post('/api/coaching/sessions/:id/finalise', authenticateToken, handleFinalise);
-app.put('/api/coaching/sessions/:id/finalise',  authenticateToken, handleFinalise);
+app.post('/api/coaching/sessions/:id/finalise', authenticateToken, rejectTrainingSession, handleFinalise);
+app.put('/api/coaching/sessions/:id/finalise',  authenticateToken, rejectTrainingSession, handleFinalise);
 
 // ══════════════════════════════════════════════════════════════
 // COACH: POST /api/coaching/sessions/:id/complete
 // Mark session as completed
 // ══════════════════════════════════════════════════════════════
-app.post('/api/coaching/sessions/:id/complete', authenticateToken, async (req, res) => {
+app.post('/api/coaching/sessions/:id/complete', authenticateToken, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
@@ -40146,7 +40177,7 @@ app.post('/api/coaching/sessions/:id/complete', authenticateToken, async (req, r
 // AUTH: POST /api/coaching/sessions/:id/feedback
 // Player submits star rating + comment for coach
 // ══════════════════════════════════════════════════════════════
-app.post('/api/coaching/sessions/:id/feedback', authenticateToken, registrationLimiter, async (req, res) => {
+app.post('/api/coaching/sessions/:id/feedback', authenticateToken, registrationLimiter, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     const { rating, comment } = req.body;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
@@ -40923,6 +40954,7 @@ app.get('/api/admin/coaching/sessions', authenticateToken, requireAdmin, async (
             FROM coaching_sessions cs
             LEFT JOIN players p ON p.id = cs.coach_player_id
             LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+            WHERE (cs.session_kind IS NULL OR cs.session_kind <> 'training') /* FIX-469: trainings live in their own panel; NULL-safe for legacy rows */
             ORDER BY cs.created_at DESC
         `);
         res.json(result.rows);
@@ -41522,7 +41554,7 @@ app.post('/api/admin/ref/applications/:id/review', authenticateToken, requireSup
 // COACH: POST /api/coaching/sessions/:id/cancel-request
 // Request cancellation of a session (coach of session only, not completed)
 // ══════════════════════════════════════════════════════════════
-app.post('/api/coaching/sessions/:id/cancel-request', authenticateToken, async (req, res) => {
+app.post('/api/coaching/sessions/:id/cancel-request', authenticateToken, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
@@ -41573,7 +41605,7 @@ app.post('/api/coaching/sessions/:id/cancel-request', authenticateToken, async (
 // SUPERADMIN: POST /api/admin/coaching/sessions/:id/cancel-approve
 // Approve a cancellation request — status → cancelled, email coach + players
 // ══════════════════════════════════════════════════════════════
-app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, requireSuperAdmin, async (req, res) => {
+app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, requireSuperAdmin, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
@@ -41626,7 +41658,7 @@ app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, r
 // SUPERADMIN: POST /api/admin/coaching/sessions/:id/cancel-reject
 // Reject a cancellation request — clears flag, emails coach
 // ══════════════════════════════════════════════════════════════
-app.post('/api/admin/coaching/sessions/:id/cancel-reject', authenticateToken, requireSuperAdmin, async (req, res) => {
+app.post('/api/admin/coaching/sessions/:id/cancel-reject', authenticateToken, requireSuperAdmin, rejectTrainingSession, async (req, res) => {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
