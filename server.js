@@ -40561,6 +40561,42 @@ app.get('/api/players/me/trainings', authenticateToken, async (req, res) => {
     }
 });
 
+// ── FIX-468: wizard tenant resolution — SERVER-SIDE, mirroring /api/admin/games ──
+// The type-first creation wizard (FIX-467) previously resolved the tenant in the
+// BROWSER (two fetches + client-side membership sorting). Fragile, and it could
+// disagree with what /api/admin/games actually pins on a standard game create.
+// This endpoint is now the single authority — the tenant is NEVER a question:
+//   • platform admin / superadmin → the FIX-340 root tenant (TF_COVENTRY_TENANT_ID),
+//     EXACTLY the tenant a standard/draft/external/tournament create is pinned to;
+//   • otherwise → the caller's active tenant_admin membership (oldest joined_at).
+// Gate matches /api/admin/games (requireCLMAdmin): anyone who can open the
+// Manage Games form can resolve. No SQL migration needed.
+app.get('/api/admin/wizard-tenant', authenticateToken, requireCLMAdmin, async (req, res) => {
+    try {
+        if (req.user.role === 'admin' || req.user.role === 'superadmin') {
+            const t = await pool.query('SELECT id, short_id, name FROM tenants WHERE id = $1', [TF_COVENTRY_TENANT_ID]);
+            if (t.rows.length) return res.json({ tenant: t.rows[0], via: 'root' });
+            // Root constant missing from this DB (shouldn't happen live) → oldest active tenant
+            const o = await pool.query(`SELECT id, short_id, name FROM tenants WHERE status = 'active' ORDER BY created_at ASC LIMIT 1`);
+            if (o.rows.length) return res.json({ tenant: o.rows[0], via: 'oldest' });
+            return res.status(404).json({ error: 'No tenants exist yet' });
+        }
+        const m = await pool.query(
+            `SELECT t.id, t.short_id, t.name
+               FROM player_tenants pt
+               JOIN tenants t ON t.id = pt.tenant_id
+              WHERE pt.player_id = $1 AND pt.role = 'tenant_admin' AND pt.status = 'active'
+                AND t.status = 'active'
+              ORDER BY pt.joined_at ASC
+              LIMIT 1`, [req.user.playerId]);
+        if (m.rows.length) return res.json({ tenant: m.rows[0], via: 'membership' });
+        return res.status(403).json({ error: 'No tenant context for this account' });
+    } catch (e) {
+        console.error('FIX-468 wizard-tenant failed:', e.message);
+        res.status(500).json({ error: 'Could not resolve tenant' });
+    }
+});
+
 // CREATE (tenant admins; superadmin passes requireTenantAdmin too)
 app.post('/api/t/:tenant_short_id/admin/trainings', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
