@@ -60432,6 +60432,34 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
             }
         }
 
+        if (step === 'wonderful-constraint-drop') {
+            // FIX-485d: the rigid status CHECK has been a recurring crash source — any
+            // Wonderful status string not in the enumerated set throws 23514 and (pre
+            // FIX-485) crash-looped the server. Enumerating every possible Wonderful
+            // status is whack-a-mole. The robust fix: DROP the CHECK entirely. Valid
+            // status values are governed in code by _safeWonderfulStatus() (FIX-477),
+            // which is the right layer for it. After this, NO status value can ever
+            // cause a constraint violation again, on any build.
+            out.push(await _migRun(client, "drop wonderful_payments_status_check",
+                `ALTER TABLE wonderful_payments DROP CONSTRAINT IF EXISTS wonderful_payments_status_check`));
+            out.push(await _migRun(client, "VERIFY constraint gone",
+                `SELECT COUNT(*)::int AS still_present FROM pg_constraint
+                  WHERE conname = 'wonderful_payments_status_check'`));
+        }
+
+        if (step === 'audit-logs-fix' || step === 'all-safe') {
+            // FIX-485c: audit_logs is missing the tenant_id column the auditLog() helper
+            // writes for tenant-scoped actions -> "column tenant_id does not exist"
+            // (non-critical, but it silently drops those audit rows). Add it (nullable
+            // UUID, matching other tenant_id columns). Also covers game_audit_log if it
+            // has the same drift.
+            out.push(await _migRun(client, "audit_logs.tenant_id",
+                `ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS tenant_id UUID`));
+            out.push(await _migRun(client, "VERIFY audit_logs.tenant_id",
+                `SELECT column_name FROM information_schema.columns
+                  WHERE table_name='audit_logs' AND column_name='tenant_id'`));
+        }
+
         if (step === 'wonderful-constraint-widen') {
             // FIX-485b: widen the status CHECK to include every value _safeWonderfulStatus
             // and the lifecycle code can write — so the reconciler UPDATE stops violating
@@ -60473,7 +60501,7 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
         }
 
         if (!out.length) {
-            return res.status(400).json({ error: 'Unknown step', valid: ['schema-drift','training-gates','faqs','free-credit-check','free-credit-apply','wonderful-constraint-read','wonderful-constraint-widen','all-safe'] });
+            return res.status(400).json({ error: 'Unknown step', valid: ['schema-drift','training-gates','faqs','free-credit-check','free-credit-apply','wonderful-constraint-read','wonderful-constraint-widen','wonderful-constraint-drop','audit-logs-fix','all-safe'] });
         }
         res.json({ step, results: out });
     } catch (e) {
@@ -62536,7 +62564,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web57`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web58-audit`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
