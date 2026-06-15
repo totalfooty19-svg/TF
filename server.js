@@ -2157,8 +2157,15 @@ function getEffectivePrice(game) {
     const kickoff  = new Date(game.game_date).getTime();
     const daysLeft = (kickoff - now) / (1000 * 60 * 60 * 24);
     const standard = parseFloat(game.cost_per_player || 0);
-    const early    = game.early_bird_price != null ? parseFloat(game.early_bird_price) : null;
-    const superEB  = game.super_early_bird_price != null ? parseFloat(game.super_early_bird_price) : null;
+    // FIX-475 ROOT: an early-bird/super price is only valid if it is a POSITIVE
+    // number. A stored 0 (or negative, or NaN) is a data artifact, NOT a real
+    // "free early bird" on a paid game — treating 0 as valid silently zeroed a
+    // real £7 fee for any game >=3 days out (the £0.00 PAY NOW bug). Coerce any
+    // non-positive EB to null so it falls through to the standard price.
+    const _eb = game.early_bird_price != null ? parseFloat(game.early_bird_price) : null;
+    const _seb = game.super_early_bird_price != null ? parseFloat(game.super_early_bird_price) : null;
+    const early    = (_eb  != null && _eb  > 0) ? _eb  : null;
+    const superEB  = (_seb != null && _seb > 0) ? _seb : null;
 
     if (daysLeft >= 7 && superEB !== null) return { price: superEB, tier: 'super' };
     if (daysLeft >= 3 && early  !== null) return { price: early,  tier: 'early' };
@@ -2174,8 +2181,11 @@ function getEffectivePrice(game) {
 // Returns same shape as getEffectivePrice.
 function getEffectivePriceAtSignup(game, signupTs) {
     const standard = parseFloat(game.cost_per_player || 0);
-    const early    = game.early_bird_price       != null ? parseFloat(game.early_bird_price)       : null;
-    const superEB  = game.super_early_bird_price != null ? parseFloat(game.super_early_bird_price) : null;
+    // FIX-475: same positive-only guard as getEffectivePrice (see note there).
+    const _eb2 = game.early_bird_price != null ? parseFloat(game.early_bird_price) : null;
+    const _seb2 = game.super_early_bird_price != null ? parseFloat(game.super_early_bird_price) : null;
+    const early    = (_eb2  != null && _eb2  > 0) ? _eb2  : null;
+    const superEB  = (_seb2 != null && _seb2 > 0) ? _seb2 : null;
     if (!signupTs || !game.game_date) return { price: standard, tier: 'standard' };
     const signup   = new Date(signupTs).getTime();
     const kickoff  = new Date(game.game_date).getTime();
@@ -2923,6 +2933,56 @@ function _alertUnresolvedPaidWebhook(wpId, detailHtml) {
         detailHtml +
         `<p><strong>Action:</strong> check the Wonderful dashboard for this order, match it to the player by amount/time, and credit via the CRM manual-credit path. The abort-then-retry case (FIX-450 log) looks exactly like this.</p>`);
 }
+
+// FIX-453: the alert ref (e.g. TF0-JAY-QEDSG) is NOT a unique person — many
+// players share a first name. To action the alert you need the ACCOUNT: player
+// id, alias, full name, mobile, email. This builds an identity block from the
+// matched payment row so the email names exactly who to credit.
+async function _wfIdentityHtml(pmt) {
+    if (!pmt) return '<p><strong>Player:</strong> unknown — no DB row matched this webhook.</p>';
+    let pl = null;
+    try {
+        if (pmt.player_id) {
+            const r = await pool.query(
+                'SELECT id, alias, full_name, first_name, phone, email FROM players WHERE id = $1',
+                [pmt.player_id]);
+            pl = r.rows[0] || null;
+        }
+    } catch (e) { /* identity is best-effort; never break the alert */ }
+    const ref   = pmt.merchant_reference || '(no ref)';
+    const amount = pmt.amount_pence != null ? '£' + (pmt.amount_pence / 100).toFixed(2) : '(unknown amount)';
+    const when  = pmt.created_at ? new Date(pmt.created_at).toISOString() : '(unknown time)';
+    if (!pl) {
+        return '<p><strong>Payment:</strong> ref ' + ref + ' · ' + amount + ' · created ' + when +
+               '<br><strong>Player:</strong> row has player_id ' + (pmt.player_id || '(none)') +
+               ' but no matching players record.</p>';
+    }
+    return '<p><strong>Player to credit:</strong><br>' +
+        '• Name: ' + (pl.full_name || pl.first_name || '(no name)') + '<br>' +
+        '• Alias: ' + (pl.alias || '(none)') + '<br>' +
+        '• Player ID: ' + pl.id + '<br>' +
+        '• Mobile: ' + (pl.phone || '(none on file)') + '<br>' +
+        '• Email: ' + (pl.email || '(none)') + '<br>' +
+        '• Payment: ref ' + ref + ' · ' + amount + ' · created ' + when + '</p>';
+}
+
+// FIX-453: identity-aware wrapper. Same dedupe as _alertUnresolvedPaidWebhook,
+// but takes the matched pmt row and prepends the identity block. Use this on
+// every caller that HAS a matched row; the bare wpId form stays for the
+// no-row-matched path.
+async function _alertUnresolvedPaidWebhookWithPlayer(wpId, pmt, detailHtml) {
+    const last = _wfPaidAlertSent.get(wpId);
+    if (last && (Date.now() - last) < 6 * 60 * 60 * 1000) return;
+    _wfPaidAlertSent.set(wpId, Date.now());
+    if (_wfPaidAlertSent.size > 200) _wfPaidAlertSent.clear();
+    let idHtml = '';
+    try { idHtml = await _wfIdentityHtml(pmt); } catch (e) { idHtml = '<p>(identity lookup failed: ' + e.message + ')</p>'; }
+    _securityAlertEmail('💸 PAID Wonderful webhook NOT credited',
+        `<p>A webhook with status <strong>paid</strong> arrived for order <strong>${wpId}</strong> but could not be safely credited automatically.</p>` +
+        idHtml +
+        detailHtml +
+        `<p><strong>Action:</strong> check the Wonderful dashboard for this order, match it to the player above by amount/time, and credit via the CRM manual-credit path. The abort-then-retry case (FIX-450 log) looks exactly like this.</p>`);
+}
 setInterval(() => {
     const cutoff = Date.now() - (5 * 60 * 1000);
     for (const [wpId, ts] of _reverseLookupFailCache) {
@@ -3356,6 +3416,15 @@ const pool = new Pool({
     max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
+    // FIX-483: no statement timeout meant a single hung query (lock wait, slow heavy
+    // query, DB hiccup) held its pool connection FOREVER. connectionTimeoutMillis only
+    // bounds how long a NEW caller waits to acquire — it does NOT kill a query already
+    // running. A few hangs drained all 20 connections permanently, so every request
+    // (and every scheduler, incl. keep-alive) failed with "timeout exceeded when trying
+    // to connect" — total lockup despite a healthy DB. These two timeouts make a stuck
+    // query/transaction release its connection back to the pool instead of holding it.
+    statement_timeout: 30000,                      // kill any query running >30s
+    idle_in_transaction_session_timeout: 30000,    // kill txns left idle >30s (un-released BEGINs)
 });
 
 pool.connect((err, client, done) => {
@@ -9260,6 +9329,79 @@ app.get('/api/dashboard/my-booked-games', authenticateToken, async (req, res) =>
 //   tier_visibility_hours === 0                        → "tier locked" card
 //   hit_visibility_wall === true                       → "improve tier" upsell
 //                                                        appended after last game
+// ── FIX-471: sessions a player can discover ────────────────────────
+// Two streams unified into one shape for the dashboard scroller + coaching page:
+//   • TRAINING: tenant sessions, ONLY in tenants the player is an active member of.
+//   • COACHING: worldwide marketplace, filtered to the player's region (NULL/ALL = no filter).
+// Both return a common card shape with kind='training'|'coaching'. Upcoming only.
+async function _playerVisibleSessions(playerId, region) {
+    const out = { trainings: [], coaching: [] };
+    // Trainings in member tenants
+    const tr = await pool.query(`
+        SELECT cs.id, cs.session_url, cs.title, cs.fee, cs.status, cs.session_date,
+               cs.duration_hours, cs.recurs_weekly, t.name AS tenant_name,
+               v.name AS venue_name, p.alias AS coach_alias, p.full_name AS coach_name,
+               (SELECT COUNT(*) FROM coaching_registrations cr
+                 WHERE cr.session_id = cs.id AND cr.status = 'registered') AS registered_count,
+               (SELECT status FROM coaching_registrations cr
+                 WHERE cr.session_id = cs.id AND cr.player_id = $1
+                 /* FIX-472: prefer the active row when a kept-fee re-register left two */
+                 ORDER BY CASE cr.status WHEN 'registered' THEN 0 WHEN 'pending' THEN 1 WHEN 'denied' THEN 2 WHEN 'dropped_out' THEN 3 ELSE 4 END, cr.id DESC
+                 LIMIT 1) AS my_status
+          FROM coaching_sessions cs
+          JOIN player_tenants pt ON pt.tenant_id = cs.tenant_id AND pt.player_id = $1 AND pt.status = 'active'
+          LEFT JOIN tenants t ON t.id = cs.tenant_id
+          LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+          LEFT JOIN players p ON p.id = cs.coach_player_id
+         WHERE cs.session_kind = 'training'
+           AND cs.status IN ('open','finalised')
+           AND (cs.session_date IS NULL OR cs.session_date > NOW())
+         ORDER BY cs.session_date ASC NULLS LAST
+         LIMIT 50`, [playerId]);
+    out.trainings = tr.rows.map(r => ({
+        kind: 'training', id: r.id, session_url: r.session_url, title: r.title,
+        fee: r.fee, status: r.status, session_date: r.session_date,
+        duration_hours: r.duration_hours, recurs_weekly: r.recurs_weekly,
+        tenant_name: r.tenant_name, venue_name: r.venue_name,
+        coach_name: r.coach_alias || r.coach_name,
+        registered_count: r.registered_count, my_status: r.my_status
+    }));
+    // Marketplace coaching, region-filtered
+    const useRegion = region && region !== 'ALL';
+    const cParams = useRegion ? [playerId, region] : [playerId];
+    const cRegion = useRegion ? 'AND v.region = $2' : '';
+    const co = await pool.query(`
+        SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type, cs.status,
+               cs.session_date, cs.duration_hours, cs.min_price, cs.max_price, cs.is_full,
+               v.name AS venue_name, v.region AS venue_region,
+               p.alias AS coach_alias, p.full_name AS coach_name,
+               (SELECT COUNT(*) FROM coaching_registrations cr
+                 WHERE cr.session_id = cs.id AND cr.status = 'registered') AS registered_count,
+               (SELECT status FROM coaching_registrations cr
+                 WHERE cr.session_id = cs.id AND cr.player_id = $1
+                 /* FIX-472: prefer the active row when a kept-fee re-register left two */
+                 ORDER BY CASE cr.status WHEN 'registered' THEN 0 WHEN 'pending' THEN 1 WHEN 'denied' THEN 2 WHEN 'dropped_out' THEN 3 ELSE 4 END, cr.id DESC
+                 LIMIT 1) AS my_status
+          FROM coaching_sessions cs
+          LEFT JOIN venues v ON v.id = cs.confirmed_venue_id
+          LEFT JOIN players p ON p.id = cs.coach_player_id
+         WHERE cs.session_kind = 'coaching'
+           AND cs.status IN ('open','coach_confirmed','venue_confirmed','finalised')
+           AND (cs.session_date IS NULL OR cs.session_date > NOW())
+           ${cRegion}
+         ORDER BY cs.session_date ASC NULLS LAST
+         LIMIT 50`, cParams);
+    out.coaching = co.rows.map(r => ({
+        kind: 'coaching', id: r.id, session_url: r.session_url,
+        title: (r.activity_type || 'Coaching'), activity_type: r.activity_type, group_type: r.group_type,
+        status: r.status, session_date: r.session_date, duration_hours: r.duration_hours,
+        min_price: r.min_price, max_price: r.max_price, is_full: r.is_full,
+        venue_name: r.venue_name, coach_name: r.coach_alias || r.coach_name,
+        registered_count: r.registered_count, my_status: r.my_status
+    }));
+    return out;
+}
+
 app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
     try {
         // ── Player + tier resolution (mirrors V1 region-slider exactly) ──
@@ -9496,6 +9638,13 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             // else venue_photo stays as v.photo_url (or null)
         }
 
+        // FIX-471: sessions stream (trainings in member tenants + region coaching).
+        // Fetched here so the scroller's Games/Sessions/Both filter has data.
+        // Never blocks games: on any failure we return an empty sessions block.
+        let sessions = { trainings: [], coaching: [] };
+        try { sessions = await _playerVisibleSessions(req.user.playerId, region); }
+        catch (se) { console.error('FIX-471 timeline sessions:', se.message); }
+
         res.json({
             region,
             region_source: regionSource,
@@ -9504,6 +9653,7 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             hit_visibility_wall: hitVisibilityWall,
             centre_index: centreIndex,
             games,
+            sessions,  // FIX-471: { trainings:[], coaching:[] } — client merges per filter
         });
     } catch (error) {
         // FIX-237: rich diagnostic log — when a player hits this, we can grep
@@ -10272,10 +10422,15 @@ app.post('/api/admin/players/:id/free-credits', authenticateToken, requireSuperA
 
         const desc = description?.trim() || (parsedAmount < 0 ? 'Free credit removal' : 'Free credit grant');
 
-        // FIX-398: per-tenant free credits. Route the grant to the ACTING ADMIN's tenant
-        // bucket (superadmin → Original/NULL = legacy free_credit_balance). A tenant admin's
-        // grant is spendable only at that tenant's games.
-        const _grantTenantId = await _resolveOwnerTenantId(req);
+        // FIX-479: every free-credit grant is TENANT-LOCKED — there is no spend-anywhere
+        // global bucket. A tenant admin's grant goes to their tenant bucket. A SUPERADMIN
+        // grant (which previously fell to the global free_credit_balance, spendable on any
+        // game) now routes to the ROOT tenant (TF_COVENTRY) bucket — the tenant all main
+        // TF games are pinned to (FIX-340). Net effect: superadmin-granted free credit is
+        // spendable ONLY on main TF games, never on another tenant's games, matching the
+        // "free credit belongs to exactly one tenant" rule.
+        const _resolved = await _resolveOwnerTenantId(req);
+        const _grantTenantId = _resolved || TF_COVENTRY_TENANT_ID;
         await adjustTenantFreeCredits(req.params.id, _grantTenantId, parsedAmount, pool);
 
         await recordCreditTransaction(pool, req.params.id, parsedAmount, 'free_credit',
@@ -11963,6 +12118,20 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         game.max_players      = parseInt(game.max_players) || 0;
         game.current_players  = parseInt(game.current_players) || 0;
         game.cost_per_player  = parseFloat(game.cost_per_player) || 0;
+
+        // FIX-474 (APP PARITY): away ext-league fixtures store the real venue in
+        // away_* columns; the placeholder venue_id points at the league default.
+        // The public /details endpoint substitutes these for display — the app's
+        // /api/games/:id did NOT, so AWAY fixtures showed the wrong (home) venue
+        // in the app. Mirror the same substitution so app == web.
+        if (game.team_selection_type === 'vs_external' && game.is_home === false) {
+            game.venue_name        = game.away_venue_name || game.venue_name;
+            game.venue_postcode    = game.away_postcode || null;
+            game.venue_pitch_pin   = game.away_pitch_pin || null;
+            game.venue_parking_pin = game.away_parking_pin || null;
+            game.venue_pitch_location = game.away_pitch_type || game.venue_pitch_location;
+            game.venue_address     = null;
+        }
 
         res.json(game);
     } catch (error) {
@@ -14143,10 +14312,13 @@ app.get('/api/games/:gameId/suggest-next', authenticateToken, async (req, res) =
 
         // Compute effective price using same tier logic as game.html
         let effectivePrice = parseFloat(nextRow.cost_per_player);
-        if (nextRow.super_early_bird_price != null && spacesLeft >= Math.ceil(maxP * 0.75)) {
-            effectivePrice = parseFloat(nextRow.super_early_bird_price);
-        } else if (nextRow.early_bird_price != null && spacesLeft >= Math.ceil(maxP * 0.5)) {
-            effectivePrice = parseFloat(nextRow.early_bird_price);
+        // FIX-475: positive-only guard (a stored 0 EB must not zero a real fee).
+        const _nSeb = nextRow.super_early_bird_price != null ? parseFloat(nextRow.super_early_bird_price) : null;
+        const _nEb  = nextRow.early_bird_price != null ? parseFloat(nextRow.early_bird_price) : null;
+        if (_nSeb != null && _nSeb > 0 && spacesLeft >= Math.ceil(maxP * 0.75)) {
+            effectivePrice = _nSeb;
+        } else if (_nEb != null && _nEb > 0 && spacesLeft >= Math.ceil(maxP * 0.5)) {
+            effectivePrice = _nEb;
         }
 
         res.json({
@@ -17313,11 +17485,30 @@ app.get('/api/games/:id/lineup', authenticateToken, async (req, res) => {
             };
         }
         const isCaptain = captainsResult.rows.some(c => c.player_id === req.user.playerId);
+        // FIX-482: tell the client which team this captain owns + whether the game is
+        // external, so the UI only lets a captain edit THEIR OWN team's tab (parity
+        // with the server-side write guard). Organisers/admins keep full edit.
+        let myCaptainTeam = null;
+        let isExternalGame = false;
+        try {
+            const [ownTeamRes, extRes] = await Promise.all([
+                pool.query(
+                    `SELECT t.team_name FROM team_players tp
+                       JOIN teams t ON t.id = tp.team_id
+                      WHERE t.game_id = $1 AND tp.player_id = $2 LIMIT 1`,
+                    [gameId, req.user.playerId]),
+                pool.query(`SELECT team_selection_type FROM games WHERE id = $1`, [gameId])
+            ]);
+            myCaptainTeam  = ownTeamRes.rows[0]?.team_name || null;
+            isExternalGame = extRes.rows[0]?.team_selection_type === 'vs_external';
+        } catch (_) { /* non-fatal: client falls back to existing behaviour */ }
         res.json({
             lineups,
             can_edit: canEdit,
             is_captain: isCaptain,
-            captains: captainsResult.rows
+            captains: captainsResult.rows,
+            my_captain_team: myCaptainTeam,
+            is_external: isExternalGame
         });
     } catch (err) {
         console.error('GET lineup error:', err);
@@ -17344,8 +17535,33 @@ app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, async (req, 
                 pool.query('SELECT 1 FROM game_captains WHERE game_id = $1 AND player_id = $2', [gameId, req.user.playerId]),
                 _isSeriesLineupEditor(gameId, req.user.playerId)
             ]);
-            if (orgCheck.rows.length === 0 && capCheck.rows.length === 0 && !editorCheck) {
+            const isOrganiser = orgCheck.rows.length > 0;
+            const isCaptain   = capCheck.rows.length > 0;
+            if (!isOrganiser && !isCaptain && !editorCheck) {
                 return res.status(403).json({ error: 'Not authorised to edit lineup' });
+            }
+            // FIX-482: a CAPTAIN may only edit THEIR OWN team's lineup — not the other
+            // team's. Organisers and series lineup editors keep full edit rights over
+            // every team. The captain's team is the team they are a player on
+            // (teams/team_players). EXCEPTION: external league/cup games (vs_external)
+            // are one team vs an outside opponent, so there is no "other team" to
+            // protect — the per-team restriction does not apply there.
+            if (isCaptain && !isOrganiser && !editorCheck) {
+                const extRes = await pool.query(
+                    `SELECT team_selection_type FROM games WHERE id = $1`, [gameId]);
+                const isExternal = extRes.rows[0]?.team_selection_type === 'vs_external';
+                if (!isExternal) {
+                    const ownTeam = await pool.query(
+                        `SELECT t.team_name
+                           FROM team_players tp
+                           JOIN teams t ON t.id = tp.team_id
+                          WHERE t.game_id = $1 AND tp.player_id = $2`,
+                        [gameId, req.user.playerId]);
+                    const ownsThisTeam = ownTeam.rows.some(r => r.team_name === teamName);
+                    if (!ownsThisTeam) {
+                        return res.status(403).json({ error: 'Captains can only edit their own team lineup' });
+                    }
+                }
             }
         }
         await pool.query(
@@ -21172,6 +21388,16 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin,
         if (!venue_id || !max_players || cost_per_player === undefined) {
             return res.status(400).json({ error: 'Missing required fields' });
         }
+        // FIX-476 ROOT: cost_per_player is written UNCONDITIONALLY (cost_per_player=$3,
+        // not COALESCE) — so a null/NaN/blank value here SILENTLY WIPED a real fee to 0
+        // (a £7 game became £0, breaking PAY NOW). A paid game's fee must never be
+        // nulled by an edit that didn't carry the price. Reject non-numeric/negative.
+        {
+            const _cpp = parseFloat(cost_per_player);
+            if (cost_per_player === null || cost_per_player === '' || isNaN(_cpp) || _cpp < 0 || _cpp > 1000) {
+                return res.status(400).json({ error: 'Cost per player must be a number between £0 and £1000 (the fee was not changed)' });
+            }
+        }
         
         if (max_players < 1) {
             return res.status(400).json({ error: 'Max players must be at least 1' });
@@ -21856,6 +22082,16 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
         if (!venue_id || !max_players || cost_per_player === undefined) {
             return res.status(400).json({ error: 'Missing required fields' });
         }
+        // FIX-476 ROOT: cost_per_player is written UNCONDITIONALLY (cost_per_player=$3,
+        // not COALESCE) — so a null/NaN/blank value here SILENTLY WIPED a real fee to 0
+        // (a £7 game became £0, breaking PAY NOW). A paid game's fee must never be
+        // nulled by an edit that didn't carry the price. Reject non-numeric/negative.
+        {
+            const _cpp = parseFloat(cost_per_player);
+            if (cost_per_player === null || cost_per_player === '' || isNaN(_cpp) || _cpp < 0 || _cpp > 1000) {
+                return res.status(400).json({ error: 'Cost per player must be a number between £0 and £1000 (the fee was not changed)' });
+            }
+        }
 
         const gameResult = await client.query('SELECT series_id FROM games WHERE id = $1', [gameId]);
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
@@ -21889,12 +22125,12 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCL
                 const utcDate = new Date(new Date(londonLocal).getTime() - offset);
 
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IS NOT NULL AND star_rating IS NOT NULL AND $4::numeric = FLOOR(star_rating) THEN star_rating_locked WHEN $4::numeric IS NOT DISTINCT FROM star_rating THEN star_rating_locked ELSE COALESCE($4::numeric IN (4,5), FALSE) END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay), early_bird_price=$13, super_early_bird_price=$14, opponent_id=COALESCE($15, opponent_id), external_opponent=COALESCE($16, external_opponent), pitch_cost=COALESCE($17, pitch_cost) WHERE id=$7',
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=COALESCE($3, cost_per_player) /* FIX-476: never null a real fee */, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IS NOT NULL AND star_rating IS NOT NULL AND $4::numeric = FLOOR(star_rating) THEN star_rating_locked WHEN $4::numeric IS NOT DISTINCT FROM star_rating THEN star_rating_locked ELSE COALESCE($4::numeric IN (4,5), FALSE) END, game_date=$5, min_rating_enabled=COALESCE($6, min_rating_enabled), requires_organiser=COALESCE($8, requires_organiser), format=COALESCE($9, format), position_type=COALESCE($10, position_type), refs_required=COALESCE($11, refs_required), ref_pay=COALESCE($12, ref_pay), early_bird_price=$13, super_early_bird_price=$14, opponent_id=COALESCE($15, opponent_id), external_opponent=COALESCE($16, external_opponent), pitch_cost=COALESCE($17, pitch_cost) WHERE id=$7',
                     [venue_id, max_players, cost_per_player, starRatingForDb, utcDate.toISOString(), min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName, parsedPitchCostSeries]
                 );
             } else {
                 await client.query(
-                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=$3, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IS NOT NULL AND star_rating IS NOT NULL AND $4::numeric = FLOOR(star_rating) THEN star_rating_locked WHEN $4::numeric IS NOT DISTINCT FROM star_rating THEN star_rating_locked ELSE COALESCE($4::numeric IN (4,5), FALSE) END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay), early_bird_price=$12, super_early_bird_price=$13, opponent_id=COALESCE($14, opponent_id), external_opponent=COALESCE($15, external_opponent), pitch_cost=COALESCE($16, pitch_cost) WHERE id=$6',
+                    'UPDATE games SET venue_id=$1, max_players=$2, cost_per_player=COALESCE($3, cost_per_player) /* FIX-476: never null a real fee */, star_rating=$4, star_rating_locked = CASE WHEN $4::numeric IS NOT NULL AND star_rating IS NOT NULL AND $4::numeric = FLOOR(star_rating) THEN star_rating_locked WHEN $4::numeric IS NOT DISTINCT FROM star_rating THEN star_rating_locked ELSE COALESCE($4::numeric IN (4,5), FALSE) END, min_rating_enabled=COALESCE($5, min_rating_enabled), requires_organiser=COALESCE($7, requires_organiser), format=COALESCE($8, format), position_type=COALESCE($9, position_type), refs_required=COALESCE($10, refs_required), ref_pay=COALESCE($11, ref_pay), early_bird_price=$12, super_early_bird_price=$13, opponent_id=COALESCE($14, opponent_id), external_opponent=COALESCE($15, external_opponent), pitch_cost=COALESCE($16, pitch_cost) WHERE id=$6',
                     [venue_id, max_players, cost_per_player, starRatingForDb, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName, parsedPitchCostSeries]
                 );
             }
@@ -27632,17 +27868,22 @@ app.post('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) =
             return res.status(400).json({ error: 'Award voting is not currently open for this game' });
         }
 
-        // Check voter is a confirmed player OR a confirmed referee for this game
-        const eligibilityResult = await pool.query(`
-            SELECT 1 FROM registrations
-            WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
-            UNION
-            SELECT 1 FROM game_referees
-            WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
-            LIMIT 1
-        `, [gameId, voterId]);
-        if (eligibilityResult.rows.length === 0) {
-            return res.status(403).json({ error: 'You must be a confirmed player or referee in this game to vote' });
+        // Check voter is a confirmed player OR a confirmed referee for this game.
+        // FIX-481: admins/superadmins can always vote (they run the game and may not
+        // be on the team sheet). Mirrors the chat admin-bypass pattern.
+        const _voteIsAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!_voteIsAdmin) {
+            const eligibilityResult = await pool.query(`
+                SELECT 1 FROM registrations
+                WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
+                UNION
+                SELECT 1 FROM game_referees
+                WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
+                LIMIT 1
+            `, [gameId, voterId]);
+            if (eligibilityResult.rows.length === 0) {
+                return res.status(403).json({ error: 'You must be a confirmed player or referee in this game to vote' });
+            }
         }
 
         // Check nominee is confirmed-registered for this game
@@ -32647,13 +32888,17 @@ app.post('/api/games/:gameId/ref-review/:refPlayerId', authenticateToken, fairne
     const safeComment = (typeof comment === 'string') ? comment.trim().slice(0, 500) : null;
 
     try {
-        // Must be confirmed player in that game
-        const playerCheck = await pool.query(
-            `SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
-            [gameId, req.user.playerId]
-        );
-        if (!playerCheck.rows.length) {
-            return res.status(403).json({ error: 'Only confirmed players can review a referee' });
+        // Must be confirmed player in that game.
+        // FIX-481: admins/superadmins can always rate refs.
+        const _refRevIsAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        if (!_refRevIsAdmin) {
+            const playerCheck = await pool.query(
+                `SELECT 1 FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'`,
+                [gameId, req.user.playerId]
+            );
+            if (!playerCheck.rows.length) {
+                return res.status(403).json({ error: 'Only confirmed players can review a referee' });
+            }
         }
 
         // Ref must be confirmed for this game
@@ -38896,6 +39141,20 @@ app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req
 // PUBLIC: GET /api/coaching/sessions
 // List upcoming open coaching sessions (public browse)
 // ══════════════════════════════════════════════════════════════
+// FIX-471: combined player sessions for the coaching-sessions page — member-tenant
+// trainings + region-filtered marketplace coaching. Auth required (member resolution).
+app.get('/api/players/me/sessions', authenticateToken, async (req, res) => {
+    try {
+        const playerRow = await pool.query('SELECT region_code FROM players WHERE id = $1', [req.user.playerId]);
+        const region = (playerRow.rows[0] && playerRow.rows[0].region_code) || 'ALL';
+        const data = await _playerVisibleSessions(req.user.playerId, region);
+        res.json({ region, trainings: data.trainings, coaching: data.coaching });
+    } catch (e) {
+        console.error('FIX-471 me/sessions:', e.message);
+        res.status(500).json({ error: 'Could not load sessions' });
+    }
+});
+
 app.get('/api/coaching/sessions', optionalAuth, publicEndpointLimiter, async (req, res) => {
     try {
         const result = await pool.query(`
@@ -38981,7 +39240,9 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
             if (req.user) {
                 const vr = await pool.query(
                     `SELECT id, status, attendance, (amount_paid_real + amount_paid_free) AS amount_paid
-                       FROM coaching_registrations WHERE session_id = $1 AND player_id = $2`,
+                       FROM coaching_registrations WHERE session_id = $1 AND player_id = $2
+                     /* FIX-472: a kept-fee re-register can leave 2 rows; prefer the ACTIVE one */
+                     ${PRIO} LIMIT 1`,
                     [session.id, req.user.playerId]);
                 viewerReg = vr.rows[0] || null;
                 canManage = await _trainingCanManage(req, session);
@@ -40582,16 +40843,20 @@ app.get('/api/players/me/trainings', authenticateToken, async (req, res) => {
             SELECT cs.id, cs.session_url, cs.title, cs.fee, cs.recurs_weekly, cs.status,
                    cs.session_date, cs.duration_hours, t.name AS tenant_name,
                    COUNT(cr2.id) FILTER (WHERE cr2.status = 'registered') AS registered_count,
-                   my.status AS my_status
+                   /* FIX-472: scalar subquery (not a join) so a 2-row kept-fee case
+                      can't duplicate the session or inflate the count; active row wins */
+                   (SELECT cr.status FROM coaching_registrations cr
+                     WHERE cr.session_id = cs.id AND cr.player_id = $1
+                     ORDER BY CASE cr.status WHEN 'registered' THEN 0 WHEN 'pending' THEN 1 WHEN 'denied' THEN 2 WHEN 'dropped_out' THEN 3 ELSE 4 END, cr.id DESC
+                     LIMIT 1) AS my_status
               FROM coaching_sessions cs
               JOIN tenants t ON t.id = cs.tenant_id
               JOIN player_tenants pt ON pt.tenant_id = cs.tenant_id
                    AND pt.player_id = $1 AND pt.status = 'active'
               LEFT JOIN coaching_registrations cr2 ON cr2.session_id = cs.id
-              LEFT JOIN coaching_registrations my ON my.session_id = cs.id AND my.player_id = $1
              WHERE cs.session_kind = 'training'
                AND cs.session_date > NOW() - INTERVAL '7 days'
-             GROUP BY cs.id, t.name, my.status
+             GROUP BY cs.id, t.name
              ORDER BY cs.session_date ASC
              LIMIT 60`, [req.user.playerId]);
         res.json({ trainings: r.rows });
@@ -40697,6 +40962,24 @@ app.post('/api/t/:tenant_short_id/admin/grant-coach', authenticateToken, require
 
 // Venue picker for trainings: every venue (single-confirmed model). Mirrors the
 // normal game venue dropdown source. requireTenantAdmin gate keeps it scoped.
+// FIX-473: generic tenant venue list (ext leagues + any admin venue picker).
+// Same body as training-venues; named for general use. Returns pin/postcode so
+// the picker can show enough to disambiguate venues with similar names.
+app.get('/api/t/:tenant_short_id/admin/venues-list', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, name, address, postcode FROM venues
+              WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY name ASC`).catch(async (err) => {
+            if (err.code === '42703') return await pool.query('SELECT id, name, address FROM venues ORDER BY name ASC');
+            throw err;
+        });
+        res.json({ venues: r.rows });
+    } catch (e) {
+        console.error('FIX-473 venues-list:', e.message);
+        res.status(500).json({ error: 'Could not load venues' });
+    }
+});
+
 app.get('/api/t/:tenant_short_id/admin/training-venues', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
         const r = await pool.query(
@@ -40779,6 +41062,7 @@ app.patch('/api/training/:id/details', authenticateToken, async (req, res) => {
         const s = await _trainingLoad(req.params.id);
         if (!s) return res.status(404).json({ error: 'Training not found' });
         if (!await _trainingCanManage(req, s)) return res.status(403).json({ error: 'Not allowed to edit this session' });
+        if (s.status === 'completed' || s.status === 'cancelled') return res.status(400).json({ error: 'This session is closed — coach and venue can no longer be changed' });
         const b = req.body || {};
         const sets = [], vals = []; let i = 1;
         if (Object.prototype.hasOwnProperty.call(b, 'coach_player_id')) {
@@ -40916,11 +41200,18 @@ app.post('/api/training/:id/register', authenticateToken, registrationLimiter, a
             client.release(); return res.status(400).json({ error: 'This session is not taking signups' });
         }
         const existing = await pool.query(
-            `SELECT id, status FROM coaching_registrations WHERE session_id = $1 AND player_id = $2`,
+            `SELECT id, status, amount_paid_real, amount_paid_free FROM coaching_registrations WHERE session_id = $1 AND player_id = $2`,
             [s.id, req.user.playerId]);
         const prior = existing.rows[0] || null;
         if (prior && (prior.status === 'registered' || prior.status === 'pending')) {
             client.release(); return res.status(409).json({ error: 'Already signed up' });
+        }
+        // FIX-472 (R2): a coach's DENIAL must stick. Without this, a denied player
+        // re-requests indefinitely. They can still be let in — the coach approves
+        // a fresh request only if the coach themselves clears the denial. We block
+        // the self-service re-request loop.
+        if (prior && prior.status === 'denied') {
+            client.release(); return res.status(403).json({ error: 'Your request was declined by the coach. Please speak to them directly.' });
         }
         const late = s.status === 'finalised';
         const fee = parseFloat(s.fee) || 0;
@@ -40931,7 +41222,15 @@ app.post('/api/training/:id/register', authenticateToken, registrationLimiter, a
             if (fee > 0) paid = await applyGameFee(client, req.user.playerId, fee, `Training: ${s.title}`, s.tenant_id, null);
             newStatus = 'registered';
         }
-        if (prior) {
+        // FIX-472 (R1): a prior dropped_out row may still hold KEPT-FEE revenue
+        // (post-cutoff drop leaves amount_paid_* > 0 — FIX-464 only zeroes on
+        // refund). Overwriting it would erase that revenue from finance and merge
+        // two real charges into one. So: if the prior row carries kept money,
+        // leave it intact and INSERT a fresh row. Otherwise reuse the prior row.
+        const priorKeptReal = prior ? (parseFloat(prior.amount_paid_real) || 0) : 0;
+        const priorKeptFree = prior ? (parseFloat(prior.amount_paid_free) || 0) : 0;
+        const priorHasKeptFee = prior && prior.status === 'dropped_out' && (priorKeptReal > 0 || priorKeptFree > 0);
+        if (prior && !priorHasKeptFee) {
             await client.query(
                 `UPDATE coaching_registrations
                     SET status = $1, amount_paid_real = $2, amount_paid_free = $3,
@@ -40939,6 +41238,7 @@ app.post('/api/training/:id/register', authenticateToken, registrationLimiter, a
                   WHERE id = $5`,
                 [newStatus, paid.realCharged, paid.freeCharged, fee > 0 && !late ? 'wallet' : null, prior.id]);
         } else {
+            // priorHasKeptFee → the dropped_out row stays as-is (finance keeps it); new row inserted.
             await client.query(
                 `INSERT INTO coaching_registrations
                    (session_id, player_id, status, amount_paid_real, amount_paid_free, paid_method)
@@ -46538,6 +46838,28 @@ async function _wonderfulPaginatedListSearch(opts) {
     return { match: r2.match, viaStatusFilter, pagesScanned: totalPages };
 }
 
+// FIX-477: the wonderful_payments.status CHECK constraint only accepts a known
+// set. Wonderful's API returns raw statuses (created/pending/paid/accepted/
+// cancelled/expired/failed/...) and the reconciler mirror-UPDATEs wrote them
+// verbatim — any value outside the constraint threw 23514, the UPDATE failed
+// ([FIX-442] silent fail spam), and the row stayed pending and got retried
+// every sweep forever. Map to a constraint-safe status so the mirror always
+// succeeds. Paid/credited are handled by the credit path, not here.
+function _safeWonderfulStatus(raw) {
+    const s = String(raw || '').toLowerCase();
+    // Values known to satisfy the constraint (init_pending rows prove 'pending';
+    // 'created'/'paid'/'cancelled'/'failed' are the lifecycle set we rely on).
+    const ALLOWED = new Set(['init_pending', 'init_failed', 'created', 'pending', 'paid', 'cancelled', 'failed']);
+    if (ALLOWED.has(s)) return s;
+    // Common Wonderful synonyms → safe equivalents.
+    if (s === 'accepted' || s === 'complete' || s === 'completed' || s === 'success' || s === 'succeeded') return 'paid';
+    if (s === 'expired' || s === 'declined' || s === 'rejected' || s === 'error') return 'failed';
+    if (s === 'abandoned' || s === 'voided' || s === 'reversed') return 'cancelled';
+    // Unknown → leave it as 'pending' so the row is still tracked and retried,
+    // never a constraint crash.
+    return 'pending';
+}
+
 async function _wonderfulVerifyStatus(pmt) {
     if (!WONDERFUL_API_KEY) return { verified: null, resolvedWpId: pmt.wonderful_payment_id || null };
 
@@ -47374,14 +47696,20 @@ app.post('/api/webhooks/wonderful', webhookLimiter, async (req, res) => {
             if (_wfStatus === 'paid' || _wfStatus === 'accepted') {
                 try {
                     const cand = await pool.query(
-                        `SELECT wp.merchant_reference, wp.status, wp.amount_pence, wp.created_at, p.alias
+                        `SELECT wp.merchant_reference, wp.status, wp.amount_pence, wp.created_at,
+                                p.id AS player_id, p.alias, p.full_name, p.phone
                          FROM wonderful_payments wp LEFT JOIN players p ON p.id = wp.player_id
                          WHERE wp.status NOT IN ('credited','credited_manually')
                            AND wp.created_at > NOW() - INTERVAL '24 hours'
                          ORDER BY wp.created_at DESC LIMIT 10`
                     );
+                    // FIX-453: candidate list now carries enough to ID the account —
+                    // name, alias, player id, mobile — so even the no-row-matched
+                    // alert is actionable when many players share a first name.
                     const rows = cand.rows.map(r =>
-                        `<li>${r.merchant_reference} · ${r.status} · £${(r.amount_pence / 100).toFixed(2)} · ${r.alias || '?'} · ${new Date(r.created_at).toISOString()}</li>`
+                        `<li>${r.merchant_reference} · ${r.status} · £${(r.amount_pence / 100).toFixed(2)} · `
+                        + `${r.full_name || r.alias || '?'} (alias ${r.alias || '—'}, id ${r.player_id || '—'}, mob ${r.phone || '—'}) · `
+                        + `${new Date(r.created_at).toISOString()}</li>`
                     ).join('');
                     _alertUnresolvedPaidWebhook(wpId,
                         `<p>No DB row matched after all lookup paths (id, order_id, ref, list-search, reverse lookup).</p>` +
@@ -47437,7 +47765,7 @@ app.post('/api/webhooks/wonderful', webhookLimiter, async (req, res) => {
             // FIX-452: if the webhook claims PAID and we can't verify it at all,
             // that's the John-class blind spot — alert so it's never silent.
             if (_wfClaimsPaid) {
-                _alertUnresolvedPaidWebhook(wpId,
+                await _alertUnresolvedPaidWebhookWithPlayer(wpId, pmt,
                     `<p>Row matched (ref <strong>${pmt.merchant_reference}</strong>, db status ${pmt.status}, £${(pmt.amount_pence / 100).toFixed(2)}) but Wonderful verification returned nothing. Reconciler keeps retrying.</p>`);
             }
             return console.error('[WF webhook] could not verify (reconciler will retry) — ref:', pmt.merchant_reference);
@@ -47450,7 +47778,7 @@ app.post('/api/webhooks/wonderful', webhookLimiter, async (req, res) => {
             // Do NOT downgrade the row (that's what stranded it last time);
             // leave it for the reconciler and alert superadmin.
             if (_wfClaimsPaid) {
-                _alertUnresolvedPaidWebhook(wpId,
+                await _alertUnresolvedPaidWebhookWithPlayer(wpId, pmt,
                     `<p>Webhook says <strong>paid</strong> but verification returned <strong>${verified}</strong> for ref <strong>${pmt.merchant_reference}</strong> (£${(pmt.amount_pence / 100).toFixed(2)}, db status ${pmt.status}). Status NOT downgraded. Check the Wonderful dashboard — likely an abort-then-retry where the link id is blind to the paid retry.</p>`);
                 return console.warn('[WF webhook] paid claim unverified (verify said', verified, ') — status untouched, alerted — ref:', pmt.merchant_reference);
             }
@@ -47458,7 +47786,7 @@ app.post('/api/webhooks/wonderful', webhookLimiter, async (req, res) => {
             // a 'credited_manually' status with a transient Wonderful state.
             await pool.query(
                 `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
-                [verified, resolvedWpId, pmt.id]
+                [_safeWonderfulStatus(verified), resolvedWpId, pmt.id]
             ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L46178):', _ce && _ce.message); });
             return;
         }
@@ -47516,7 +47844,7 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
                 // Mirror Wonderful's state in our DB without crediting. Guard manual credit.
                 await pool.query(
                     `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
-                    [verified, resolvedWpId, p.id]
+                    [_safeWonderfulStatus(verified), resolvedWpId, p.id]
                 ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L46236):', _ce && _ce.message); });
             }
         }
@@ -48844,17 +49172,14 @@ app.post('/api/comms/claim/:token', authenticateToken, async (req, res) => {
                 await client.query('ROLLBACK');
                 return res.status(500).json({ error: 'Campaign misconfigured (invalid gift amount).' });
             }
-            // Grant via the same pattern as /api/admin/players/:id/free-credits — adds
-            // to balance AND records a free_credit transaction. Wrapped in transaction
-            // here unlike the admin endpoint, so we get atomicity.
-            // Comms claim gifts free credits — goes to the free_credit_balance bucket.
-            await client.query(`
-                INSERT INTO credits (player_id, balance, free_credit_balance)
-                VALUES ($1, 0, $2)
-                ON CONFLICT (player_id) DO UPDATE
-                   SET free_credit_balance = credits.free_credit_balance + $2,
-                       last_updated        = CURRENT_TIMESTAMP
-            `, [req.user.playerId, amt]);
+            // FIX-480: comms-claim gifts must be TENANT-LOCKED like every other grant
+            // (no spend-anywhere global bucket). Comms campaigns carry no tenant_id, and
+            // they're run from the superadmin/main universe, so route to the ROOT tenant
+            // (TF_COVENTRY) bucket — the same tenant all main TF games are pinned to. This
+            // makes the gift spendable only on main TF games, never another tenant's.
+            // adjustTenantFreeCredits writes player_tenant_free_credits (root) atomically
+            // on the same client/transaction.
+            await adjustTenantFreeCredits(req.user.playerId, TF_COVENTRY_TENANT_ID, amt, client);
             await recordCreditTransaction(client, req.user.playerId, amt, 'free_credit',
                 `Comms campaign #${r.campaign_id} — claim`);
             await client.query(
@@ -56280,7 +56605,9 @@ app.post('/api/games/:gameUrl/organiser-review', authenticateToken, async (req, 
         }
 
         // Reviewer must have a CONFIRMED registration in the game.
-        const partRes = await client.query(
+        // FIX-481: admins/superadmins can always review the organiser.
+        const _orgRevIsAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+        const partRes = _orgRevIsAdmin ? { rows: [{ ok: 1 }] } : await client.query(
             `SELECT 1 FROM registrations
               WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'
               LIMIT 1`,
@@ -59923,6 +60250,185 @@ app.get('/api/games/:id/my-discipline-preview', authenticateToken, async (req, r
 });
 
 
+// FIX-478: wallet breakdown — real balance + free credits split by where each
+// free bucket can be spent. Free credit is bucketed: a global "Original" bucket
+// (free_credit_balance, spendable on non-tenant/root games) plus per-tenant
+// buckets (player_tenant_free_credits, spendable only at that tenant's games).
+// The dashboard summed them into one "free" figure which hid WHY a player could
+// see free credit but not spend it on a given game. This exposes the split so
+// the wallet can show "free credits -> expand -> which tenant each applies to".
+app.get('/api/players/me/wallet', authenticateToken, async (req, res) => {
+    try {
+        const pid = req.user.playerId;
+        const base = await pool.query(
+            'SELECT COALESCE(balance,0) AS balance, COALESCE(free_credit_balance,0) AS global_free FROM credits WHERE player_id = $1',
+            [pid]);
+        const realBalance = parseFloat(base.rows[0]?.balance || 0);
+        const globalFree  = parseFloat(base.rows[0]?.global_free || 0);
+        // Per-tenant free buckets with the tenant name, positive balances only.
+        const buckets = await pool.query(
+            `SELECT ptfc.tenant_id, ptfc.balance, t.name AS tenant_name
+               FROM player_tenant_free_credits ptfc
+               LEFT JOIN tenants t ON t.id = ptfc.tenant_id
+              WHERE ptfc.player_id = $1 AND COALESCE(ptfc.balance,0) > 0
+              ORDER BY ptfc.balance DESC`, [pid]);
+        const tenantBuckets = buckets.rows.map(r => ({
+            tenant_id: r.tenant_id,
+            tenant_name: r.tenant_name || 'Unknown group',
+            amount: parseFloat(r.balance || 0)
+        }));
+        const tenantFreeTotal = tenantBuckets.reduce((a, b) => a + b.amount, 0);
+        const freeTotal = globalFree + tenantFreeTotal;
+        res.json({
+            balance: realBalance,                 // real, spendable anywhere
+            free_total: freeTotal,                // all free credit (matches dashboard figure)
+            free_breakdown: {
+                global: globalFree,               // "Original" — spendable on main/root games
+                tenants: tenantBuckets            // [{tenant_name, amount, tenant_id}]
+            },
+            total_available: realBalance + freeTotal
+        });
+    } catch (e) {
+        console.error('FIX-478 wallet:', e.message);
+        res.status(500).json({ error: 'Could not load wallet' });
+    }
+});
+
+// ── FIX-484: ONE-TIME migration runner (REMOVE AFTER USE) ───────────────────
+// Browser-triggered DB migrations for when the psql shell is unavailable. Gated
+// by a secret token in the query string. Each step is idempotent (IF NOT EXISTS /
+// ON CONFLICT) so re-running is safe. Visit:
+//   /api/admin/run-migration/<step>?token=TOKEN
+// where <step> is: schema-drift | faqs | free-credit-check | free-credit-apply |
+//                  training-gates | wonderful-constraint-read | all-safe
+// Remove this whole block once migrations are done.
+const _MIGRATION_TOKEN = process.env.MIGRATION_TOKEN || 'a8a0a46fd17eb4ea472301f9466ee4ef';
+async function _migRun(client, label, sql, params) {
+    try {
+        const r = await client.query(sql, params || []);
+        return { step: label, ok: true, rows: r.rows && r.rows.length ? r.rows : undefined, rowCount: r.rowCount };
+    } catch (e) {
+        return { step: label, ok: false, error: e.message, code: e.code };
+    }
+}
+app.get('/api/admin/run-migration/:step', async (req, res) => {
+    if (req.query.token !== _MIGRATION_TOKEN) {
+        return res.status(403).json({ error: 'Forbidden — bad or missing token' });
+    }
+    const step = req.params.step;
+    const out = [];
+    const client = await pool.connect();
+    try {
+        if (step === 'schema-drift' || step === 'all-safe') {
+            const cols = [
+                ["recalibration_stability", "NUMERIC NOT NULL DEFAULT 1.0"],
+                ["voter_accuracy_score", "NUMERIC NOT NULL DEFAULT 1.0"],
+                ["ovr_suspicion", "NUMERIC NOT NULL DEFAULT 0.0"],
+                ["total_wins", "INTEGER NOT NULL DEFAULT 0"],
+                ["total_draws", "INTEGER NOT NULL DEFAULT 0"],
+                ["total_losses", "INTEGER NOT NULL DEFAULT 0"],
+                ["overall_rating", "NUMERIC"],
+                ["defending_rating", "NUMERIC"],
+                ["strength_rating", "NUMERIC"],
+                ["fitness_rating", "NUMERIC"],
+                ["pace_rating", "NUMERIC"],
+                ["decisions_rating", "NUMERIC"],
+                ["assisting_rating", "NUMERIC"],
+                ["shooting_rating", "NUMERIC"],
+                ["goalkeeper_rating", "NUMERIC"],
+                ["total_appearances", "INTEGER NOT NULL DEFAULT 0"]
+            ];
+            for (const [name, def] of cols) {
+                out.push(await _migRun(client, "players." + name,
+                    `ALTER TABLE players ADD COLUMN IF NOT EXISTS ${name} ${def}`));
+            }
+            // verify
+            out.push(await _migRun(client, "VERIFY schema-drift",
+                `SELECT column_name FROM information_schema.columns
+                  WHERE table_name='players' AND column_name = ANY($1) ORDER BY column_name`,
+                [cols.map(c => c[0])]));
+        }
+
+        if (step === 'training-gates' || step === 'all-safe') {
+            out.push(await _migRun(client, "coaching_sessions.max_players DROP NOT NULL",
+                `ALTER TABLE coaching_sessions ALTER COLUMN max_players DROP NOT NULL`));
+            out.push(await _migRun(client, "coaching_sessions coach columns",
+                `ALTER TABLE coaching_sessions
+                   ADD COLUMN IF NOT EXISTS photo_url TEXT,
+                   ADD COLUMN IF NOT EXISTS coach_certifications TEXT,
+                   ADD COLUMN IF NOT EXISTS coaching_appearances INTEGER NOT NULL DEFAULT 0`));
+            out.push(await _migRun(client, "venues.is_active",
+                `ALTER TABLE venues ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE`));
+            out.push(await _migRun(client, "CHECK badges 'Coach' row",
+                `SELECT id, name FROM badges WHERE name = 'Coach'`));
+            out.push(await _migRun(client, "CHECK players region column",
+                `SELECT column_name FROM information_schema.columns
+                  WHERE table_name='players' AND column_name LIKE '%region%'`));
+        }
+
+        if (step === 'faqs') {
+            // 11 FAQs — ON CONFLICT-free; guard by checking question text to avoid dupes.
+            const faqs = [{"category": "Sign-ups & sessions", "question": "What happens if I sign up but not enough people join — does the session still go ahead?", "answer": "If a session doesn't get enough players to go ahead, you'll be told in advance so you know not to turn up — and you'll be fully refunded. It's rare for a session not to run, but if it happens you're never left out of pocket or turning up to an empty pitch.", "keywords": ["cancelled", "not enough players", "refund", "minimum", "session off", "advance notice", "go ahead"], "display_order": 10}, {"category": "Sign-ups & sessions", "question": "Will I get a refund if a session is cancelled?", "answer": "Yes. If a session is called off because it didn't fill, you're automatically refunded — you don't need to chase it.", "keywords": ["refund", "cancelled", "money back", "called off"], "display_order": 11}, {"category": "Sign-ups & sessions", "question": "How do I know if a session is filling up or full?", "answer": "Each game page shows how many spots are left (e.g. \"OPEN — 15 SPOTS LEFT\") and the current player count (e.g. 1/16). You can watch it fill in real time on the game page before you commit.", "keywords": ["full", "spots left", "capacity", "how many players", "filling up", "places"], "display_order": 12}, {"category": "Star ratings & game level", "question": "What does the star rating on a game mean?", "answer": "The star rating tells you roughly how strong a game is going to be. It's not fixed — it changes depending on who has signed up and how good they are. A 2–3 star game is a chilled, relaxed standard; higher stars mean a stronger, more competitive line-up.", "keywords": ["star rating", "stars", "level", "difficulty", "how good", "standard", "2 star", "3 star"], "display_order": 20}, {"category": "Star ratings & game level", "question": "How is my own star level worked out?", "answer": "When you sign up, the system works out a starting level from the questions you answer about yourself. From then on it tracks your results — your wins and how you perform — to fine-tune your rating over time. So it gets more accurate the more you play.", "keywords": ["my rating", "my level", "how calculated", "signup questions", "wins", "fine tune", "overall rating"], "display_order": 21}, {"category": "Star ratings & game level", "question": "How do I know I'm at the right level for a game before I turn up?", "answer": "The game's star rating is your guide — it reflects the standard of who's signed up, so you can see what you're walking into before you commit. A 2–3 star game is chilled and welcoming, so if you're new or unsure, those are a safe bet. You won't accidentally end up in a game far above your level without it being clear from the stars.", "keywords": ["right level", "am i good enough", "out of my depth", "ballers", "expected level", "before i turn up", "new player"], "display_order": 22}, {"category": "Star ratings & game level", "question": "Why does the star level of a session change?", "answer": "Because it's based on who's actually signed up. As stronger or weaker players join, the game's overall standard shifts, so the star rating moves with it. It's a live reflection of the current line-up, not a fixed label on the session.", "keywords": ["changes", "why different", "varies", "line up", "who signed up", "live rating"], "display_order": 23}, {"category": "Star ratings & game level", "question": "I'm not confident yet — which game should I start with?", "answer": "If you're not confident, start with a 1-star game. They're the most relaxed, welcoming standard, so it's the perfect place to get a feel for how it all works without any pressure. Once you've played a few and found your feet, you can move up to higher-star games whenever you fancy a tougher test.", "keywords": ["not confident", "beginner", "new", "nervous", "first game", "1 star", "one star", "start", "easiest", "where to begin", "unsure"], "display_order": 24}, {"category": "Game history & stats", "question": "Can I see the star level of previous sessions?", "answer": "Yes. Every past game keeps its star rating, so you can scroll back through a series and see how strong each previous session was. It's a good way to gauge the typical standard of a regular session before you sign up.", "keywords": ["previous sessions", "past games", "history", "previous star ratings", "series", "scroll back", "typical level"], "display_order": 30}, {"category": "Game history & stats", "question": "Can I see who played in previous games and their stats?", "answer": "Yes. On a past game you can see who played, along with their stats. It's all kept on the game page so you can look back at any session in a series.", "keywords": ["who played", "stats", "previous players", "past games", "player list", "history", "appearances"], "display_order": 31}, {"category": "Game history & stats", "question": "How do I look back through previous games in a series?", "answer": "Open any game in the series and use the date arrows at the top to step back and forward through the other sessions (e.g. ◀ 10 Jun … 1 Jul ▶). Each one shows that session's venue, format, star rating, and who played.", "keywords": ["series", "previous", "navigate", "date arrows", "scroll", "past sessions", "browse games"], "display_order": 32}];
+            let inserted = 0, skipped = 0;
+            for (const f of faqs) {
+                const exists = await client.query(
+                    'SELECT 1 FROM faq_entries WHERE question = $1 LIMIT 1', [f.question]);
+                if (exists.rows.length) { skipped++; continue; }
+                await client.query(
+                    `INSERT INTO faq_entries (category, question, answer, keywords, display_order)
+                     VALUES ($1,$2,$3,$4,$5)`,
+                    [f.category, f.question, f.answer, f.keywords, f.display_order]);
+                inserted++;
+            }
+            out.push({ step: 'faqs', ok: true, inserted, skipped });
+        }
+
+        if (step === 'free-credit-check') {
+            out.push(await _migRun(client, "global free credit summary",
+                `SELECT COUNT(*)::int AS players_with_global_free,
+                        COALESCE(SUM(free_credit_balance),0) AS total_global_free
+                   FROM credits WHERE COALESCE(free_credit_balance,0) > 0`));
+        }
+
+        if (step === 'free-credit-apply') {
+            await client.query('BEGIN');
+            const moved = await _migRun(client, "move global free -> root tenant bucket",
+                `INSERT INTO player_tenant_free_credits (player_id, tenant_id, balance)
+                 SELECT player_id, '11111111-1111-1111-1111-111111111111', free_credit_balance
+                   FROM credits WHERE COALESCE(free_credit_balance,0) > 0
+                 ON CONFLICT (player_id, tenant_id)
+                   DO UPDATE SET balance = player_tenant_free_credits.balance + EXCLUDED.balance`);
+            out.push(moved);
+            if (moved.ok) {
+                out.push(await _migRun(client, "zero global free",
+                    `UPDATE credits SET free_credit_balance = 0 WHERE COALESCE(free_credit_balance,0) > 0`));
+                out.push(await _migRun(client, "VERIFY remaining global",
+                    `SELECT COALESCE(SUM(free_credit_balance),0) AS remaining_global FROM credits`));
+                await client.query('COMMIT');
+            } else {
+                await client.query('ROLLBACK');
+                out.push({ step: 'free-credit-apply', ok: false, error: 'rolled back — see move error above' });
+            }
+        }
+
+        if (step === 'wonderful-constraint-read') {
+            out.push(await _migRun(client, "current wonderful_payments_status_check def",
+                `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+                  WHERE conname = 'wonderful_payments_status_check'`));
+        }
+
+        if (!out.length) {
+            return res.status(400).json({ error: 'Unknown step', valid: ['schema-drift','training-gates','faqs','free-credit-check','free-credit-apply','wonderful-constraint-read','all-safe'] });
+        }
+        res.json({ step, results: out });
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        res.status(500).json({ step, error: e.message, partial: out });
+    } finally {
+        client.release();
+    }
+});
+
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 
@@ -62125,11 +62631,24 @@ app.listen(PORT, () => {
                             console.log(`  ✓ credited £${result.pounds.toFixed(2)} — ref ${pmt.merchant_reference}${pmt.game_id ? ` · auto-register: ${result.autoRegister.status || 'topup-only'}` : ''}`);
                         }
                     } else {
-                        // Not paid — mirror Wonderful's state in our DB without crediting. Guard manual credit.
+                        // FIX-454 (alert parity with the webhook path): if our DB already
+                        // recorded this row as 'paid' (a prior webhook said so) but verify
+                        // now returns a non-creditable state, this is the SAME blind spot
+                        // the webhook alerts on — a paid-but-unsettleable payment. The
+                        // webhook only fires once; if the player never re-polls, the
+                        // reconciler is the ONLY place this recurs, so alert here too.
+                        // Identity-aware so the email names exactly who to chase.
+                        if (pmt.status === 'paid' && verified && verified !== 'paid' && verified !== 'accepted') {
+                            const _alertId = pmt.wonderful_payment_id || pmt.merchant_reference || ('row-' + pmt.id);
+                            await _alertUnresolvedPaidWebhookWithPlayer(_alertId, pmt,
+                                `<p>Reconciler:${scope.label} — DB had this row as <strong>paid</strong> but Wonderful verify now returns <strong>${verified}</strong> for ref <strong>${pmt.merchant_reference}</strong> (£${(pmt.amount_pence / 100).toFixed(2)}). Not credited, not downgraded. Likely abort-then-retry or an unsettled/reversed payment — check the Wonderful dashboard.</p>`
+                            ).catch((_ae) => console.error('[FIX-454] reconciler alert failed:', _ae && _ae.message));
+                        }
+                        // Mirror Wonderful's state in our DB without crediting. Guard manual credit.
                         if (pmt.status !== verified) {
                             await pool.query(
                                 `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
-                                [verified, resolvedWpId, pmt.id]
+                                [_safeWonderfulStatus(verified), resolvedWpId, pmt.id]
                             ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L60672):', _ce && _ce.message); });
                         }
                         stillPending++;
