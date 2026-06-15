@@ -21735,8 +21735,11 @@ app.get('/api/admin/games/:gameId/revenue-breakdown', authenticateToken, require
                 total_paid:       (parseFloat(r.amount_paid_real) || 0) + (parseFloat(r.amount_paid_free) || 0)
             }));
         } catch (e) {
-            // Table doesn't exist yet — P2.3 hasn't shipped. Treat as empty list.
-            if (e.code !== '42P01') throw e;
+            // Table or a column doesn't exist yet — P2.3 schema drift. Treat as empty
+            // list rather than 500-ing the whole finance modal. FIX-486: also swallow
+            // 42703 (undefined_column) — the dropped_no_refund table on some envs lacks
+            // dropped_at/reason; the breakdown still works without that section.
+            if (e.code !== '42P01' && e.code !== '42703') throw e;
         }
 
         // Aggregate totals — match what the dashboard tile shows.
@@ -21867,7 +21870,8 @@ app.get('/api/admin/games/:gameId/finance', authenticateToken, requireSuperAdmin
             droppedReal  = parseFloat(dnrAgg.rows[0].dropped_real) || 0;
             droppedFree  = parseFloat(dnrAgg.rows[0].dropped_free) || 0;
         } catch (e) {
-            if (e.code !== '42P01') throw e;
+            // FIX-486: swallow missing-table (42P01) AND missing-column (42703).
+            if (e.code !== '42P01' && e.code !== '42703') throw e;
             // Table missing — pre-migration. Treat as zero.
         }
 
@@ -60432,6 +60436,19 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
             }
         }
 
+        if (step === 'dropped-no-refund-fix' || step === 'all-safe') {
+            // FIX-486b: the dropped_no_refund table (created out-of-band as P2.3) is
+            // missing the dropped_at + reason columns the revenue-breakdown SELECT reads,
+            // which 500'd the finance modal. Add them IF the table exists. If the table
+            // doesn't exist at all, these are no-ops via the try/catch in _migRun.
+            out.push(await _migRun(client, "dropped_no_refund.dropped_at",
+                `ALTER TABLE dropped_no_refund ADD COLUMN IF NOT EXISTS dropped_at TIMESTAMPTZ DEFAULT NOW()`));
+            out.push(await _migRun(client, "dropped_no_refund.reason",
+                `ALTER TABLE dropped_no_refund ADD COLUMN IF NOT EXISTS reason TEXT`));
+            out.push(await _migRun(client, "dropped_no_refund.recorded_by",
+                `ALTER TABLE dropped_no_refund ADD COLUMN IF NOT EXISTS recorded_by UUID`));
+        }
+
         if (step === 'wonderful-constraint-drop') {
             // FIX-485d: the rigid status CHECK has been a recurring crash source — any
             // Wonderful status string not in the enumerated set throws 23514 and (pre
@@ -60501,7 +60518,7 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
         }
 
         if (!out.length) {
-            return res.status(400).json({ error: 'Unknown step', valid: ['schema-drift','training-gates','faqs','free-credit-check','free-credit-apply','wonderful-constraint-read','wonderful-constraint-widen','wonderful-constraint-drop','audit-logs-fix','all-safe'] });
+            return res.status(400).json({ error: 'Unknown step', valid: ['schema-drift','training-gates','faqs','free-credit-check','free-credit-apply','wonderful-constraint-read','wonderful-constraint-widen','wonderful-constraint-drop','audit-logs-fix','dropped-no-refund-fix','all-safe'] });
         }
         res.json({ step, results: out });
     } catch (e) {
