@@ -39007,6 +39007,27 @@ process.on('unhandledRejection', (reason) => {
     console.error('Unhandled Promise Rejection:', reason);
 });
 process.on('uncaughtException', (err) => {
+    // FIX-485: do NOT exit on benign DB connection drops. An idle pooled connection
+    // closed by statement_timeout / idle_in_transaction_session_timeout (FIX-483),
+    // or by a transient network blip, surfaces here as an uncaught error on a
+    // BACKGROUND connection (reconciler/scheduler) with no try/catch. Killing the
+    // whole process for that turns a dropped-connection into a crash-loop (every
+    // restart the reconciler hits the same row and exits again). The pg pool simply
+    // re-establishes the connection on the next query, so these are recoverable and
+    // must be logged-and-ignored, NOT fatal. Genuine programmer errors still exit.
+    const msg = (err && err.message) ? String(err.message) : '';
+    const benignDb = (
+        msg.includes('terminating connection due to idle-in-transaction timeout') ||
+        msg.includes('canceling statement due to statement timeout') ||
+        msg.includes('Connection terminated unexpectedly') ||
+        msg.includes('Connection terminated due to connection timeout') ||
+        msg.includes('connection terminated') ||
+        (err && (err.code === '57014' || err.code === '25P03' || err.code === '08006' || err.code === '08003'))
+    );
+    if (benignDb) {
+        console.error('[FIX-485] recoverable DB connection error (ignored, pool will reconnect):', msg);
+        return; // keep the process alive
+    }
     console.error('Uncaught Exception — exiting:', err.message);
     process.exit(1);
 });
@@ -60411,6 +60432,40 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
             }
         }
 
+        if (step === 'wonderful-constraint-widen') {
+            // FIX-485b: widen the status CHECK to include every value _safeWonderfulStatus
+            // and the lifecycle code can write — so the reconciler UPDATE stops violating
+            // it (which was leaving a transaction stuck → idle timeout → crash loop).
+            await client.query('BEGIN');
+            const drop = await _migRun(client, 'drop old constraint',
+                `ALTER TABLE wonderful_payments DROP CONSTRAINT IF EXISTS wonderful_payments_status_check`);
+            out.push(drop);
+            const add = await _migRun(client, 'add widened constraint',
+                `ALTER TABLE wonderful_payments ADD CONSTRAINT wonderful_payments_status_check
+                 CHECK (status IN (
+                    -- existing allowed set (from current constraint)
+                    'pending','credited','completed','failed','refunded','cancelled',
+                    'init_pending','init_failed','processing','submitted','paid',
+                    'accepted','expired',
+                    -- safe lifecycle set used by _safeWonderfulStatus (new build)
+                    'created','credited_manually',
+                    -- raw Wonderful statuses the OLD (web57) build may write directly
+                    -- before FIX-477 maps them — include so the UPDATE never violates
+                    'declined','rejected','error','abandoned','voided','reversed',
+                    'success','succeeded','complete'
+                 ))`);
+            out.push(add);
+            if (drop.ok && add.ok) {
+                await client.query('COMMIT');
+                out.push(await _migRun(client, 'VERIFY new constraint',
+                    `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+                      WHERE conname = 'wonderful_payments_status_check'`));
+            } else {
+                await client.query('ROLLBACK');
+                out.push({ step: 'wonderful-constraint-widen', ok: false, error: 'rolled back — see errors above' });
+            }
+        }
+
         if (step === 'wonderful-constraint-read') {
             out.push(await _migRun(client, "current wonderful_payments_status_check def",
                 `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
@@ -60418,7 +60473,7 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
         }
 
         if (!out.length) {
-            return res.status(400).json({ error: 'Unknown step', valid: ['schema-drift','training-gates','faqs','free-credit-check','free-credit-apply','wonderful-constraint-read','all-safe'] });
+            return res.status(400).json({ error: 'Unknown step', valid: ['schema-drift','training-gates','faqs','free-credit-check','free-credit-apply','wonderful-constraint-read','wonderful-constraint-widen','all-safe'] });
         }
         res.json({ step, results: out });
     } catch (e) {
