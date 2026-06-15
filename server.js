@@ -24221,6 +24221,419 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
     }
 });
 
+// ════════════════════════════════════════════════════════════════════════
+// FIX-487 — EDIT a COMPLETED game (ADMIN / SUPERADMIN ONLY)
+// Surgically corrects a finished game's result, discipline, beef and team
+// assignments WITHOUT re-running the full completion cascade — so finance,
+// guest cashback, refer-a-friend, payout rows and awards/voting windows are
+// never disturbed (none of them depend on who won).
+//
+// CORE TECHNIQUE — per-player DELTA. For each stat we compute the credit a
+// player HAS now vs the credit they SHOULD have after the edit, and apply
+// only the difference. This makes a result-change and team-moves commutative:
+// no ordering hazard, no double-count, and re-running with the same body is
+// a no-op.
+//
+// v1 SCOPE: team-based games only ('normal', 'draft_memory'). Tournament and
+// external games are rejected (different win semantics — use their own flow).
+//
+// KNOWN LIMIT: completion 'swaps' are not persisted, so win credit here is
+// assumed to follow current team membership. If a game was completed WITH a
+// swap, fix the affected player by MOVING them to the correct team (teamMoves)
+// — that makes membership and credit consistent again.
+//
+// BODY (every field optional — only the dimensions you send are touched):
+//   winningTeam       : 'red' | 'blue' | 'draw'           new result
+//   teamMoves         : [{ playerId, toTeam:'Red'|'Blue' }]   move player(s) between teams
+//   disciplineRecords : [{ playerId, offense, points, warning }]  FULL replacement for this game
+//   beefEntries       : [{ player1, player2, level }]      level>=1 sets, 0 removes (bidirectional)
+// ════════════════════════════════════════════════════════════════════════
+app.put('/api/admin/games/:gameId/edit-completed', authenticateToken, requireAdmin, async (req, res) => {
+    const client  = await pool.connect();
+    const actorId = req.user.playerId;
+    try {
+        const { gameId } = req.params;
+        const { winningTeam, teamMoves, disciplineRecords, beefEntries } = req.body || {};
+
+        // Reject an empty edit early.
+        const touchesResult     = winningTeam !== undefined;
+        const touchesMoves      = Array.isArray(teamMoves) && teamMoves.length > 0;
+        const touchesDiscipline = Array.isArray(disciplineRecords);
+        const touchesBeef       = Array.isArray(beefEntries) && beefEntries.length > 0;
+        if (!touchesResult && !touchesMoves && !touchesDiscipline && !touchesBeef) {
+            return res.status(400).json({ error: 'Nothing to edit — send winningTeam, teamMoves, disciplineRecords and/or beefEntries' });
+        }
+
+        // ---- Load + gate the game ----
+        const gq = await pool.query(
+            `SELECT id, team_selection_type, game_status, star_rating, series_id, tenant_id, winning_team
+               FROM games WHERE id = $1`, [gameId]);
+        if (!gq.rows.length) return res.status(404).json({ error: 'Game not found' });
+        const game = gq.rows[0];
+        if (game.game_status !== 'completed') {
+            return res.status(400).json({ error: 'Only completed games can be edited here' });
+        }
+        if (game.team_selection_type === 'tournament' || game.team_selection_type === 'vs_external') {
+            return res.status(400).json({ error: 'Tournament and external games are not supported by this editor yet — use their own result flow' });
+        }
+        const tenantId  = game.tenant_id || null;
+        const cls       = starClassFromRating(game.star_rating).toLowerCase();   // a/b/c/d/e
+        const winsCol   = `total_wins_${cls}`;
+        const drawsCol  = `total_draws_${cls}`;
+
+        // Normalise a winner value to lowercase red/blue/draw (null = no winner).
+        const normWinner = (w) => {
+            if (w === null || w === undefined || w === '') return null;
+            const lw = String(w).toLowerCase();
+            return (lw === 'red' || lw === 'blue' || lw === 'draw') ? lw : '__invalid__';
+        };
+        const currentWinner = normWinner(game.winning_team);
+        let   desiredWinner = currentWinner;
+        if (touchesResult) {
+            desiredWinner = normWinner(winningTeam);
+            if (desiredWinner === '__invalid__') {
+                return res.status(400).json({ error: "winningTeam must be 'red', 'blue', or 'draw'" });
+            }
+        }
+        const capTeam = (w) => (w === 'red' ? 'Red' : w === 'blue' ? 'Blue' : null);
+
+        // ---- Participants (confirmed registrations) ----
+        const partq = await pool.query(
+            `SELECT DISTINCT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`, [gameId]);
+        const confirmed = new Set(partq.rows.map(r => r.player_id));
+        if (confirmed.size === 0) {
+            return res.status(400).json({ error: 'No confirmed participants found for this game' });
+        }
+
+        // ---- Validate teamMoves (membership re-checked inside the txn) ----
+        const moves = Array.isArray(teamMoves) ? teamMoves : [];
+        for (const m of moves) {
+            if (!m || !m.playerId || !confirmed.has(m.playerId)) {
+                return res.status(400).json({ error: 'teamMoves contains a player not confirmed for this game' });
+            }
+            if (m.toTeam !== 'Red' && m.toTeam !== 'Blue') {
+                return res.status(400).json({ error: "teamMoves toTeam must be 'Red' or 'Blue'" });
+            }
+        }
+
+        // ---- Validate discipline ----
+        const OFFENSE_LABELS = {
+            on_time:    'On Time',
+            not_ready:  'Not Ready (0-5 Min)',
+            late_drop:  'Late Drop Out',
+            '5_10_late':'5-10 Minutes Late',
+            '10_late':  '10+ Minutes Late',
+            no_show:    'No Show'
+        };
+        if (touchesDiscipline) {
+            for (const d of disciplineRecords) {
+                if (!d || !d.playerId || !confirmed.has(d.playerId)) {
+                    return res.status(400).json({ error: 'disciplineRecords contains a player not confirmed for this game' });
+                }
+                if (d.offense && !OFFENSE_LABELS[d.offense]) {
+                    return res.status(400).json({ error: `Unknown discipline offense: ${d.offense}` });
+                }
+                const pts = parseInt(d.points);
+                if (isNaN(pts) || pts < 0 || pts > 100) {
+                    return res.status(400).json({ error: 'discipline points must be an integer 0-100' });
+                }
+            }
+        }
+
+        // ---- Validate beef ----
+        const beefs = Array.isArray(beefEntries) ? beefEntries : [];
+        for (const b of beefs) {
+            if (!b || !confirmed.has(b.player1) || !confirmed.has(b.player2)) {
+                return res.status(400).json({ error: 'beefEntries contains a player not confirmed for this game' });
+            }
+            if (b.player1 === b.player2) {
+                return res.status(400).json({ error: 'beefEntries cannot pair a player with themselves' });
+            }
+            const lvl = parseInt(b.level);
+            if (isNaN(lvl) || lvl < 0 || lvl > 5) {
+                return res.status(400).json({ error: 'beef level must be an integer 0-5 (0 removes)' });
+            }
+        }
+
+        await client.query('BEGIN');
+
+        // Lock the game row and re-confirm it is still completed.
+        const lk = await client.query(`SELECT game_status FROM games WHERE id = $1 FOR UPDATE`, [gameId]);
+        if (lk.rows[0]?.game_status !== 'completed') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Game is no longer completed' });
+        }
+
+        // ===== Capture CURRENT state BEFORE any edits =====
+        const ctq = await client.query(
+            `SELECT tp.player_id, t.team_name
+               FROM teams t JOIN team_players tp ON tp.team_id = t.id
+              WHERE t.game_id = $1`, [gameId]);
+        const currentTeam = new Map();                       // player_id -> 'Red'/'Blue'
+        for (const r of ctq.rows) currentTeam.set(r.player_id, r.team_name);
+
+        const oldDiscq = await client.query(
+            `SELECT player_id, offense_type FROM discipline_records WHERE game_id = $1`, [gameId]);
+        const oldNoShow = new Set(oldDiscq.rows.filter(r => r.offense_type === 'No Show').map(r => r.player_id));
+
+        // A moved player must actually be on a team.
+        for (const m of moves) {
+            if (!currentTeam.has(m.playerId)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'A player in teamMoves is not on a team in this game and cannot be moved' });
+            }
+        }
+
+        // ===== DISCIPLINE: full replace (so the no-show set becomes final) =====
+        const tierAffected = new Set();
+        let   newNoShow    = oldNoShow;
+        if (touchesDiscipline) {
+            for (const r of oldDiscq.rows) tierAffected.add(r.player_id);
+            await client.query(`DELETE FROM discipline_records WHERE game_id = $1`, [gameId]);
+            newNoShow = new Set();
+            for (const d of disciplineRecords) {
+                const pts = parseInt(d.points);
+                if (pts > 0 && d.offense) {
+                    const label = OFFENSE_LABELS[d.offense] || 'Unknown';
+                    try {
+                        await client.query(
+                            `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level, tenant_id)
+                             VALUES ($1,$2,$3,$4,$5,$6)`,
+                            [d.playerId, gameId, label, pts, d.warning || null, tenantId]);
+                    } catch (e) {
+                        if (e && e.code === '42703') {   // pre-tenant schema: retry without tenant_id
+                            await client.query(
+                                `INSERT INTO discipline_records (player_id, game_id, offense_type, points, warning_level)
+                                 VALUES ($1,$2,$3,$4,$5)`,
+                                [d.playerId, gameId, label, pts, d.warning || null]);
+                        } else { throw e; }
+                    }
+                    tierAffected.add(d.playerId);
+                    if (d.offense === 'no_show') newNoShow.add(d.playerId);
+                }
+            }
+        }
+
+        // ===== TEAM MOVES (build desired team map) =====
+        const desiredTeam = new Map(currentTeam);
+        if (moves.length) {
+            const tIdsq = await client.query(`SELECT id, team_name FROM teams WHERE game_id = $1`, [gameId]);
+            const teamId = {};
+            for (const r of tIdsq.rows) teamId[r.team_name] = r.id;
+            for (const m of moves) {
+                if (!teamId[m.toTeam]) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: `This game has no ${m.toTeam} team` });
+                }
+                await client.query(
+                    `UPDATE team_players SET team_id = $1
+                      WHERE player_id = $2 AND team_id IN (SELECT id FROM teams WHERE game_id = $3)`,
+                    [teamId[m.toTeam], m.playerId, gameId]);
+                desiredTeam.set(m.playerId, m.toTeam);
+            }
+
+            // FIX-487: keep team_setups.team_composition in sync with the move(s) so the
+            // fairness / performance-score path (which reads team_composition) doesn't desync.
+            const _compRed = [], _compBlue = [];
+            for (const [pidK, tn] of desiredTeam) {
+                if (tn === 'Red') _compRed.push(pidK);
+                else if (tn === 'Blue') _compBlue.push(pidK);
+            }
+            try {
+                await client.query(
+                    `UPDATE team_setups SET team_composition = $1::jsonb
+                      WHERE game_id = $2 AND status = 'completed'`,
+                    [JSON.stringify({ red: _compRed, blue: _compBlue }), gameId]);
+            } catch (e) {
+                console.warn('[FIX-487] team_setups composition sync skipped:', e.message);
+            }
+        }
+
+        // ===== UNIFIED per-player WIN / DRAW / APPEARANCE delta =====
+        const curWinnerCap = capTeam(currentWinner);
+        const desWinnerCap = capTeam(desiredWinner);
+        for (const pid of confirmed) {
+            // WIN credit — team-based (a win goes to the winning team's roster).
+            const curWin = (curWinnerCap && currentTeam.get(pid) === curWinnerCap) ? 1 : 0;
+            const desWin = (desWinnerCap && desiredTeam.get(pid) === desWinnerCap) ? 1 : 0;
+            const winDelta = desWin - curWin;
+
+            // DRAW credit — attendance-based (everyone who showed up on a draw).
+            const curDraw = (currentWinner === 'draw' && !oldNoShow.has(pid)) ? 1 : 0;
+            const desDraw = (desiredWinner === 'draw' && !newNoShow.has(pid)) ? 1 : 0;
+            const drawDelta = desDraw - curDraw;
+
+            // APPEARANCE — attendance-based; only moves if no-show status changed.
+            const curApp = oldNoShow.has(pid) ? 0 : 1;
+            const desApp = newNoShow.has(pid) ? 0 : 1;
+            const appDelta = desApp - curApp;
+
+            if (winDelta !== 0) {
+                await client.query(
+                    `UPDATE players SET total_wins = total_wins + $1, ${winsCol} = ${winsCol} + $1 WHERE id = $2`,
+                    [winDelta, pid]);
+            }
+            if (drawDelta !== 0) {
+                await client.query(
+                    `UPDATE players SET total_draws = total_draws + $1, ${drawsCol} = ${drawsCol} + $1 WHERE id = $2`,
+                    [drawDelta, pid]);
+            }
+            if (appDelta !== 0) {
+                await client.query(
+                    `UPDATE players SET total_appearances = total_appearances + $1 WHERE id = $2`,
+                    [appDelta, pid]);
+            }
+        }
+
+        // ===== Flip the result + adjust series score (draft_memory only) =====
+        if (desiredWinner !== currentWinner) {
+            await client.query(`UPDATE games SET winning_team = $1 WHERE id = $2`, [desiredWinner, gameId]);
+
+            // game_series red_wins/blue_wins/draws is only maintained for draft_memory in this build.
+            if (game.series_id && game.team_selection_type === 'draft_memory') {
+                const dec = currentWinner === 'red'  ? 'red_wins = red_wins - 1'
+                          : currentWinner === 'blue' ? 'blue_wins = blue_wins - 1'
+                          : currentWinner === 'draw' ? 'draws = draws - 1' : null;
+                const inc = desiredWinner === 'red'  ? 'red_wins = red_wins + 1'
+                          : desiredWinner === 'blue' ? 'blue_wins = blue_wins + 1'
+                          : desiredWinner === 'draw' ? 'draws = draws + 1' : null;
+                if (dec) await client.query(`UPDATE game_series SET ${dec} WHERE id = $1`, [game.series_id]);
+                if (inc) await client.query(`UPDATE game_series SET ${inc} WHERE id = $1`, [game.series_id]);
+            }
+        }
+
+        // ===== BEEF set/clear (bidirectional) =====
+        for (const b of beefs) {
+            const lvl = parseInt(b.level);
+            if (lvl >= 1) {
+                for (const pair of [[b.player1, b.player2], [b.player2, b.player1]]) {
+                    await client.query(
+                        `INSERT INTO beef (player_id, target_player_id, rating) VALUES ($1,$2,$3)
+                         ON CONFLICT (player_id, target_player_id) DO UPDATE SET rating = $3`,
+                        [pair[0], pair[1], lvl]);
+                }
+            } else {
+                await client.query(
+                    `DELETE FROM beef
+                      WHERE (player_id = $1 AND target_player_id = $2)
+                         OR (player_id = $2 AND target_player_id = $1)`,
+                    [b.player1, b.player2]);
+            }
+        }
+
+        await client.query('COMMIT');
+
+        // ===== Post-commit, non-blocking =====
+        setImmediate(() => auditLog(pool, actorId, 'completed_game_edited', gameId,
+            `Edited completed game ${gameId}: ` +
+            `${desiredWinner !== currentWinner ? `result ${currentWinner || 'none'}->${desiredWinner || 'none'}; ` : ''}` +
+            `${moves.length ? `${moves.length} team move(s); ` : ''}` +
+            `${touchesDiscipline ? 'discipline replaced; ' : ''}` +
+            `${beefs.length ? `${beefs.length} beef change(s); ` : ''}`,
+            tenantId).catch(() => {}));
+
+        // Derived: re-run the OVR-suspicion classifier on the post-edit state — completion
+        // does the same; it reads via pool so it sees the committed change. (Streaks / on-fire
+        // and monthly trophies are NOT recomputed here — see audit notes.)
+        setImmediate(() => _recomputeOvrSuspicionForGame(gameId).catch(e =>
+            console.error('[FIX-487 edit-completed] OVR suspicion recompute failed:', e.message)));
+
+        // Tier recalc for affected players — never inside a transaction.
+        if (tierAffected.size > 0) {
+            setImmediate(async () => {
+                for (const pid of tierAffected) {
+                    try {
+                        const pts     = await getRevolvingPointsForTenant(pid, tenantId, pool);
+                        const newTier = tierFromRevolvingPoints(pts);
+                        await applyTierChangeForTenant(pool, pid, tenantId, newTier);
+                    } catch (e) {
+                        console.error('[FIX-487 edit-completed] tier recalc failed for', pid, ':', e.message);
+                    }
+                }
+            });
+        }
+
+        return res.json({
+            ok: true,
+            gameId,
+            changed: {
+                result:    desiredWinner !== currentWinner ? { from: currentWinner, to: desiredWinner } : null,
+                teamMoves: moves.length,
+                discipline: touchesDiscipline,
+                beef:      beefs.length
+            }
+        });
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Edit completed game error:', error);
+        return res.status(500).json({ error: 'Failed to edit completed game' });
+    } finally {
+        client.release();
+    }
+});
+
+
+// ════════════════════════════════════════════════════════════════════════
+// FIX-487 — current edit-state for the game.html "Edit result" pop-up.
+// Returns the live winner, both rosters (with names), current discipline rows
+// and current beef pairs among confirmed participants — everything the modal
+// needs to pre-fill itself so the admin edits from the real state, not blank.
+// ════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/games/:gameId/edit-state', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const gq = await pool.query(
+            `SELECT id, team_selection_type, game_status, winning_team FROM games WHERE id = $1`, [gameId]);
+        if (!gq.rows.length) return res.status(404).json({ error: 'Game not found' });
+        const g = gq.rows[0];
+
+        const rost = await pool.query(
+            `SELECT t.team_name, tp.player_id, p.full_name, p.alias
+               FROM teams t
+               JOIN team_players tp ON tp.team_id = t.id
+               JOIN players p ON p.id = tp.player_id
+              WHERE t.game_id = $1
+              ORDER BY t.team_name, p.full_name`, [gameId]);
+
+        const disc = await pool.query(
+            `SELECT player_id, offense_type, points, warning_level
+               FROM discipline_records WHERE game_id = $1`, [gameId]);
+
+        const partsRes = await pool.query(
+            `SELECT player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'`, [gameId]);
+        const parts = partsRes.rows.map(r => r.player_id);
+        const beefPairs = [];
+        if (parts.length) {
+            const bq = await pool.query(
+                `SELECT player_id, target_player_id, rating FROM beef
+                  WHERE rating >= 1 AND player_id = ANY($1) AND target_player_id = ANY($1)`, [parts]);
+            const seen = new Set();
+            for (const b of bq.rows) {
+                const key = [b.player_id, b.target_player_id].sort().join('|');
+                if (seen.has(key)) continue;
+                seen.add(key);
+                beefPairs.push({ player1: b.player_id, player2: b.target_player_id, level: b.rating });
+            }
+        }
+
+        return res.json({
+            gameId,
+            gameType:    g.team_selection_type,
+            gameStatus:  g.game_status,
+            winningTeam: g.winning_team,
+            editable:    g.game_status === 'completed'
+                         && g.team_selection_type !== 'tournament'
+                         && g.team_selection_type !== 'vs_external',
+            roster:      rost.rows,
+            discipline:  disc.rows,
+            beef:        beefPairs
+        });
+    } catch (e) {
+        console.error('edit-state error:', e.message);
+        return res.status(500).json({ error: 'Failed to load edit state' });
+    }
+});
+
 // Get MOTM nominees and votes for a game
 
 // PUBLIC endpoint - Get team sheet by game URL (no auth required)
