@@ -1741,6 +1741,7 @@ const AUDIT_TAG_TABLE = {
     tenant_refund_policy_updated:    { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'med' },
     tenant_monthly_config:           { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
     tenant_disabled_awards_updated:  { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
+    tenant_external_awards_updated:  { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
     tenant_custom_award_created:     { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
     tenant_custom_award_updated:     { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'low' },
     tenant_custom_award_deleted:     { cat: 'tenant', sub: 'customisation', actor: 'admin', sev: 'med' },
@@ -1777,10 +1778,24 @@ const AUDIT_TAG_TABLE = {
     league_fixture_postponed:        { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'med' },
     league_score_confirmed:          { cat: 'league', sub: 'scores', actor: 'admin', sev: 'med' },
     league_score_reopened:           { cat: 'league', sub: 'scores', actor: 'admin', sev: 'med' },
+    league_fixture_teams_set:        { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'med' },
+    league_fixtures_added:           { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'med' },
+    league_fixture_reslotted:        { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'med' },
+    league_fixture_voided:           { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'high' },
+    league_fixture_deleted:          { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'high' },
+    league_fixture_refilled:         { cat: 'league', sub: 'fixtures', actor: 'admin', sev: 'med' },
     league_share_paid:               { cat: 'league', sub: 'payouts', actor: 'admin', sev: 'high' },
     league_team_dropped_cancel:      { cat: 'league', sub: 'teams', actor: 'admin', sev: 'med' },
     league_team_dropped_reshuffle:   { cat: 'league', sub: 'teams', actor: 'admin', sev: 'med' },
     league_team_replaced:            { cat: 'league', sub: 'teams', actor: 'admin', sev: 'med' },
+    cup_created:                     { cat: 'league', sub: 'cup', actor: 'admin', sev: 'med' },
+    cup_entrants_added:              { cat: 'league', sub: 'cup', actor: 'admin', sev: 'low' },
+    cup_entrant_removed:             { cat: 'league', sub: 'cup', actor: 'admin', sev: 'low' },
+    cup_drawn:                       { cat: 'league', sub: 'cup', actor: 'admin', sev: 'med' },
+    cup_seeds_set:                   { cat: 'league', sub: 'cup', actor: 'admin', sev: 'low' },
+    cup_score_confirmed:             { cat: 'league', sub: 'cup', actor: 'admin', sev: 'med' },
+    cup_score_reopened:              { cat: 'league', sub: 'cup', actor: 'admin', sev: 'med' },
+    cup_completed:                   { cat: 'league', sub: 'cup', actor: 'admin', sev: 'high' },
 
     // ─── VENUE / FAQ / SHOP / RATING / CREDITS / PRIVACY / MISC (FIX-425) ───
     venue_verified:                  { cat: 'ops', sub: 'venue', actor: 'admin', sev: 'med' },
@@ -3425,6 +3440,16 @@ const pool = new Pool({
     // query/transaction release its connection back to the pool instead of holding it.
     statement_timeout: 30000,                      // kill any query running >30s
     idle_in_transaction_session_timeout: 30000,    // kill txns left idle >30s (un-released BEGINs)
+});
+
+// node-postgres emits 'error' on the POOL when an IDLE client dies — e.g. Render
+// Postgres drops a connection ("Connection terminated unexpectedly", seen in logs).
+// With no handler, that error bubbles to the process-level uncaughtException path.
+// This logs it and lets the pool quietly discard the dead client (a fresh one is
+// created on next checkout). It does NOT stop the DB-side drop (that's infra) — it
+// keeps idle-connection drops from escalating into an uncaught process error.
+pool.on('error', (err) => {
+    console.error('[pg pool] idle client error (discarded, pool recovers):', err && err.message);
 });
 
 pool.connect((err, client, done) => {
@@ -8094,6 +8119,25 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
         const award_counts = {};
         for (const row of awardsRes.rows) award_counts[row.award_type] = parseInt(row.cnt);
 
+        // 6★ external tier — coach-recorded goals/assists + MOTMs on external LEAGUE/CUP
+        // fixtures (games with external_league_id). Surfaced as a separate prestige tier on
+        // the profile; clients show only the non-zero stats so profiles aren't clogged.
+        // Goals/assists are external-only data (no overlap). External MOTMs also remain in
+        // the all-time motm_wins total — de-duping that is a deliberate follow-up decision.
+        let external_goals = 0, external_assists = 0, external_motms = 0;
+        try {
+            const _eg = await pool.query(
+                `SELECT COALESCE(SUM(goals),0) AS g, COALESCE(SUM(assists),0) AS a
+                   FROM ext_league_player_stats WHERE player_id = $1`, [player.id]);
+            external_goals = parseInt(_eg.rows[0].g) || 0;
+            external_assists = parseInt(_eg.rows[0].a) || 0;
+            const _em = await pool.query(
+                `SELECT COUNT(*) AS c FROM game_awards ga JOIN games g ON g.id = ga.game_id
+                   WHERE ga.recipient_player_id = $1 AND ga.award_type = 'motm'
+                     AND NOT ga.removed_due_to_team_drop AND g.external_league_id IS NOT NULL`, [player.id]);
+            external_motms = parseInt(_em.rows[0].c) || 0;
+        } catch (e) { if (e && e.code !== '42703' && e.code !== '42P01') throw e; }
+
         // FIX-105: compute draws + effective wins once — used by both owner/admin and public branches
         const total_draws = parseInt(player.total_draws || 0);
         const effective_wins = parseFloat((parseInt(player.total_wins || 0) + total_draws * 0.5).toFixed(1));
@@ -8102,7 +8146,7 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
             : 0;
 
         if (isOwnProfile || isAdmin) {
-            res.json({ ...player, win_percent, motm_percent, tournament_wins, external_game_wins, award_counts,
+            res.json({ ...player, win_percent, motm_percent, tournament_wins, external_game_wins, external_goals, external_assists, external_motms, award_counts,
                        total_draws, effective_wins, effective_win_percent });
         } else {
             // Public view — limited data per visibility matrix
@@ -8124,6 +8168,9 @@ app.get('/api/players/:id', authenticateToken, playerLookupLimiter, async (req, 
                 motm_percent,
                 tournament_wins,
                 external_game_wins,
+                external_goals,
+                external_assists,
+                external_motms,
                 award_counts,
                 badges:           player.badges,
                 ai_bio:           player.ai_bio || null,
@@ -13677,6 +13724,31 @@ async function cleanupBffRivalAutoFillForDroppingPlayer(client, playerId, gameId
 // Body: { position, positions, positionAreas } — same shape as /register.
 // Validates: game accepts new sign-ups, game not full, player not already
 // registered, player not tier-banned. Returns rsvp_deadline.
+// ── GK slot evaluation — single source of truth for the goalkeeper cap across
+// ALL signup paths. Counts GKs holding a slot (confirmed + rsvp). When full:
+//   • a PAYING signup may bump the oldest UNPAID rsvp GK  → action 'bump'
+//   • otherwise the caller must offer "GK backup or outfield" → action 'gk_full'
+// maxGKSlots: vs_external 1, tournament tournament_team_count (4 default), else 2.
+async function evaluateGkSlot(client, gameId, game, opts = {}) {
+    const paying = !!opts.paying;
+    const maxGKSlots = game.team_selection_type === 'vs_external' ? 1
+                     : game.team_selection_type === 'tournament' ? (game.tournament_team_count || 4)
+                     : 2;
+    const gkRows = await client.query(
+        `SELECT id, status FROM registrations
+          WHERE game_id = $1 AND status IN ('confirmed','rsvp')
+            AND UPPER(TRIM(position_preference)) = 'GK'
+          ORDER BY registered_at ASC, id ASC`, [gameId]);
+    const confirmed = gkRows.rows.filter(r => r.status === 'confirmed').length;
+    const rsvps     = gkRows.rows.filter(r => r.status === 'rsvp');
+    const active    = confirmed + rsvps.length;
+    if (active < maxGKSlots) return { ok: true, action: 'allow', maxGKSlots };
+    if (paying && confirmed < maxGKSlots && rsvps.length > 0) {
+        return { ok: true, action: 'bump', bumpRegId: rsvps[0].id, maxGKSlots };
+    }
+    return { ok: false, action: 'gk_full', maxGKSlots };
+}
+
 app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -13831,6 +13903,33 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
             });
         }
 
+        // ── GK cap ──────────────────────────────────────────────────────────
+        // A GK-only signup can't exceed the keeper slots. Free RSVP can't bump a
+        // paid keeper, so when full the player must choose: GK backup or outfield.
+        // The front-end re-submits with gkFullChoice once the player picks.
+        const _rsvpIsGk = (positionValue || '').trim().toUpperCase() === 'GK';
+        let _rsvpStatus = 'rsvp';
+        let _rsvpBackupType = null;
+        let _rsvpPos = positionValue;
+        let _rsvpAreas = sanitisedPositionAreas;
+        if (_rsvpIsGk) {
+            const _gk = await evaluateGkSlot(client, gameId, game, { paying: false });
+            if (!_gk.ok) {
+                const _choice = (req.body && req.body.gkFullChoice) || null;
+                if (_choice === 'backup')       { _rsvpStatus = 'backup'; _rsvpBackupType = 'gk_backup'; }
+                else if (_choice === 'outfield') { _rsvpPos = 'outfield'; _rsvpAreas = null; }
+                else {
+                    await client.query('ROLLBACK');
+                    return res.status(409).json({
+                        error: 'gk_full',
+                        message: `This game already has the maximum ${_gk.maxGKSlots} goalkeeper${_gk.maxGKSlots === 1 ? '' : 's'}. Join as a GK backup, or play outfield.`,
+                        maxGKSlots: _gk.maxGKSlots,
+                        choices: ['backup', 'outfield']
+                    });
+                }
+            }
+        }
+
         // Compute deadline. Floor at NOW (in case a game is < 24h away — RSVP
         // is still allowed but the deadline is essentially "ASAP"; the warning
         // email won't fire because we're already past the 48h window).
@@ -13839,29 +13938,40 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
         const minDeadline     = new Date(Date.now() + 60 * 1000); // at least 1 min in future
         const rsvpDeadline    = defaultDeadline > minDeadline ? defaultDeadline : minDeadline;
 
-        // Insert the RSVP row. amount_paid / amount_paid_free stay 0 — no money moved.
+        // Insert the registration. amount_paid / amount_paid_free stay 0 — no money moved.
+        // status / position / backup_type come from the GK-cap evaluation above.
         await client.query(
             `INSERT INTO registrations
-                (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, is_comped, position_areas, rsvp_deadline)
-             VALUES ($1, $2, 'rsvp', $3, 0, 0, false, $4, $5)`,
-            [gameId, req.user.playerId, positionValue, sanitisedPositionAreas, rsvpDeadline]
+                (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, is_comped, position_areas, rsvp_deadline, backup_type)
+             VALUES ($1, $2, $3, $4, 0, 0, false, $5, $6, $7)`,
+            [gameId, req.user.playerId, _rsvpStatus, _rsvpPos, _rsvpAreas, rsvpDeadline, _rsvpBackupType]
         );
 
         await client.query('COMMIT');
 
+        const _isGkBackup = (_rsvpStatus === 'backup');
         // Post-commit: email + push + audit (fire and forget).
         try {
             const gd = await getGameDataForNotification(gameId);
-            _sendRsvpEmail('confirmation', req.user.playerId, gd, { deadline: rsvpDeadline }).catch(() => {});
-            sendNotification('rsvp_confirmed', req.user.playerId, {
-                ...gd,
-                deadline_short: _rsvpFormatDeadline(rsvpDeadline)
-            }).catch(() => {});
-            await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_created',
-                `RSVP created, deadline ${rsvpDeadline.toISOString()}`).catch(() => {});
+            if (_isGkBackup) {
+                // GK slots were full and the player chose the GK backup list.
+                await gameAuditLog(pool, gameId, req.user.playerId, 'player_signed_up',
+                    'Joined GK backup list (GK slots full) via RSVP').catch(() => {});
+                registrationEvent(pool, gameId, req.user.playerId, 'gk_backup_joined',
+                    'Position: GK | Backup type: gk_backup | via RSVP').catch(() => {});
+            } else {
+                _sendRsvpEmail('confirmation', req.user.playerId, gd, { deadline: rsvpDeadline }).catch(() => {});
+                sendNotification('rsvp_confirmed', req.user.playerId, {
+                    ...gd,
+                    deadline_short: _rsvpFormatDeadline(rsvpDeadline)
+                }).catch(() => {});
+                await gameAuditLog(pool, gameId, req.user.playerId, 'rsvp_created',
+                    `RSVP created, deadline ${rsvpDeadline.toISOString()}`).catch(() => {});
+            }
         } catch (_) { /* non-critical */ }
 
-        return res.json({ ok: true, rsvp_deadline: rsvpDeadline.toISOString() });
+        return res.json({ ok: true, rsvp_deadline: rsvpDeadline.toISOString(),
+            status: _rsvpStatus, gk_backup: _isGkBackup, position: _rsvpPos });
     } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('[FIX-315] POST /api/games/:id/rsvp error:', err);
@@ -23569,7 +23679,14 @@ app.post('/api/admin/games/:gameId/complete', authenticateToken, requireGameMana
             return res.status(400).json({ error: 'Game has already been completed' });
         }
 
-        const shouldHaveMotm = !(isExternal && winningTeam === 'blue');
+        // AUDIT FIX: external league/cup games with goals/assists override take NO voted awards
+        // (coach gives goals/assists instead) — don't open voting, so no empty awards UI / cron tally.
+        let _extAwardOverride = false;
+        if (isExternal) {
+            const _ovr = await client.query(`SELECT xl.award_goals, xl.award_assists FROM games g JOIN external_leagues xl ON xl.id = g.external_league_id WHERE g.id = $1`, [gameId]).catch(() => ({ rows: [] }));
+            if (_ovr.rows[0] && (_ovr.rows[0].award_goals || _ovr.rows[0].award_assists)) _extAwardOverride = true;
+        }
+        const shouldHaveMotm = !(isExternal && winningTeam === 'blue') && !_extAwardOverride;
         
         // 1. Update game winning team and status
         // awards_open = true opens TF Game Awards voting automatically (replaces old MOTM nominee selection)
@@ -25317,8 +25434,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                 const _lq = await pool.query(
                     `SELECT l.id, l.short_id, l.name, l.status, l.primary_color,
                             f.round_number, f.status AS fixture_status, f.home_score, f.away_score,
-                            h.id AS home_id, h.name AS home_name, h.bib_colour AS home_colour,
-                            a.id AS away_id, a.name AS away_name, a.bib_colour AS away_colour
+                            h.id AS home_id, h.name AS home_name, h.bib_colour AS home_colour, h.club_id AS home_club_id,
+                            a.id AS away_id, a.name AS away_name, a.bib_colour AS away_colour, a.club_id AS away_club_id
                        FROM leagues l
                        JOIN league_fixtures f ON f.league_id = l.id AND f.game_id = $1
                        JOIN league_teams h ON h.id = f.home_team_id
@@ -25330,8 +25447,8 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                         id: lx.id, short_id: lx.short_id, name: lx.name, status: lx.status, primary_color: lx.primary_color,
                         round: lx.round_number, fixture_status: lx.fixture_status,
                         home_score: lx.home_score, away_score: lx.away_score,
-                        home_team: { id: lx.home_id, name: lx.home_name, bib_colour: lx.home_colour },
-                        away_team: { id: lx.away_id, name: lx.away_name, bib_colour: lx.away_colour }
+                        home_team: { id: lx.home_id, club_id: lx.home_club_id, name: lx.home_name, bib_colour: lx.home_colour },
+                        away_team: { id: lx.away_id, club_id: lx.away_club_id, name: lx.away_name, bib_colour: lx.away_colour }
                     };
                     // FIX-407 (Block N Phase 4c): home/away squads + per-player availability
                     // (availability = whether they've RSVP'd to this fixture's game).
@@ -26208,7 +26325,7 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
         const player = playerResult.rows[0];
 
         // Parallel fetches for badges, awards, and contextual wins
-        const [badgesResult, awardsResult, extWinsResult, tournWinsResult] = await Promise.all([
+        const [badgesResult, awardsResult, extWinsResult, tournWinsResult, extStatsResult] = await Promise.all([
             pool.query(`
                 SELECT b.name, b.icon, b.color, b.description
                 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
@@ -26239,6 +26356,19 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
                   AND g.game_status = 'completed'
                   AND g.team_selection_type = 'tournament'
                   AND LOWER(t.team_name) = LOWER(g.winning_team)`, [player.id]),
+            // External tier: coach-entered goals/assists + external games played (kept
+            // separate from internal OVR — purely a display tier).
+            pool.query(`
+                SELECT
+                  (SELECT COALESCE(SUM(goals),0) FROM ext_league_player_stats WHERE player_id = $1)::int AS ext_goals,
+                  (SELECT COALESCE(SUM(assists),0) FROM ext_league_player_stats WHERE player_id = $1)::int AS ext_assists,
+                  (SELECT COUNT(*) FROM registrations r JOIN games g ON g.id = r.game_id
+                     WHERE r.player_id = $1 AND r.status = 'confirmed' AND g.game_status = 'completed'
+                       AND g.team_selection_type = 'vs_external')::int AS ext_games,
+                  (SELECT COUNT(*) FROM game_awards ga JOIN games g2 ON g2.id = ga.game_id
+                     WHERE ga.recipient_player_id = $1 AND ga.award_type = 'motm'
+                       AND NOT ga.removed_due_to_team_drop AND g2.external_league_id IS NOT NULL)::int AS ext_motms`, [player.id])
+                .catch(() => ({ rows: [{ ext_goals: 0, ext_assists: 0, ext_games: 0, ext_motms: 0 }] })),
         ]);
 
         // Build award counts map
@@ -26273,6 +26403,10 @@ app.get('/api/public/player/:playerId', publicPlayerLimiter, async (req, res) =>
                 motm_ratio: motmRatio,
                 external_wins: externalWins,
                 tournament_wins: tournamentWins,
+                external_goals: parseInt(extStatsResult.rows[0]?.ext_goals || 0),
+                external_assists: parseInt(extStatsResult.rows[0]?.ext_assists || 0),
+                external_games: parseInt(extStatsResult.rows[0]?.ext_games || 0),
+                external_motms: parseInt(extStatsResult.rows[0]?.ext_motms || 0),
                 award_counts: awardCounts,
                 ai_bio: player.ai_bio || null
             },
@@ -27222,7 +27356,9 @@ const SILENT_AWARDS = new Set(['invisible_man','lost']);
 // = the standard 20 minus the tenant's disabled set, PLUS the tenant's active custom awards.
 // Returns keys + per-key min-vote thresholds + custom metadata. tenantId null
 // (TF Coventry legacy games) -> full standard set, no custom. Table/column-missing safe.
-async function getTenantAwardConfig(tenantId) {
+async function getTenantAwardConfig(tenantId, context = 'normal') {
+    if (context === 'external') return _externalAwardConfig(tenantId);
+    if (context === 'external_override') return { disabled: new Set(), custom: [], standardKeys: [], allKeys: [], customKeys: new Set(), minVotes: {} };
     let disabled = new Set();
     let custom = [];
     if (tenantId) {
@@ -27252,6 +27388,87 @@ async function getTenantAwardConfig(tenantId) {
         customKeys: new Set(custom.map(c => c.award_key)),
         minVotes,
     };
+}
+
+// External league/cup award set: positive-only enable-list, default MOTM only.
+// Never touches normal-game award config (separate dimension from disabled_awards).
+async function _externalAwardConfig(tenantId) {
+    let enabled = null;
+    if (tenantId) {
+        try {
+            const t = await pool.query(`SELECT external_awards FROM tenants WHERE id = $1 LIMIT 1`, [tenantId]);
+            if (t.rows[0] && Array.isArray(t.rows[0].external_awards)) enabled = t.rows[0].external_awards;
+        } catch (e) { if (e && e.code !== '42703') throw e; }
+    }
+    if (!enabled || !enabled.length) enabled = ['motm'];
+    const posSet = new Set(POSITIVE_AWARDS);
+    const standardKeys = AWARD_TYPES.filter(k => k === 'motm' || (posSet.has(k) && enabled.includes(k)));
+    if (!standardKeys.includes('motm')) standardKeys.unshift('motm');
+    let custom = [];
+    try {
+        const c = await pool.query(
+            `SELECT award_key, label, emoji, polarity, min_votes FROM tenant_custom_awards
+              WHERE tenant_id = $1 AND active = TRUE AND polarity = 'positive' ORDER BY created_at ASC`, [tenantId]);
+        custom = c.rows.filter(r => enabled.includes(r.award_key));
+    } catch (e) { if (e && e.code !== '42P01') throw e; }
+    const minVotes = {};
+    for (const k of standardKeys) minVotes[k] = (AWARD_MIN_VOTES[k] ?? MIN_VOTES_REQUIRED);
+    for (const c2 of custom) minVotes[c2.award_key] = c2.min_votes;
+    return {
+        disabled: new Set(), custom, standardKeys,
+        allKeys: standardKeys.concat(custom.map(c2 => c2.award_key)),
+        customKeys: new Set(custom.map(c2 => c2.award_key)),
+        minVotes,
+    };
+}
+
+// Effective voted-award config for a specific game: normal set, reduced external set, or
+// EMPTY when an external league/cup has goals/assists override on (the coach gives goals/assists
+// as the awards instead — no voting). One lookup; normal games skip it entirely.
+async function getGameAwardConfig(game) {
+    if (!game || !game.external_league_id) {
+        const _c = await getTenantAwardConfig(game ? game.tenant_id : null, 'normal');
+        _c.mode = 'normal';
+        return _c;
+    }
+    let override = false;
+    try {
+        const x = await pool.query(`SELECT award_goals, award_assists FROM external_leagues WHERE id = $1`, [game.external_league_id]);
+        if (x.rows[0] && (x.rows[0].award_goals || x.rows[0].award_assists)) override = true;
+    } catch (e) { if (e && e.code !== '42703' && e.code !== '42P01') throw e; }
+    const _mode = override ? 'external_override' : 'external';
+    const _c = await getTenantAwardConfig(game.tenant_id, _mode);
+    _c.mode = _mode;
+    return _c;
+}
+
+// 2b: for an external override game, the "awards" are the coach-recorded goals/assists.
+// Builds the display payload (Manager alias + per-player goals/assists) surfaced on the
+// awards endpoints so web + app render it identically in place of the empty voting grid.
+async function _buildOverrideAwards(gameId) {
+    let managerAlias = null;
+    let stats = [];
+    let awardGoals = false, awardAssists = false;
+    try {
+        // award_goals / award_assists are independent — show only the awarded categories.
+        const tg = await pool.query(
+            `SELECT xl.award_goals, xl.award_assists
+               FROM games g JOIN external_leagues xl ON xl.id = g.external_league_id WHERE g.id = $1`,
+            [gameId]);
+        if (tg.rows[0]) { awardGoals = !!tg.rows[0].award_goals; awardAssists = !!tg.rows[0].award_assists; }
+        const mgr = await pool.query(
+            `SELECT p.alias, p.full_name FROM games g JOIN players p ON p.id = g.assigned_coach_player_id WHERE g.id = $1`,
+            [gameId]);
+        if (mgr.rows[0]) managerAlias = mgr.rows[0].alias || mgr.rows[0].full_name || null;
+        const st = await pool.query(
+            `SELECT p.alias, p.full_name, s.goals, s.assists
+               FROM ext_league_player_stats s JOIN players p ON p.id = s.player_id
+              WHERE s.game_id = $1
+              ORDER BY s.goals DESC, s.assists DESC, COALESCE(p.alias, p.full_name) ASC`,
+            [gameId]);
+        stats = st.rows.map(r => ({ alias: r.alias || r.full_name, goals: r.goals || 0, assists: r.assists || 0 }));
+    } catch (e) { if (e && e.code !== '42703' && e.code !== '42P01') throw e; }
+    return { managerAlias, stats, awardGoals, awardAssists };
 }
 
 // Send email to a player for an award win — fire-and-forget, never throws
@@ -27447,7 +27664,7 @@ async function closeAwards(gameId) {
         // Get game info
         const gameResult = await pool.query(
             `SELECT g.awards_open, g.awards_close_at, g.game_url, g.star_rating,
-                    g.team_selection_type, g.tenant_id,
+                    g.team_selection_type, g.tenant_id, g.external_league_id,
                     TO_CHAR(g.game_date AT TIME ZONE 'Europe/London', 'Day') as day_name,
                     v.name as venue_name
              FROM games g LEFT JOIN venues v ON v.id = g.venue_id
@@ -27468,7 +27685,7 @@ async function closeAwards(gameId) {
         // Pre-FIX-334 deploys: empty Set (all awards enabled). TF Coventry:
         // empty by default (Mitchell wants all 17 awards).
         // FIX-421: effective award set for this game's tenant (standard minus disabled + active custom).
-        const _awardCfg = await getTenantAwardConfig(game.tenant_id);
+        const _awardCfg = await getGameAwardConfig(game);
 
         // FIX-148: awards_open=false moved to AFTER the loop. Was here previously,
         // which meant if the grant loop failed partway, awards_open was already false
@@ -27543,6 +27760,11 @@ async function closeAwards(gameId) {
                     );
 
                     if (awardType === 'motm') {
+                        // 6★ external tier: external league/cup MOTMs are a separate prestige
+                        // tier (surfaced on profiles via game_awards), so they do NOT increment the
+                        // global motm_wins / motm_wins_{class}. The game_awards row above and the
+                        // motm_winner_id write below STILL happen (game page + 6★ tier need them).
+                        if (!game.external_league_id) {
                         const motmClassCol = `motm_wins_${starClass.toLowerCase()}`;
                         // FIX-147: 42703 fallback for pre-migration safety, scoped to this tx.
                         try {
@@ -27561,6 +27783,7 @@ async function closeAwards(gameId) {
                                 throw motmErr;
                             }
                         }
+                        } // end 6★ external-league guard — external MOTMs skip the global motm_wins increment
                         // FIX-100: write winner back to games.motm_winner_id (NULL guard prevents tie overwrite)
                         await _awardClient.query(
                             'UPDATE games SET motm_winner_id = $1 WHERE id = $2 AND motm_winner_id IS NULL',
@@ -28161,7 +28384,7 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
         const playerId = req.user.playerId;
 
         const gameResult = await pool.query(
-            'SELECT awards_open, awards_close_at, game_status, tenant_id FROM games WHERE id = $1',
+            'SELECT awards_open, awards_close_at, game_status, tenant_id, external_league_id FROM games WHERE id = $1',
             [gameId]
         );
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
@@ -28222,11 +28445,14 @@ app.get('/api/games/:gameId/awards', authenticateToken, async (req, res) => {
         }
 
         // FIX-421: tell the client which awards this tenant offers (hide disabled, surface custom).
-        const _awardCfg = await getTenantAwardConfig(game.tenant_id);
+        const _awardCfg = await getGameAwardConfig(game);
+        const _overrideAwards = _awardCfg.mode === 'external_override' ? await _buildOverrideAwards(gameId) : null;
 
         res.json({
             awardsOpen: game.awards_open,
             awardsCloseAt: game.awards_close_at,
+            awardMode: _awardCfg.mode,
+            overrideAwards: _overrideAwards,
             gameStatus: game.game_status,
             votedCount: parseInt(participantsResult.rows[0].voted_count),
             totalPlayers: parseInt(totalRegisteredResult.rows[0].total),
@@ -28262,14 +28488,14 @@ app.post('/api/games/:gameId/awards/vote', authenticateToken, async (req, res) =
 
         // Check awards are open (+ FIX-421: need tenant_id for the effective award set)
         const gameResult = await pool.query(
-            'SELECT awards_open, awards_close_at, tenant_id FROM games WHERE id = $1',
+            'SELECT awards_open, awards_close_at, tenant_id, external_league_id FROM games WHERE id = $1',
             [gameId]
         );
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
 
         // FIX-421: validate against the tenant's EFFECTIVE set (standard minus disabled + custom).
         // Rejects disabled standard awards and unknown keys; accepts the tenant's custom keys.
-        const _voteCfg = await getTenantAwardConfig(gameResult.rows[0].tenant_id);
+        const _voteCfg = await getGameAwardConfig(gameResult.rows[0]);
         if (!_voteCfg.allKeys.includes(awardType)) {
             return res.status(400).json({ error: 'Invalid award type' });
         }
@@ -28362,7 +28588,7 @@ app.get('/api/public/game/:gameUrl/awards', async (req, res) => {
         const { gameUrl } = req.params;
 
         const gameResult = await pool.query(
-            'SELECT id, awards_open, awards_close_at, game_status, tenant_id FROM games WHERE game_url = $1',
+            'SELECT id, awards_open, awards_close_at, game_status, tenant_id, external_league_id FROM games WHERE game_url = $1',
             [gameUrl]
         );
         if (gameResult.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
@@ -28383,11 +28609,14 @@ app.get('/api/public/game/:gameUrl/awards', async (req, res) => {
         );
 
         // FIX-421: custom-award metadata so results pages can label/emoji tenant custom awards.
-        const _awardCfg = await getTenantAwardConfig(game.tenant_id);
+        const _awardCfg = await getGameAwardConfig(game);
+        const _overrideAwards = _awardCfg.mode === 'external_override' ? await _buildOverrideAwards(game.id) : null;
 
         res.json({
             awardsOpen: game.awards_open,
             awardsCloseAt: game.awards_close_at,
+            awardMode: _awardCfg.mode,
+            overrideAwards: _overrideAwards,
             awards: awardsResult.rows.map(a => ({
                 awardType: a.award_type,
                 motmValue: a.motm_value,
@@ -28397,6 +28626,7 @@ app.get('/api/public/game/:gameUrl/awards', async (req, res) => {
                 playerId: a.player_id,
                 playerAlias: a.alias || a.full_name,
             })),
+            availableAwards: _awardCfg.allKeys,
             customAwards: _awardCfg.custom.map(c => ({ key: c.award_key, label: c.label, emoji: c.emoji, polarity: c.polarity, min_votes: c.min_votes })),
         });
     } catch (error) {
@@ -41013,13 +41243,15 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues', authenticateToken, require
         await pool.query(`
             INSERT INTO external_leagues
               (id, tenant_id, kind, name, parent_league_name, external_website_url, public_slug,
-               default_venue_id, default_coach_player_id, series_awards_enabled, game_awards_enabled, created_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+               default_venue_id, default_coach_player_id, series_awards_enabled, game_awards_enabled,
+               award_goals, award_assists, created_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
             [id, req.tenant.id, kind, name,
              b.parent_league_name ? String(b.parent_league_name).slice(0, 80) : null,
              b.external_website_url ? String(b.external_website_url).slice(0, 300) : null,
              slug, b.default_venue_id || null, b.default_coach_player_id || null,
-             b.series_awards_enabled !== false, b.game_awards_enabled !== false, req.user.playerId]);
+             b.series_awards_enabled !== false, b.game_awards_enabled !== false,
+             b.award_goals === true, b.award_assists === true, req.user.playerId]);
         await auditLog(pool, req.user.playerId, 'ext_league_created', null,
             `${kind} "${name}"`, req.tenant.id).catch(() => {});
         res.status(201).json({ ok: true, id, public_slug: slug,
@@ -41067,6 +41299,8 @@ app.patch('/api/t/:tenant_short_id/admin/ext-leagues/:id', authenticateToken, re
         if (b.default_coach_player_id !== undefined) put('default_coach_player_id', b.default_coach_player_id || null);
         if (b.series_awards_enabled !== undefined) put('series_awards_enabled', b.series_awards_enabled === true);
         if (b.game_awards_enabled !== undefined) put('game_awards_enabled', b.game_awards_enabled === true);
+        if (b.award_goals !== undefined) put('award_goals', b.award_goals === true);
+        if (b.award_assists !== undefined) put('award_assists', b.award_assists === true);
         if (b.status !== undefined) put('status', b.status === 'archived' ? 'archived' : 'active');
         if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
         vals.push(req.params.id);
@@ -41075,6 +41309,42 @@ app.patch('/api/t/:tenant_short_id/admin/ext-leagues/:id', authenticateToken, re
     } catch (e) {
         console.error('FIX-463 edit error:', e.message);
         res.status(500).json({ error: 'Could not update' });
+    }
+});
+
+// EXT AWARD CONFIG (design) — tenant-level positive-only set for external league/cup games.
+// CRM picker reads this; empty list => MOTM only. Does not affect normal-game awards.
+app.get('/api/t/:tenant_short_id/admin/external-awards', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const t = await pool.query(`SELECT external_awards FROM tenants WHERE id = $1`, [req.tenant.id]);
+        const enabled = (t.rows[0] && Array.isArray(t.rows[0].external_awards)) ? t.rows[0].external_awards : [];
+        let custom = [];
+        try {
+            const c = await pool.query(`SELECT award_key, label, emoji FROM tenant_custom_awards WHERE tenant_id = $1 AND active = TRUE AND polarity = 'positive' ORDER BY created_at ASC`, [req.tenant.id]);
+            custom = c.rows;
+        } catch (e) { if (e && e.code !== '42P01') throw e; }
+        res.json({ enabled, available_standard: POSITIVE_AWARDS, available_custom: custom, default_when_empty: ['motm'] });
+    } catch (e) {
+        if (e && e.code === '42703') return res.json({ enabled: [], available_standard: POSITIVE_AWARDS, available_custom: [], default_when_empty: ['motm'] });
+        console.error('ext-awards get:', e.message); res.status(500).json({ error: 'failed' });
+    }
+});
+app.put('/api/t/:tenant_short_id/admin/external-awards', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const sel = Array.isArray((req.body || {}).enabled) ? req.body.enabled : [];
+        const posSet = new Set(POSITIVE_AWARDS);
+        const customKeys = new Set();
+        try {
+            const c = await pool.query(`SELECT award_key FROM tenant_custom_awards WHERE tenant_id = $1 AND active = TRUE AND polarity = 'positive'`, [req.tenant.id]);
+            c.rows.forEach(r => customKeys.add(r.award_key));
+        } catch (e) { if (e && e.code !== '42P01') throw e; }
+        const clean = Array.from(new Set(sel.filter(k => typeof k === 'string' && (posSet.has(k) || customKeys.has(k)))));
+        await pool.query(`UPDATE tenants SET external_awards = $1::jsonb WHERE id = $2`, [JSON.stringify(clean), req.tenant.id]);
+        await auditLog(pool, req.user.playerId, 'tenant_external_awards_updated', null, `External awards set (${clean.length})`, req.tenant.id).catch(() => {});
+        res.json({ ok: true, enabled: clean });
+    } catch (e) {
+        if (e && e.code === '42703') return res.status(503).json({ error: 'not_ready' });
+        console.error('ext-awards put:', e.message); res.status(500).json({ error: 'failed' });
     }
 });
 
@@ -43910,9 +44180,13 @@ app.get('/api/games/:gameUrl/rating-feedback-pair', authenticateToken, async (re
         const voterId     = req.user.playerId;
 
         // Resolve game
-        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
+        const gR = await pool.query(`SELECT id, team_selection_type, external_league_id FROM games WHERE game_url = $1`, [gameUrl]);
         if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
         const gameId = gR.rows[0].id;
+        // External league/cup games carry no peer rating-feedback (separate tier, no OVR impact).
+        if (gR.rows[0].team_selection_type === 'vs_external' || gR.rows[0].external_league_id != null) {
+            return res.json({ none: true, reason: 'external_game' });
+        }
 
         // Voter eligibility: must be confirmed in this game
         const vR = await pool.query(
@@ -44062,9 +44336,13 @@ app.post('/api/games/:gameUrl/rating-feedback', authenticateToken, async (req, r
         const voteWeight = (weight === 0.5 || weight === '0.5') ? 0.5 : 1.0;
 
         // Resolve game
-        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
+        const gR = await pool.query(`SELECT id, team_selection_type, external_league_id FROM games WHERE game_url = $1`, [gameUrl]);
         if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
         const gameId = gR.rows[0].id;
+        // External league/cup games carry no peer rating-feedback (separate tier, no OVR impact).
+        if (gR.rows[0].team_selection_type === 'vs_external' || gR.rows[0].external_league_id != null) {
+            return res.json({ none: true, reason: 'external_game' });
+        }
 
         // UUID-shape validation. players.id and games.id are UUIDs.
         const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -44270,6 +44548,69 @@ async function _genLeagueShortId() {
     }
     return 'L-' + crypto.randomBytes(6).toString('hex').toUpperCase();
 }
+// FIX-489: short id for cups (C- prefix), mirrors _genLeagueShortId.
+async function _genCupShortId() {
+    const alpha = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    for (let attempt = 0; attempt < 8; attempt++) {
+        let s = 'C-';
+        const bytes = crypto.randomBytes(5);
+        for (let k = 0; k < 5; k++) s += alpha[bytes[k] % alpha.length];
+        try {
+            const r = await pool.query('SELECT 1 FROM cups WHERE short_id = $1', [s]);
+            if (r.rows.length === 0) return s;
+        } catch (e) { return s; }
+    }
+    return 'C-' + crypto.randomBytes(6).toString('hex').toUpperCase();
+}
+// FIX-489: standard single-elimination seed positions for a bracket of size P (power of 2).
+// Returns seed numbers 1..P in bracket-position order so top seeds meet only late.
+function _cupSeedOrder(P) {
+    let order = [1, 2];
+    while (order.length < P) {
+        const sum = order.length * 2 + 1;
+        const next = [];
+        for (const sd of order) { next.push(sd); next.push(sum - sd); }
+        order = next;
+    }
+    return order;
+}
+function _cupRoundName(teams) {
+    if (teams <= 2) return 'Final';
+    if (teams === 4) return 'Semi-Finals';
+    if (teams === 8) return 'Quarter-Finals';
+    return 'Round of ' + teams;
+}
+// FIX-489: single-leg tie resolution. Higher score wins; if level, pens decide
+// (extra_time is procedural — a level scoreline still ends in pens in the data).
+function _cupResolveSingleLeg(hs, as, hp, ap) {
+    if (hs > as) return { decided: true, winner: 'home', needsPens: false };
+    if (as > hs) return { decided: true, winner: 'away', needsPens: false };
+    if (hp == null || ap == null || hp === ap) return { decided: false, winner: null, needsPens: true };
+    return { decided: true, winner: hp > ap ? 'home' : 'away', needsPens: true };
+}
+// FIX-489: place a winner (or NULL to clear) into the next round's bracket slot.
+// Single-elim: round i slot j feeds round i+1 slot floor(j/2), home if j even else away.
+async function _cupAdvanceWinner(client, cupId, roundNumber, slot, entrantId) {
+    const nr = await client.query(`SELECT id FROM cup_rounds WHERE cup_id=$1 AND round_number=$2`, [cupId, roundNumber + 1]);
+    if (!nr.rows.length) return null; // was the final
+    const nextSlot = Math.floor(slot / 2);
+    const side = (slot % 2 === 0) ? 'home_entrant_id' : 'away_entrant_id';
+    await client.query(`UPDATE cup_fixtures SET ${side}=$1 WHERE cup_id=$2 AND round_id=$3 AND bracket_slot=$4`,
+        [entrantId, cupId, nr.rows[0].id, nextSlot]);
+    return nr.rows[0].id;
+}
+// FIX-489 (audit): wipe any existing draw (rounds/fixtures/groups) for a cup. Called when the
+// entrant set changes so the bracket can never go stale or be left with a NULL slot. Returns
+// true if a draw was actually cleared (so callers can tell the admin to re-draw).
+async function _clearCupDraw(client, cupId) {
+    const hadR = await client.query(`SELECT 1 FROM cup_rounds WHERE cup_id=$1 LIMIT 1`, [cupId]);
+    const hadG = await client.query(`SELECT 1 FROM cup_groups WHERE cup_id=$1 LIMIT 1`, [cupId]);
+    if (!hadR.rows.length && !hadG.rows.length) return false;
+    await client.query(`DELETE FROM cup_fixtures WHERE cup_id=$1`, [cupId]);
+    await client.query(`DELETE FROM cup_groups WHERE cup_id=$1`, [cupId]);
+    await client.query(`DELETE FROM cup_rounds WHERE cup_id=$1`, [cupId]);
+    return true;
+}
 // Claim slug: readable team-name stub + unguessable random suffix.
 function _genClaimSlug(name) {
     let base = 'team';
@@ -44352,7 +44693,7 @@ app.get('/api/t/:tenant_short_id/admin/leagues/:id', authenticateToken, requireT
                FROM leagues WHERE id = $1 AND tenant_id = $2`, [lid, req.tenant.id]);
         if (lr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
         const tr = await pool.query(
-            `SELECT id, name, bib_colour, captain_player_id, claim_slug, claimed_at, status, created_at
+            `SELECT id, club_id, name, bib_colour, captain_player_id, claim_slug, claimed_at, status, created_at
                FROM league_teams WHERE league_id = $1 ORDER BY created_at ASC`, [lid]);
         res.json({ league: lr.rows[0], teams: tr.rows });
     } catch (e) {
@@ -44370,6 +44711,7 @@ app.patch('/api/t/:tenant_short_id/admin/leagues/:id', authenticateToken, requir
         const cur = await pool.query('SELECT status FROM leagues WHERE id=$1 AND tenant_id=$2', [lid, req.tenant.id]);
         if (cur.rows.length === 0) return res.status(404).json({ error: 'not_found' });
         const inSetup = cur.rows[0].status === 'setup';
+        const wasCompleted = cur.rows[0].status === 'completed';
         const b = req.body || {};
         const updates = []; const vals = []; let i = 1;
         for (const f of ['name', 'description', 'logo_url', 'primary_color', 'tiebreak_order']) {
@@ -44403,6 +44745,10 @@ app.patch('/api/t/:tenant_short_id/admin/leagues/:id', authenticateToken, requir
         if (!updates.length) return res.status(400).json({ error: 'no valid fields' });
         vals.push(lid); vals.push(req.tenant.id);
         await pool.query(`UPDATE leagues SET ${updates.join(', ')} WHERE id=$${i++} AND tenant_id=$${i++}`, vals);
+        // On first transition into 'completed', record the winner's honour (best-effort, idempotent).
+        if (b.status === 'completed' && !wasCompleted) {
+            setImmediate(() => _recordLeagueWinnerHonour(lid).catch(e => console.error('league honours:', e.message)));
+        }
         res.json({ ok: true });
     } catch (e) {
         console.error('FIX-402 patch league:', e.message);
@@ -44431,15 +44777,21 @@ app.post('/api/t/:tenant_short_id/admin/leagues/:id/teams', authenticateToken, r
         const created = [];
         for (const nm of names) {
             const slug = _genClaimSlug(nm);
+            // forward-fill: every new league team gets a canonical club (persists across leagues + cups)
+            const cr = await pool.query(
+                `INSERT INTO clubs (tenant_id, name) VALUES ($1,$2) RETURNING id`,
+                [req.tenant.id, nm]);
+            const clubId = cr.rows[0].id;
             try {
                 const r = await pool.query(
-                    `INSERT INTO league_teams (league_id, name, claim_slug) VALUES ($1,$2,$3)
-                     RETURNING id, name, claim_slug`, [lid, nm, slug]);
+                    `INSERT INTO league_teams (league_id, name, claim_slug, club_id) VALUES ($1,$2,$3,$4)
+                     RETURNING id, name, claim_slug`, [lid, nm, slug, clubId]);
                 created.push({
                     id: r.rows[0].id, name: r.rows[0].name, claim_slug: r.rows[0].claim_slug,
                     claim_url: `https://totalfooty.co.uk/claim-team.html?slug=${encodeURIComponent(r.rows[0].claim_slug)}`
                 });
             } catch (ie) {
+                await pool.query('DELETE FROM clubs WHERE id=$1', [clubId]).catch(() => {}); // drop orphan club if team insert skipped
                 if (ie.code === '23505') continue; // duplicate name/slug — skip this one
                 throw ie;
             }
@@ -44458,7 +44810,7 @@ app.post('/api/t/:tenant_short_id/admin/leagues/:id/teams', authenticateToken, r
 app.get('/api/leagues/teams/by-slug/:slug', publicEndpointLimiter, async (req, res) => {
     try {
         const r = await pool.query(
-            `SELECT lt.id, lt.name, lt.bib_colour, lt.status, lt.claimed_at,
+            `SELECT lt.id, lt.club_id, lt.name, lt.bib_colour, lt.status, lt.claimed_at,
                     l.id AS league_id, l.name AS league_name, l.short_id AS league_short_id,
                     l.status AS league_status, l.start_date, l.format, l.team_count
                FROM league_teams lt JOIN leagues l ON l.id = lt.league_id
@@ -44466,7 +44818,7 @@ app.get('/api/leagues/teams/by-slug/:slug', publicEndpointLimiter, async (req, r
         if (r.rows.length === 0) return res.status(404).json({ error: 'not_found' });
         const row = r.rows[0];
         res.json({
-            team:   { id: row.id, name: row.name, bib_colour: row.bib_colour, status: row.status, claimed: !!row.claimed_at },
+            team:   { id: row.id, club_id: row.club_id, name: row.name, bib_colour: row.bib_colour, status: row.status, claimed: !!row.claimed_at },
             league: { id: row.league_id, name: row.league_name, short_id: row.league_short_id, status: row.league_status,
                       start_date: row.start_date, format: row.format, team_count: row.team_count }
         });
@@ -44509,13 +44861,25 @@ app.post('/api/leagues/teams/claim/:slug', authenticateToken, async (req, res) =
     }
 });
 
+// Keep a club's denormalised display fields (name/bib_colour) in step with its team.
+// clubs duplicates these from league_teams, so every team name/colour write syncs here.
+async function _syncClubDisplay(db, clubId, fields) {
+    if (!clubId || !fields) return;
+    const sets = []; const vals = []; let i = 1;
+    if (fields.name !== undefined)       { sets.push(`name=$${i++}`); vals.push(fields.name); }
+    if (fields.bib_colour !== undefined) { sets.push(`bib_colour=$${i++}`); vals.push(fields.bib_colour); }
+    if (!sets.length) return;
+    vals.push(clubId);
+    await db.query(`UPDATE clubs SET ${sets.join(', ')} WHERE id=$${i}`, vals).catch(() => {});
+}
+
 // Edit a team's name + colour (captain OR superadmin OR the league tenant's tenant_admin).
 app.patch('/api/leagues/teams/:id', authenticateToken, async (req, res) => {
     try {
         const tid = req.params.id;
         if (!isValidUuid(tid)) return res.status(400).json({ error: 'invalid_id' });
         const tr = await pool.query(
-            `SELECT lt.id, lt.captain_player_id, l.tenant_id
+            `SELECT lt.id, lt.captain_player_id, lt.club_id, l.tenant_id
                FROM league_teams lt JOIN leagues l ON l.id = lt.league_id WHERE lt.id=$1`, [tid]);
         if (tr.rows.length === 0) return res.status(404).json({ error: 'not_found' });
         const team = tr.rows[0];
@@ -44527,16 +44891,19 @@ app.patch('/api/leagues/teams/:id', authenticateToken, async (req, res) => {
         if (!allowed) return res.status(403).json({ error: 'forbidden' });
         const b = req.body || {};
         const updates = []; const vals = []; let i = 1;
+        const clubSync = {};
         if (b.name !== undefined) {
             const n = String(b.name).trim();
             if (!n) return res.status(400).json({ error: 'name required' });
             updates.push(`name=$${i++}`); vals.push(n);
+            clubSync.name = n;
         }
         if (b.bib_colour !== undefined) {
             // FIX-410k (audit v3): validate hex -- bib_colour renders into inline style="".
             const _bc = (b.bib_colour === null ? null : String(b.bib_colour).trim());
             if (_bc && !/^#[0-9a-fA-F]{3,8}$/.test(_bc)) return res.status(400).json({ error: 'bib_colour must be a hex code like #ff0066' });
             updates.push(`bib_colour=$${i++}`); vals.push(_bc);
+            clubSync.bib_colour = _bc;
         }
         if (!updates.length) return res.status(400).json({ error: 'no valid fields' });
         vals.push(tid);
@@ -44546,6 +44913,8 @@ app.patch('/api/leagues/teams/:id', authenticateToken, async (req, res) => {
             if (ie.code === '23505') return res.status(409).json({ error: 'name_taken' });
             throw ie;
         }
+        // keep the canonical club identity in step with the team's display fields
+        await _syncClubDisplay(pool, team.club_id, clubSync);
         res.json({ ok: true });
     } catch (e) {
         console.error('FIX-402 patch team:', e.message);
@@ -44771,6 +45140,7 @@ app.get('/api/t/:tenant_short_id/admin/leagues/:id/fixtures', authenticateToken,
         const r = await pool.query(
             `SELECT f.id, f.round_number, f.sequence_in_round, f.scheduled_at, f.status,
                     f.home_score, f.away_score, f.game_id,
+                    f.home_team_id, f.away_team_id,
                     h.name AS home_name, a.name AS away_name
                FROM league_fixtures f
                JOIN league_teams h ON h.id = f.home_team_id
@@ -44866,6 +45236,93 @@ function _orderLeagueStandings(rows, confirmedFixtures, lg) {
     return result;
 }
 
+// Final/live league table with full tiebreaks. Shared by the public league view + honours writer.
+// Carries club_id so callers can link each row to its club profile.
+async function _leagueFinalTable(leagueId, lg) {
+    const tableR = await pool.query(
+        `WITH team_stats AS (
+            SELECT t.id AS team_id, t.club_id, t.name, t.bib_colour,
+                   COUNT(f.id) FILTER (WHERE f.status='confirmed')::int AS played,
+                   SUM(CASE WHEN f.status='confirmed' AND
+                            ((f.home_team_id=t.id AND f.home_score>f.away_score)
+                          OR (f.away_team_id=t.id AND f.away_score>f.home_score)) THEN 1 ELSE 0 END)::int AS won,
+                   SUM(CASE WHEN f.status='confirmed' AND f.home_score=f.away_score THEN 1 ELSE 0 END)::int AS drawn,
+                   SUM(CASE WHEN f.status='confirmed' AND
+                            ((f.home_team_id=t.id AND f.home_score<f.away_score)
+                          OR (f.away_team_id=t.id AND f.away_score<f.home_score)) THEN 1 ELSE 0 END)::int AS lost,
+                   SUM(CASE WHEN f.home_team_id=t.id THEN COALESCE(f.home_score,0)
+                            WHEN f.away_team_id=t.id THEN COALESCE(f.away_score,0) ELSE 0 END)::int AS gf,
+                   SUM(CASE WHEN f.home_team_id=t.id THEN COALESCE(f.away_score,0)
+                            WHEN f.away_team_id=t.id THEN COALESCE(f.home_score,0) ELSE 0 END)::int AS ga
+              FROM league_teams t
+              LEFT JOIN league_fixtures f
+                ON (f.home_team_id=t.id OR f.away_team_id=t.id) AND f.status='confirmed'
+             WHERE t.league_id=$1 AND t.status='active'
+             GROUP BY t.id, t.club_id, t.name, t.bib_colour
+         )
+         SELECT team_id, club_id, name, bib_colour, played, won, drawn, lost, gf, ga,
+                (won*$2 + drawn*$3 + lost*$4) AS points,
+                (gf - ga) AS gd
+           FROM team_stats
+          ORDER BY points DESC, gd DESC, gf DESC, name ASC`,
+        [leagueId, lg.points_for_win, lg.points_for_draw, lg.points_for_loss]);
+    const h2hR = await pool.query(
+        `SELECT home_team_id, away_team_id, home_score, away_score
+           FROM league_fixtures
+          WHERE league_id=$1 AND status='confirmed' AND home_score IS NOT NULL AND away_score IS NOT NULL`, [leagueId]);
+    return _orderLeagueStandings(tableR.rows, h2hR.rows, lg);
+}
+
+// On league completion, record the winner (top of the final table) as a club honour.
+// Idempotent: never double-records for the same club+competition.
+async function _recordLeagueWinnerHonour(leagueId) {
+    const lr = await pool.query(
+        `SELECT id, name, tenant_id, points_for_win, points_for_draw, points_for_loss, tiebreak_order
+           FROM leagues WHERE id=$1 AND status='completed'`, [leagueId]);
+    if (!lr.rows.length) return;
+    const lg = lr.rows[0];
+    const table = await _leagueFinalTable(leagueId, lg);
+    if (!table.length || !table[0].played || !table[0].club_id) return; // no games played / no winner
+    const w = table[0];
+    await pool.query(
+        `INSERT INTO club_honours (club_id, tenant_id, competition_type, competition_id, competition_name, placement, is_winner)
+         SELECT $1, $2, 'league', $3, $4, 1, TRUE
+          WHERE NOT EXISTS (SELECT 1 FROM club_honours WHERE club_id=$1 AND competition_type='league' AND competition_id=$3)`,
+        [w.club_id, lg.tenant_id, leagueId, lg.name]);
+}
+
+// FIX-489: keep a cup's club_honours correct. Clears then (if completed) rewrites the
+// champion (placement 1, winner) and runner-up (placement 2) from the final. Idempotent,
+// and self-healing across reopen / re-complete (a reverted final clears the honour).
+async function _syncCupHonours(cupId) {
+    const cr = await pool.query(`SELECT id, name, tenant_id, status FROM cups WHERE id=$1`, [cupId]);
+    if (!cr.rows.length) return;
+    const cup = cr.rows[0];
+    await pool.query(`DELETE FROM club_honours WHERE competition_type='cup' AND competition_id=$1`, [cupId]);
+    if (cup.status !== 'completed') return;
+    const fr = await pool.query(
+        `SELECT f.winner_entrant_id, f.home_entrant_id, f.away_entrant_id
+           FROM cup_fixtures f JOIN cup_rounds r ON r.id = f.round_id
+          WHERE f.cup_id=$1 AND f.status='confirmed' AND f.winner_entrant_id IS NOT NULL
+          ORDER BY r.round_number DESC, f.bracket_slot ASC LIMIT 1`, [cupId]);
+    if (!fr.rows.length) return;
+    const fin = fr.rows[0];
+    const champE = fin.winner_entrant_id;
+    const runnerE = (fin.home_entrant_id === champE) ? fin.away_entrant_id : fin.home_entrant_id;
+    const idr = await pool.query(`SELECT id, club_id FROM cup_entrants WHERE id = ANY($1::uuid[])`, [[champE, runnerE].filter(Boolean)]);
+    const clubOf = {}; idr.rows.forEach(r => { clubOf[r.id] = r.club_id; });
+    if (clubOf[champE]) {
+        await pool.query(
+            `INSERT INTO club_honours (club_id, tenant_id, competition_type, competition_id, competition_name, placement, is_winner)
+             VALUES ($1,$2,'cup',$3,$4,1,TRUE)`, [clubOf[champE], cup.tenant_id, cupId, cup.name]);
+    }
+    if (runnerE && clubOf[runnerE]) {
+        await pool.query(
+            `INSERT INTO club_honours (club_id, tenant_id, competition_type, competition_id, competition_name, placement, is_winner)
+             VALUES ($1,$2,'cup',$3,$4,2,FALSE)`, [clubOf[runnerE], cup.tenant_id, cupId, cup.name]);
+    }
+}
+
 app.get('/api/public/leagues/:short_id', async (req, res) => {
     try {
         const sid = String(req.params.short_id || '').trim();
@@ -44880,44 +45337,12 @@ app.get('/api/public/leagues/:short_id', async (req, res) => {
         const lg = lr.rows[0];
         if (lg.status === 'cancelled') return res.status(404).json({ error: 'not_found' });
 
-        // Standings (active teams only; points from the league's own config).
-        const tableR = await pool.query(
-            `WITH team_stats AS (
-                SELECT t.id AS team_id, t.name, t.bib_colour,
-                       COUNT(f.id) FILTER (WHERE f.status='confirmed')::int AS played,
-                       SUM(CASE WHEN f.status='confirmed' AND
-                                ((f.home_team_id=t.id AND f.home_score>f.away_score)
-                              OR (f.away_team_id=t.id AND f.away_score>f.home_score)) THEN 1 ELSE 0 END)::int AS won,
-                       SUM(CASE WHEN f.status='confirmed' AND f.home_score=f.away_score THEN 1 ELSE 0 END)::int AS drawn,
-                       SUM(CASE WHEN f.status='confirmed' AND
-                                ((f.home_team_id=t.id AND f.home_score<f.away_score)
-                              OR (f.away_team_id=t.id AND f.away_score<f.home_score)) THEN 1 ELSE 0 END)::int AS lost,
-                       SUM(CASE WHEN f.home_team_id=t.id THEN COALESCE(f.home_score,0)
-                                WHEN f.away_team_id=t.id THEN COALESCE(f.away_score,0) ELSE 0 END)::int AS gf,
-                       SUM(CASE WHEN f.home_team_id=t.id THEN COALESCE(f.away_score,0)
-                                WHEN f.away_team_id=t.id THEN COALESCE(f.home_score,0) ELSE 0 END)::int AS ga
-                  FROM league_teams t
-                  LEFT JOIN league_fixtures f
-                    ON (f.home_team_id=t.id OR f.away_team_id=t.id) AND f.status='confirmed'
-                 WHERE t.league_id=$1 AND t.status='active'
-                 GROUP BY t.id, t.name, t.bib_colour
-             )
-             SELECT team_id, name, bib_colour, played, won, drawn, lost, gf, ga,
-                    (won*$2 + drawn*$3 + lost*$4) AS points,
-                    (gf - ga) AS gd
-               FROM team_stats
-              ORDER BY points DESC, gd DESC, gf DESC, name ASC`,
-            [lg.id, lg.points_for_win, lg.points_for_draw, lg.points_for_loss]);
-
-        // FIX-410h: confirmed head-to-head fixtures (for relative H2H tie-breaks).
-        const h2hR = await pool.query(
-            `SELECT home_team_id, away_team_id, home_score, away_score
-               FROM league_fixtures
-              WHERE league_id=$1 AND status='confirmed' AND home_score IS NOT NULL AND away_score IS NOT NULL`, [lg.id]);
+        // Standings with full tiebreaks (shared helper; carries club_id for row links).
+        const _finalTable = await _leagueFinalTable(lg.id, lg);
 
         // Teams (all non-replaced, incl. dropped flag for context) + captain + roster size.
         const teamsR = await pool.query(
-            `SELECT lt.id, lt.name, lt.bib_colour, lt.status, lt.claimed_at,
+            `SELECT lt.id, lt.club_id, lt.name, lt.bib_colour, lt.status, lt.claimed_at,
                     p.alias AS captain_name,
                     (SELECT COUNT(*)::int FROM league_team_players ltp
                       WHERE ltp.league_team_id = lt.id AND ltp.status='active') AS roster_count
@@ -44930,12 +45355,12 @@ app.get('/api/public/leagues/:short_id', async (req, res) => {
         const fixR = await pool.query(
             `SELECT f.id, f.round_number, f.sequence_in_round, f.scheduled_at, f.status,
                     f.home_score, f.away_score, f.game_id,
-                    h.name AS home_name, h.bib_colour AS home_bib, h.status AS home_status,
-                    a.name AS away_name, a.bib_colour AS away_bib, a.status AS away_status
+                    h.name AS home_name, h.bib_colour AS home_bib, h.status AS home_status, h.club_id AS home_club_id,
+                    a.name AS away_name, a.bib_colour AS away_bib, a.status AS away_status, a.club_id AS away_club_id
                FROM league_fixtures f
                JOIN league_teams h ON h.id = f.home_team_id
                JOIN league_teams a ON a.id = f.away_team_id
-              WHERE f.league_id=$1
+              WHERE f.league_id=$1 AND f.status <> 'cancelled'
               ORDER BY f.round_number ASC, f.sequence_in_round ASC`, [lg.id]);
 
         res.json({
@@ -44945,12 +45370,12 @@ app.get('/api/public/leagues/:short_id', async (req, res) => {
                 format: lg.format, rounds: lg.rounds, start_date: lg.start_date, team_count: lg.team_count,
                 tenant_name: lg.tenant_name
             },
-            table: _orderLeagueStandings(tableR.rows, h2hR.rows, lg),
+            table: _finalTable,
             teams: teamsR.rows,
             fixtures: fixR.rows
         });
     } catch (e) {
-        if (e && e.code === '42P01') return res.status(404).json({ error: 'not_found' }); // pre-migration
+        if (e && (e.code === '42P01' || e.code === '42703')) return res.status(404).json({ error: 'not_found' }); // pre-migration: missing table or column
         console.error('FIX-404 public league:', e.message);
         res.status(500).json({ error: 'failed' });
     }
@@ -44981,8 +45406,8 @@ app.get('/api/games/:id/league-context', authenticateToken, async (req, res) => 
         const _lq = await pool.query(
             `SELECT l.id, l.short_id, l.name, l.status, l.primary_color,
                     f.round_number, f.status AS fixture_status, f.home_score, f.away_score,
-                    h.id AS home_id, h.name AS home_name, h.bib_colour AS home_colour,
-                    a.id AS away_id, a.name AS away_name, a.bib_colour AS away_colour
+                    h.id AS home_id, h.name AS home_name, h.bib_colour AS home_colour, h.club_id AS home_club_id,
+                    a.id AS away_id, a.name AS away_name, a.bib_colour AS away_colour, a.club_id AS away_club_id
                FROM leagues l
                JOIN league_fixtures f ON f.league_id = l.id AND f.game_id = $1
                JOIN league_teams h ON h.id = f.home_team_id
@@ -44994,8 +45419,8 @@ app.get('/api/games/:id/league-context', authenticateToken, async (req, res) => 
             id: lx.id, short_id: lx.short_id, name: lx.name, status: lx.status, primary_color: lx.primary_color,
             round: lx.round_number, fixture_status: lx.fixture_status,
             home_score: lx.home_score, away_score: lx.away_score,
-            home_team: { id: lx.home_id, name: lx.home_name, bib_colour: lx.home_colour },
-            away_team: { id: lx.away_id, name: lx.away_name, bib_colour: lx.away_colour }
+            home_team: { id: lx.home_id, club_id: lx.home_club_id, name: lx.home_name, bib_colour: lx.home_colour },
+            away_team: { id: lx.away_id, club_id: lx.away_club_id, name: lx.away_name, bib_colour: lx.away_colour }
         };
         const _rq = await pool.query(
             `SELECT ltp.league_team_id, ltp.player_id, ltp.is_captain, p.alias,
@@ -45135,7 +45560,7 @@ async function _ensureInviteSlug(teamId, teamName) {
 app.get('/api/leagues/my-teams', authenticateToken, async (req, res) => {
     try {
         const r = await pool.query(
-            `SELECT lt.id, lt.name, lt.bib_colour, lt.status,
+            `SELECT lt.id, lt.club_id, lt.name, lt.bib_colour, lt.status,
                     (lt.captain_player_id = $1) AS is_captain,
                     l.id AS league_id, l.short_id AS league_short_id, l.name AS league_name, l.status AS league_status,
                     (SELECT COUNT(*)::int FROM league_team_players x WHERE x.league_team_id=lt.id AND x.status='active') AS roster_count
@@ -45213,7 +45638,7 @@ app.get('/api/leagues/teams/:id/manage', authenticateToken, async (req, res) => 
 app.get('/api/leagues/teams/invite/:invite_slug', publicEndpointLimiter, async (req, res) => {
     try {
         const r = await pool.query(
-            `SELECT lt.id, lt.name, lt.bib_colour, lt.status,
+            `SELECT lt.id, lt.club_id, lt.name, lt.bib_colour, lt.status,
                     l.name AS league_name, l.short_id AS league_short_id, l.status AS league_status, l.team_count, l.format,
                     (SELECT COUNT(*)::int FROM league_team_players x WHERE x.league_team_id=lt.id AND x.status='active') AS roster_count
                FROM league_teams lt JOIN leagues l ON l.id = lt.league_id
@@ -45221,7 +45646,7 @@ app.get('/api/leagues/teams/invite/:invite_slug', publicEndpointLimiter, async (
         if (r.rows.length === 0) return res.status(404).json({ error: 'not_found' });
         const row = r.rows[0];
         res.json({
-            team: { id: row.id, name: row.name, bib_colour: row.bib_colour, status: row.status, roster_count: row.roster_count },
+            team: { id: row.id, club_id: row.club_id, name: row.name, bib_colour: row.bib_colour, status: row.status, roster_count: row.roster_count },
             league: { name: row.league_name, short_id: row.league_short_id, status: row.league_status, team_count: row.team_count, format: row.format }
         });
     } catch (e) {
@@ -45367,6 +45792,646 @@ app.post('/api/t/:tenant_short_id/admin/league-fixtures/:id/postpone', authentic
     }
 });
 
+// ════════════════════════════════════════════════════════════════════════
+// PHASE 2 (FIX-488) — Manual league fixture / slot editor.
+// Fills the auto-round-robin gap: hand-pick pairings, add one-off fixtures,
+// reorder / re-date slots, void & hard-delete, and refill a voided slot with a
+// new (or the same) pairing. Standings count ONLY status='confirmed', so every
+// team/slot mutation is gated to non-confirmed fixtures (reopen a confirmed
+// result first). Each fixture owns a linked games row (RSVP/payments/awards);
+// it is kept in sync — date on re-slot, cancel on void, re-activate on refill.
+// ════════════════════════════════════════════════════════════════════════
+
+// All teamIds are active (non-dropped/replaced) members of this league?
+async function _leagueTeamsActive(db, leagueId, teamIds) {
+    const ids = [...new Set(teamIds.filter(Boolean).map(String))];
+    if (ids.length === 0) return false;
+    const r = await db.query(
+        `SELECT COUNT(*)::int AS n FROM league_teams
+          WHERE id = ANY($1::uuid[]) AND league_id=$2 AND status NOT IN ('dropped','replaced')`,
+        [ids, leagueId]);
+    return r.rows[0].n === ids.length;
+}
+
+// Resolve a fixture to {id,league_id,game_id,status,tenant_id}, enforcing tenant ownership.
+async function _leagueFixtureOwned(db, fixtureId, tenantId) {
+    const r = await db.query(
+        `SELECT f.id, f.league_id, f.game_id, f.status, l.tenant_id
+           FROM league_fixtures f JOIN leagues l ON l.id=f.league_id WHERE f.id=$1`, [fixtureId]);
+    if (!r.rows.length || String(r.rows[0].tenant_id) !== String(tenantId)) return null;
+    return r.rows[0];
+}
+
+// 1) Swap / hand-pick the pairing of a not-yet-played fixture.
+app.patch('/api/t/:tenant_short_id/admin/league-fixtures/:id/teams', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) return res.status(400).json({ error: 'invalid_id' });
+        const home = req.body && req.body.home_team_id, away = req.body && req.body.away_team_id;
+        if (!isValidUuid(home) || !isValidUuid(away)) return res.status(400).json({ error: 'home_team_id and away_team_id required' });
+        if (String(home) === String(away)) return res.status(400).json({ error: 'home and away must differ' });
+        const fx = await _leagueFixtureOwned(pool, fid, req.tenant.id);
+        if (!fx) return res.status(404).json({ error: 'not_found' });
+        if (!['scheduled','postponed'].includes(fx.status)) return res.status(409).json({ error: 'fixture_locked', detail: 'Only a scheduled/postponed fixture can be re-paired (reopen a confirmed one; refill a voided one).' });
+        if (!await _leagueTeamsActive(pool, fx.league_id, [home, away])) return res.status(400).json({ error: 'teams_not_in_league' });
+        const upd = await pool.query(
+            `UPDATE league_fixtures SET home_team_id=$1, away_team_id=$2 WHERE id=$3 AND status IN ('scheduled','postponed') RETURNING id`,
+            [home, away, fid]);
+        if (upd.rowCount === 0) return res.status(409).json({ error: 'fixture_locked' });
+        await auditLog(pool, req.user.playerId, 'league_fixture_teams_set', null, `Fixture ${fid} -> ${home} v ${away}`, req.tenant.id).catch(()=>{});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-488 fixture teams:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// 2) Add one or more one-off fixtures (each gets its own games row).
+app.post('/api/t/:tenant_short_id/admin/leagues/:id/fixtures', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const lid = req.params.id;
+        if (!isValidUuid(lid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        let items = Array.isArray(req.body && req.body.fixtures) ? req.body.fixtures
+                  : (req.body && (req.body.home_team_id || req.body.away_team_id)) ? [req.body] : null;
+        if (!items || items.length === 0) { client.release(); return res.status(400).json({ error: 'no_fixtures' }); }
+        if (items.length > 50) { client.release(); return res.status(400).json({ error: 'too_many', detail: 'Max 50 fixtures per request' }); }
+
+        await client.query('BEGIN');
+        const lr = await client.query('SELECT id, status FROM leagues WHERE id=$1 AND tenant_id=$2 FOR UPDATE', [lid, req.tenant.id]);
+        if (!lr.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        if (['completed','cancelled'].includes(lr.rows[0].status)) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'league_' + lr.rows[0].status }); }
+
+        const allTeamIds = [];
+        for (const it of items) {
+            if (!it || !isValidUuid(it.home_team_id) || !isValidUuid(it.away_team_id)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'home_team_id and away_team_id required on each fixture' }); }
+            if (String(it.home_team_id) === String(it.away_team_id)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'home and away must differ' }); }
+            const when = new Date(it.scheduled_at);
+            if (!it.scheduled_at || isNaN(when.getTime())) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'invalid_date' }); }
+            allTeamIds.push(it.home_team_id, it.away_team_id);
+        }
+        if (!await _leagueTeamsActive(client, lid, allTeamIds)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'teams_not_in_league' }); }
+
+        const maxR = await client.query('SELECT COALESCE(MAX(round_number),0)::int AS m FROM league_fixtures WHERE league_id=$1', [lid]);
+        const defaultRound = maxR.rows[0].m + 1;
+        const created = [];
+        for (const it of items) {
+            const when = new Date(it.scheduled_at).toISOString();
+            const rn = parseInt(it.round_number, 10);
+            const round = (Number.isInteger(rn) && rn > 0 && rn <= 1000) ? rn : defaultRound;
+            const seqR = await client.query('SELECT COALESCE(MAX(sequence_in_round),0)::int AS s FROM league_fixtures WHERE league_id=$1 AND round_number=$2', [lid, round]);
+            const seq = seqR.rows[0].s + 1;
+            const gameId = await _createLeagueGameRow(client, lid, req.tenant.id, when);
+            const ins = await client.query(
+                `INSERT INTO league_fixtures (league_id, home_team_id, away_team_id, round_number, sequence_in_round, scheduled_at, status, game_id)
+                 VALUES ($1,$2,$3,$4,$5,$6,'scheduled',$7) RETURNING id`,
+                [lid, it.home_team_id, it.away_team_id, round, seq, when, gameId]);
+            created.push(ins.rows[0].id);
+        }
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'league_fixtures_added', null, `${created.length} manual fixture(s) added to league ${lid}`, req.tenant.id).catch(()=>{});
+        res.status(201).json({ ok: true, created: created.length, ids: created });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(()=>{});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-488 add fixtures:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// 3) Re-slot a fixture — change date and/or round / sequence (reorder).
+app.patch('/api/t/:tenant_short_id/admin/league-fixtures/:id/slot', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) return res.status(400).json({ error: 'invalid_id' });
+        const b = req.body || {};
+        const hasDate  = b.scheduled_at !== undefined && b.scheduled_at !== null && b.scheduled_at !== '';
+        const hasRound = b.round_number !== undefined && b.round_number !== null;
+        const hasSeq   = b.sequence_in_round !== undefined && b.sequence_in_round !== null;
+        if (!hasDate && !hasRound && !hasSeq) return res.status(400).json({ error: 'nothing_to_change' });
+        let when = null, round = null, seq = null;
+        if (hasDate)  { when = new Date(b.scheduled_at); if (isNaN(when.getTime())) return res.status(400).json({ error: 'invalid_date' }); }
+        if (hasRound) { round = parseInt(b.round_number, 10); if (!Number.isInteger(round) || round < 1 || round > 1000) return res.status(400).json({ error: 'invalid_round' }); }
+        if (hasSeq)   { seq = parseInt(b.sequence_in_round, 10); if (!Number.isInteger(seq) || seq < 1 || seq > 1000) return res.status(400).json({ error: 'invalid_sequence' }); }
+        const fx = await _leagueFixtureOwned(pool, fid, req.tenant.id);
+        if (!fx) return res.status(404).json({ error: 'not_found' });
+        if (['confirmed','cancelled'].includes(fx.status)) return res.status(409).json({ error: 'fixture_locked', detail: 'Reopen a confirmed fixture / refill a voided one before re-slotting.' });
+        const sets = [], vals = []; let i = 1;
+        if (hasDate)  { sets.push(`scheduled_at=$${i++}`); vals.push(when.toISOString()); }
+        if (hasRound) { sets.push(`round_number=$${i++}`); vals.push(round); }
+        if (hasSeq)   { sets.push(`sequence_in_round=$${i++}`); vals.push(seq); }
+        vals.push(fid);
+        const upd = await pool.query(`UPDATE league_fixtures SET ${sets.join(', ')} WHERE id=$${i} AND status NOT IN ('confirmed','cancelled') RETURNING game_id`, vals);
+        if (upd.rowCount === 0) return res.status(409).json({ error: 'fixture_locked' });
+        if (hasDate && upd.rows[0].game_id) await pool.query(`UPDATE games SET game_date=$1 WHERE id=$2`, [when.toISOString(), upd.rows[0].game_id]).catch(e=>console.error('FIX-488 slot game-date sync:', e.message));
+        await auditLog(pool, req.user.playerId, 'league_fixture_reslotted', null, `Fixture ${fid} re-slotted`, req.tenant.id).catch(()=>{});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('FIX-488 reslot:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// 4) Void a fixture — drops it from standings; cancels its games row. Reversible via refill.
+app.post('/api/t/:tenant_short_id/admin/league-fixtures/:id/void', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const fx = await _leagueFixtureOwned(client, fid, req.tenant.id);
+        if (!fx) { client.release(); return res.status(404).json({ error: 'not_found' }); }
+        if (fx.status === 'cancelled') { client.release(); return res.status(409).json({ error: 'already_void' }); }
+        await client.query('BEGIN');
+        const upd = await client.query(`UPDATE league_fixtures SET status='cancelled' WHERE id=$1 AND status <> 'cancelled' RETURNING id`, [fid]);
+        if (upd.rowCount === 0) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'already_void' }); }
+        if (fx.game_id) await client.query(`UPDATE games SET game_status='cancelled' WHERE id=$1`, [fx.game_id]);
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'league_fixture_voided', null, `Fixture ${fid} voided`, req.tenant.id).catch(()=>{});
+        res.json({ ok: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(()=>{});
+        console.error('FIX-488 void:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// 5) Hard-delete a fixture (+ its games row & RSVPs). Not allowed on a confirmed result.
+app.delete('/api/t/:tenant_short_id/admin/league-fixtures/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const fx = await _leagueFixtureOwned(client, fid, req.tenant.id);
+        if (!fx) { client.release(); return res.status(404).json({ error: 'not_found' }); }
+        if (fx.status === 'confirmed') { client.release(); return res.status(409).json({ error: 'confirmed_locked', detail: 'Reopen or void a confirmed fixture before deleting.' }); }
+        // FIX-488 (RULE 5): refuse to destroy a fixture that holds settled split payments —
+        // delete cascades league_payments_split and orphans wonderful_payments.league_split_id, with no refund.
+        const _paid = await client.query(`SELECT COALESCE(SUM(amount_paid_pence),0)::int AS p FROM league_payments_split WHERE fixture_id=$1`, [fid]).catch(() => ({ rows: [{ p: 0 }] }));
+        if ((_paid.rows[0] && _paid.rows[0].p || 0) > 0) { client.release(); return res.status(409).json({ error: 'has_payments', detail: 'This fixture has recorded payments — void it (reversible) or refund/reconcile first; deleting would destroy the payment record.' }); }
+        await client.query('BEGIN');
+        await client.query('DELETE FROM league_fixtures WHERE id=$1', [fid]);
+        if (fx.game_id) {
+            await client.query('DELETE FROM registrations WHERE game_id=$1', [fx.game_id]).catch(()=>{});
+            await client.query('DELETE FROM games WHERE id=$1', [fx.game_id]).catch(()=>{});
+        }
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'league_fixture_deleted', null, `Fixture ${fid} deleted`, req.tenant.id).catch(()=>{});
+        res.json({ ok: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(()=>{});
+        console.error('FIX-488 delete:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// 6) Refill a voided slot with a new (or the same) pairing — reinstates fixture + game.
+app.post('/api/t/:tenant_short_id/admin/league-fixtures/:id/refill', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const home = req.body && req.body.home_team_id, away = req.body && req.body.away_team_id;
+        if (!isValidUuid(home) || !isValidUuid(away)) { client.release(); return res.status(400).json({ error: 'home_team_id and away_team_id required' }); }
+        if (String(home) === String(away)) { client.release(); return res.status(400).json({ error: 'home and away must differ' }); }
+        const when = (req.body && req.body.scheduled_at) ? new Date(req.body.scheduled_at) : null;
+        if (when && isNaN(when.getTime())) { client.release(); return res.status(400).json({ error: 'invalid_date' }); }
+        const fx = await _leagueFixtureOwned(client, fid, req.tenant.id);
+        if (!fx) { client.release(); return res.status(404).json({ error: 'not_found' }); }
+        if (fx.status !== 'cancelled') { client.release(); return res.status(409).json({ error: 'not_voided', detail: 'Refill only applies to a voided fixture; use the teams editor for a live one.' }); }
+        if (!await _leagueTeamsActive(client, fx.league_id, [home, away])) { client.release(); return res.status(400).json({ error: 'teams_not_in_league' }); }
+        await client.query('BEGIN');
+        const upd = await client.query(
+            `UPDATE league_fixtures
+                SET home_team_id=$1, away_team_id=$2, status='scheduled',
+                    home_score=NULL, away_score=NULL, confirmed_at=NULL, confirmed_by=NULL,
+                    scheduled_at=COALESCE($3, scheduled_at)
+              WHERE id=$4 AND status='cancelled' RETURNING game_id, scheduled_at`,
+            [home, away, when ? when.toISOString() : null, fid]);
+        if (upd.rowCount === 0) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'not_voided' }); }
+        if (upd.rows[0].game_id) await client.query(`UPDATE games SET game_status='available', game_date=$1 WHERE id=$2`, [upd.rows[0].scheduled_at, upd.rows[0].game_id]);
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'league_fixture_refilled', null, `Fixture ${fid} refilled -> ${home} v ${away}`, req.tenant.id).catch(()=>{});
+        res.json({ ok: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(()=>{});
+        console.error('FIX-488 refill:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// CUPS (FIX-489 Phase 3) — foundation: create, list, detail, entrants.
+// Multi-league knockout / groups+knockout. Entrants are backed by the canonical
+// clubs identity (ad-hoc entrants mint a real clubs row). Bracket generation,
+// scoring and views are built in later passes. Tenant-scoped admin only.
+// ════════════════════════════════════════════════════════════════════════
+app.post('/api/t/:tenant_short_id/admin/cups', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const name = String(b.name || '').trim();
+        if (!name) return res.status(400).json({ error: 'name required' });
+        const format = (b.format === 'groups_knockout') ? 'groups_knockout' : 'knockout';
+        const seeding = (b.seeding === 'seeded') ? 'seeded' : 'random';
+        const seedSource = (b.seed_source === 'league_position') ? 'league_position' : 'manual';
+        const awayGoals = b.away_goals === true || b.away_goals === 'true';
+        const extraTime = (b.extra_time === 'et_then_pens') ? 'et_then_pens' : 'straight_pens';
+        const singleLegFinal = b.single_leg_final === true || b.single_leg_final === 'true';
+        const defaultLegs = (parseInt(b.default_legs, 10) === 2) ? 2 : 1;
+        const _VALID_BREAK = ['h2h,gd,gs', 'gd,h2h,gs', 'gd,gs,h2h'];
+        const breakOrder = _VALID_BREAK.includes(b.league_break_order) ? b.league_break_order : 'gd,gs,h2h';
+        const cadence = Math.max(1, Math.min(60, parseInt(b.cadence_days, 10) || 7));
+        const startDate = b.start_date ? new Date(b.start_date) : null;
+        if (b.start_date && (!startDate || isNaN(startDate.getTime()))) return res.status(400).json({ error: 'invalid start_date' });
+        const shortId = await _genCupShortId();
+        const r = await pool.query(
+            `INSERT INTO cups (short_id, tenant_id, name, description, primary_color, format, seeding, seed_source,
+                               away_goals, extra_time, single_leg_final, default_legs, league_break_order, cadence_days, start_date, created_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+             RETURNING id, short_id`,
+            [shortId, req.tenant.id, name, (b.description || null), (b.primary_color || null), format, seeding, seedSource,
+             awayGoals, extraTime, singleLegFinal, defaultLegs, breakOrder, cadence,
+             startDate ? startDate.toISOString().slice(0, 10) : null, req.user.playerId]);
+        await auditLog(pool, req.user.playerId, 'cup_created', null, `Cup "${name}" (${shortId})`, req.tenant.id).catch(() => {});
+        res.status(201).json({ id: r.rows[0].id, short_id: r.rows[0].short_id });
+    } catch (e) {
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-489 create cup:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.get('/api/t/:tenant_short_id/admin/cups', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT c.id, c.short_id, c.name, c.format, c.status, c.start_date, c.created_at,
+                    (SELECT COUNT(*)::int FROM cup_entrants e WHERE e.cup_id=c.id AND e.status='active') AS entrant_count
+               FROM cups c WHERE c.tenant_id=$1 ORDER BY c.created_at DESC`, [req.tenant.id]);
+        res.json({ cups: r.rows });
+    } catch (e) {
+        if (e.code === '42P01') return res.json({ cups: [] });
+        console.error('FIX-489 list cups:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.get('/api/t/:tenant_short_id/admin/cups/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const cid = req.params.id;
+        if (!isValidUuid(cid)) return res.status(400).json({ error: 'invalid_id' });
+        const cr = await pool.query(
+            `SELECT id, short_id, name, description, primary_color, format, seeding, seed_source,
+                    away_goals, extra_time, single_leg_final, default_legs, league_break_order,
+                    status, start_date, cadence_days, created_at, completed_at
+               FROM cups WHERE id=$1 AND tenant_id=$2`, [cid, req.tenant.id]);
+        if (!cr.rows.length) return res.status(404).json({ error: 'not_found' });
+        const er = await pool.query(
+            `SELECT e.id, e.club_id, e.seed, e.status, e.source_league_id, e.source_league_team_id,
+                    COALESCE(cl.name, e.display_name) AS name, l.name AS source_league_name
+               FROM cup_entrants e
+               LEFT JOIN clubs cl ON cl.id = e.club_id
+               LEFT JOIN leagues l ON l.id = e.source_league_id
+              WHERE e.cup_id=$1 ORDER BY e.seed NULLS LAST, e.created_at ASC`, [cid]);
+        const rd = await pool.query(
+            `SELECT id, round_number, name, legs FROM cup_rounds WHERE cup_id=$1 ORDER BY round_number ASC`, [cid]);
+        const fx = await pool.query(
+            `SELECT id, round_id, group_id, bracket_slot, leg, home_entrant_id, away_entrant_id, is_bye,
+                    scheduled_at, home_score, away_score, home_pens, away_pens, winner_entrant_id, status, game_id
+               FROM cup_fixtures WHERE cup_id=$1 ORDER BY round_id ASC NULLS LAST, bracket_slot ASC`, [cid]);
+        res.json({ cup: cr.rows[0], entrants: er.rows, rounds: rd.rows, fixtures: fx.rows });
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return res.status(404).json({ error: 'not_found' });
+        console.error('FIX-489 cup detail:', e.message);
+        res.status(500).json({ error: 'failed' });
+    }
+});
+
+// Add entrants: source = whole 'league' | individual 'team' | 'adhoc' (mints a real clubs row).
+app.post('/api/t/:tenant_short_id/admin/cups/:id/entrants', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const cid = req.params.id;
+        if (!isValidUuid(cid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const b = req.body || {};
+        const source = b.source;
+        if (!['league', 'team', 'adhoc'].includes(source)) { client.release(); return res.status(400).json({ error: "source must be 'league', 'team', or 'adhoc'" }); }
+        await client.query('BEGIN');
+        const cr = await client.query(`SELECT status FROM cups WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, [cid, req.tenant.id]);
+        if (!cr.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        if (cr.rows[0].status !== 'draft') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'cup_not_draft', detail: 'Entrants can only be changed while the cup is in draft.' }); }
+
+        let added = 0, skipped = 0;
+        const insEntrant = async (clubId, nm, srcLeague, srcTeam) => {
+            const r = await client.query(
+                `INSERT INTO cup_entrants (cup_id, club_id, source_league_id, source_league_team_id, display_name)
+                 VALUES ($1,$2,$3,$4,$5) ON CONFLICT (cup_id, club_id) DO NOTHING RETURNING id`,
+                [cid, clubId, srcLeague || null, srcTeam || null, nm || null]);
+            if (r.rowCount) added++; else skipped++;
+        };
+
+        if (source === 'league') {
+            if (!isValidUuid(b.league_id)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'league_id required' }); }
+            const own = await client.query(`SELECT 1 FROM leagues WHERE id=$1 AND tenant_id=$2`, [b.league_id, req.tenant.id]);
+            if (!own.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'league_not_found' }); }
+            const teams = await client.query(
+                `SELECT id, club_id, name FROM league_teams
+                  WHERE league_id=$1 AND status NOT IN ('dropped','replaced') AND club_id IS NOT NULL
+                  ORDER BY created_at ASC`, [b.league_id]);
+            for (const t of teams.rows) await insEntrant(t.club_id, t.name, b.league_id, t.id);
+        } else if (source === 'team') {
+            if (!isValidUuid(b.league_team_id)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'league_team_id required' }); }
+            const tr = await client.query(
+                `SELECT lt.id, lt.club_id, lt.name, lt.league_id
+                   FROM league_teams lt JOIN leagues l ON l.id=lt.league_id
+                  WHERE lt.id=$1 AND l.tenant_id=$2 AND lt.status NOT IN ('dropped','replaced')`, [b.league_team_id, req.tenant.id]);
+            if (!tr.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'team_not_found' }); }
+            const t = tr.rows[0];
+            if (!t.club_id) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'team_no_club', detail: 'That team has no club identity yet.' }); }
+            await insEntrant(t.club_id, t.name, t.league_id, t.id);
+        } else {
+            const nm = String(b.name || '').trim();
+            if (!nm) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'name required for an ad-hoc team' }); }
+            const club = await client.query(`INSERT INTO clubs (tenant_id, name) VALUES ($1,$2) RETURNING id`, [req.tenant.id, nm]);
+            await insEntrant(club.rows[0].id, nm, null, null);
+        }
+        const drawCleared = await _clearCupDraw(client, cid);
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'cup_entrants_added', null, `Cup ${cid}: +${added} entrant(s) (${source})`, req.tenant.id).catch(() => {});
+        res.status(201).json({ ok: true, added, skipped, draw_cleared: drawCleared });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-489 add entrants:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/t/:tenant_short_id/admin/cups/:id/entrants/:entrantId', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const cid = req.params.id, eid = req.params.entrantId;
+        if (!isValidUuid(cid) || !isValidUuid(eid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        await client.query('BEGIN');
+        const cr = await client.query(`SELECT status FROM cups WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, [cid, req.tenant.id]);
+        if (!cr.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        if (cr.rows[0].status !== 'draft') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'cup_not_draft' }); }
+        const er = await client.query(`SELECT club_id, source_league_team_id FROM cup_entrants WHERE id=$1 AND cup_id=$2`, [eid, cid]);
+        if (!er.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'entrant_not_found' }); }
+        const clubId = er.rows[0].club_id, fromTeam = er.rows[0].source_league_team_id;
+        await client.query(`DELETE FROM cup_entrants WHERE id=$1`, [eid]);
+        // Clean up an ad-hoc club with no league_team and no remaining entrant (mirror league orphan-club cleanup).
+        if (!fromTeam) {
+            await client.query(
+                `DELETE FROM clubs c WHERE c.id=$1
+                   AND NOT EXISTS (SELECT 1 FROM league_teams lt WHERE lt.club_id=c.id)
+                   AND NOT EXISTS (SELECT 1 FROM cup_entrants ce WHERE ce.club_id=c.id)`, [clubId]).catch(() => {});
+        }
+        const drawCleared = await _clearCupDraw(client, cid);
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'cup_entrant_removed', null, `Cup ${cid}: removed entrant ${eid}`, req.tenant.id).catch(() => {});
+        res.json({ ok: true, draw_cleared: drawCleared });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-489 remove entrant:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// Set manual seeds (seed_source='manual'). Editable while the cup is in draft.
+app.patch('/api/t/:tenant_short_id/admin/cups/:id/seeds', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const cid = req.params.id;
+        if (!isValidUuid(cid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const seeds = Array.isArray((req.body || {}).seeds) ? req.body.seeds : null;
+        if (!seeds) { client.release(); return res.status(400).json({ error: 'seeds array required' }); }
+        await client.query('BEGIN');
+        const cr = await client.query(`SELECT status FROM cups WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, [cid, req.tenant.id]);
+        if (!cr.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        if (cr.rows[0].status !== 'draft') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'cup_not_draft' }); }
+        let n = 0;
+        for (const it of seeds) {
+            if (!it || !isValidUuid(it.entrant_id)) continue;
+            const sv = (it.seed == null || it.seed === '') ? null : parseInt(it.seed, 10);
+            const u = await client.query(`UPDATE cup_entrants SET seed=$1 WHERE id=$2 AND cup_id=$3 RETURNING id`,
+                [Number.isFinite(sv) ? sv : null, it.entrant_id, cid]);
+            if (u.rowCount) n++;
+        }
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'cup_seeds_set', null, `Cup ${cid}: ${n} seed(s) set`, req.tenant.id).catch(() => {});
+        res.json({ ok: true, updated: n });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-489 set seeds:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally { client.release(); }
+});
+
+// Draw the knockout bracket: byes to nearest power of two, seeded (manual / league position)
+// or random placement, rounds named, byes auto-advanced. Re-runnable while in draft (shuffle).
+app.post('/api/t/:tenant_short_id/admin/cups/:id/draw', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const cid = req.params.id;
+        if (!isValidUuid(cid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        await client.query('BEGIN');
+        const cr = await client.query(
+            `SELECT id, format, seeding, seed_source, single_leg_final, default_legs, status
+               FROM cups WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, [cid, req.tenant.id]);
+        if (!cr.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        const cup = cr.rows[0];
+        if (cup.status !== 'draft') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'cup_not_draft', detail: 'Re-draw is only allowed while the cup is in draft.' }); }
+        if (cup.format !== 'knockout') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'groups_draw_pending', detail: 'Group-stage draw is built in the next pass; this cup is groups+knockout.' }); }
+
+        const eR = await client.query(
+            `SELECT id, source_league_id, source_league_team_id, seed FROM cup_entrants
+              WHERE cup_id=$1 AND status='active' ORDER BY created_at ASC`, [cid]);
+        const entrants = eR.rows.map((r, i) => ({ ...r, _idx: i }));
+        const N = entrants.length;
+        if (N < 2) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'need_two', detail: 'Add at least two entrants before drawing.' }); }
+
+        // order entrants into seeds[0..N-1] (seeds[0] = top seed)
+        let seeded;
+        if (cup.seeding === 'random') {
+            seeded = entrants.slice();
+            for (let i = seeded.length - 1; i > 0; i--) { const k = crypto.randomBytes(1)[0] % (i + 1); const tmp = seeded[i]; seeded[i] = seeded[k]; seeded[k] = tmp; }
+        } else if (cup.seed_source === 'league_position') {
+            const posByTeam = {};
+            const leagueIds = Array.from(new Set(entrants.map(e => e.source_league_id).filter(Boolean)));
+            for (const lid of leagueIds) {
+                try {
+                    const lgR = await pool.query(`SELECT * FROM leagues WHERE id=$1`, [lid]);
+                    if (!lgR.rows.length) continue;
+                    const tbl = await _leagueFinalTable(lid, lgR.rows[0]);
+                    tbl.forEach((row, idx) => { posByTeam[row.team_id] = idx + 1; });
+                } catch (_) {}
+            }
+            seeded = entrants.slice().sort((a, b) => {
+                const pa = posByTeam[a.source_league_team_id] || 999, pb = posByTeam[b.source_league_team_id] || 999;
+                return pa !== pb ? pa - pb : a._idx - b._idx;
+            });
+        } else { // manual
+            seeded = entrants.slice().sort((a, b) => {
+                const sa = (a.seed == null ? 1e9 : a.seed), sb = (b.seed == null ? 1e9 : b.seed);
+                return sa !== sb ? sa - sb : a._idx - b._idx;
+            });
+        }
+
+        let P = 1; while (P < N) P *= 2;
+        const byes = P - N;
+        const roundCount = Math.round(Math.log2(P));
+        const order = _cupSeedOrder(P);                 // bracket positions hold seed numbers 1..P
+        const entrantBySeed = (sn) => (sn <= N ? seeded[sn - 1] : null); // null => BYE
+
+        // wipe any previous draw (re-runnable shuffle)
+        await client.query(`DELETE FROM cup_fixtures WHERE cup_id=$1`, [cid]);
+        await client.query(`DELETE FROM cup_groups WHERE cup_id=$1`, [cid]);
+        await client.query(`DELETE FROM cup_rounds WHERE cup_id=$1`, [cid]);
+
+        // create rounds
+        const rounds = [];
+        for (let i = 1; i <= roundCount; i++) {
+            const teams = P / Math.pow(2, i - 1);
+            const name = (i === 1 && byes > 0) ? 'Preliminary Round' : _cupRoundName(teams);
+            const legs = (teams === 2 && cup.single_leg_final) ? 1 : cup.default_legs;
+            const rr = await client.query(`INSERT INTO cup_rounds (cup_id, round_number, name, legs) VALUES ($1,$2,$3,$4) RETURNING id`, [cid, i, name, legs]);
+            rounds.push({ id: rr.rows[0].id, slots: teams / 2 });
+        }
+        // empty future-round fixtures so byes/winners can advance into slots
+        const fixId = {};
+        for (let i = 2; i <= roundCount; i++) {
+            for (let j = 0; j < rounds[i - 1].slots; j++) {
+                const fr = await client.query(`INSERT INTO cup_fixtures (cup_id, round_id, bracket_slot, status) VALUES ($1,$2,$3,'scheduled') RETURNING id`, [cid, rounds[i - 1].id, j]);
+                fixId[i + ':' + j] = fr.rows[0].id;
+            }
+        }
+        // round 1 + bye advancement
+        let prelimMatches = 0;
+        for (let j = 0; j < rounds[0].slots; j++) {
+            const he = entrantBySeed(order[2 * j]), ae = entrantBySeed(order[2 * j + 1]);
+            if (he && ae) {
+                await client.query(`INSERT INTO cup_fixtures (cup_id, round_id, bracket_slot, home_entrant_id, away_entrant_id, status) VALUES ($1,$2,$3,$4,$5,'scheduled')`, [cid, rounds[0].id, j, he.id, ae.id]);
+                prelimMatches++;
+            } else if (he || ae) {
+                const adv = he || ae;
+                await client.query(`INSERT INTO cup_fixtures (cup_id, round_id, bracket_slot, home_entrant_id, is_bye, winner_entrant_id, status) VALUES ($1,$2,$3,$4,TRUE,$5,'confirmed')`, [cid, rounds[0].id, j, adv.id, adv.id]);
+                if (roundCount >= 2) {
+                    const side = (j % 2 === 0) ? 'home_entrant_id' : 'away_entrant_id';
+                    await client.query(`UPDATE cup_fixtures SET ${side}=$1 WHERE id=$2`, [adv.id, fixId['2:' + Math.floor(j / 2)]]);
+                }
+            } else {
+                await client.query(`INSERT INTO cup_fixtures (cup_id, round_id, bracket_slot, status) VALUES ($1,$2,$3,'scheduled')`, [cid, rounds[0].id, j]);
+            }
+        }
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'cup_drawn', null, `Cup ${cid}: ${N} entrants, P=${P}, ${byes} bye(s)`, req.tenant.id).catch(() => {});
+        res.status(201).json({ ok: true, entrants: N, bracket_size: P, byes, prelim_matches: prelimMatches, rounds: roundCount });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (e.code === '42P01') return res.status(503).json({ error: 'not_ready' });
+        console.error('FIX-489 draw:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally { client.release(); }
+});
+
+// Confirm a knockout tie result (single-leg). Resolves the winner (pens when level),
+// advances them into the next round slot, and completes the cup when the final lands.
+app.post('/api/t/:tenant_short_id/admin/cup-fixtures/:id/confirm-score', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        const b = req.body || {};
+        const hs = parseInt(b.home_score, 10), as = parseInt(b.away_score, 10);
+        if (!Number.isFinite(hs) || !Number.isFinite(as) || hs < 0 || as < 0) { client.release(); return res.status(400).json({ error: 'scores_required' }); }
+        const hp = (b.home_pens == null || b.home_pens === '') ? null : parseInt(b.home_pens, 10);
+        const ap = (b.away_pens == null || b.away_pens === '') ? null : parseInt(b.away_pens, 10);
+        await client.query('BEGIN');
+        const fr = await client.query(
+            `SELECT f.id, f.cup_id, f.round_id, f.group_id, f.bracket_slot, f.is_bye, f.status,
+                    f.home_entrant_id, f.away_entrant_id, r.round_number, r.legs, c.tenant_id
+               FROM cup_fixtures f
+               JOIN cups c ON c.id = f.cup_id
+               LEFT JOIN cup_rounds r ON r.id = f.round_id
+              WHERE f.id=$1 FOR UPDATE`, [fid]);
+        if (!fr.rows.length || fr.rows[0].tenant_id !== req.tenant.id) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        const f = fr.rows[0];
+        if (f.status === 'confirmed') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'already_confirmed', detail: 'Reopen this tie before re-entering a result.' }); }
+        if (f.is_bye) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'is_bye' }); }
+        if (f.group_id) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'group_scoring_pending', detail: 'Group scoring is built with the group stage.' }); }
+        if (!f.home_entrant_id || !f.away_entrant_id) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'entrants_tbd', detail: 'Both entrants must be decided before scoring.' }); }
+        if (f.legs === 2) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'two_leg_pending', detail: 'Two-legged tie scoring is built in the next pass.' }); }
+        const r = _cupResolveSingleLeg(hs, as, hp, ap);
+        if (!r.decided) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'pens_required', detail: 'Scores are level — enter a penalty result to decide the tie.' }); }
+        const winner = (r.winner === 'home') ? f.home_entrant_id : f.away_entrant_id;
+        await client.query(
+            `UPDATE cup_fixtures SET home_score=$1, away_score=$2, home_pens=$3, away_pens=$4,
+                    winner_entrant_id=$5, status='confirmed', confirmed_at=NOW() WHERE id=$6`,
+            [hs, as, hp, ap, winner, fid]);
+        await client.query(`UPDATE cups SET status='active' WHERE id=$1 AND status='draft'`, [f.cup_id]);
+        const nextRoundId = await _cupAdvanceWinner(client, f.cup_id, f.round_number, f.bracket_slot, winner);
+        let completed = false;
+        if (!nextRoundId) { await client.query(`UPDATE cups SET status='completed', completed_at=NOW() WHERE id=$1`, [f.cup_id]); completed = true; }
+        await client.query('COMMIT');
+        const pensTxt = (hp != null && ap != null) ? (' (pens ' + hp + '-' + ap + ')') : '';
+        await auditLog(pool, req.user.playerId, completed ? 'cup_completed' : 'cup_score_confirmed', null, `Cup ${f.cup_id}: ${hs}-${as}${pensTxt}`, req.tenant.id).catch(() => {});
+        if (completed) setImmediate(() => _syncCupHonours(f.cup_id).catch(e => console.error('cup honours:', e.message)));
+        res.json({ ok: true, winner_entrant_id: winner, cup_completed: completed });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-489 cup confirm-score:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally { client.release(); }
+});
+
+// Reopen a confirmed tie — only if the next-round result it fed has NOT been confirmed
+// (downstream integrity). Clears the result and pulls the winner back out of the next slot.
+app.post('/api/t/:tenant_short_id/admin/cup-fixtures/:id/reopen', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const fid = req.params.id;
+        if (!isValidUuid(fid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
+        await client.query('BEGIN');
+        const fr = await client.query(
+            `SELECT f.id, f.cup_id, f.round_id, f.bracket_slot, f.is_bye, f.status, r.round_number, c.tenant_id
+               FROM cup_fixtures f JOIN cups c ON c.id=f.cup_id
+               LEFT JOIN cup_rounds r ON r.id=f.round_id
+              WHERE f.id=$1 FOR UPDATE`, [fid]);
+        if (!fr.rows.length || fr.rows[0].tenant_id !== req.tenant.id) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+        const f = fr.rows[0];
+        if (f.is_bye) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'is_bye' }); }
+        if (f.status !== 'confirmed') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'not_confirmed' }); }
+        const nr = await client.query(`SELECT id FROM cup_rounds WHERE cup_id=$1 AND round_number=$2`, [f.cup_id, f.round_number + 1]);
+        if (nr.rows.length) {
+            const nextSlot = Math.floor(f.bracket_slot / 2);
+            const nf = await client.query(`SELECT status FROM cup_fixtures WHERE cup_id=$1 AND round_id=$2 AND bracket_slot=$3`, [f.cup_id, nr.rows[0].id, nextSlot]);
+            if (nf.rows.some(x => x.status === 'confirmed')) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'downstream_locked', detail: 'Reopen the next-round result first.' }); }
+        }
+        await client.query(`UPDATE cup_fixtures SET home_score=NULL, away_score=NULL, home_pens=NULL, away_pens=NULL, winner_entrant_id=NULL, status='scheduled', confirmed_at=NULL WHERE id=$1`, [fid]);
+        await _cupAdvanceWinner(client, f.cup_id, f.round_number, f.bracket_slot, null);
+        await client.query(`UPDATE cups SET status='active', completed_at=NULL WHERE id=$1 AND status='completed'`, [f.cup_id]);
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'cup_score_reopened', null, `Cup ${f.cup_id}: fixture reopened`, req.tenant.id).catch(() => {});
+        setImmediate(() => _syncCupHonours(f.cup_id).catch(e => console.error('cup honours:', e.message)));
+        res.json({ ok: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-489 cup reopen:', e.message);
+        res.status(500).json({ error: 'failed' });
+    } finally { client.release(); }
+});
+
 // Payment status for the confirm-UI pills (degrades to zeros when no splits yet — Phase 6).
 app.get('/api/t/:tenant_short_id/admin/league-fixtures/:id/payment-status', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
@@ -45465,11 +46530,15 @@ app.post('/api/t/:tenant_short_id/admin/leagues/:id/replace-team', authenticateT
 
         const slug = _genClaimSlug(rep.name);
         const hasCaptain = isValidUuid(rep.captain_player_id);
+        // forward-fill: replacement team gets its own canonical club
+        const _repClub = await client.query(
+            `INSERT INTO clubs (tenant_id, name, bib_colour) VALUES ($1,$2,$3) RETURNING id`,
+            [req.tenant.id, String(rep.name).trim(), _repBib]);
         const nr = await client.query(
-            `INSERT INTO league_teams (league_id, name, bib_colour, claim_slug, status, replacement_for_id, captain_player_id, claimed_at)
-             VALUES ($1,$2,$3,$4,'active',$5,$6,$7) RETURNING id`,
+            `INSERT INTO league_teams (league_id, name, bib_colour, claim_slug, status, replacement_for_id, captain_player_id, claimed_at, club_id)
+             VALUES ($1,$2,$3,$4,'active',$5,$6,$7,$8) RETURNING id`,
             [lid, String(rep.name).trim(), _repBib, slug, droppedId,
-             hasCaptain ? rep.captain_player_id : null, hasCaptain ? new Date().toISOString() : null]);
+             hasCaptain ? rep.captain_player_id : null, hasCaptain ? new Date().toISOString() : null, _repClub.rows[0].id]);
         const newId = nr.rows[0].id;
         if (hasCaptain) {
             await client.query(
@@ -45791,9 +46860,13 @@ app.post('/api/games/:gameUrl/rating-feedback/more', authenticateToken, async (r
         const { gameUrl } = req.params;
         const voterId     = req.user.playerId;
 
-        const gR = await pool.query(`SELECT id FROM games WHERE game_url = $1`, [gameUrl]);
+        const gR = await pool.query(`SELECT id, team_selection_type, external_league_id FROM games WHERE game_url = $1`, [gameUrl]);
         if (gR.rows.length === 0) return res.status(404).json({ error: 'game_not_found' });
         const gameId = gR.rows[0].id;
+        // External league/cup games carry no peer rating-feedback (separate tier, no OVR impact).
+        if (gR.rows[0].team_selection_type === 'vs_external' || gR.rows[0].external_league_id != null) {
+            return res.json({ none: true, reason: 'external_game' });
+        }
 
         // Eligibility: voter must be confirmed in the game
         const vR = await pool.query(
@@ -48263,8 +49336,13 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
 
         console.log('[WF status-poll] ref:', ref, 'db_status:', p.status, 'wp_id:', p.wonderful_payment_id || 'NULL');
 
-        // Cold-start recovery
-        if (p.status !== 'credited' && p.status !== 'credited_manually' && WONDERFUL_API_KEY) {
+        // Cold-start recovery — NON-TERMINAL payments only. A terminal payment
+        // (credited/credited_manually/failed/cancelled/expired/init_failed) has nothing
+        // to recover; re-verifying it here fires a pointless list-search on every tight
+        // client poll (the cancel→paid-within-48h edge stays covered by the background
+        // reconciler, FIX-451). Returning the stored status is identical + cheap.
+        const _WF_TERMINAL_STATUSES = ['credited', 'credited_manually', 'failed', 'cancelled', 'expired', 'init_failed'];
+        if (!_WF_TERMINAL_STATUSES.includes(p.status) && WONDERFUL_API_KEY) {
             const { verified, resolvedWpId } = await _wonderfulVerifyStatus(p);
             if (verified === 'paid' || verified === 'accepted') {
                 try {
@@ -60942,6 +62020,65 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
     }
 });
 
+// ---- Club profile (public, clickable everywhere) — identity + squad + competition history + honours ----
+app.get('/api/public/club/:id', publicPlayerLimiter, async (req, res) => {
+    try {
+        const cid = req.params.id;
+        if (!isValidUuid(cid)) return res.status(400).json({ error: 'invalid_id' });
+
+        const cr = await pool.query(
+            `SELECT id, name, crest_url, bib_colour, created_at FROM clubs WHERE id=$1`, [cid]);
+        if (cr.rows.length === 0) return res.status(404).json({ error: 'club_not_found' });
+        const club = cr.rows[0];
+
+        // competitions this club has been part of (leagues now; cups added in the cup phase)
+        const comps = await pool.query(
+            `SELECT lt.id AS team_id, lt.name AS team_name, lt.status AS team_status,
+                    l.id AS league_id, l.name AS league_name, l.status AS league_status, l.short_id AS league_short_id
+             FROM league_teams lt
+             JOIN leagues l ON l.id = lt.league_id
+             WHERE lt.club_id = $1
+             ORDER BY l.created_at DESC NULLS LAST`, [cid]);
+
+        // current squad: distinct active players across the club's active teams
+        const squad = await pool.query(
+            `SELECT DISTINCT p.id AS player_id, p.alias, p.full_name, ltp.is_captain
+             FROM league_team_players ltp
+             JOIN league_teams lt ON lt.id = ltp.league_team_id
+             JOIN players p ON p.id = ltp.player_id
+             WHERE lt.club_id = $1 AND ltp.status = 'active' AND lt.status IN ('active','unclaimed')
+             ORDER BY ltp.is_captain DESC, p.alias NULLS LAST`, [cid]);
+
+        // honours — populated once league/cup completion flows write here
+        const honours = await pool.query(
+            `SELECT competition_type, competition_id, competition_name, placement, is_winner, awarded_at
+             FROM club_honours WHERE club_id = $1 ORDER BY awarded_at DESC`, [cid]
+        ).catch(() => ({ rows: [] }));
+
+        res.json({
+            club: {
+                id: club.id, name: club.name, crest_url: club.crest_url,
+                bib_colour: club.bib_colour, created_at: club.created_at
+            },
+            competitions: comps.rows.map(r => ({
+                type: 'league', league_id: r.league_id, league_name: r.league_name,
+                league_short_id: r.league_short_id, league_status: r.league_status,
+                team_id: r.team_id, team_name: r.team_name, team_status: r.team_status
+            })),
+            squad: squad.rows.map(r => ({
+                player_id: r.player_id, alias: r.alias || r.full_name, is_captain: r.is_captain
+            })),
+            honours: honours.rows.map(r => ({
+                type: r.competition_type, competition_id: r.competition_id, competition_name: r.competition_name,
+                placement: r.placement, is_winner: r.is_winner, awarded_at: r.awarded_at
+            }))
+        });
+    } catch (e) {
+        console.error('club profile error:', e);
+        res.status(500).json({ error: 'server_error' });
+    }
+});
+
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 
@@ -62658,6 +63795,33 @@ async function fix401BootstrapLeagues() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_leagues_tenant ON leagues(tenant_id)`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_leagues_status ON leagues(status)`);
 
+        // 1b) clubs — canonical team identity that persists across leagues + cups.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS clubs (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id   UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                crest_url   TEXT,
+                bib_colour  TEXT,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_clubs_tenant ON clubs(tenant_id)`);
+
+        // 1c) club_honours — what a club has won/placed in completed leagues + cups.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS club_honours (
+                id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                club_id          UUID NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+                tenant_id        UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                competition_type TEXT NOT NULL CHECK (competition_type IN ('league','cup')),
+                competition_id   UUID NOT NULL,
+                competition_name TEXT NOT NULL,
+                placement        INTEGER,
+                is_winner        BOOLEAN NOT NULL DEFAULT FALSE,
+                awarded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_club_honours_club ON club_honours(club_id)`);
+
         // 2) league_teams — persistent team entities + claim flow + drop lifecycle.
         await pool.query(`
             CREATE TABLE IF NOT EXISTS league_teams (
@@ -62680,6 +63844,8 @@ async function fix401BootstrapLeagues() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_league_teams_league ON league_teams(league_id)`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_league_teams_captain ON league_teams(captain_player_id)`);
         await pool.query(`ALTER TABLE league_teams ADD COLUMN IF NOT EXISTS invite_slug TEXT UNIQUE`); // FIX-406 Block N P2: shared team invite link
+        await pool.query(`ALTER TABLE league_teams ADD COLUMN IF NOT EXISTS club_id UUID REFERENCES clubs(id)`); // canonical club link (clubs table)
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_league_teams_club ON league_teams(club_id)`);
 
         // 3) league_team_players — roster.
         await pool.query(`
@@ -62749,7 +63915,104 @@ async function fix401BootstrapLeagues() {
         await pool.query(`ALTER TABLE wonderful_payments ADD COLUMN IF NOT EXISTS league_split_id UUID`); // FIX-410b: online split-share link
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_league_id ON games(league_id) WHERE league_id IS NOT NULL`);
 
-        console.log('✅ FIX-401 league schema ready (5 tables + games.league_id)');
+        // 7) CUPS (FIX-489 Phase 3) — multi-league knockout / groups+knockout on top of the clubs identity.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS cups (
+                id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                short_id           TEXT UNIQUE NOT NULL,
+                tenant_id          UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                name               TEXT NOT NULL,
+                description        TEXT,
+                primary_color      TEXT,
+                format             TEXT NOT NULL DEFAULT 'knockout' CHECK (format IN ('knockout','groups_knockout')),
+                seeding            TEXT NOT NULL DEFAULT 'random' CHECK (seeding IN ('seeded','random')),
+                seed_source        TEXT NOT NULL DEFAULT 'manual' CHECK (seed_source IN ('league_position','manual')),
+                away_goals         BOOLEAN NOT NULL DEFAULT FALSE,
+                extra_time         TEXT NOT NULL DEFAULT 'straight_pens' CHECK (extra_time IN ('et_then_pens','straight_pens')),
+                single_leg_final   BOOLEAN NOT NULL DEFAULT FALSE,
+                default_legs       INTEGER NOT NULL DEFAULT 1 CHECK (default_legs IN (1,2)),
+                league_break_order TEXT NOT NULL DEFAULT 'gd,gs,h2h',
+                status             TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','active','completed','cancelled')),
+                start_date         DATE,
+                cadence_days       INTEGER NOT NULL DEFAULT 7,
+                created_by         UUID REFERENCES players(id) ON DELETE SET NULL,
+                created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at       TIMESTAMPTZ
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_cups_tenant ON cups(tenant_id)`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS cup_entrants (
+                id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                cup_id                UUID NOT NULL REFERENCES cups(id) ON DELETE CASCADE,
+                club_id               UUID NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+                source_league_id      UUID REFERENCES leagues(id) ON DELETE SET NULL,
+                source_league_team_id UUID REFERENCES league_teams(id) ON DELETE SET NULL,
+                display_name          TEXT,
+                seed                  INTEGER,
+                status                TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','dropped','replaced')),
+                created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (cup_id, club_id)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_cup_entrants_cup ON cup_entrants(cup_id)`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS cup_groups (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                cup_id      UUID NOT NULL REFERENCES cups(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                qualifiers  INTEGER NOT NULL DEFAULT 2 CHECK (qualifiers >= 1),
+                sort_order  INTEGER NOT NULL DEFAULT 0
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_cup_groups_cup ON cup_groups(cup_id)`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS cup_group_teams (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                group_id    UUID NOT NULL REFERENCES cup_groups(id) ON DELETE CASCADE,
+                entrant_id  UUID NOT NULL REFERENCES cup_entrants(id) ON DELETE CASCADE,
+                UNIQUE (group_id, entrant_id)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_cup_group_teams_group ON cup_group_teams(group_id)`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS cup_rounds (
+                id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                cup_id        UUID NOT NULL REFERENCES cups(id) ON DELETE CASCADE,
+                round_number  INTEGER NOT NULL,
+                name          TEXT NOT NULL,
+                legs          INTEGER NOT NULL DEFAULT 1 CHECK (legs IN (1,2)),
+                UNIQUE (cup_id, round_number)
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_cup_rounds_cup ON cup_rounds(cup_id)`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS cup_fixtures (
+                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                cup_id            UUID NOT NULL REFERENCES cups(id) ON DELETE CASCADE,
+                round_id          UUID REFERENCES cup_rounds(id) ON DELETE CASCADE,
+                group_id          UUID REFERENCES cup_groups(id) ON DELETE CASCADE,
+                bracket_slot      INTEGER,
+                leg               INTEGER NOT NULL DEFAULT 1 CHECK (leg IN (1,2)),
+                home_entrant_id   UUID REFERENCES cup_entrants(id) ON DELETE SET NULL,
+                away_entrant_id   UUID REFERENCES cup_entrants(id) ON DELETE SET NULL,
+                is_bye            BOOLEAN NOT NULL DEFAULT FALSE,
+                scheduled_at      TIMESTAMPTZ,
+                home_score        INTEGER,
+                away_score        INTEGER,
+                home_pens         INTEGER,
+                away_pens         INTEGER,
+                winner_entrant_id UUID REFERENCES cup_entrants(id) ON DELETE SET NULL,
+                status            TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled','confirmed','cancelled')),
+                game_id           UUID REFERENCES games(id) ON DELETE SET NULL,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                confirmed_at      TIMESTAMPTZ
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_cup_fixtures_cup ON cup_fixtures(cup_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_cup_fixtures_round ON cup_fixtures(round_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_cup_fixtures_group ON cup_fixtures(group_id)`);
+
+        console.log('✅ FIX-401/489 league + cup schema ready');
     } catch (e) {
         console.error('❌ FIX-401 league bootstrap failed:', e.message);
     }
@@ -62837,6 +64100,11 @@ async function fix386BootstrapRefundPolicy() {
         // defaults; the new tile would 503). Add it idempotently alongside the other
         // two refund columns. Nullable TEXT — empty = no custom policy text shown.
         await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS cancellation_policy_text TEXT`);
+        // EXT awards (design): tenant-level positive-only enable-list for external league/cup games
+        // (empty/null => MOTM only). Normal games keep using disabled_awards untouched.
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS external_awards JSONB`);
+        await pool.query(`ALTER TABLE external_leagues ADD COLUMN IF NOT EXISTS award_goals BOOLEAN NOT NULL DEFAULT FALSE`);
+        await pool.query(`ALTER TABLE external_leagues ADD COLUMN IF NOT EXISTS award_assists BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`UPDATE tenants SET refund_cutoff_hours = 2 WHERE refund_cutoff_hours IS NULL`);
         await pool.query(`UPDATE tenants SET no_refund_after_teams = TRUE WHERE no_refund_after_teams IS NULL`);
         console.log('✅ FIX-386 refund-policy schema ready (refund_cutoff_hours default 2, no_refund_after_teams default TRUE, cancellation_policy_text)');
