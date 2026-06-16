@@ -48,7 +48,7 @@ try:
 except Exception:
     TICKER_TO_EPIC = {}
 
-BUILD = "mr_flip_book build 2026-06-15e (N.1 direction x year: regime-complementary hedge test)"
+BUILD = "mr_flip_book build 2026-06-15f (deep-dive battery: DD attribution / sub-annual corr / crash-grind / breadth)"
 
 N_FOCUS = float(os.environ.get("MRB_N", "3"))
 STOP_MULT = float(os.environ.get("MRB_STOP", "1.0"))
@@ -365,6 +365,65 @@ def direction_year_split(tdf, down_years):
                 down_long=dl, down_short=ds, short_led=int((sa > la).sum()))
 
 
+def deep_dive(tdf):
+    """Section 6 battery (off existing trade data, no account params): answers the
+    questions N.1 raised -- drawdown attribution, sub-annual correlation, crash-vs-grind,
+    book breadth/concurrency. All run on the trades already in memory (one scan)."""
+    t = tdf.copy()
+    t["exit_date"] = pd.to_datetime(t["exit_date"])
+    t = t.sort_values("exit_date").reset_index(drop=True)
+    t["year"] = t["exit_date"].dt.year
+    t["m"] = t["exit_date"].dt.to_period("M")
+    cum = t["R"].cumsum().values
+    run_peak = np.maximum.accumulate(cum)
+    ddv = run_peak - cum
+    trough_i = int(np.argmax(ddv)) if len(ddv) else 0
+    peak_i = int(np.argmax(cum[:trough_i + 1])) if trough_i > 0 else 0
+    win = t.iloc[peak_i:trough_i + 1]
+    pk, tr = t["exit_date"].iloc[peak_i], t["exit_date"].iloc[trough_i]
+
+    print("\n  --- 6a DRAWDOWN ATTRIBUTION (is the worst combined DD a joint long+short bleed?) ---")
+    lwin = win[win["direction"] == "long"]["R"].sum()
+    swin = win[win["direction"] == "short"]["R"].sum()
+    joint = "BOTH bled together (coincident)" if (lwin < 0 and swin < 0) else "one side offset the other"
+    print(f"  worst combined R-DD {ddv[trough_i]:.0f}R over {pk.date()} -> {tr.date()} ({(tr - pk).days}d)")
+    print(f"    in-window: long {lwin:+.0f}R, short {swin:+.0f}R  ->  {joint}")
+    print(f"  underwater {100*(ddv > 1e-9).mean():.0f}% of trade-time")
+
+    print("\n  --- 6b SUB-ANNUAL CORRELATION (does the +0.42 annual coincidence hold monthly?) ---")
+    lm = t[t["direction"] == "long"].groupby("m")["R"].sum()
+    sm = t[t["direction"] == "short"].groupby("m")["R"].sum()
+    mm = pd.concat([lm, sm], axis=1).fillna(0.0); mm.columns = ["L", "S"]
+    mcorr = float(mm["L"].corr(mm["S"])) if len(mm) > 1 else float("nan")
+    opp = float((((mm["L"] > 0) & (mm["S"] < 0)) | ((mm["L"] < 0) & (mm["S"] > 0))).mean())
+    print(f"  monthly corr(long, short) = {mcorr:+.2f}   (annual was +0.42)")
+    print(f"  opposite-sign months = {100*opp:.0f}%  (genuine intra-year offset, even if annual is +ve)")
+
+    print("\n  --- 6c CRASH vs GRIND down-years (do shorts carry crashes but not grinds?) ---")
+    for label, yrs in (("CRASH [2000,2002,2008]", {2000, 2002, 2008}),
+                       ("GRIND [2018,2022]    ", {2018, 2022})):
+        sub = t[t["year"].isin(yrs)]
+        lr = sub[sub["direction"] == "long"]["R"].sum()
+        sr = sub[sub["direction"] == "short"]["R"].sum()
+        print(f"  {label}: long {lr:+.0f}R vs short {sr:+.0f}R  ->  "
+              f"{'SHORTS carry' if sr > lr else 'longs lead'}")
+
+    print("\n  --- 6d BOOK BREADTH / CONCURRENCY (is the worst drawdown broad or concentrated?) ---")
+    wtk = win.groupby("tk")["R"].sum().sort_values()
+    ntk = int(t["tk"].nunique())
+    nneg = int((wtk < 0).sum())
+    print(f"  worst-DD window: {nneg}/{ntk} tickers net-negative "
+          f"({'broad' if nneg > ntk / 2 else 'concentrated'})")
+    print("  biggest losers in window: " + ", ".join(f"{k} {v:+.0f}R" for k, v in wtk.head(3).items()))
+    piv = t.pivot_table(index="m", columns="tk", values="R", aggfunc="sum").fillna(0.0)
+    if piv.shape[1] > 1:
+        cm = piv.corr().values
+        iu = np.triu_indices_from(cm, k=1)
+        ac = float(np.nanmean(cm[iu]))
+        print(f"  avg pairwise monthly corr across {piv.shape[1]} tickers = {ac:+.2f} "
+              f"({'correlated book' if ac > 0.2 else 'largely idiosyncratic'})")
+
+
 def main():
     print(BUILD)
     mode = sys.argv[1] if len(sys.argv) > 1 else "live"
@@ -518,6 +577,11 @@ def main():
           f"(gap = equity-drift tailwind on longs if they win the bull years)")
     print("  >>> regime insurance (shorts carry down-years, anti-corr) vs a coincident")
     print("      return-stream (both positive throughout, shorts just a smaller long).")
+    # ===== 6. DEEP-DIVE BATTERY (off existing trade data; answers N.1's questions) =====
+    print("\n" + "=" * 70)
+    print("6. DEEP-DIVE BATTERY  (DD attribution / sub-annual corr / crash-grind / breadth)")
+    print("=" * 70)
+    deep_dive(tdf)
     print("\n" + "=" * 70)
     print("BOOK SUMMARY")
     print("=" * 70)
