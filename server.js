@@ -3146,6 +3146,8 @@ const NOTIF_TEMPLATES = {
     multi_team_voting_opened: d => ({ title: 'Vote on Teams! 🗳️', body: `Multiple team setups proposed for ${d.day} at ${d.venue}. Tap to vote.` }),
     game_cancelled:    d => ({ title: 'Game Cancelled ❌',       body: `The game on ${d.day} at ${d.venue} has been cancelled. Refund issued.` }),
     cost_changed:      d => ({ title: 'Price Updated 💰',        body: `Game cost changed: was £${d.oldCost}, now £${d.newCost}.` }),
+    training_updated:   d => ({ title: 'Training Updated 📣', body: (d.timeChanged && d.feeChanged) ? `"${d.title}" changed — new time, and cost is now £${d.newCost}.` : d.timeChanged ? `"${d.title}" has a new date/time — check the session page.` : `"${d.title}" cost changed: was £${d.oldCost}, now £${d.newCost}.` }),
+    training_cancelled: d => ({ title: 'Training Cancelled ❌', body: `"${d.title}" on ${d.day} was cancelled. Any payment has been refunded to your wallet.` }),
     game_reminder:     d => ({ title: 'Game Tomorrow! ⚽',       body: `You're playing ${d.day} at ${d.time}, ${d.venue}.` }),
     motm_voting_open:  d => ({ title: 'Vote for MOTM 🏆',       body: `Voting is open for ${d.day}. Cast your vote now!` }),
     motm_winner:       d => ({ title: 'MOTM Winner 🌟',          body: `${d.winnerName} has won Man of the Match for ${d.day}!` }),
@@ -41775,7 +41777,7 @@ app.patch('/api/training/:id/details', authenticateToken, async (req, res) => {
         const s = await _trainingLoad(req.params.id);
         if (!s) return res.status(404).json({ error: 'Training not found' });
         if (!await _trainingCanManage(req, s)) return res.status(403).json({ error: 'Not allowed to edit this session' });
-        if (s.status === 'completed' || s.status === 'cancelled') return res.status(400).json({ error: 'This session is closed — coach and venue can no longer be changed' });
+        if (s.status === 'completed' || s.status === 'cancelled') return res.status(400).json({ error: 'This session is closed — it can no longer be edited' });
         const b = req.body || {};
         const sets = [], vals = []; let i = 1;
         if (Object.prototype.hasOwnProperty.call(b, 'coach_player_id')) {
@@ -41796,14 +41798,114 @@ app.patch('/api/training/:id/details', authenticateToken, async (req, res) => {
             }
             sets.push('confirmed_venue_id = $' + i++); vals.push(vid);
         }
+        // FIX-490: full edit — name / time / cost / duration (mirrors create validation)
+        let timeChanged = false, feeChanged = false;
+        const oldFee = parseFloat(s.fee) || 0; let newFee = oldFee;
+        if (Object.prototype.hasOwnProperty.call(b, 'title')) {
+            const title = String(b.title || '').trim();
+            if (title.length < 3 || title.length > 80) return res.status(400).json({ error: 'Title must be 3-80 characters' });
+            sets.push('title = $' + i++); vals.push(title);
+        }
+        if (Object.prototype.hasOwnProperty.call(b, 'session_date')) {
+            const when = new Date(b.session_date);
+            if (isNaN(when.getTime())) return res.status(400).json({ error: 'Valid session date/time required' });
+            if (!s.session_date || new Date(s.session_date).getTime() !== when.getTime()) timeChanged = true;
+            sets.push('session_date = $' + i++); vals.push(when.toISOString());
+        }
+        if (Object.prototype.hasOwnProperty.call(b, 'fee')) {
+            const fee = (b.fee === '' || b.fee == null) ? 0 : parseFloat(b.fee);
+            if (isNaN(fee) || fee < 0 || fee > 500) return res.status(400).json({ error: 'Fee must be 0-500' });
+            if (fee !== oldFee) { feeChanged = true; newFee = fee; }
+            sets.push('fee = $' + i++); vals.push(fee);
+        }
+        if (Object.prototype.hasOwnProperty.call(b, 'duration_hours')) {
+            const dur = parseFloat(b.duration_hours);
+            if (isNaN(dur) || dur <= 0 || dur > 12) return res.status(400).json({ error: 'Duration must be 0-12 hours' });
+            sets.push('duration_hours = $' + i++); vals.push(dur);
+        }
         if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
         vals.push(s.id);
         await pool.query(`UPDATE coaching_sessions SET ${sets.join(', ')} WHERE id = $${i}`, vals);
         await auditLog(pool, req.user.playerId, 'training_created', null, `Training "${s.title}" details updated`, s.tenant_id).catch(() => {});
+        // FIX-490: notify signed-up players when time or cost changes
+        if (timeChanged || feeChanged) {
+            const dDay = new Date(b.session_date || s.session_date).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Europe/London' });
+            const reg = await pool.query(`SELECT player_id FROM coaching_registrations WHERE session_id = $1 AND status IN ('registered','pending')`, [s.id]);
+            for (const row of reg.rows) {
+                sendNotification('training_updated', row.player_id, { title: s.title, day: dDay, timeChanged, feeChanged, oldCost: oldFee.toFixed(2), newCost: newFee.toFixed(2) }).catch(() => {});
+            }
+        }
         res.json({ ok: true });
     } catch (e) {
         console.error('FIX-470 training details edit:', e.message);
         res.status(500).json({ error: 'Could not update session' });
+    }
+});
+
+// FIX-490: CANCEL a training — full refund to every signup + notify. An organiser
+// cancel refunds in full regardless of the drop-out cutoff (the player didn't choose
+// to leave). Pass { scope: 'series' } on a recurring session to cancel the whole weekly
+// series (this + every upcoming instance) AND stop it ever regenerating.
+app.post('/api/training/:id/cancel', authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const s = await _trainingLoad(req.params.id);
+        if (!s) { client.release(); return res.status(404).json({ error: 'Training not found' }); }
+        if (!await _trainingCanManage(req, s)) { client.release(); return res.status(403).json({ error: 'Not allowed' }); }
+        if (s.status === 'completed' || s.status === 'cancelled') { client.release(); return res.status(400).json({ error: 'This session is already closed' }); }
+        const seriesScope = !!(req.body && req.body.scope === 'series' && s.recurs_weekly && s.series_id);
+        // Target set: just this session, or (series) this + every upcoming active instance.
+        let targets;
+        if (seriesScope) {
+            const t = await pool.query(
+                `SELECT id, title, session_date FROM coaching_sessions
+                  WHERE series_id = $1 AND status IN ('open','finalised') AND session_date >= $2
+                  ORDER BY session_date`, [s.series_id, s.session_date]);
+            targets = t.rows.length ? t.rows : [{ id: s.id, title: s.title, session_date: s.session_date }];
+        } else {
+            targets = [{ id: s.id, title: s.title, session_date: s.session_date }];
+        }
+        await client.query('BEGIN');
+        let refundedTotal = 0, refundedCount = 0, sessionsCancelled = 0;
+        const toNotify = [];
+        for (const sess of targets) {
+            const regs = await client.query(
+                `SELECT id, player_id, amount_paid_real, amount_paid_free FROM coaching_registrations
+                  WHERE session_id = $1 AND status IN ('registered','pending')`, [sess.id]);
+            const dDay = new Date(sess.session_date).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Europe/London' });
+            for (const reg of regs.rows) {
+                const real = parseFloat(reg.amount_paid_real) || 0;
+                const free = parseFloat(reg.amount_paid_free) || 0;
+                if (real > 0) {
+                    await client.query(`UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`, [real, reg.player_id]);
+                    await recordCreditTransaction(client, reg.player_id, real, 'refund', `Training cancelled: ${sess.title}`);
+                }
+                if (free > 0) await refundFreeCredits(reg.player_id, free, null, client);
+                if (real > 0 || free > 0) { refundedTotal += real + free; refundedCount++; }
+                await client.query(`UPDATE coaching_registrations SET status = 'cancelled', amount_paid_real = 0, amount_paid_free = 0 WHERE id = $1`, [reg.id]);
+                toNotify.push({ playerId: reg.player_id, title: sess.title, day: dDay });
+            }
+            await client.query(`UPDATE coaching_sessions SET status = 'cancelled' WHERE id = $1`, [sess.id]);
+            sessionsCancelled++;
+        }
+        // Stop regeneration across the ENTIRE series — even a leftover past-dated open
+        // instance must not be able to spawn a successor on completion.
+        if (seriesScope) await client.query(`UPDATE coaching_sessions SET recurs_weekly = FALSE WHERE series_id = $1`, [s.series_id]);
+        await client.query('COMMIT');
+        for (const n of toNotify) sendNotification('training_cancelled', n.playerId, { title: n.title, day: n.day }).catch(() => {});
+        await auditLog(pool, req.user.playerId, 'training_cancelled', null,
+            `Training "${s.title}" ${seriesScope ? `SERIES cancelled (${sessionsCancelled} session(s))` : 'CANCELLED'} — ${refundedCount} refund(s) totalling £${refundedTotal.toFixed(2)}`,
+            s.tenant_id).catch(() => {});
+        const refundNote = refundedCount ? ` ${refundedCount} refund(s) totalling £${refundedTotal.toFixed(2)} returned to wallets.` : '';
+        res.json({ ok: true, scope: seriesScope ? 'series' : 'instance', sessions_cancelled: sessionsCancelled,
+            refunded: refundedCount, refunded_total: refundedTotal,
+            message: (seriesScope ? `Series cancelled — ${sessionsCancelled} session(s) closed.` : 'Session cancelled.') + refundNote });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('FIX-490 training cancel error:', e.message);
+        res.status(500).json({ error: 'Could not cancel session' });
+    } finally {
+        client.release();
     }
 });
 
@@ -64267,7 +64369,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web59-sess-pool`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web61-series-cancel`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
