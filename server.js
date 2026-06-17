@@ -3431,6 +3431,10 @@ const pool = new Pool({
     max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
+    // keepAlive keeps the TCP socket warm so managed-PG idle-connection reaping
+    // doesn't silently drop pooled clients ("Connection terminated unexpectedly").
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10000,
     // FIX-483: no statement timeout meant a single hung query (lock wait, slow heavy
     // query, DB hiccup) held its pool connection FOREVER. connectionTimeoutMillis only
     // bounds how long a NEW caller waits to acquire — it does NOT kill a query already
@@ -9387,7 +9391,7 @@ async function _playerVisibleSessions(playerId, region) {
     const tr = await pool.query(`
         SELECT cs.id, cs.session_url, cs.title, cs.fee, cs.status, cs.session_date,
                cs.duration_hours, cs.recurs_weekly, t.name AS tenant_name,
-               v.name AS venue_name, p.alias AS coach_alias, p.full_name AS coach_name,
+               v.name AS venue_name, v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo, p.alias AS coach_alias, p.full_name AS coach_name,
                (SELECT COUNT(*) FROM coaching_registrations cr
                  WHERE cr.session_id = cs.id AND cr.status = 'registered') AS registered_count,
                (SELECT status FROM coaching_registrations cr
@@ -9410,6 +9414,7 @@ async function _playerVisibleSessions(playerId, region) {
         fee: r.fee, status: r.status, session_date: r.session_date,
         duration_hours: r.duration_hours, recurs_weekly: r.recurs_weekly,
         tenant_name: r.tenant_name, venue_name: r.venue_name,
+        venue_photo: (r.venue_background_image ? 'https://totalfooty.co.uk/assets/venues/' + r.venue_background_image : (r.venue_photo || null)),
         coach_name: r.coach_alias || r.coach_name,
         registered_count: r.registered_count, my_status: r.my_status
     }));
@@ -9420,7 +9425,7 @@ async function _playerVisibleSessions(playerId, region) {
     const co = await pool.query(`
         SELECT cs.id, cs.session_url, cs.activity_type, cs.group_type, cs.status,
                cs.session_date, cs.duration_hours, cs.min_price, cs.max_price, cs.is_full,
-               v.name AS venue_name, v.region AS venue_region,
+               v.name AS venue_name, v.region AS venue_region, v.background_image_filename AS venue_background_image, v.photo_url AS venue_photo,
                p.alias AS coach_alias, p.full_name AS coach_name,
                (SELECT COUNT(*) FROM coaching_registrations cr
                  WHERE cr.session_id = cs.id AND cr.status = 'registered') AS registered_count,
@@ -9443,7 +9448,7 @@ async function _playerVisibleSessions(playerId, region) {
         title: (r.activity_type || 'Coaching'), activity_type: r.activity_type, group_type: r.group_type,
         status: r.status, session_date: r.session_date, duration_hours: r.duration_hours,
         min_price: r.min_price, max_price: r.max_price, is_full: r.is_full,
-        venue_name: r.venue_name, coach_name: r.coach_alias || r.coach_name,
+        venue_name: r.venue_name, venue_photo: (r.venue_background_image ? 'https://totalfooty.co.uk/assets/venues/' + r.venue_background_image : (r.venue_photo || null)), coach_name: r.coach_alias || r.coach_name,
         registered_count: r.registered_count, my_status: r.my_status
     }));
     return out;
@@ -39910,7 +39915,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                     `SELECT id, status, attendance, (amount_paid_real + amount_paid_free) AS amount_paid
                        FROM coaching_registrations WHERE session_id = $1 AND player_id = $2
                      /* FIX-472: a kept-fee re-register can leave 2 rows; prefer the ACTIVE one */
-                     ${PRIO} LIMIT 1`,
+                     ORDER BY CASE status WHEN 'registered' THEN 0 WHEN 'pending' THEN 1 WHEN 'denied' THEN 2 WHEN 'dropped_out' THEN 3 ELSE 4 END, id DESC LIMIT 1`,
                     [session.id, req.user.playerId]);
                 viewerReg = vr.rows[0] || null;
                 canManage = await _trainingCanManage(req, session);
@@ -64262,7 +64267,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web58-audit`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web59-sess-pool`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
