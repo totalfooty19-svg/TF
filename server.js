@@ -41251,8 +41251,8 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues', authenticateToken, require
             INSERT INTO external_leagues
               (id, tenant_id, kind, name, parent_league_name, external_website_url, public_slug,
                default_venue_id, default_coach_player_id, series_awards_enabled, game_awards_enabled,
-               award_goals, award_assists, created_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+               award_goals, award_assists, created_by, status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, 'active')`,
             [id, req.tenant.id, kind, name,
              b.parent_league_name ? String(b.parent_league_name).slice(0, 80) : null,
              b.external_website_url ? String(b.external_website_url).slice(0, 300) : null,
@@ -64369,7 +64369,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web61-series-cancel`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web62-extleague-status`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
