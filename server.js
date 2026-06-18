@@ -41389,6 +41389,7 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fixtures', authenticateT
         if (isNaN(cost) || cost < 0 || cost > 500) return res.status(400).json({ error: 'Cost must be 0-500' });
         const coachId = b.assigned_coach_player_id || L.default_coach_player_id || null;
         const gameUrl = 'xg-' + Math.random().toString(36).slice(2, 10);
+        // star_rating is NULL (not 0): games_star_rating_check enforces 1-5 OR NULL; external fixtures are unrated.
         const ins = await pool.query(`
             INSERT INTO games (
                 venue_id, game_date, max_players, cost_per_player, format, regularity,
@@ -41400,7 +41401,7 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fixtures', authenticateT
                 away_pitch_pin, away_parking_pin, away_pitch_type, assigned_coach_player_id,
                 pitch_cost
             ) VALUES ($1,$2,$3,$4,$5,'one-off','everyone','outfield_gk',$6,
-                      'vs_external',$7,$8,0,0,false,0,false,$9,
+                      'vs_external',$7,$8,0,0,false,NULL,false,$9,
                       $10,$11,$12,$13,$14,$15,$16,$17,$18)
             RETURNING id, game_url`,
             [venueId, when.toISOString(), maxPlayers, cost,
@@ -64369,7 +64370,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web62-extleague-status`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web63-extfixture`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
