@@ -55919,7 +55919,7 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
     const alias      = String(b.alias || firstName || '').trim().slice(0, 30);
     const email      = String(b.email || '').trim().toLowerCase();
     const password   = String(b.password || '');
-    const phone      = b.phone ? String(b.phone).trim().slice(0, 20) : null;
+    const phone      = b.phone ? String(b.phone).trim().slice(0, 20) : '';  // players.phone is NOT NULL (register requires it); '' not null for an optional founder phone
     const region     = String(b.region || '').trim();
     const acceptTcs  = b.accept_tcs === true || b.accept_tcs === 'true';
 
@@ -64700,7 +64700,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web72-tcscolumns`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web73-tenantphone`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
