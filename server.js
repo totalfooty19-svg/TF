@@ -8269,11 +8269,14 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
     try {
         const { playerId } = req.params;
 
-        // CRIT-9: Prevent IDOR — only the player themselves or an admin can view game history
-        const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
-        if (!isAdmin && req.user.playerId !== playerId) {
-            return res.status(403).json({ error: 'You can only view your own game history' });
-        }
+        // Game history is viewable by any authenticated player (social football feature).
+        // Self + admins get the full view; viewing ANOTHER player is capped to a compact
+        // summary — next 3 upcoming, last 5 completed — so a full schedule/history isn't exposed.
+        const isAdmin  = req.user.role === 'admin' || req.user.role === 'superadmin';
+        const isSelf   = req.user.playerId === playerId;
+        const fullView = isAdmin || isSelf;
+        const upcomingLimit  = fullView ? 100 : 3;
+        const completedLimit = fullView ? 20  : 5;
         // Get upcoming games (registered and not completed)
         const upcomingResult = await pool.query(`
             SELECT g.id, g.game_date, g.cost_per_player, g.max_players, g.format, g.game_url,
@@ -8287,7 +8290,8 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
             AND g.game_status IN ('available', 'confirmed')
             AND g.game_date >= CURRENT_TIMESTAMP
             ORDER BY g.game_date ASC
-        `, [playerId]);
+            LIMIT $2
+        `, [playerId, upcomingLimit]);
         
         // Get completed games
         const completedResult = await pool.query(`
@@ -8312,8 +8316,8 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
             AND r.status = 'confirmed'
             AND g.game_status = 'completed'
             ORDER BY g.game_date DESC
-            LIMIT 20
-        `, [playerId]);
+            LIMIT $2
+        `, [playerId, completedLimit]);
         
         res.json({
             upcomingGames: upcomingResult.rows,
@@ -26703,14 +26707,10 @@ app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireCLMAdmin, 
             [gameId]
         );
 
-        // FIX-357: cancel any pending auto-release timer + resolve waiting intents
+        // FIX-357b: cancel any pending auto-release timer, then PROCESS the queue
+        // (auto-complete what can be, and email every waiting player the outcome).
         _clearPendingLockRelease(gameId);
-        pool.query(
-            `UPDATE game_signup_intents
-                SET resolved_at = NOW()
-              WHERE game_id = $1 AND resolved_at IS NULL`,
-            [gameId]
-        ).catch(() => {});
+        setImmediate(() => _processSignupQueue(gameId).catch(() => {}));
 
         res.json({ message: 'Game unlocked' });
         setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'game_unlocked', 'Player editing unlocked'));
@@ -64400,12 +64400,8 @@ function _scheduleLockRelease(gameId, delaySeconds) {
                     'game_unlocked',
                     `Auto-released for waiting player after ${delaySeconds}s grace`
                 ).catch(() => {}));
-                pool.query(
-                    `UPDATE game_signup_intents
-                        SET resolved_at = NOW()
-                      WHERE game_id = $1 AND resolved_at IS NULL`,
-                    [gameId]
-                ).catch(() => {});
+                // FIX-357b: process the queue now the lock is auto-released.
+                await _processSignupQueue(gameId).catch(() => {});
             }
         } catch (e) {
             console.warn('[FIX-357] scheduled release failed:', e.message);
@@ -64420,6 +64416,188 @@ function _clearPendingLockRelease(gameId) {
     if (handle) {
         clearTimeout(handle);
         _pendingLockReleases.delete(gameId);
+    }
+}
+
+// FIX-357b — outcome email for a queued signup action.
+async function _emailQueueOutcome(playerId, gameId, intentType, outcome) {
+    try {
+        const pr = await pool.query('SELECT email, alias, full_name FROM players WHERE id = $1', [playerId]);
+        const to = pr.rows[0] && pr.rows[0].email;
+        if (!to) return;
+        const name = (pr.rows[0].alias || pr.rows[0].full_name || 'there');
+        const gr = await pool.query(
+            `SELECT g.game_date, g.game_url, v.name AS venue_name
+               FROM games g LEFT JOIN venues v ON v.id = g.venue_id WHERE g.id = $1`,
+            [gameId]
+        );
+        const g = gr.rows[0] || {};
+        const when = g.game_date
+            ? new Date(g.game_date).toLocaleString('en-GB', { weekday:'short', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' })
+            : 'the scheduled time';
+        const venue = g.venue_name || 'the venue';
+        const link = g.game_url ? `https://api.totalfooty.co.uk/g/${g.game_url}` : 'https://totalfooty.co.uk';
+        const M = {
+            registered:       { s: "\u2705 You're in \u2014 spot confirmed",          b: `Hi ${name},<br><br>The game you tried to join was locked by an admin, so your request was queued. It has now gone through \u2014 <strong>you're confirmed</strong> for ${when} at ${venue}.<br><br><a href="${link}">View the game</a>` },
+            payment_required: { s: "Your spot is waiting \u2014 payment needed",       b: `Hi ${name},<br><br>The game you tried to join was locked, so your request was queued. It's open again, but it's a paid game \u2014 please reopen it to confirm and pay for your spot before it fills.<br><br><a href="${link}">Grab your spot</a>` },
+            full:             { s: "The game filled up while it was locked",        b: `Hi ${name},<br><br>The game you tried to join was locked and filled up before it reopened. You can still reopen it to join as a backup.<br><br><a href="${link}">Join as backup</a>` },
+            game_closed:      { s: "That game is no longer open",                   b: `Hi ${name},<br><br>The game you tried to join is no longer accepting sign-ups (it was cancelled or completed while locked).<br><br><a href="${link}">View the game</a>` },
+            reopen_drop:      { s: "Finish dropping out",                          b: `Hi ${name},<br><br>The game was locked when you tried to drop out, so the action was queued. It's open again \u2014 please reopen it to complete dropping out (and any refund).<br><br><a href="${link}">Open the game</a>` },
+            reopen_guest:     { s: "Finish your guest change",                     b: `Hi ${name},<br><br>The game was locked when you tried to update a guest, so the action was queued. It's open again \u2014 please reopen it to re-add or remove your guest.<br><br><a href="${link}">Open the game</a>` },
+            reopen:           { s: "The game is open again",                       b: `Hi ${name},<br><br>The game was locked when you made your request, so it was queued. It's open again now \u2014 please reopen it to complete what you were doing.<br><br><a href="${link}">Open the game</a>` },
+            error:            { s: "The game is open again",                       b: `Hi ${name},<br><br>The game was locked when you made your request. It's open again now \u2014 please reopen it to complete what you were doing.<br><br><a href="${link}">Open the game</a>` },
+        };
+        const m = M[outcome.code] || M.reopen;
+        await emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to,
+            subject: m.s,
+            html: (typeof wrapEmailHtml === 'function') ? wrapEmailHtml(m.b) : m.b,
+        });
+    } catch (e) {
+        console.warn('[FIX-357b] outcome email failed:', e.message);
+    }
+}
+
+// FIX-357b — process the signup queue once the lock lifts (called from /unlock
+// and the auto-preempt timer). Oldest intent first. Only a FREE, unrestricted,
+// has-a-spot join is auto-completed (no stored params, no live charge); every
+// other case is reported by email ("come pay" / "join as backup" / "reopen to
+// complete") and never silently dropped. Each intent is its own transaction.
+async function _processSignupQueue(gameId) {
+    let intents;
+    try {
+        const r = await pool.query(
+            `SELECT id, player_id, intent_type FROM game_signup_intents
+              WHERE game_id = $1 AND resolved_at IS NULL ORDER BY created_at ASC`,
+            [gameId]
+        );
+        intents = r.rows;
+    } catch (e) {
+        if (e && e.code === '42P01') return;
+        console.warn('[FIX-357b] queue read failed:', e.message);
+        return;
+    }
+    if (!intents.length) return;
+
+    for (const intent of intents) {
+        let outcome = { code: 'reopen' };
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const gRes = await client.query(
+                `SELECT id, game_status, cost_per_player, max_players,
+                        min_rating_enabled, exclusivity, tenant_id,
+                        team_selection_type, is_venue_clash
+                   FROM games WHERE id = $1 FOR UPDATE`,
+                [gameId]
+            );
+            if (gRes.rows.length) {
+                const game = gRes.rows[0];
+                const itype = intent.intent_type;
+                if (itype === 'register' || itype === 'rsvp' || itype === 'register_friend') {
+                    const exist = await client.query(
+                        `SELECT 1 FROM registrations
+                          WHERE game_id = $1 AND player_id = $2
+                            AND status IN ('confirmed','rsvp','backup','confirmed_backup') LIMIT 1`,
+                        [gameId, intent.player_id]
+                    );
+                    if (exist.rows.length) {
+                        outcome = { code: 'already_in' };
+                    } else if (!['available','confirmed'].includes(game.game_status)) {
+                        outcome = { code: 'game_closed' };
+                    } else if (parseFloat(game.cost_per_player) > 0) {
+                        outcome = { code: 'payment_required' };
+                    } else {
+                        // Auto-confirm ONLY a plain free game with no team-preference structure
+                        // (tournament / vs-external / venue-clash all need a team choice we don't
+                        // have stored), no rating gate, open exclusivity, no ban — mirrors the
+                        // register guards so the queue can't create an invalid/over-cap row.
+                        const restricted = !!game.min_rating_enabled
+                            || (game.exclusivity && !['open','public',''].includes(String(game.exclusivity).toLowerCase()))
+                            || game.team_selection_type === 'tournament'
+                            || game.team_selection_type === 'vs_external'
+                            || !!game.is_venue_clash;
+                        let banned = false;
+                        if (game.tenant_id && game.tenant_id !== TF_COVENTRY_TENANT_ID) {
+                            try {
+                                const b = await client.query(
+                                    `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'banned' LIMIT 1`,
+                                    [intent.player_id, game.tenant_id]
+                                );
+                                banned = b.rows.length > 0;
+                            } catch (_) {}
+                        }
+                        const cap = await client.query(
+                            `SELECT (SELECT COUNT(*) FROM registrations WHERE game_id = $1 AND status IN ('confirmed','rsvp'))
+                                  + (SELECT COUNT(*) FROM game_guests WHERE game_id = $1) AS n`,
+                            [gameId]
+                        );
+                        const full = parseInt(cap.rows[0].n, 10) >= parseInt(game.max_players, 10);
+                        // Referee conflict — a confirmed ref cannot also be a player (mirrors register).
+                        let isRef = false;
+                        try {
+                            const rc = await client.query(
+                                `SELECT 1 FROM game_referees WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed' LIMIT 1`,
+                                [gameId, intent.player_id]
+                            );
+                            isRef = rc.rows.length > 0;
+                        } catch (_) {}
+                        let posVal = 'outfield';
+                        try { const pr = await _resolvePositionForSignup(client, intent.player_id, {}); if (pr && pr.positionValue) posVal = pr.positionValue; } catch (_) {}
+                        // GK cap — simple games allow 2 GK slots (mirrors register's gk_full guard).
+                        let gkFull = false;
+                        if (posVal.trim().toUpperCase() === 'GK') {
+                            const gk = await client.query(
+                                `SELECT COUNT(*) AS n FROM registrations
+                                  WHERE game_id = $1 AND status = 'confirmed' AND UPPER(TRIM(position_preference)) = 'GK'`,
+                                [gameId]
+                            );
+                            gkFull = parseInt(gk.rows[0].n, 10) >= 2;
+                        }
+                        if (restricted || banned || isRef) {
+                            outcome = { code: 'reopen' };
+                        } else if (full || gkFull) {
+                            outcome = { code: 'full' };
+                        } else {
+                            const upd = await client.query(
+                                `UPDATE registrations SET status='confirmed', position_preference=$3,
+                                        amount_paid=0, amount_paid_free=0, is_comped=FALSE
+                                  WHERE game_id=$1 AND player_id=$2
+                                    AND status NOT IN ('confirmed','rsvp','backup','confirmed_backup')
+                                  RETURNING id`,
+                                [gameId, intent.player_id, posVal]
+                            );
+                            if (upd.rowCount === 0) {
+                                await client.query(
+                                    `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, is_comped)
+                                     VALUES ($1, $2, 'confirmed', $3, 0, 0, FALSE)`,
+                                    [gameId, intent.player_id, posVal]
+                                );
+                            }
+                            outcome = { code: 'registered' };
+                        }
+                    }
+                } else if (itype === 'drop_out') {
+                    outcome = { code: 'reopen_drop' };
+                } else if (itype === 'guest_add' || itype === 'guest_remove') {
+                    outcome = { code: 'reopen_guest' };
+                } else {
+                    outcome = { code: 'reopen' };
+                }
+            }
+            await client.query(`UPDATE game_signup_intents SET resolved_at = NOW() WHERE id = $1`, [intent.id]);
+            await client.query('COMMIT');
+        } catch (e) {
+            try { await client.query('ROLLBACK'); } catch (_) {}
+            console.warn('[FIX-357b] intent', intent.id, 'failed:', e.message);
+            outcome = { code: 'error' };
+        } finally {
+            client.release();
+        }
+        if (outcome.code !== 'already_in') {
+            setImmediate(() => _emailQueueOutcome(intent.player_id, gameId, intent.intent_type, outcome).catch(() => {}));
+        }
     }
 }
 
@@ -64455,9 +64633,10 @@ async function _recordSignupIntent(gameId, playerId, intentType) {
     }
 
     return {
-        code: 'GAME_LOCKED_RETRY_PENDING',
-        error: 'Admin is finishing up. Retrying in 15 seconds…',
+        code: 'GAME_LOCKED_QUEUED',
+        error: 'This game is currently locked by an admin. Your request is queued — please check back for confirmation. We\'ll email you the outcome.',
         retry_after_seconds: LOCK_PREEMPT_GRACE_SECONDS,
+        queued: true,
     };
 }
 
@@ -64515,7 +64694,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web68-cancelrefund`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web71-queueguards`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
