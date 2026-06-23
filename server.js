@@ -64353,6 +64353,12 @@ async function fix386BootstrapRefundPolicy() {
         // INSERT can rely on the column existing (avoids the schema-drift class
         // of bug that bit ext-leagues/games this build).
         await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS region TEXT`);
+        // FIX-461: tenant T&C acceptance columns. Referenced by start-tenant's
+        // INSERT (and the in-app accept flow) but never created by any migration —
+        // on a DB missing them the INSERT 42703s and tenant creation 500s. Self-heal
+        // here (same schema-drift class as region above); idempotent.
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS accepted_tenant_tcs_version TEXT`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS accepted_tenant_tcs_at TIMESTAMPTZ`);
         // EXT awards (design): tenant-level positive-only enable-list for external league/cup games
         // (empty/null => MOTM only). Normal games keep using disabled_awards untouched.
         await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS external_awards JSONB`);
@@ -64694,7 +64700,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web71-queueguards`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web72-tcscolumns`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
