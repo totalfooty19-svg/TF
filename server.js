@@ -56059,8 +56059,10 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
             signup_link: signupLink, crm_link: 'https://totalfooty.co.uk/crm.html'
         });
     } catch (e) {
-        console.error('FIX-460 start-tenant error:', e.message);
-        return res.status(500).json({ error: 'Could not create your tenant. Please try again.' });  // internals scrubbed
+        // TEMP DIAG (web74): echo the real Postgres error so we stop guessing. REVERT after diagnosis.
+        console.error('FIX-460 start-tenant error:', e.code, '|', e.message, '|', e.detail, '|', e.column, '|', e.constraint);
+        return res.status(500).json({ error: 'Could not create your tenant. Please try again.',
+            _debug: { code: e.code || null, message: e.message || null, detail: e.detail || null, column: e.column || null, constraint: e.constraint || null } });
     }
 });
 
@@ -64700,7 +64702,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web73-tenantphone`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web74-diag`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
