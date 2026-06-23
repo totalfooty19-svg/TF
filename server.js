@@ -1298,6 +1298,78 @@ const CURRENT_PLAYER_TCS_VERSION    = 'v1.0-draft';
 const CURRENT_TENANT_TCS_VERSION    = 'v1.0-draft';
 const CURRENT_ORGANISER_TCS_VERSION = 'v1.0-draft';
 
+// ════════════════════════════════════════════════════════════════════════════
+// CANONICAL UK REGIONS  (new-tenant "based-in" + future player multi-select)
+// One-tier flat list of UK towns/cities (sorted). STORED value is the town
+// string. Can be grouped into areas later if needed. Single source — exposed at
+// GET /api/public/regions and validated server-side via VALID_TENANT_REGIONS.
+// NOTE: distinct from the legacy player-signup VALID_REGIONS (GAFFA's 5
+// operational towns, FIX-107). That flat list is unchanged and player-scoped;
+// this is the national tenant list. To drop Republic of Ireland: delete that key.
+// ════════════════════════════════════════════════════════════════════════════
+const UK_REGIONS = [
+  'Aberdare','Aberdeen','Aberystwyth','Accrington','Airdrie','Aldershot',
+  'Altrincham','Antrim','Arbroath','Armagh','Ashford','Ashington',
+  'Ashton-under-Lyne','Athlone','Aylesbury','Ayr','Ballymena','Banbury',
+  'Bangor (Co. Down)','Bangor (Gwynedd)','Barking & Dagenham','Barnet','Barnsley','Barnstaple',
+  'Barrow-in-Furness','Barry','Basildon','Basingstoke','Bath','Bearsden',
+  'Bedford','Bedworth','Belfast','Bellshill','Beverley','Bexley',
+  'Bicester','Birkenhead','Birmingham','Bishop Auckland','Blackburn','Blackpool',
+  'Blyth','Bolton','Boston','Bournemouth','Bracknell','Bradford',
+  'Braintree','Bray','Brent','Bridgend','Bridgwater','Brighouse',
+  'Brighton & Hove','Bristol','Bromley','Bromsgrove','Burnley','Bury',
+  'Bury St Edmunds','Caernarfon','Caerphilly','Camberley','Cambridge','Camden',
+  'Cannock','Canterbury','Cardiff','Carlisle','Carlow','Carmarthen',
+  'Carrickfergus','Castleford','Chatham','Chelmsford','Cheltenham','Chester',
+  'Chester-le-Street','Chesterfield','Chichester','Chippenham','Chorley','Christchurch',
+  'Cirencester','Clacton-on-Sea','Clydebank','Coalville','Coatbridge','Colchester',
+  'Coleraine','Colwyn Bay','Consett','Cookstown','Corby','Cork',
+  'Coventry','Craigavon','Cramlington','Crawley','Crewe','Croydon',
+  'Cumbernauld','Cwmbran','Darlington','Dartford','Derby','Derry/Londonderry',
+  'Dewsbury','Doncaster','Dover','Drogheda','Dublin','Dudley',
+  'Dumbarton','Dumfries','Dundalk','Dundee','Dunfermline','Durham',
+  'Ealing','East Kilbride','Eastbourne','Ebbw Vale','Edinburgh','Elgin',
+  'Enfield','Ennis','Enniskillen','Exeter','Falkirk','Falmouth',
+  'Farnborough','Folkestone','Frome','Galway','Gateshead','Gillingham',
+  'Glasgow','Glenrothes','Gloucester','Grantham','Gravesend','Great Yarmouth',
+  'Greenock','Greenwich','Grimsby','Guildford','Hackney','Halesowen',
+  'Halifax','Hamilton','Hammersmith & Fulham','Haringey','Harlow','Harrogate',
+  'Harrow','Hartlepool','Hastings','Hatfield','Havering','Hemel Hempstead',
+  'Hereford','Hexham','High Wycombe','Hillingdon','Hinckley','Horsham',
+  'Hounslow','Huddersfield','Hull','Huntingdon','Ilkeston','Inverness',
+  'Ipswich','Irvine','Islington','Keighley','Kettering','Kidderminster',
+  'Kilkenny','Kilmarnock','King\'s Lynn','Kingston upon Thames','Kirkcaldy','Lambeth',
+  'Lancaster','Larne','Leamington Spa','Leeds','Leicester','Letterkenny',
+  'Lewisham','Lichfield','Limavady','Limerick','Lincoln','Lisburn',
+  'Liverpool','Livingston','Llandudno','Llanelli','London','Long Eaton',
+  'Loughborough','Lowestoft','Lurgan','Luton','Macclesfield','Maesteg',
+  'Maidstone','Manchester','Mansfield','Margate','Melton Mowbray','Merthyr Tydfil',
+  'Merton','Middlesbrough','Milton Keynes','Mold','Morpeth','Motherwell',
+  'Mullingar','Musselburgh','Naas','Navan','Neath','Newark-on-Trent',
+  'Newbury','Newcastle upon Tyne','Newham','Newport','Newport (Isle of Wight)','Newry',
+  'Newton Abbot','Newtownabbey','Newtownards','Northampton','Norwich','Nottingham',
+  'Nuneaton','Oldham','Omagh','Oxford','Paignton','Paisley',
+  'Penzance','Perth','Peterborough','Plymouth','Pontefract','Pontypool',
+  'Pontypridd','Poole','Port Talbot','Portadown','Portsmouth','Preston',
+  'Reading','Redbridge','Redcar','Redditch','Renfrew','Rhyl',
+  'Richmond upon Thames','Rochdale','Rotherham','Royal Tunbridge Wells','Rugby','Runcorn',
+  'Sale','Salford','Salisbury','Scarborough','Scunthorpe','Seaham',
+  'Selby','Sevenoaks','Sheffield','Shrewsbury','Sligo','Slough',
+  'Smethwick','Solihull','South Shields','Southampton','Southend-on-Sea','Southport',
+  'Southwark','St Albans','St Andrews','St Austell','St Helens','Stafford',
+  'Stevenage','Stirling','Stockport','Stockton-on-Tees','Stoke-on-Trent','Stourbridge',
+  'Strabane','Stroud','Sunderland','Sutton','Sutton Coldfield','Swansea',
+  'Swindon','Swords','Tamworth','Taunton','Telford','Tewkesbury',
+  'Torquay','Tower Hamlets','Tralee','Trowbridge','Truro','Tullamore',
+  'Wakefield','Walsall','Waltham Forest','Wandsworth','Warrington','Warwick',
+  'Washington','Waterford','Watford','Wellingborough','Wells','Welwyn Garden City',
+  'West Bromwich','Weston-super-Mare','Wexford','Weymouth','Widnes','Wigan',
+  'Wishaw','Woking','Wokingham','Wolverhampton','Worcester','Worksop',
+  'Worthing','Wrexham','Yeovil','York',
+];
+const VALID_TENANT_REGIONS = new Set(UK_REGIONS);
+
+
 // FIX-320 (Day 4): auditLog gains an optional tenantId parameter for tenant-
 // scoped admin actions. Backward-compatible — existing callers (5 args, no
 // tenantId) generate the same INSERT as before. New tenant-scoped callers
@@ -7550,7 +7622,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 LEFT JOIN credits c ON c.player_id = p.id
                 LEFT JOIN users u ON u.id = p.user_id
                 ORDER BY p.squad_number NULLS LAST, p.full_name
-                LIMIT 500
+                LIMIT 5000
             `);
             console.log(`[/api/players] light=1 rows=${lightResult.rows.length} ms=${Date.now()-_t0} pool(total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount})`);
             if (isAdmin) {
@@ -7656,7 +7728,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
             LEFT JOIN ext_wins ew ON ew.player_id = p.id
             LEFT JOIN player_badge_agg pba ON pba.player_id = p.id
             ORDER BY p.squad_number NULLS LAST, p.full_name
-            LIMIT 500
+            LIMIT 5000
         `);
         
         console.log(`[/api/players] heavy rows=${result.rows.length} ms=${Date.now()-_t0} pool(total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount})`);
@@ -7733,7 +7805,7 @@ app.get('/api/admin/players/search', authenticateToken, requireAdmin, async (req
                    OR LOWER(u.email)     LIKE $1
                    OR p.squad_number = $2
                 ORDER BY (p.squad_number = $2) DESC, p.alias NULLS LAST, p.full_name
-                LIMIT 20`
+                LIMIT 50`
             : `SELECT p.id, p.alias, p.full_name, p.squad_number, u.email
                  FROM players p
                  LEFT JOIN users u ON u.id = p.user_id
@@ -7741,7 +7813,7 @@ app.get('/api/admin/players/search', authenticateToken, requireAdmin, async (req
                    OR LOWER(p.full_name) LIKE $1
                    OR LOWER(u.email)     LIKE $1
                 ORDER BY p.alias NULLS LAST, p.full_name
-                LIMIT 20`;
+                LIMIT 50`;
         const params = isNumeric ? [like, squadNum] : [like];
 
         const result = await pool.query(sql, params);
@@ -7955,7 +8027,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
             LEFT JOIN credits c ON c.player_id = p.id
             LEFT JOIN users u ON u.id = p.user_id
             ORDER BY p.squad_number NULLS LAST, p.full_name
-            LIMIT 1500
+            LIMIT 5000
         `);
 
         // All badges for the badge matrix headers
@@ -41205,7 +41277,7 @@ async function _extLeagueCanManage(req, tenantId, assignedCoachId) {
 // gated, which 403s tenant admins; the fixture form needs this read.
 app.get('/api/t/:tenant_short_id/admin/opponents', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
-        const r = await pool.query('SELECT id, name, logo_url, social_website FROM opponents ORDER BY name ASC LIMIT 500');
+        const r = await pool.query('SELECT id, name, logo_url, social_website FROM opponents ORDER BY name ASC LIMIT 5000');
         res.json({ opponents: r.rows });
     } catch (e) {
         console.error('FIX-463 opp list:', e.message);
@@ -42916,49 +42988,82 @@ app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, r
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'Session ID required' });
 
-    const sessionResult = await pool.query(
-        `SELECT id, coach_player_id, status, cancel_requested, activity_type, session_date
-         FROM coaching_sessions WHERE id=$1`,
-        [id]
-    );
-    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
-    const session = sessionResult.rows[0];
-    if (!session.cancel_requested) return res.status(400).json({ error: 'No cancellation request pending' });
-    if (session.status === 'cancelled') return res.status(400).json({ error: 'Session already cancelled' });
+    const client = await pool.connect();
+    try {
+        const sessionResult = await client.query(
+            `SELECT id, coach_player_id, status, cancel_requested, activity_type, session_date
+             FROM coaching_sessions WHERE id=$1`,
+            [id]
+        );
+        if (sessionResult.rows.length === 0) { client.release(); return res.status(404).json({ error: 'Session not found' }); }
+        const session = sessionResult.rows[0];
+        if (!session.cancel_requested) { client.release(); return res.status(400).json({ error: 'No cancellation request pending' }); }
+        if (session.status === 'cancelled') { client.release(); return res.status(400).json({ error: 'Session already cancelled' }); }
 
-    // Get registered players
-    const regsResult = await pool.query(
-        `SELECT cr.player_id FROM coaching_registrations cr
-         WHERE cr.session_id=$1 AND cr.status='registered'`,
-        [id]
-    );
-    const playerIds = regsResult.rows.map(r => r.player_id);
-    // Include coach
-    if (session.coach_player_id) playerIds.push(session.coach_player_id);
-    const uniqueIds = [...new Set(playerIds)];
+        await client.query('BEGIN');
 
-    await pool.query(
-        `UPDATE coaching_sessions SET status='cancelled', cancel_requested=FALSE, updated_at=NOW() WHERE id=$1`,
-        [id]
-    );
-    await logCoachingAudit(id, null, req.user.playerId, 'session_cancelled', 'Cancellation approved by superadmin.');
+        // MONEY: refund every paid registration before cancelling — approving a
+        // cancellation must return players' money, not just flip the session to
+        // 'cancelled'. Mirrors the FIX-490 /api/training/:id/cancel refund path.
+        const regs = await client.query(
+            `SELECT id, player_id, amount_paid_real, amount_paid_free
+             FROM coaching_registrations
+             WHERE session_id=$1 AND status IN ('registered','pending')`,
+            [id]
+        );
+        let refundedTotal = 0, refundedCount = 0;
+        const notifyIds = new Set();
+        for (const reg of regs.rows) {
+            const real = parseFloat(reg.amount_paid_real) || 0;
+            const free = parseFloat(reg.amount_paid_free) || 0;
+            if (real > 0) {
+                await client.query(`UPDATE credits SET balance = balance + $1, last_updated = CURRENT_TIMESTAMP WHERE player_id = $2`, [real, reg.player_id]);
+                await recordCreditTransaction(client, reg.player_id, real, 'refund', 'Coaching session cancelled');
+            }
+            if (free > 0) await refundFreeCredits(reg.player_id, free, null, client);
+            if (real > 0 || free > 0) { refundedTotal += real + free; refundedCount++; }
+            await client.query(`UPDATE coaching_registrations SET status = 'cancelled', amount_paid_real = 0, amount_paid_free = 0 WHERE id = $1`, [reg.id]);
+            notifyIds.add(reg.player_id);
+        }
 
-    // Email all affected players + coach
-    if (uniqueIds.length > 0) {
-        const activityLabel = htmlEncode(session.activity_type ? session.activity_type.replace(/_/g,' ') : 'coaching');
-        const dateStr = session.session_date
-            ? new Date(session.session_date).toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short', year:'numeric', timeZone:'Europe/London' })
-            : 'TBC';
-        try {
-            await sendCoachingEmail(uniqueIds,
-                'Coaching Session Cancelled',
-                `<p style="color:#888">Unfortunately, the <strong style="color:#fff">${activityLabel}</strong> coaching session scheduled for <strong style="color:#fff">${htmlEncode(dateStr)}</strong> has been cancelled.</p>
-                 <p style="color:#888;margin-top:8px">If you have any questions please contact TotalFooty.</p>`
-            );
-        } catch(e) { console.error('cancel-approve email failed:', e.message); }
+        await client.query(
+            `UPDATE coaching_sessions SET status='cancelled', cancel_requested=FALSE, updated_at=NOW() WHERE id=$1`,
+            [id]
+        );
+        await logCoachingAudit(id, null, req.user.playerId, 'session_cancelled',
+            `Cancellation approved by superadmin. ${refundedCount} refund(s) totalling £${refundedTotal.toFixed(2)}.`);
+
+        await client.query('COMMIT');
+
+        // Email affected players + coach (after commit)
+        if (session.coach_player_id) notifyIds.add(session.coach_player_id);
+        const uniqueIds = [...notifyIds];
+        if (uniqueIds.length > 0) {
+            const activityLabel = htmlEncode(session.activity_type ? session.activity_type.replace(/_/g,' ') : 'coaching');
+            const dateStr = session.session_date
+                ? new Date(session.session_date).toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short', year:'numeric', timeZone:'Europe/London' })
+                : 'TBC';
+            const refundLine = refundedCount > 0
+                ? `<p style="color:#888;margin-top:8px">Any advance payment has been refunded to your TotalFooty wallet.</p>`
+                : '';
+            try {
+                await sendCoachingEmail(uniqueIds,
+                    'Coaching Session Cancelled',
+                    `<p style="color:#888">Unfortunately, the <strong style="color:#fff">${activityLabel}</strong> coaching session scheduled for <strong style="color:#fff">${htmlEncode(dateStr)}</strong> has been cancelled.</p>
+                     ${refundLine}
+                     <p style="color:#888;margin-top:8px">If you have any questions please contact TotalFooty.</p>`
+                );
+            } catch(e) { console.error('cancel-approve email failed:', e.message); }
+        }
+
+        res.json({ success: true, refunded: refundedCount, refunded_total: refundedTotal });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('cancel-approve error:', e.message);
+        res.status(500).json({ error: 'Could not approve cancellation' });
+    } finally {
+        client.release();
     }
-
-    res.json({ success: true });
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -43038,6 +43143,25 @@ app.delete('/api/admin/coaching/sessions/:id', authenticateToken, requireSuperAd
         );
         const registeredPlayerIds = regResult.rows.map(r => r.player_id);
 
+        // MONEY GUARD: never hard-delete a session that still has money attached
+        // to its registrations — that would take players' cash with no refund
+        // (and the email below promises one). Force the refunding cancel path
+        // (POST /api/training/:id/cancel) first; once it refunds it zeroes
+        // amount_paid_real/free, after which this delete is safe.
+        const _paidRegs = await client.query(
+            `SELECT COUNT(*)::int AS n FROM coaching_registrations
+             WHERE session_id=$1 AND (COALESCE(amount_paid_real,0) > 0 OR COALESCE(amount_paid_free,0) > 0)`,
+            [id]
+        );
+        if (_paidRegs.rows[0].n > 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                error: 'This session has paid registrations. Cancel it first (that refunds everyone), then delete the now-empty session.',
+                code: 'paid_registrations_present',
+                paid_registrations: _paidRegs.rows[0].n
+            });
+        }
+
         // Cascade delete all child records
         await client.query('DELETE FROM coaching_registrations  WHERE session_id=$1', [id]);
         await client.query('DELETE FROM coaching_session_venues WHERE session_id=$1', [id]);
@@ -43058,7 +43182,7 @@ app.delete('/api/admin/coaching/sessions/:id', authenticateToken, requireSuperAd
                        <tr><td style="color:#888;width:140px">Activity</td><td style="color:#fff;font-weight:700">${htmlEncode(activityLabel)}</td></tr>
                        <tr><td style="color:#888">Date</td><td style="color:#fff">${htmlEncode(dateStr)}</td></tr>
                      </table>
-                     <p style="color:#888;margin-top:16px">If you paid in advance, a full refund will be issued shortly. Apologies for any inconvenience.</p>`
+                     <p style="color:#888;margin-top:16px">Apologies for any inconvenience.</p>`
                 );
             } catch(e) { console.error('delete session email failed:', e.message); }
         }
@@ -49925,7 +50049,7 @@ app.get('/api/admin/comms/players-pool', authenticateToken, requireAdmin, async 
               JOIN users u ON u.id = p.user_id
              WHERE ${conds.join(' AND ')}
              ORDER BY p.created_at DESC
-             LIMIT 500
+             LIMIT 5000
         `, params);
         res.json({ players: result.rows, filter, regionCode, excludeGameId, msgFilter, notMessagedDays });
     } catch (error) {
@@ -55776,6 +55900,14 @@ async function _fix322UniqueSlug(baseSlug, excludeTenantId = null) {
 //                       TF sees each new tenant the moment it's born.
 // Money path: none. State path: tenant + membership — both audited.
 // ════════════════════════════════════════════════════════════════════════
+// GET /api/public/regions — canonical two-tier UK region list for the
+// new-tenant wizard (and future player multi-select). Public, no auth.
+// Static data; cached a day. Flat sorted list; stored value is the town/city.
+app.get('/api/public/regions', (req, res) => {
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.json({ regions: UK_REGIONS });
+});
+
 app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
     if (String(process.env.PUBLIC_TENANT_SIGNUP || 'on').toLowerCase() === 'off') {
         return res.status(503).json({ error: 'New tenant signup is temporarily closed.' });
@@ -55788,11 +55920,15 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
     const email      = String(b.email || '').trim().toLowerCase();
     const password   = String(b.password || '');
     const phone      = b.phone ? String(b.phone).trim().slice(0, 20) : null;
+    const region     = String(b.region || '').trim();
+    const acceptTcs  = b.accept_tcs === true || b.accept_tcs === 'true';
 
     if (tenantName.length < 3 || tenantName.length > 60) return res.status(400).json({ error: 'Organisation name must be 3–60 characters' });
     if (!firstName || !lastName) return res.status(400).json({ error: 'First and last name are required' });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
     if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    if (!region || !VALID_TENANT_REGIONS.has(region)) return res.status(400).json({ error: 'Please choose your region from the list' });
+    if (!acceptTcs) return res.status(400).json({ error: 'You must accept the Tenant Terms & Conditions to continue' });
 
     try {
         // ── Resolve or create the account ─────────────────────────────────
@@ -55840,10 +55976,12 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
             const shortId = String(Math.floor(Math.random() * 90000) + 10000);
             try {
                 const r = await pool.query(
-                    `INSERT INTO tenants (short_id, name, slug, logo_url, primary_color, reply_to_email, status)
-                     VALUES ($1, $2, $3, NULL, NULL, $4, 'active')
+                    `INSERT INTO tenants (short_id, name, slug, logo_url, primary_color, reply_to_email, status,
+                                          region, accepted_tenant_tcs_version, accepted_tenant_tcs_at)
+                     VALUES ($1, $2, $3, NULL, NULL, $4, 'active',
+                             $5, $6, NOW())
                      RETURNING id, short_id, name, slug`,
-                    [shortId, tenantName, workingSlug, email]
+                    [shortId, tenantName, workingSlug, email, region, CURRENT_TENANT_TCS_VERSION]
                 );
                 tenant = r.rows[0];
                 try { // FIX-399 starter-4 seed (same as superadmin create)
@@ -55887,6 +56025,7 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
             ['Slug',     tenant.slug],
             ['Founder',  (firstName + ' ' + lastName).trim()],
             ['Email',    email],
+            ['Region',   region],
             ['Account',  existingAccount ? 'existing' : 'new'],
         ]).catch(() => {}));
 
@@ -61544,7 +61683,7 @@ app.get('/api/t/:tenant_short_id/admin/players', authenticateToken, requireTenan
             LEFT JOIN users u ON u.id = p.user_id
             WHERE pt.tenant_id = $1 AND pt.status = 'active' ${search}
             ORDER BY LOWER(COALESCE(p.alias, p.full_name)) ASC
-            LIMIT 500`, params);
+            LIMIT 5000`, params);
         // Attach per-tenant points only when discipline is on.
         const players = [];
         for (const row of r.rows) {
@@ -64208,6 +64347,12 @@ async function fix386BootstrapRefundPolicy() {
         // defaults; the new tile would 503). Add it idempotently alongside the other
         // two refund columns. Nullable TEXT — empty = no custom policy text shown.
         await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS cancellation_policy_text TEXT`);
+        // New-tenant wizard: canonical "based-in" region (validated against
+        // VALID_TENANT_REGIONS at the API). Nullable — existing/superadmin-created
+        // tenants may have none. Added to the boot migration so the start-tenant
+        // INSERT can rely on the column existing (avoids the schema-drift class
+        // of bug that bit ext-leagues/games this build).
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS region TEXT`);
         // EXT awards (design): tenant-level positive-only enable-list for external league/cup games
         // (empty/null => MOTM only). Normal games keep using disabled_awards untouched.
         await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS external_awards JSONB`);
@@ -64370,7 +64515,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web63-extfixture`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web68-cancelrefund`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
