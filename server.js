@@ -55934,9 +55934,9 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
         // ── Resolve or create the account ─────────────────────────────────
         let user, player, existingAccount = false;
         const uRes = await pool.query(
-            'SELECT id, email, password_hash, role, totp_enabled FROM users WHERE email = $1', [email]
+            'SELECT id, email, password_hash, role, token_version, totp_enabled FROM users WHERE email = $1', [email]
         ).catch(e => { // pre-2FA-migration tolerance
-            if (e.code === '42703') return pool.query('SELECT id, email, password_hash, role, FALSE AS totp_enabled FROM users WHERE email = $1', [email]);
+            if (e.code === '42703') return pool.query('SELECT id, email, password_hash, role, token_version, FALSE AS totp_enabled FROM users WHERE email = $1', [email]);
             throw e;
         });
         if (uRes.rows.length > 0) {
@@ -55944,13 +55944,13 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
             existingAccount = true;
             const ok = await bcrypt.compare(password, user.password_hash || '');
             if (!ok) return res.status(401).json({ error: 'An account with this email already exists and the password doesn\'t match. Log in at totalfooty.co.uk first, or use the correct password.' });
-            const pRes = await pool.query('SELECT id, alias, is_clm_admin, is_organiser, token_version FROM players WHERE user_id = $1', [user.id]);
+            const pRes = await pool.query('SELECT id, alias, is_clm_admin, is_organiser FROM players WHERE user_id = $1', [user.id]);
             if (pRes.rows.length === 0) return res.status(409).json({ error: 'Account exists but has no player profile — contact support.' });
             player = pRes.rows[0];
         } else {
             const passwordHash = await bcrypt.hash(password, 12);
             const nu = await pool.query(
-                'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role',
+                'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, token_version',
                 [email, passwordHash, 'player']
             );
             user = nu.rows[0]; user.totp_enabled = false;
@@ -55961,7 +55961,7 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
                                       pace_rating, decisions_rating, assisting_rating, shooting_rating,
                                       overall_rating)
                  VALUES ($1, $2, $3, $4, $5, $6, 'Midfielder', 'gold', 50, 65, 65, 65, 65, 65, 65, 65, 65)
-                 RETURNING id, alias, is_clm_admin, is_organiser, token_version`,
+                 RETURNING id, alias, is_clm_admin, is_organiser`,
                 [user.id, (firstName + ' ' + lastName).trim(), firstName, lastName, alias || firstName, phone]
             );
             player = np.rows[0];
@@ -56045,7 +56045,7 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
                 userId: user.id, playerId: player.id, email: user.email, role: user.role,
                 isCLMAdmin: player.is_clm_admin || false,
                 isOrganiser: player.is_organiser || false,
-                tokenVersion: player.token_version || 0
+                tokenVersion: user.token_version || 0
             },
             JWT_SECRET, { expiresIn: '7d' }
         );
@@ -64702,7 +64702,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web74-diag`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web75-tokenver`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
