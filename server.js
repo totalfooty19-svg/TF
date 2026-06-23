@@ -55908,6 +55908,15 @@ app.get('/api/public/regions', (req, res) => {
     res.json({ regions: UK_REGIONS });
 });
 
+// Founder player build (FIX-461): skill level -> full rating profile, mirroring
+// register's legacy SKILL_STAT_MAP so a tenant founder is a real player, not flat 65s.
+const START_SKILL_MAP = {
+    beginner: { gk: 84, def: 12, str: 12, fit: 12, pac: 12, dec: 11, ast: 10, sht: 10, overall: 79 },
+    casual:   { gk: 86, def: 12, str: 12, fit: 12, pac: 12, dec: 12, ast: 12, sht: 12, overall: 84 },
+    average:  { gk: 87, def: 13, str: 12, fit: 13, pac: 12, dec: 12, ast: 12, sht: 12, overall: 86 },
+    decent:   { gk: 88, def: 12, str: 12, fit: 13, pac: 12, dec: 13, ast: 13, sht: 13, overall: 88 },
+};
+
 app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
     if (String(process.env.PUBLIC_TENANT_SIGNUP || 'on').toLowerCase() === 'off') {
         return res.status(503).json({ error: 'New tenant signup is temporarily closed.' });
@@ -55919,20 +55928,31 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
     const alias      = String(b.alias || firstName || '').trim().slice(0, 30);
     const email      = String(b.email || '').trim().toLowerCase();
     const password   = String(b.password || '');
-    const phone      = b.phone ? String(b.phone).trim().slice(0, 20) : '';  // players.phone is NOT NULL (register requires it); '' not null for an optional founder phone
+    const phone      = b.phone ? String(b.phone).trim().slice(0, 20) : '';
     const region     = String(b.region || '').trim();
     const acceptTcs  = b.accept_tcs === true || b.accept_tcs === 'true';
+    // FIX-244 signup shape — mirrors the player register flow (positions + primary + level + years off)
+    const signupPositions = Array.isArray(b.signupPositions) ? b.signupPositions
+                          : (Array.isArray(b.signup_positions) ? b.signup_positions : []);
+    const signupPrimary   = b.signupPrimary || b.signup_primary || null;
+    const signupLevel     = b.signupLevel   || b.signup_level   || null;
+    const signupYearsOff  = (b.signupYearsOff !== undefined) ? b.signupYearsOff : b.signup_years_off;
 
     if (tenantName.length < 3 || tenantName.length > 60) return res.status(400).json({ error: 'Organisation name must be 3–60 characters' });
     if (!firstName || !lastName) return res.status(400).json({ error: 'First and last name are required' });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
     if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     if (!region || !VALID_TENANT_REGIONS.has(region)) return res.status(400).json({ error: 'Please choose your region from the list' });
+    if (!Array.isArray(signupPositions) || signupPositions.length === 0) return res.status(400).json({ error: 'Please choose at least one position' });
+    if (!signupLevel || FIX244_LEVEL_OVR_MAP[signupLevel] === undefined) return res.status(400).json({ error: 'Please choose your level' });
     if (!acceptTcs) return res.status(400).json({ error: 'You must accept the Tenant Terms & Conditions to continue' });
 
+    // Derive the founder's ratings exactly like the player register flow; casual fallback mirrors register.
+    const st = _deriveSignupStats(signupPositions, signupPrimary, signupLevel, signupYearsOff) || START_SKILL_MAP.casual;
+
     try {
-        // ── Resolve or create the account ─────────────────────────────────
-        let user, player, existingAccount = false;
+        // ── Resolve account (READ-only; auth/early returns happen before any write) ──
+        let user = null, existingAccount = false, existingPlayer = null;
         const uRes = await pool.query(
             'SELECT id, email, password_hash, role, token_version, totp_enabled FROM users WHERE email = $1', [email]
         ).catch(e => { // pre-2FA-migration tolerance
@@ -55945,79 +55965,96 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
             const ok = await bcrypt.compare(password, user.password_hash || '');
             if (!ok) return res.status(401).json({ error: 'An account with this email already exists and the password doesn\'t match. Log in at totalfooty.co.uk first, or use the correct password.' });
             const pRes = await pool.query('SELECT id, alias, is_clm_admin, is_organiser FROM players WHERE user_id = $1', [user.id]);
-            if (pRes.rows.length === 0) return res.status(409).json({ error: 'Account exists but has no player profile — contact support.' });
-            player = pRes.rows[0];
-        } else {
-            const passwordHash = await bcrypt.hash(password, 12);
-            const nu = await pool.query(
-                'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, token_version',
-                [email, passwordHash, 'player']
-            );
-            user = nu.rows[0]; user.totp_enabled = false;
-            const np = await pool.query(
-                `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone,
-                                      position, reliability_tier,
-                                      goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
-                                      pace_rating, decisions_rating, assisting_rating, shooting_rating,
-                                      overall_rating)
-                 VALUES ($1, $2, $3, $4, $5, $6, 'Midfielder', 'gold', 50, 65, 65, 65, 65, 65, 65, 65, 65)
-                 RETURNING id, alias, is_clm_admin, is_organiser`,
-                [user.id, (firstName + ' ' + lastName).trim(), firstName, lastName, alias || firstName, phone]
-            );
-            player = np.rows[0];
+            existingPlayer = pRes.rows[0] || null; // may be null -> we fill the gap inside the txn (no more 409 orphans)
         }
 
-        // ── Create the tenant — mirror of the superadmin loop (FIX-333) ──
+        // ── Slug (best-effort unique; a late collision becomes a retryable 503) ──
         const baseSlug = _fix322Slugify(tenantName);
         if (!baseSlug) return res.status(400).json({ error: 'Organisation name must contain letters or numbers' });
-        let workingSlug = await _fix322UniqueSlug(baseSlug);
-        let tenant = null;
-        for (let attempt = 0; attempt < 5; attempt++) {
-            const shortId = String(Math.floor(Math.random() * 90000) + 10000);
-            try {
-                const r = await pool.query(
-                    `INSERT INTO tenants (short_id, name, slug, logo_url, primary_color, reply_to_email, status,
-                                          region, accepted_tenant_tcs_version, accepted_tenant_tcs_at)
-                     VALUES ($1, $2, $3, NULL, NULL, $4, 'active',
-                             $5, $6, NOW())
-                     RETURNING id, short_id, name, slug`,
-                    [shortId, tenantName, workingSlug, email, region, CURRENT_TENANT_TCS_VERSION]
+        const workingSlug = await _fix322UniqueSlug(baseSlug);
+
+        // ── ALL writes in ONE transaction: user -> player -> tenant -> membership ──
+        // If any step fails the whole thing rolls back, so we never orphan a user
+        // (the bug that produced the 409s). Monthly seed + audit run AFTER commit.
+        const client = await pool.connect();
+        let player = null, tenant = null;
+        try {
+            await client.query('BEGIN');
+
+            if (!existingAccount) {
+                const passwordHash = await bcrypt.hash(password, 12);
+                const nu = await client.query(
+                    'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, token_version',
+                    [email, passwordHash, 'player']
                 );
-                tenant = r.rows[0];
-                try { // FIX-399 starter-4 seed (same as superadmin create)
-                    await pool.query(
-                        `INSERT INTO tenant_monthly_config (tenant_id, enabled, metric_ids)
-                         VALUES ($1, TRUE, $2) ON CONFLICT (tenant_id) DO NOTHING`,
-                        [tenant.id, MONTHLY_STARTER_METRIC_IDS]);
-                } catch (seedErr) {
-                    if (!(seedErr && (seedErr.code === '42P01' || seedErr.code === '42703')))
-                        console.error('FIX-460 starter-4 seed failed (non-fatal):', seedErr.message);
-                }
-                break;
-            } catch (e) {
-                if (e && e.code === '23505') {
-                    if (e.constraint && e.constraint.includes('slug')) {
-                        workingSlug = workingSlug + '-' + Date.now().toString(36).slice(-4);
-                    }
-                    continue; // short_id collision -> new random id next loop
-                }
-                throw e;
+                user = nu.rows[0]; user.totp_enabled = false;
             }
+
+            if (existingPlayer) {
+                player = existingPlayer; // existing player keeps their profile; we only add the tenant role
+            } else {
+                // New account OR fill-the-gap: build a real player from the chosen skill level + position.
+                const np = await client.query(
+                    `INSERT INTO players (user_id, full_name, first_name, last_name, alias, phone, position, reliability_tier,
+                                          goalkeeper_rating, defending_rating, strength_rating, fitness_rating,
+                                          pace_rating, decisions_rating, assisting_rating, shooting_rating, overall_rating,
+                                          skill_level, age_range, region_code, coachable,
+                                          signup_positions, signup_primary, signup_level, signup_years_off)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'gold',
+                             $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                             $17, $18, $19, $20,
+                             $21, $22, $23, $24)
+                     RETURNING id, alias, is_clm_admin, is_organiser`,
+                    [user.id, (firstName + ' ' + lastName).trim(), firstName, lastName, alias || firstName, phone,
+                     (st._signupPrimary || 'outfield'),
+                     st.gk, st.def, st.str, st.fit, st.pac, st.dec, st.ast, st.sht, st.overall,
+                     null, null, null, false,
+                     st._signupPositions || null, st._signupPrimary || null, st._signupLevel || null,
+                     (st._signupYearsOff === undefined ? null : st._signupYearsOff)]
+                );
+                player = np.rows[0];
+            }
+
+            const shortId = String(Math.floor(Math.random() * 90000) + 10000);
+            const tr = await client.query(
+                `INSERT INTO tenants (short_id, name, slug, logo_url, primary_color, reply_to_email, status,
+                                      region, accepted_tenant_tcs_version, accepted_tenant_tcs_at)
+                 VALUES ($1, $2, $3, NULL, NULL, $4, 'active',
+                         $5, $6, NOW())
+                 RETURNING id, short_id, name, slug`,
+                [shortId, tenantName, workingSlug, email, region, CURRENT_TENANT_TCS_VERSION]
+            );
+            tenant = tr.rows[0];
+
+            await client.query(
+                `INSERT INTO player_tenants (player_id, tenant_id, role, status, joined_at,
+                                             show_in_dashboard, allow_tenant_contact)
+                 VALUES ($1, $2, 'tenant_admin', 'active', NOW(), TRUE, TRUE)
+                 ON CONFLICT (player_id, tenant_id)
+                 DO UPDATE SET role = 'tenant_admin', status = 'active'`,
+                [player.id, tenant.id]
+            );
+
+            await client.query('COMMIT');
+        } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw e; // collision / other -> outer catch (23505 -> 503, else 500)
+        } finally {
+            client.release();
         }
-        if (!tenant) return res.status(503).json({ error: 'Could not allocate a tenant id — please try again.' });
 
-        // ── Founder membership: tenant_admin ──────────────────────────────
-        await pool.query(
-            `INSERT INTO player_tenants (player_id, tenant_id, role, status, joined_at,
-                                         show_in_dashboard, allow_tenant_contact)
-             VALUES ($1, $2, 'tenant_admin', 'active', NOW(), TRUE, TRUE)
-             ON CONFLICT (player_id, tenant_id)
-             DO UPDATE SET role = 'tenant_admin', status = 'active'`,
-            [player.id, tenant.id]
-        );
+        // ── Post-commit, non-critical: starter-4 monthly seed (idempotent, fire-and-forget) ──
+        pool.query(
+            `INSERT INTO tenant_monthly_config (tenant_id, enabled, metric_ids)
+             VALUES ($1, TRUE, $2) ON CONFLICT (tenant_id) DO NOTHING`,
+            [tenant.id, MONTHLY_STARTER_METRIC_IDS]
+        ).catch(seedErr => {
+            if (!(seedErr && (seedErr.code === '42P01' || seedErr.code === '42703')))
+                console.error('FIX-460 starter-4 seed failed (non-fatal):', seedErr.message);
+        });
 
-        // ── Audit + superadmin alert (fire-and-forget) ────────────────────
-        await auditLog(pool, player.id, 'tenant_self_created', null,
+        // ── Audit + superadmin alert (fire-and-forget) ──
+        auditLog(pool, player.id, 'tenant_self_created', null,
             `Public link: tenant "${tenantName}" (${tenant.short_id}) by ${email}${existingAccount ? ' (existing account)' : ' (new account)'}`,
             tenant.id).catch(() => {});
         setImmediate(() => notifyAdmin('\uD83C\uDFDB\uFE0F New tenant via public link — ' + tenantName, [
@@ -56031,7 +56068,7 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
 
         const signupLink = 'https://totalfooty.co.uk/?flow=signup&tenant_short_id=' + tenant.short_id;
 
-        // ── Auto-login (never bypass 2FA) ─────────────────────────────────
+        // ── Auto-login (never bypass 2FA) ──
         if (user.totp_enabled === true) {
             return res.status(201).json({
                 ok: true, needs_login: true,
@@ -56059,10 +56096,10 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
             signup_link: signupLink, crm_link: 'https://totalfooty.co.uk/crm.html'
         });
     } catch (e) {
-        // TEMP DIAG (web74): echo the real Postgres error so we stop guessing. REVERT after diagnosis.
-        console.error('FIX-460 start-tenant error:', e.code, '|', e.message, '|', e.detail, '|', e.column, '|', e.constraint);
-        return res.status(500).json({ error: 'Could not create your tenant. Please try again.',
-            _debug: { code: e.code || null, message: e.message || null, detail: e.detail || null, column: e.column || null, constraint: e.constraint || null } });
+        // short_id/slug collision -> retryable; everything else -> 500. Full error is logged server-side (Render logs) only.
+        if (e && e.code === '23505') return res.status(503).json({ error: 'Could not allocate a unique id — please try again.' });
+        console.error('FIX-460 start-tenant error:', e.code, e.message, e.detail, e.column, e.constraint);
+        return res.status(500).json({ error: 'Could not create your tenant. Please try again.' });
     }
 });
 
@@ -64702,7 +64739,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web75-tokenver`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web78-signupmirror`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
