@@ -1294,9 +1294,9 @@ const TF_COVENTRY_SHORT_ID  = '10000';
 //
 // Versioning policy: any change requiring re-acceptance gets a new version.
 // Cosmetic/typo fixes that don't change rights/obligations: don't bump.
-const CURRENT_PLAYER_TCS_VERSION    = 'v1.0-draft';
-const CURRENT_TENANT_TCS_VERSION    = 'v1.0-draft';
-const CURRENT_ORGANISER_TCS_VERSION = 'v1.0-draft';
+const CURRENT_PLAYER_TCS_VERSION    = 'v1.0';
+const CURRENT_TENANT_TCS_VERSION    = 'v1.0';
+const CURRENT_ORGANISER_TCS_VERSION = 'v1.0';
 
 // ════════════════════════════════════════════════════════════════════════════
 // CANONICAL UK REGIONS  (new-tenant "based-in" + future player multi-select)
@@ -7838,6 +7838,11 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                 p.ovr_suspicion, -- FIX-245: rating-suspicion flag for the 🚩/🔥 indicator
                 u.role as user_role, u.email,
                 c.balance as credits,
+
+                -- Tenant memberships (active) — powers the tenant filter in manage-players
+                (SELECT json_agg(json_build_object('short_id', t.short_id, 'name', t.name) ORDER BY t.name)
+                 FROM player_tenants pt JOIN tenants t ON t.id = pt.tenant_id
+                 WHERE pt.player_id = p.id AND pt.status = 'active') as tenants,
 
                 -- Badges with IDs
                 (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
@@ -64739,7 +64744,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web78-signupmirror`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web80-tenantfilter`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
