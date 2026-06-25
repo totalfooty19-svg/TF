@@ -62370,6 +62370,117 @@ app.get('/api/public/club/:id', publicPlayerLimiter, async (req, res) => {
     }
 });
 
+// --- T&C bodies served from the API (not a static file) -----------------------
+// Previously fetched from Namecheap (/tcs/*.html), which kept 404'ing (file not
+// uploaded / Cloudflare-cached miss) and locked users out of the gate. Serving
+// them here means they deploy with the backend: no static file, no cache to purge.
+const PLAYER_TCS_V1_HTML = `<!-- TotalFooty Player Terms & Conditions — v1.0.
+     Fetched by the T&C gate in index.html and injected into the modal body.
+     Styled for the dark modal. Edit the wording freely; the FILENAME
+     (player-v1.0.html) must keep matching CURRENT_PLAYER_TCS_VERSION in
+     server.js — if you revise the terms materially, bump both together. -->
+<div style="color:#cfcfcf;font-size:14px;line-height:1.7;">
+
+  <h3 style="font-family:'Bebas Neue',sans-serif;letter-spacing:1.5px;color:#fff;font-size:21px;margin:0 0 4px;">TotalFooty — Player Terms &amp; Conditions</h3>
+  <p style="margin:0 0 18px;color:#888;font-size:12px;">Version 1.0</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">1. Acceptance &amp; eligibility</h4>
+  <p style="margin:0 0 12px;">By creating an account or using TotalFooty you agree to these terms. You confirm you are at least 16 years old (or have the consent of a parent or guardian) and that the details you provide are accurate. If you take part on behalf of a club or group, you confirm you are entitled to do so.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">2. Your account</h4>
+  <p style="margin:0 0 12px;">You are responsible for keeping your login details secure and for activity that takes place under your account. Keep your contact details current so you receive game, payment and cancellation notifications. Do not impersonate anyone or create accounts to evade a restriction or ban.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">3. Conduct on and off the pitch</h4>
+  <p style="margin:0 0 8px;">TotalFooty exists to support grassroots football. You agree to:</p>
+  <ul style="margin:0 0 12px;padding-left:20px;">
+    <li style="margin-bottom:5px;">treat other players, organisers and opponents with respect;</li>
+    <li style="margin-bottom:5px;">play fairly and follow the rules and reasonable instructions of your game's organiser;</li>
+    <li style="margin-bottom:5px;">not engage in abuse, harassment, discrimination, threats or violence;</li>
+    <li style="margin-bottom:5px;">turn up for games you have confirmed, or withdraw in good time so your place can be filled.</li>
+  </ul>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">4. Bookings, payments &amp; cancellations</h4>
+  <p style="margin:0 0 12px;">When you join a paid game you agree to pay the stated fee. Refunds and cancellation deadlines are set by each organiser or club and are shown to you before you confirm and on the cancellation screen — including any cut-off time before kick-off after which a place becomes non-refundable, and whether refunds stop once teams have been selected. Free credits, where granted, may be applied to eligible games. Payments are handled by our payment providers; we do not store your full card details.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">5. Ratings, stats &amp; feedback</h4>
+  <p style="margin:0 0 12px;">TotalFooty records appearances, results, ratings, awards and player feedback to run leagues, team selection and recognition features. Ratings and peer feedback are intended to be constructive; coordinated or malicious use may result in action on your account.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">6. Data &amp; privacy</h4>
+  <p style="margin:0 0 12px;">We process your personal data to operate the service — managing games, payments, communications and the features above. We do not sell your personal data. You may request access to or deletion of your data by contacting us. Our privacy policy accompanies these terms.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">7. Safety &amp; liability</h4>
+  <p style="margin:0 0 12px;">Football carries inherent physical risk and you take part at your own risk. You are responsible for ensuring you are fit to play and for any equipment you use. To the extent permitted by law, TotalFooty and the organisers using it are not liable for injury, loss or damage arising from participation, except where caused by their negligence. Report any injuries or safety concerns to your organiser.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">8. Suspensions &amp; bans</h4>
+  <p style="margin:0 0 12px;">Organisers and TotalFooty may restrict, suspend or remove access where these terms are broken — for example repeated no-shows, non-payment, or abusive behaviour. Where money is owed to you at the point of removal, it remains payable subject to the applicable refund rules.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">9. Changes to these terms</h4>
+  <p style="margin:0 0 12px;">We may update these terms. When we do, you will be asked to review and accept the new version before continuing to use TotalFooty. Continued use after acceptance means you agree to the updated terms.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">10. Contact</h4>
+  <p style="margin:0 0 6px;">Questions about these terms? Contact <a href="mailto:totalfooty19@gmail.com" style="color:#4da3ff;">totalfooty19@gmail.com</a>.</p>
+
+  <p style="margin:18px 0 0;color:#888;font-size:12px;">By clicking <strong>Accept &amp; Continue</strong> you confirm you have read and agree to these Player Terms &amp; Conditions (v1.0).</p>
+
+</div>
+`;
+const TENANT_TCS_V1_HTML = `<!-- TotalFooty Tenant (Operator) Terms & Conditions — v1.0.
+     Fetched by the T&C gate for tenant_admin accounts and injected into the
+     modal body. Styled for the dark modal. The FILENAME (tenant-v1.0.html)
+     must keep matching CURRENT_TENANT_TCS_VERSION in server.js. -->
+<div style="color:#cfcfcf;font-size:14px;line-height:1.7;">
+
+  <h3 style="font-family:'Bebas Neue',sans-serif;letter-spacing:1.5px;color:#fff;font-size:21px;margin:0 0 4px;">TotalFooty — Operator Terms &amp; Conditions</h3>
+  <p style="margin:0 0 18px;color:#888;font-size:12px;">Version 1.0 · for clubs and organisers running games on TotalFooty</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">1. Acceptance &amp; authority</h4>
+  <p style="margin:0 0 12px;">These terms apply to you as an operator (tenant) running games, leagues, training or other activity for your members on TotalFooty. By accepting, you confirm you are authorised to enter into these terms on behalf of your club or group, and that the information you provide about your organisation is accurate.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">2. Your organisation &amp; members</h4>
+  <p style="margin:0 0 12px;">You are responsible for managing your roster, organisers and the activity you run. You will deal fairly with your members and keep the settings that affect them — pricing, cancellation policy, organiser allowances and discipline rules — accurate and up to date. You are responsible for the conduct of the organisers you appoint.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">3. Games &amp; player money</h4>
+  <p style="margin:0 0 12px;">You set the fees for your games and you must publish a clear cancellation and refund policy, including any cut-off before kick-off and whether refunds stop once teams are selected. You agree to honour the policy you publish and to action refunds where they are due. Comped slots, discounts and weekly caps you grant to organisers will be applied as you configure them.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">4. Payouts, bank details &amp; fees</h4>
+  <p style="margin:0 0 12px;">Funds you collect from players, less any TotalFooty fees and applicable payment-processing costs, are paid out to the verified bank account you provide. You are responsible for the accuracy of those bank details. You authorise TotalFooty to deduct its agreed fees and to withhold payout where there is a genuine dispute, suspected fraud, or a breach of these terms. You are responsible for your own tax and accounting obligations.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">5. Data protection</h4>
+  <p style="margin:0 0 12px;">You and TotalFooty each handle members' personal data in connection with the service. You will only use member data to operate your activity, will keep it secure, and will not use it for unrelated purposes or pass it to third parties without a lawful basis. You will comply with applicable data-protection law in respect of your members, and respond to their data requests where you are responsible for doing so.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">6. Conduct, safeguarding &amp; safety</h4>
+  <p style="margin:0 0 12px;">You are responsible for providing a safe, respectful environment for your members, including any safeguarding obligations that apply where minors or vulnerable adults take part. You will ensure venues and activity are appropriate and that you hold any insurance, permissions or qualifications the law or your venue requires.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">7. Acceptable &amp; lawful use</h4>
+  <p style="margin:0 0 12px;">You will use TotalFooty only for legitimate grassroots football activity, will not misuse the platform or its messaging features, and will not attempt to disrupt, reverse-engineer or gain unauthorised access to the service or to other tenants' data.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">8. Suspension &amp; termination</h4>
+  <p style="margin:0 0 12px;">TotalFooty may suspend or terminate operator access where these terms are breached — for example non-payment of fees, failure to honour published refund policies, or conduct that puts members at risk. On termination, sums properly owed between the parties remain payable, and you will deal fairly with any outstanding obligations to your members.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">9. Liability</h4>
+  <p style="margin:0 0 12px;">TotalFooty provides the platform on a reasonable-efforts basis. To the extent permitted by law, TotalFooty is not liable for losses arising from your operation of your activity, from member conduct, or from matters within your control. Nothing in these terms limits liability that cannot be limited by law.</p>
+
+  <h4 style="color:#fff;font-size:14px;margin:18px 0 6px;letter-spacing:0.5px;">10. Changes &amp; contact</h4>
+  <p style="margin:0 0 6px;">We may update these terms and will ask you to accept a new version before continuing. Questions? Contact <a href="mailto:totalfooty19@gmail.com" style="color:#4da3ff;">totalfooty19@gmail.com</a>.</p>
+
+  <p style="margin:18px 0 0;color:#888;font-size:12px;">By clicking <strong>Accept &amp; Continue</strong> you confirm you have read and agree to these Operator Terms &amp; Conditions (v1.0) on behalf of your organisation.</p>
+
+</div>
+`;
+const _TCS_BODIES = {
+    'player|v1.0': PLAYER_TCS_V1_HTML,
+    'tenant|v1.0': TENANT_TCS_V1_HTML,
+};
+app.get('/api/public/tcs/:kind/:version', (req, res) => {
+    // Tolerate a stale '-draft' suffix from old clients (maps to the published version).
+    const ver = String(req.params.version || '').replace(/-draft$/, '');
+    const html = _TCS_BODIES[`${req.params.kind}|${ver}`];
+    res.set('Access-Control-Allow-Origin', '*'); // public terms; fetched cross-origin + via the edge proxy
+    if (!html) return res.status(404).type('text/plain').send('Terms not found');
+    res.set('Cache-Control', 'public, max-age=300');
+    res.type('html').send(html);
+});
+
 app.use((req, res) => { res.status(404).json({ error: 'Not found' }); });
 
 
@@ -64744,7 +64855,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web80-tenantfilter`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web82-tcsedge`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
