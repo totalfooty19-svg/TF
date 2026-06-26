@@ -55859,6 +55859,19 @@ const _FIX322_TEXT_FIELDS = [
     'bank_account_holder_name', 'bank_account_number', 'bank_sort_code',
 ];
 
+// Strict integer validator. parseInt('2.4') silently returns 2, so decimals/junk
+// were being accepted on numeric settings fields. This rejects anything that isn't a
+// whole number within [min,max]: returns the integer, or null for the caller to 400.
+function _strictInt(raw, min = -Infinity, max = Infinity) {
+    if (typeof raw === 'number') {
+        return (Number.isInteger(raw) && raw >= min && raw <= max) ? raw : null;
+    }
+    const s = String(raw == null ? '' : raw).trim();
+    if (!/^-?\d+$/.test(s)) return null;
+    const n = Number(s);
+    return (Number.isInteger(n) && n >= min && n <= max) ? n : null;
+}
+
 // Slug helper: deterministic, URL-safe, capped at 60 chars.
 function _fix322Slugify(name) {
     if (!name) return '';
@@ -56260,9 +56273,9 @@ app.patch('/api/admin/tenants/:id', authenticateToken, requireSuperAdmin, async 
     }
     for (const f of _FIX322_INT_FIELDS) {
         if (body[f] !== undefined) {
-            const n = body[f] === null ? null : parseInt(body[f], 10);
-            if (body[f] !== null && (!Number.isFinite(n) || n < 0)) {
-                return res.status(400).json({ error: `${f} must be a non-negative integer` });
+            const n = body[f] === null ? null : _strictInt(body[f], 0, Infinity);
+            if (body[f] !== null && n === null) {
+                return res.status(400).json({ error: `${f} must be a non-negative whole number` });
             }
             updates.push(`${f} = $${idx++}`);
             values.push(n);
@@ -56801,13 +56814,16 @@ app.get('/api/t/:tenant_short_id/admin/refund-policy',
 app.put('/api/t/:tenant_short_id/admin/refund-policy',
     authenticateToken, requireTenantAdmin, async (req, res) => {
         const body = req.body || {};
-        const hrs = parseInt(body.refund_cutoff_hours, 10);
-        if (isNaN(hrs) || hrs < 0 || hrs > 8760) {
-            return res.status(400).json({ error: 'refund_cutoff_hours must be an integer between 0 and 8760' });
+        const hrs = _strictInt(body.refund_cutoff_hours, 0, 8760);
+        if (hrs === null) {
+            return res.status(400).json({ error: 'refund_cutoff_hours must be a whole number between 0 and 8760' });
         }
         const noRefundAfterTeams = !!body.no_refund_after_teams;
-        const text = typeof body.cancellation_policy_text === 'string'
-            ? body.cancellation_policy_text.trim().slice(0, 2000) : '';
+        const rawPolicy = typeof body.cancellation_policy_text === 'string' ? body.cancellation_policy_text.trim() : '';
+        if (rawPolicy.length > 2000) {
+            return res.status(400).json({ error: 'cancellation_policy_text must be 2000 characters or fewer' });
+        }
+        const text = rawPolicy;
         try {
             const r = await pool.query(
                 `UPDATE tenants
@@ -57868,8 +57884,9 @@ function _validateCustomAward(body) {
     const label    = (body && typeof body.label === 'string') ? body.label.trim() : '';
     const emoji    = (body && typeof body.emoji === 'string' && body.emoji.trim()) ? body.emoji.trim() : '\u{1F3C6}';
     const polarity = (body && body.polarity === 'banter') ? 'banter' : 'positive';
-    let minVotes = parseInt(body && body.min_votes, 10);
-    if (!Number.isFinite(minVotes)) minVotes = 3;
+    let minVotes = (body && body.min_votes !== undefined && body.min_votes !== null && body.min_votes !== '')
+        ? _strictInt(body.min_votes, 1, 20) : 3;
+    if (minVotes === null) return { error: 'min_votes must be a whole number between 1 and 20' };
     if (label.length < 2 || label.length > 40) return { error: 'label must be 2-40 characters' };
     if (emoji.length > 8) return { error: 'emoji too long' };
     if (minVotes < 1 || minVotes > 20) return { error: 'min_votes must be between 1 and 20' };
@@ -59106,9 +59123,9 @@ app.patch('/api/t/:tenant_short_id/admin/allowance',
 
         for (const [key, def] of Object.entries(dialMap)) {
             if (body[key] !== undefined) {
-                const n = parseInt(body[key], 10);
-                if (!Number.isFinite(n) || n < def.min || n > def.max) {
-                    return res.status(400).json({ error: `${key} must be integer in [${def.min}, ${def.max}]` });
+                const n = _strictInt(body[key], def.min, def.max);
+                if (n === null) {
+                    return res.status(400).json({ error: `${key} must be a whole number in [${def.min}, ${def.max}]` });
                 }
                 updates.push(`${def.col} = $${idx++}`);
                 values.push(n);
@@ -64855,7 +64872,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web82-tcsedge`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web83-inputvld`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
