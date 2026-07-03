@@ -3566,7 +3566,7 @@ const authenticateToken = async (req, res, next) => {
         // FIX-075: Verify player still exists (deleted players should lose access immediately)
         try {
             const playerExists = await pool.query(
-                'SELECT p.id, p.is_clm_admin, p.is_organiser, u.token_version, u.role FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
+                'SELECT p.id, p.is_organiser, u.token_version, u.role FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1',
                 [user.playerId]
             );
             if (playerExists.rows.length === 0) {
@@ -3580,7 +3580,6 @@ const authenticateToken = async (req, res, next) => {
             }
             // SEC-ROLE: Always use role from DB, not JWT — prevents stale elevated roles
             user.role = playerExists.rows[0].role;
-            user.isCLMAdmin = playerExists.rows[0].is_clm_admin || false;
             user.isOrganiser = playerExists.rows[0].is_organiser || false;
         } catch (e) {
             return res.status(500).json({ error: 'Authentication error' });
@@ -4310,26 +4309,6 @@ async function _fix330GenerateInvoicesForPeriod(periodStart, periodEnd) {
 // ════════════════════════════════════════════════════════════════════════════
 
 
-// CLM Admin: is_clm_admin flag, only operates on CLM-exclusive games
-const requireCLMAdmin = async (req, res, next) => {
-    try {
-        if (req.user.role === 'admin' || req.user.role === 'superadmin') return next();
-        const result = await pool.query('SELECT is_clm_admin FROM players WHERE id = $1', [req.user.playerId]);
-        if (!result.rows[0]?.is_clm_admin) return res.status(403).json({ error: 'CLM admin access required' });
-        const gameId = req.params.gameId || req.params.id;
-        if (gameId) {
-            const gc = await pool.query('SELECT exclusivity FROM games WHERE id = $1', [gameId]);
-            if (gc.rows.length > 0 && gc.rows[0].exclusivity !== 'clm') {
-                return res.status(403).json({ error: 'CLM admins can only manage CLM games' });
-            }
-        }
-        next();
-    } catch (error) {
-        console.error('CLM admin check error:', error);
-        res.status(500).json({ error: 'Authorization check failed' });
-    }
-};
-
 // Organiser: is_organiser flag, must be registered for the game
 const requireOrganiser = async (req, res, next) => {
     try {
@@ -4353,25 +4332,20 @@ const requireOrganiser = async (req, res, next) => {
     }
 };
 
-// Either admin, CLM admin (CLM games), or organiser (registered games)
+// Either admin or organiser (registered games)
 const requireGameManager = async (req, res, next) => {
     try {
         if (req.user.role === 'admin' || req.user.role === 'superadmin') {
             req.managerRole = 'admin';
             return next();
         }
-        const pr = await pool.query('SELECT is_clm_admin, is_organiser FROM players WHERE id = $1', [req.user.playerId]);
+        const pr = await pool.query('SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]);
         const player = pr.rows[0];
         if (!player) return res.status(403).json({ error: 'Access denied' });
         const gameId = req.params.gameId || req.params.id;
         if (gameId) {
-            const gc = await pool.query('SELECT exclusivity FROM games WHERE id = $1', [gameId]);
-            const game = gc.rows[0];
-            if (!game) return res.status(404).json({ error: 'Game not found' });
-            if (player.is_clm_admin && game.exclusivity === 'clm') {
-                req.managerRole = 'clm_admin';
-                return next();
-            }
+            const gc = await pool.query('SELECT id FROM games WHERE id = $1', [gameId]);
+            if (!gc.rows[0]) return res.status(404).json({ error: 'Game not found' });
             if (player.is_organiser) {
                 const rc = await pool.query(
                     "SELECT id FROM registrations WHERE game_id = $1 AND player_id = $2 AND status = 'confirmed'",
@@ -6913,23 +6887,6 @@ app.post('/api/auth/register', async (req, res) => {
                             } else {
                                 // Set referred_by on new player
                                 await pool.query('UPDATE players SET referred_by = $1 WHERE id = $2', [referrerId, playerId]);
-
-                                // CLM badge inheritance via referral chain
-                                const referrerCLM = await pool.query(
-                                    "SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'CLM'",
-                                    [referrerId]
-                                );
-                                if (referrerCLM.rows.length > 0) {
-                                    const clmBadge = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
-                                    if (clmBadge.rows.length > 0) {
-                                        await pool.query(
-                                            'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                                            [playerId, clmBadge.rows[0].id]
-                                        );
-                                        await auditLog(pool, null, 'badge_auto_awarded', playerId, `badge: CLM (inherited via referral from player ${referrerId})`);
-                                    }
-                                }
-
                             }
                         }
                     }
@@ -7186,7 +7143,7 @@ app.post('/api/auth/login', async (req, res) => {
         // via /api/players/me immediately after — no need to duplicate it here.
         // This keeps the login response tiny (~300 bytes) so it passes through Cloudflare instantly.
         const playerResult = await pool.query(
-            `SELECT p.id, p.full_name, p.alias, p.is_clm_admin, p.is_organiser, u.token_version,
+            `SELECT p.id, p.full_name, p.alias, p.is_organiser, u.token_version,
              (SELECT json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon))
               FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id) as badges
              FROM players p
@@ -7209,7 +7166,6 @@ app.post('/api/auth/login', async (req, res) => {
                 playerId: player.id,
                 email: user.email,
                 role: user.role,
-                isCLMAdmin: player.is_clm_admin || false,
                 isOrganiser: player.is_organiser || false,
                 tokenVersion: player.token_version || 0
             },
@@ -7241,7 +7197,6 @@ app.post('/api/auth/login', async (req, res) => {
                 fullName: player.full_name,
                 alias: player.alias,
                 role: user.role,
-                isCLMAdmin: player.is_clm_admin || false,
                 isOrganiser: player.is_organiser || false,
                 badges: player.badges || []
             }
@@ -7382,7 +7337,6 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     try {
         const playerResult = await pool.query(
             `SELECT p.id, p.full_name, p.alias, p.squad_number, p.referral_code, u.role,
-             COALESCE(p.is_clm_admin, false) as is_clm_admin,
              COALESCE(p.is_organiser, false) as is_organiser,
              COALESCE(u.totp_enabled, false) as totp_enabled,
              u.force_password_change
@@ -7404,7 +7358,6 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
             squadNumber: player.squad_number,
             referralCode: player.referral_code,
             role: player.role,
-            isCLMAdmin: player.is_clm_admin || false,
             isOrganiser: player.is_organiser || false,
             totpEnabled: player.totp_enabled === true, // FIX-444
             mustChangePassword: player.force_password_change === true
@@ -7518,7 +7471,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                     p.total_wins, p.total_draws,
                     (SELECT COUNT(*) FROM registrations
                      WHERE player_id = p.id AND status = 'confirmed')::int AS confirmed_registration_count,
-                    p.is_clm_admin,
                     p.is_organiser,
                     p.referred_by,
                     c.balance as credits,
@@ -7553,7 +7505,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                 // Add frontend-friendly role flags
                 player.isAdmin = player.role === 'admin' || player.role === 'superadmin';
                 player.isSuperAdmin = player.role === 'superadmin';
-                player.isCLMAdmin = player.is_clm_admin || false;
                 player.isOrganiser = player.is_organiser || false;
             }
         } catch (detailsError) {
@@ -7576,7 +7527,6 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
         }
         
         // Ensure role flags always have defaults
-        if (player.isCLMAdmin === undefined) player.isCLMAdmin = false;
         if (player.isOrganiser === undefined) player.isOrganiser = false;
         if (player.isAdmin === undefined) player.isAdmin = false;
         if (player.isSuperAdmin === undefined) player.isSuperAdmin = false;
@@ -7694,7 +7644,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 p.id, p.full_name, p.alias, p.squad_number, p.player_number, p.player_number_text, p.photo_url, /* FIX-302 */
                 p.reliability_tier, p.total_appearances, p.motm_wins, p.total_wins, p.total_draws,
                 p.phone, u.email,
-                p.is_clm_admin, p.is_organiser,
+                p.is_organiser,
                 c.balance as credits,
                 p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
@@ -7737,7 +7687,7 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
         } else {
             // Strip sensitive fields for non-admin users
             const safeRows = result.rows.map(p => {
-                const { phone, email, credits, is_clm_admin, is_organiser,
+                const { phone, email, credits, is_organiser,
                     overall_rating, defending_rating, strength_rating, fitness_rating,
                     pace_rating, decisions_rating, assisting_rating, shooting_rating, goalkeeper_rating,
                     ...safe } = p;
@@ -7758,9 +7708,9 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
 // ==========================================
 // ─── P3 (default organiser) — list endpoint for the dropdown ───────────────
 // Returns players flagged is_organiser. Used by Add Game / Edit Game / Edit Series
-// forms to populate the "default organiser" dropdown. requireCLMAdmin matches
+// forms to populate the "default organiser" dropdown. requireAdmin matches
 // the gates on the forms that consume it.
-app.get('/api/players/organisers', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.get('/api/players/organisers', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT p.id, p.full_name, p.alias, p.squad_number
@@ -7834,7 +7784,7 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                 p.overall_rating, p.defending_rating, p.strength_rating, p.fitness_rating,
                 p.pace_rating, p.decisions_rating, p.assisting_rating, p.shooting_rating,
                 p.goalkeeper_rating,
-                p.is_clm_admin, p.is_organiser,
+                p.is_organiser,
                 p.ovr_suspicion, -- FIX-245: rating-suspicion flag for the 🚩/🔥 indicator
                 u.role as user_role, u.email,
                 c.balance as credits,
@@ -7906,15 +7856,6 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                  JOIN players ref ON ct.player_id = ref.id
                  WHERE ref.referred_by = p.id AND ct.type = 'game_fee'), 0) as referred_spend,
 
-                -- CLM REVENUE per player: their fees at CLM games + their guests' fees at CLM games
-                COALESCE((SELECT SUM(g.cost_per_player) FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 WHERE r.player_id = p.id AND r.status = 'confirmed'
-                 AND g.exclusivity = 'clm' AND g.game_status = 'completed'), 0)
-                +
-                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg
-                 JOIN games g ON g.id = gg.game_id
-                 WHERE gg.invited_by = p.id AND g.exclusivity = 'clm'), 0) as clm_revenue,
 
                 -- FINANCIAL: last 3 months
                 COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
@@ -7938,16 +7879,6 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                  WHERE ref.referred_by = p.id AND ct.type = 'game_fee'
                  AND ct.created_at >= NOW() - INTERVAL '3 months'), 0) as referred_spend_3m,
 
-                COALESCE((SELECT SUM(g.cost_per_player) FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 WHERE r.player_id = p.id AND r.status = 'confirmed'
-                 AND g.exclusivity = 'clm' AND g.game_status = 'completed'
-                 AND g.game_date >= NOW() - INTERVAL '3 months'), 0)
-                +
-                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg
-                 JOIN games g ON g.id = gg.game_id
-                 WHERE gg.invited_by = p.id AND g.exclusivity = 'clm'
-                 AND g.game_date >= NOW() - INTERVAL '3 months'), 0) as clm_revenue_3m,
 
                 -- FINANCIAL: calendar year
                 COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
@@ -7971,16 +7902,6 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
                  WHERE ref.referred_by = p.id AND ct.type = 'game_fee'
                  AND ct.created_at >= DATE_TRUNC('year', NOW())), 0) as referred_spend_year,
 
-                COALESCE((SELECT SUM(g.cost_per_player) FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 WHERE r.player_id = p.id AND r.status = 'confirmed'
-                 AND g.exclusivity = 'clm' AND g.game_status = 'completed'
-                 AND g.game_date >= DATE_TRUNC('year', NOW())), 0)
-                +
-                COALESCE((SELECT SUM(gg.amount_paid) FROM game_guests gg
-                 JOIN games g ON g.id = gg.game_id
-                 WHERE gg.invited_by = p.id AND g.exclusivity = 'clm'
-                 AND g.game_date >= DATE_TRUNC('year', NOW())), 0) as clm_revenue_year,
 
                 -- FREE CREDITS: all time
                 COALESCE((SELECT SUM(ct.amount) FROM credit_transactions ct
@@ -8038,30 +7959,9 @@ app.get('/api/admin/players/grid', authenticateToken, requireAdmin, async (req, 
         // All badges for the badge matrix headers
         const badgesResult = await pool.query('SELECT id, name, color, icon FROM badges ORDER BY name');
 
-        // CLM totals (platform-wide) — all time, last 3 months, calendar year
-        const clmTotals = await pool.query(`
-            SELECT
-                COALESCE(SUM(g.cost_per_player * sub.player_count + COALESCE(sub.guest_revenue, 0)), 0) as clm_total,
-                COALESCE(SUM(CASE WHEN g.game_date >= NOW() - INTERVAL '3 months'
-                    THEN g.cost_per_player * sub.player_count + COALESCE(sub.guest_revenue, 0) ELSE 0 END), 0) as clm_total_3m,
-                COALESCE(SUM(CASE WHEN g.game_date >= DATE_TRUNC('year', NOW())
-                    THEN g.cost_per_player * sub.player_count + COALESCE(sub.guest_revenue, 0) ELSE 0 END), 0) as clm_total_year
-            FROM games g
-            JOIN (
-                SELECT r.game_id,
-                    COUNT(*) as player_count,
-                    (SELECT COALESCE(SUM(gg.amount_paid), 0) FROM game_guests gg WHERE gg.game_id = r.game_id) as guest_revenue
-                FROM registrations r
-                WHERE r.status = 'confirmed'
-                GROUP BY r.game_id
-            ) sub ON sub.game_id = g.id
-            WHERE g.exclusivity = 'clm' AND g.game_status = 'completed'
-        `);
-
         res.json({
             players: result.rows,
-            allBadges: badgesResult.rows,
-            clmTotals: clmTotals.rows[0] || { clm_total: 0, clm_total_3m: 0, clm_total_year: 0 }
+            allBadges: badgesResult.rows
         });
     } catch (error) {
         console.error('Error fetching admin players grid:', error);
@@ -9174,13 +9074,12 @@ app.get('/api/dashboard/region-slider', authenticateToken, async (req, res) => {
             const badges = await pool.query(`
                 SELECT b.name FROM player_badges pb
                 JOIN badges b ON b.id = pb.badge_id
-                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','CLM','Misfits')`,
+                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','Misfits')`,
                 [req.user.playerId]
             );
             const badgeNames = new Set(badges.rows.map(r => r.name));
             const exclusions = [];
             if (!badgeNames.has('TF All Star')) exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'allstars')");
-            if (!badgeNames.has('CLM'))         exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'clm')");
             if (!badgeNames.has('Misfits'))     exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'misfits')");
             badgeFilter = exclusions.length ? 'AND ' + exclusions.join(' AND ') : '';
         }
@@ -9309,13 +9208,12 @@ app.get('/api/dashboard/recent-games', authenticateToken, async (req, res) => {
             const badges = await pool.query(`
                 SELECT b.name FROM player_badges pb
                 JOIN badges b ON b.id = pb.badge_id
-                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','CLM','Misfits')`,
+                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','Misfits')`,
                 [req.user.playerId]
             );
             const badgeNames = new Set(badges.rows.map(r => r.name));
             const exclusions = [];
             if (!badgeNames.has('TF All Star')) exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'allstars')");
-            if (!badgeNames.has('CLM'))         exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'clm')");
             if (!badgeNames.has('Misfits'))     exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'misfits')");
             badgeFilter = exclusions.length ? 'AND ' + exclusions.join(' AND ') : '';
         }
@@ -9576,13 +9474,12 @@ app.get('/api/dashboard/timeline', authenticateToken, async (req, res) => {
             const badges = await pool.query(`
                 SELECT b.name FROM player_badges pb
                 JOIN badges b ON b.id = pb.badge_id
-                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','CLM','Misfits')`,
+                WHERE pb.player_id = $1 AND b.name IN ('TF All Star','Misfits')`,
                 [req.user.playerId]
             );
             const badgeNames = new Set(badges.rows.map(r => r.name));
             const exclusions = [];
             if (!badgeNames.has('TF All Star')) exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'allstars')");
-            if (!badgeNames.has('CLM'))         exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'clm')");
             if (!badgeNames.has('Misfits'))     exclusions.push("(g.exclusivity IS NULL OR g.exclusivity != 'misfits')");
             badgeFilter = exclusions.length ? 'AND ' + exclusions.join(' AND ') : '';
         }
@@ -10355,7 +10252,7 @@ app.put('/api/admin/players/:id/stats', authenticateToken, requireAdmin, async (
 // Why a second endpoint rather than gameId-in-body on the global one:
 //   - URL carries the scope so requireGameManager middleware works
 //     without modification (it reads gameId from req.params).
-//   - Keeps the global endpoint admin-only (used by the CLM player editor
+//   - Keeps the global endpoint admin-only (used by the admin player editor
 //     for cross-game stat edits, which organisers shouldn't be able to do).
 app.put('/api/games/:gameId/players/:playerId/stats', authenticateToken, requireGameManager, async (req, res) => {
     try {
@@ -11663,7 +11560,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
             pool.query(`
                 SELECT b.name FROM player_badges pb
                 JOIN badges b ON b.id = pb.badge_id
-                WHERE pb.player_id = $1 AND b.name IN ('TF All Star', 'CLM', 'Misfits')
+                WHERE pb.player_id = $1 AND b.name IN ('TF All Star', 'Misfits')
             `, [req.user.playerId]),
         ]);
 
@@ -11673,7 +11570,6 @@ app.get('/api/games', authenticateToken, async (req, res) => {
 
         const _badgeNames   = new Set((badgeResult.rows || []).map(r => r.name));
         const hasAllStarBadge = _badgeNames.has('TF All Star');
-        const hasCLMBadge     = _badgeNames.has('CLM');
         const hasMisfitsBadge = _badgeNames.has('Misfits');
         
         // Tier-based visibility (exact requirements)
@@ -11717,7 +11613,6 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                 ))
                 AND g.game_status != 'cancelled'
                 ${!isAdmin && !hasAllStarBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'allstars')" : ''}
-                ${!isAdmin && !hasCLMBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'clm')" : ''}
                 ${!isAdmin && !hasMisfitsBadge ? "AND (g.exclusivity IS NULL OR g.exclusivity != 'misfits')" : ''}
                 AND ($2 = TRUE OR (g.tenant_id IS NULL AND $3 = TRUE) OR g.tenant_id = ANY($4::uuid[]) OR ($5 = TRUE AND g.tenant_id IS NOT NULL))
             ),
@@ -12090,15 +11985,8 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
         
         const game = gameResult.rows[0];
 
-        // FIX-067: Enforce exclusivity — non-admins cannot access CLM/allstars games without the badge
+        // FIX-067: Enforce exclusivity — non-admins cannot access allstars games without the badge
         const isAdminUser = req.user.role === 'admin' || req.user.role === 'superadmin';
-        if (!isAdminUser && game.exclusivity === 'clm') {
-            const hasCLM = await pool.query(
-                `SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'CLM'`,
-                [req.user.playerId]
-            );
-            if (!hasCLM.rows.length) return res.status(403).json({ error: 'Access denied' });
-        }
         if (!isAdminUser && game.exclusivity === 'allstars') {
             const hasAllstars = await pool.query(
                 `SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = $1 AND b.name = 'Allstars'`,
@@ -12276,7 +12164,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
 });
 
 // ─── OPPONENTS ───────────────────────────────────────────────────────────────
-app.get('/api/opponents', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.get('/api/opponents', authenticateToken, requireAdmin, async (req, res) => {
     try { const r = await pool.query('SELECT id,name,logo_url,star_rating,social_instagram,social_twitter,social_website FROM opponents ORDER BY name ASC'); res.json(r.rows); }
     catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
@@ -12284,7 +12172,7 @@ app.get('/api/public/opponents', async (req, res) => {
     try { const r = await pool.query('SELECT id,name,logo_url,star_rating FROM opponents ORDER BY name ASC'); res.json(r.rows); }
     catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
-app.post('/api/opponents', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.post('/api/opponents', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { name, logo_url, star_rating, social_instagram, social_twitter, social_website } = req.body;
         if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
@@ -12301,7 +12189,7 @@ app.post('/api/opponents', authenticateToken, requireCLMAdmin, async (req, res) 
         console.error('POST /api/opponents:', e.message); res.status(500).json({ error: 'Failed' });
     }
 });
-app.put('/api/opponents/:id', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.put('/api/opponents/:id', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { name, logo_url, star_rating, social_instagram, social_twitter, social_website } = req.body;
         if (!name?.trim()) return res.status(400).json({ error: 'Name required' });
@@ -12749,7 +12637,7 @@ app.get('/api/admin/players/:playerId/relationships', authenticateToken, require
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { 
             venueId, gameDate, maxPlayers, costPerPlayer, format, regularity, 
@@ -12829,9 +12717,7 @@ app.post('/api/admin/games', authenticateToken, requireCLMAdmin, async (req, res
         if (venueCheck.rows.length === 0) return res.status(400).json({ error: 'Invalid venue' });
         if (!venueCheck.rows[0].is_active) return res.status(400).json({ error: 'Cannot create games on an archived venue. Restore it first if needed.' });
         
-        // CLM admins can only create CLM-exclusive games
-        const isCLMAdminOnly = req.user.role !== 'admin' && req.user.role !== 'superadmin';
-        const gameExclusivity = isCLMAdminOnly ? 'clm' : (exclusivity || 'everyone');
+        const gameExclusivity = exclusivity || 'everyone';
         
         // Tournament validation
         const selTypeCheck = teamSelectionType || 'normal';
@@ -15257,26 +15143,6 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             }
         }
         
-        if (game.exclusivity === 'clm') {
-            const badgeCheck = await client.query(`
-                SELECT 1 FROM player_badges pb
-                JOIN badges b ON b.id = pb.badge_id
-                WHERE pb.player_id = $1 AND b.name = 'CLM'
-            `, [req.user.playerId]);
-
-            if (badgeCheck.rows.length === 0) {
-                // N6: Auto-grant CLM badge when player accesses a CLM game via shared URL
-                const clmBadge = await client.query("SELECT id FROM badges WHERE name = 'CLM'");
-                if (clmBadge.rows.length > 0) {
-                    await client.query(
-                        'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                        [req.user.playerId, clmBadge.rows[0].id]
-                    );
-                    await auditLog(pool, req.user.playerId, 'badge_auto_awarded', req.user.playerId, 'badge: CLM (auto-granted via CLM game registration)');
-                }
-            }
-        }
-
         if (game.exclusivity === 'misfits') {
             const badgeCheck = await client.query(`
                 SELECT 1 FROM player_badges pb
@@ -16722,7 +16588,7 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
 // Admin-only manual edit of a guest's derived stats. Server recomputes
 // overall_rating from the 7 outfield stats (or goalkeeper_rating for GK
 // guests) and flags is_admin_override = TRUE so the reset button un-greys.
-// FIX-249: reverted to requireGameManager (admin/superadmin/CLM admin/
+// FIX-249: reverted to requireGameManager (admin/superadmin/
 // organiser-of-this-game). User clarified organisers SHOULD be able to
 // edit stats. Per-game scope still enforced via requireGameManager's
 // organiser-must-be-confirmed-for-this-game check.
@@ -17278,23 +17144,6 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 if (friendBadge.rows.length === 0) {
                     await client.query('ROLLBACK');
                     return res.status(403).json({ error: `This is an All Star game. Neither you nor ${friendName} has the required badge.` });
-                }
-            }
-        }
-
-        if (game.exclusivity === 'clm') {
-            const regBadge = await client.query(`
-                SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
-                WHERE pb.player_id = $1 AND b.name = 'CLM'
-            `, [registeringPlayerId]);
-            if (regBadge.rows.length === 0) {
-                const friendBadge = await client.query(`
-                    SELECT 1 FROM player_badges pb JOIN badges b ON b.id = pb.badge_id
-                    WHERE pb.player_id = $1 AND b.name = 'CLM'
-                `, [friendPlayerId]);
-                if (friendBadge.rows.length === 0) {
-                    await client.query('ROLLBACK');
-                    return res.status(403).json({ error: `This is a CLM exclusive game. Neither you nor ${friendName} has the required badge.` });
                 }
             }
         }
@@ -21226,10 +21075,26 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
 });
 
 // Delete single game with refunds (transaction-protected)
-app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.delete('/api/admin/games/:gameId', authenticateToken, async (req, res) => {
+    // D-fix auth: superadmin/admin may delete ANY game; a tenant admin (or the
+    // assigned coach) may delete/cancel their OWN external-league fixture.
+    // ?mode=cancel soft-cancels (refund + mark cancelled) instead of deleting.
+    const _isFullAdmin = req.user && (req.user.role === 'admin' || req.user.role === 'superadmin');
+    if (!_isFullAdmin) {
+        const _gRow = await pool.query('SELECT exclusivity, tenant_id, external_league_id, assigned_coach_player_id FROM games WHERE id = $1', [req.params.gameId]);
+        if (!_gRow.rows.length) return res.status(404).json({ error: 'Game not found' });
+        const _gg = _gRow.rows[0];
+        if (_gg.external_league_id) {
+            if (!(await _extLeagueCanManage(req, _gg.tenant_id, _gg.assigned_coach_player_id)))
+                return res.status(403).json({ error: 'Not allowed to manage this fixture' });
+        } else {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+    }
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
+        const _cancelMode = req.query.mode === 'cancel';
         await client.query('BEGIN');
         const registrations = await client.query(
             `SELECT player_id, status, backup_type, amount_paid, amount_paid_free, registered_by_player_id, is_comped FROM registrations WHERE game_id = $1 AND (status = 'confirmed' OR (status = 'backup' AND backup_type = 'confirmed_backup'))`,
@@ -21309,20 +21174,28 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
                 await recordCreditTransaction(client, guest.invited_by, guestFreeRefund, 'free_credit', 'Game cancelled - +1 guest free credit restored');
             }
         }
-        await client.query('DELETE FROM motm_votes WHERE game_id = $1', [gameId]);
-        await client.query('DELETE FROM motm_nominees WHERE game_id = $1', [gameId]);
-        await client.query('DELETE FROM tournament_results WHERE game_id = $1', [gameId]);
-        await client.query('DELETE FROM game_messages WHERE game_id = $1', [gameId]);
-        await client.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)', [gameId]);
-        await client.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
-        await client.query('DELETE FROM game_guests WHERE game_id = $1', [gameId]);
-        await client.query('DELETE FROM registrations WHERE game_id = $1', [gameId]);
-        await client.query('UPDATE discipline_records SET game_id = NULL WHERE game_id = $1', [gameId]);
-        await client.query('DELETE FROM games WHERE id = $1', [gameId]);
+        if (_cancelMode) {
+            // Soft-cancel: players already refunded above; keep the fixture and its rows,
+            // just mark it cancelled so it still shows in the list (and drops out of active
+            // game queries, which already exclude game_status='cancelled').
+            await client.query("UPDATE games SET game_status = 'cancelled' WHERE id = $1", [gameId]);
+        } else {
+            await client.query('DELETE FROM motm_votes WHERE game_id = $1', [gameId]);
+            await client.query('DELETE FROM motm_nominees WHERE game_id = $1', [gameId]);
+            await client.query('DELETE FROM tournament_results WHERE game_id = $1', [gameId]);
+            await client.query('DELETE FROM game_messages WHERE game_id = $1', [gameId]);
+            await client.query('DELETE FROM team_players WHERE team_id IN (SELECT id FROM teams WHERE game_id = $1)', [gameId]);
+            await client.query('DELETE FROM teams WHERE game_id = $1', [gameId]);
+            await client.query('DELETE FROM game_guests WHERE game_id = $1', [gameId]);
+            await client.query('DELETE FROM registrations WHERE game_id = $1', [gameId]);
+            await client.query('DELETE FROM ext_league_player_stats WHERE game_id = $1', [gameId]);
+            await client.query('UPDATE discipline_records SET game_id = NULL WHERE game_id = $1', [gameId]);
+            await client.query('DELETE FROM games WHERE id = $1', [gameId]);
+        }
         await client.query('COMMIT');
-        setImmediate(() => auditLog(pool, req.user.playerId, 'game_deleted', null,
-            `Game ${gameId} deleted by admin. Refunded ${totalRefunded} players. Date: ${cancelDate} | Venue: ${cancelGameData.venue}`));
-        res.json({ message: 'Game deleted. Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
+        setImmediate(() => auditLog(pool, req.user.playerId, (_cancelMode ? 'game_cancelled' : 'game_deleted'), null,
+            `Game ${gameId} ${_cancelMode ? 'cancelled' : 'deleted'}. Refunded ${totalRefunded} players. Date: ${cancelDate} | Venue: ${cancelGameData.venue}`));
+        res.json({ message: (_cancelMode ? 'Fixture cancelled. ' : 'Game deleted. ') + 'Refunded ' + totalRefunded + ' players and ' + guests.rows.length + ' guest fees.' });
 
         // Non-critical: notify all affected players
         setImmediate(async () => {
@@ -21348,7 +21221,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, requireCLMAdmin, async
 });
 
 // Delete entire weekly series with refunds (FUTURE games only, transaction-protected)
-app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
@@ -21510,7 +21383,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireC
 });
 
 // Update game settings (venue, max players, price, tournament team count)
-app.put('/api/admin/games/:gameId/settings', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.put('/api/admin/games/:gameId/settings', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name, early_bird_price, super_early_bird_price, opponent_id: edit_opp_id, pitch_cost, default_organiser_id } = req.body;
@@ -22237,7 +22110,7 @@ app.post('/api/admin/games/:gameId/registrations/:regId/drop-no-refund', authent
 });
 
 // Update ALL future games in a weekly series (venue, players, cost, star rating, time)
-app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
@@ -24554,9 +24427,9 @@ app.put('/api/admin/games/:gameId/edit-completed', authenticateToken, requireAdm
             if (b.player1 === b.player2) {
                 return res.status(400).json({ error: 'beefEntries cannot pair a player with themselves' });
             }
-            const lvl = parseInt(b.level);
-            if (isNaN(lvl) || lvl < 0 || lvl > 5) {
-                return res.status(400).json({ error: 'beef level must be an integer 0-5 (0 removes)' });
+            const lvl = _strictInt(b.level, 0, 5);
+            if (lvl === null) {
+                return res.status(400).json({ error: 'beef level must be a whole number 0-5 (0 removes)' });
             }
         }
 
@@ -24709,7 +24582,7 @@ app.put('/api/admin/games/:gameId/edit-completed', authenticateToken, requireAdm
 
         // ===== BEEF set/clear (bidirectional) =====
         for (const b of beefs) {
-            const lvl = parseInt(b.level);
+            const lvl = _strictInt(b.level, 0, 5) || 0;
             if (lvl >= 1) {
                 for (const pair of [[b.player1, b.player2], [b.player2, b.player1]]) {
                     await client.query(
@@ -25964,7 +25837,7 @@ app.get('/api/public/landing-stats', async (req, res) => {
                   FROM games
                  WHERE game_date BETWEEN NOW() AND NOW() + INTERVAL '7 days'
                    AND game_status IN ('available','confirmed')
-                   AND (exclusivity IS NULL OR exclusivity NOT IN ('clm','allstars','misfits'))
+                   AND (exclusivity IS NULL OR exclusivity NOT IN ('allstars','misfits'))
             `),
             // Distinct venues with games in the last/next 90 days.
             pool.query(`
@@ -25982,7 +25855,7 @@ app.get('/api/public/landing-stats', async (req, res) => {
                    AND g.game_status IN ('available','confirmed')
                    AND v.region IS NOT NULL
                    AND v.region != ''
-                   AND (g.exclusivity IS NULL OR g.exclusivity NOT IN ('clm','allstars','misfits'))
+                   AND (g.exclusivity IS NULL OR g.exclusivity NOT IN ('allstars','misfits'))
                  ORDER BY v.region
             `),
             // Recent completed games with MOTM — real social proof. Limit 6.
@@ -25996,7 +25869,7 @@ app.get('/api/public/landing-stats', async (req, res) => {
                   LEFT JOIN players p ON p.id = g.motm_winner_id
                  WHERE g.game_status = 'completed'
                    AND g.motm_winner_id IS NOT NULL
-                   AND (g.exclusivity IS NULL OR g.exclusivity NOT IN ('clm','allstars','misfits'))
+                   AND (g.exclusivity IS NULL OR g.exclusivity NOT IN ('allstars','misfits'))
                  ORDER BY g.game_date DESC
                  LIMIT 6
             `),
@@ -26248,7 +26121,7 @@ app.get('/api/public/games', async (req, res) => {
             LEFT JOIN venues v ON v.id = g.venue_id
             LEFT JOIN game_series gs ON gs.id = g.series_id
             LEFT JOIN players motm_p ON motm_p.id = g.motm_winner_id
-            WHERE g.exclusivity IS NULL OR g.exclusivity NOT IN ('clm','allstars','misfits')
+            WHERE g.exclusivity IS NULL OR g.exclusivity NOT IN ('allstars','misfits')
             ORDER BY
                 CASE WHEN g.game_status IN ('available','confirmed') THEN 0 ELSE 1 END,
                 g.game_date ASC
@@ -26293,7 +26166,7 @@ app.get('/api/public/games', async (req, res) => {
 });
 
 // GET /api/public/games/completed — all completed games with MOTM winners (no exclusivity filter)
-// Used by admin social graphics hub — MOTM card needs to see CLM/restricted games too
+// Used by admin social graphics hub — MOTM card needs to see restricted games too
 app.get('/api/public/games/completed', async (req, res) => {
     try {
         const result = await pool.query(`
@@ -26626,7 +26499,7 @@ app.get('/api/admin/games/:gameId/waiting-signups',
     }
 });
 
-app.post('/api/admin/games/:gameId/lock', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/lock', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
 
@@ -26689,7 +26562,7 @@ app.post('/api/admin/games/:gameId/lock', authenticateToken, requireCLMAdmin, as
 });
 
 // Unlock game
-app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/unlock', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
 
@@ -26841,7 +26714,7 @@ app.get('/api/admin/games/:gameId/players', authenticateToken, requireGameManage
 });
 
 // Add player to game (admin)
-app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { playerId, position } = req.body;
@@ -26979,7 +26852,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireCLMAdm
 });
 
 // Add player with custom discount (admin)
-app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { playerId, customAmount, position } = req.body;
@@ -27102,7 +26975,7 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
 });
 
 // Remove player from game (admin)
-app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId, registrationId } = req.params;
         
@@ -29130,7 +29003,6 @@ app.get('/api/public/referral/:code', referralCodeLimiter, async (req, res) => {
         let referrer = null;
         const pRef = await pool.query(
             `SELECT p.id, p.alias, p.full_name,
-             EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm,
              EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'Misfits') as has_misfits
              FROM players p WHERE p.referral_code = $1`,
             [code.toUpperCase()]
@@ -29141,7 +29013,6 @@ app.get('/api/public/referral/:code', referralCodeLimiter, async (req, res) => {
         } else {
             const rRef = await pool.query(
                 `SELECT p.id, p.alias, p.full_name,
-                 EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'CLM') as has_clm,
                  EXISTS(SELECT 1 FROM player_badges pb JOIN badges b ON pb.badge_id = b.id WHERE pb.player_id = p.id AND b.name = 'Misfits') as has_misfits
                  FROM referrals r JOIN players p ON r.referrer_id = p.id WHERE r.referral_code = $1`,
                 [code.toUpperCase()]
@@ -29156,11 +29027,9 @@ app.get('/api/public/referral/:code', referralCodeLimiter, async (req, res) => {
         res.json({
             valid: true,
             referrerName: referrer.alias || referrer.full_name,
-            hasCLM: referrer.has_clm,
             hasMisfits: referrer.has_misfits,
             message: (() => {
                 const badges = [];
-                if (referrer.has_clm) badges.push('CLM');
                 if (referrer.has_misfits) badges.push('Misfits');
                 const name = referrer.alias || referrer.full_name;
                 if (badges.length > 0) {
@@ -29253,9 +29122,12 @@ app.put('/api/admin/raf/settings', authenticateToken, requireTenantOwner, async 
         const tid = req.rafTenantId;
         const b = req.body || {};
         const en = (b.raf_enabled === true || b.raf_enabled === 'true');
-        const wp = Math.max(0, parseInt(b.raf_welcome_pence, 10) || 0);
-        const gp = Math.max(0, parseInt(b.raf_per_game_pence, 10) || 0);
-        let mg = parseInt(b.raf_max_games_paid, 10); if (isNaN(mg)) mg = 0; if (mg < -1) mg = -1;
+        const wp = _intOpt(b.raf_welcome_pence, 0, 100000000, 0);
+        const gp = _intOpt(b.raf_per_game_pence, 0, 100000000, 0);
+        const mg = _intOpt(b.raf_max_games_paid, -1, 100000, 0);
+        if ([wp, gp, mg].some(v => Number.isNaN(v))) {
+            return res.status(400).json({ error: 'RAF amounts must be whole numbers (welcome/per-game pence \u2265 0, max games \u2265 -1)' });
+        }
         await pool.query(
             `UPDATE tenants SET raf_enabled=$2, raf_welcome_pence=$3, raf_per_game_pence=$4, raf_max_games_paid=$5
               WHERE id=$1`, [tid, en, wp, gp, mg]);
@@ -29633,7 +29505,7 @@ app.post('/api/admin/raf/backfill', authenticateToken, requireSuperAdmin, async 
 
 
 // ==========================================
-// MANAGE GAMES (scoped for CLM admin / Organiser)
+// MANAGE GAMES (scoped for Organiser)
 // ==========================================
 
 app.get('/api/manage/games', authenticateToken, async (req, res) => {
@@ -29641,11 +29513,11 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
         const playerId = req.user.playerId;
         const isFullAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
         const playerResult = await pool.query(
-            'SELECT is_clm_admin, is_organiser FROM players WHERE id = $1', [playerId]
+            'SELECT is_organiser FROM players WHERE id = $1', [playerId]
         );
         const player = playerResult.rows[0];
         if (!player) return res.status(403).json({ error: 'Player not found' });
-        if (!isFullAdmin && !player.is_clm_admin && !player.is_organiser) {
+        if (!isFullAdmin && !player.is_organiser) {
             return res.status(403).json({ error: 'No management access' });
         }
         
@@ -29755,9 +29627,6 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
         } else {
             // Build OR conditions for each role the player has
             const conditions = [];
-            if (player.is_clm_admin) {
-                conditions.push(`g.exclusivity = 'clm'`);
-            }
             if (player.is_organiser) {
                 conditions.push(`EXISTS (
                     SELECT 1 FROM registrations r 
@@ -29922,13 +29791,13 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
 
         res.json({
             games: sanitisedRows,
-            managerRole: isFullAdmin ? 'admin' : (player.is_clm_admin && player.is_organiser) ? 'clm_organiser' : player.is_clm_admin ? 'clm_admin' : 'organiser',
+            managerRole: isFullAdmin ? 'admin' : 'organiser',
             is_superadmin: isSuperadmin,
             permissions: {
-                canCreate: isFullAdmin || player.is_clm_admin,
-                canDelete: isFullAdmin || player.is_clm_admin,
-                canChangeSettings: isFullAdmin || player.is_clm_admin,
-                canAddRemovePlayers: isFullAdmin || player.is_clm_admin,
+                canCreate: isFullAdmin,
+                canDelete: isFullAdmin,
+                canChangeSettings: isFullAdmin,
+                canAddRemovePlayers: isFullAdmin,
                 canGenerateTeams: true,
                 canComplete: true,
                 canAccessCredits: isFullAdmin,
@@ -29942,11 +29811,11 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
     }
 });
 
-// Superadmin: Toggle CLM admin or Organiser flag on a player
+// Superadmin: Toggle Organiser flag / role on a player
 app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSuperAdmin, async (req, res) => {
     try {
         const { playerId } = req.params;
-        const { is_clm_admin, is_organiser, role } = req.body;
+        const { is_organiser, role } = req.body;
         
         // Safety: never allow promoting to superadmin via API
         if (role === 'superadmin') {
@@ -29968,11 +29837,6 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
         const values = [];
         let idx = 1;
         
-        if (is_clm_admin !== undefined) {
-            updates.push('is_clm_admin = $' + idx);
-            values.push(!!is_clm_admin);
-            idx++;
-        }
         if (is_organiser !== undefined) {
             updates.push('is_organiser = $' + idx);
             values.push(!!is_organiser);
@@ -30000,18 +29864,6 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
             return res.status(400).json({ error: 'No flags to update' });
         }
         
-        // Auto-grant CLM badge if setting CLM admin
-        if (is_clm_admin) {
-            const cb = await pool.query("SELECT id FROM badges WHERE name = 'CLM'");
-            if (cb.rows.length > 0) {
-                await pool.query(
-                    'INSERT INTO player_badges (player_id, badge_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-                    [playerId, cb.rows[0].id]
-                );
-                await auditLog(pool, req.user.playerId, 'badge_auto_awarded', playerId, 'badge: CLM (granted with CLM admin role)');
-            }
-        }
-        
         // Auto-grant Organiser badge if setting organiser
         if (is_organiser) {
             const ob = await pool.query("SELECT id FROM badges WHERE name = 'Organiser'");
@@ -30025,7 +29877,7 @@ app.put('/api/admin/players/:playerId/role-flags', authenticateToken, requireSup
         }
         
         const updated = await pool.query(
-            `SELECT p.id, p.alias, p.full_name, p.is_clm_admin, p.is_organiser, u.role as user_role 
+            `SELECT p.id, p.alias, p.full_name, p.is_organiser, u.role as user_role 
              FROM players p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
             [playerId]
         );
@@ -30634,7 +30486,7 @@ app.post('/api/admin/games/:gameId/finalise-tournament', authenticateToken, requ
 // ==========================================
 
 // PUT /api/admin/games/:gameId/convert-type — convert a game between types
-app.put('/api/admin/games/:gameId/convert-type', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.put('/api/admin/games/:gameId/convert-type', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
         const { newType } = req.body;
@@ -33162,7 +33014,7 @@ app.delete('/api/games/:gameId/apply-ref', authenticateToken, registrationLimite
 });
 
 // GET /api/admin/games/:gameId/referees — list all referee applications for a game
-// Accessible to game managers (organisers, CLM admins, admins)
+// Accessible to game managers (organisers, admins)
 // Returns { refs: [], game: {} } so the panel works even when no refs have been assigned yet
 app.get('/api/admin/games/:gameId/referees', authenticateToken, requireGameManager, async (req, res) => {
     const { gameId } = req.params;
@@ -35191,7 +35043,7 @@ app.get('/api/admin/games/:id/team-feedback', authenticateToken, requireGameMana
 // the UI can render rows without 500s.)
 //
 // FIX-220 R2-#13: gate is requireGameManager (read-only). Multi-mode wizard
-// needs game managers (admin/CLM/organiser) to be able to list templates so
+// needs game managers (admin/organiser) to be able to list templates so
 // they can populate the slot picker. Mutating endpoints (POST/PUT/archive)
 // remain requireSuperAdmin.
 app.get('/api/admin/templates', authenticateToken, requireGameManager, async (req, res) => {
@@ -36373,9 +36225,9 @@ app.post('/api/admin/games/:gameId/open-multi-voting', authenticateToken, requir
     // Validate voting_minutes if provided. Same range as /generate-teams (1-1440 = 24h max).
     let votingMinutes = null;
     if (req.body && req.body.voting_minutes !== undefined && req.body.voting_minutes !== null) {
-        const v = parseInt(req.body.voting_minutes, 10);
-        if (!Number.isInteger(v) || v < 1 || v > 1440) {
-            return res.status(400).json({ error: 'voting_minutes must be an integer between 1 and 1440' });
+        const v = _strictInt(req.body.voting_minutes, 1, 1440);
+        if (v === null) {
+            return res.status(400).json({ error: 'voting_minutes must be a whole number between 1 and 1440' });
         }
         votingMinutes = v;
     }
@@ -38602,13 +38454,13 @@ app.post('/api/auth/force-change-password', authenticateToken, async (req, res) 
 
         // Issue a fresh cookie with updated token_version
         const playerRow = await pool.query(
-            'SELECT p.id, p.is_clm_admin, p.is_organiser, u.role, u.token_version FROM players p JOIN users u ON u.id = p.user_id WHERE u.id = $1',
+            'SELECT p.id, p.is_organiser, u.role, u.token_version FROM players p JOIN users u ON u.id = p.user_id WHERE u.id = $1',
             [req.user.userId]
         );
         const pr = playerRow.rows[0];
         const newToken = jwt.sign(
             { userId: req.user.userId, playerId: pr.id, email: req.user.email,
-              role: pr.role, isCLMAdmin: pr.is_clm_admin || false,
+              role: pr.role,
               isOrganiser: pr.is_organiser || false, tokenVersion: pr.token_version },
             JWT_SECRET,
             { expiresIn: '7d' }
@@ -38705,7 +38557,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
         // Issue a fresh session cookie so the player is immediately logged in
         const freshPlayer = await pool.query(
-            `SELECT p.id, p.is_clm_admin, p.is_organiser, u.id as user_id, u.email, u.role, u.token_version
+            `SELECT p.id, p.is_organiser, u.id as user_id, u.email, u.role, u.token_version
              FROM players p JOIN users u ON u.id = p.user_id WHERE p.id = $1`,
             [resetToken.player_id]
         );
@@ -38713,7 +38565,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
             const fp = freshPlayer.rows[0];
             const freshToken = jwt.sign(
                 { userId: fp.user_id, playerId: fp.id, email: fp.email,
-                  role: fp.role, isCLMAdmin: fp.is_clm_admin || false,
+                  role: fp.role,
                   isOrganiser: fp.is_organiser || false, tokenVersion: fp.token_version },
                 JWT_SECRET,
                 { expiresIn: '7d' }
@@ -41278,7 +41130,7 @@ async function _extLeagueCanManage(req, tenantId, assignedCoachId) {
     return m.rows.length > 0;
 }
 
-// FIX-463: scoped opponents LIST — the global GET /api/opponents is CLM-admin
+// FIX-463: scoped opponents LIST — the global GET /api/opponents is admin
 // gated, which 403s tenant admins; the fixture form needs this read.
 app.get('/api/t/:tenant_short_id/admin/opponents', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
@@ -41461,7 +41313,8 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fixtures', authenticateT
             // cleaner but risks a 23502 on a NOT NULL constraint.
             venueId = L.default_venue_id || null;
         }
-        const maxPlayers = parseInt(b.max_players) > 0 ? parseInt(b.max_players) : 16;
+        const maxPlayers = _intOpt(b.max_players, 1, 999, 16);
+        if (Number.isNaN(maxPlayers)) return res.status(400).json({ error: 'max_players must be a whole number' });
         const cost = b.cost_per_player === undefined || b.cost_per_player === '' ? 0 : parseFloat(b.cost_per_player);
         if (isNaN(cost) || cost < 0 || cost > 500) return res.status(400).json({ error: 'Cost must be 0-500' });
         const coachId = b.assigned_coach_player_id || L.default_coach_player_id || null;
@@ -41516,10 +41369,10 @@ app.put('/api/ext-league/games/:gameId/stats', authenticateToken, async (req, re
         if (!(await _extLeagueCanManage(req, game.tenant_id, game.assigned_coach_player_id)))
             return res.status(403).json({ error: 'Not allowed' });
         const b = req.body || {};
-        const tf = b.tf_score === undefined || b.tf_score === null || b.tf_score === '' ? null : parseInt(b.tf_score);
-        const op = b.opp_score === undefined || b.opp_score === null || b.opp_score === '' ? null : parseInt(b.opp_score);
-        if ((tf !== null && (isNaN(tf) || tf < 0 || tf > 99)) || (op !== null && (isNaN(op) || op < 0 || op > 99)))
-            return res.status(400).json({ error: 'Scores must be 0-99' });
+        const tf = b.tf_score === undefined || b.tf_score === null || b.tf_score === '' ? null : _strictInt(b.tf_score, 0, 99);
+        const op = b.opp_score === undefined || b.opp_score === null || b.opp_score === '' ? null : _strictInt(b.opp_score, 0, 99);
+        if ((b.tf_score !== undefined && b.tf_score !== null && b.tf_score !== '' && tf === null) || (b.opp_score !== undefined && b.opp_score !== null && b.opp_score !== '' && op === null))
+            return res.status(400).json({ error: 'Scores must be whole numbers 0-99' });
         if (tf !== null || op !== null) {
             await pool.query('UPDATE games SET ext_tf_score = $1, ext_opp_score = $2 WHERE id = $3',
                 [tf, op, game.id]);
@@ -41546,6 +41399,55 @@ app.put('/api/ext-league/games/:gameId/stats', authenticateToken, async (req, re
     } catch (e) {
         console.error('FIX-463 stats error:', e.message);
         res.status(500).json({ error: 'Could not save stats' });
+    }
+});
+
+// D: tenant edits their own external-league fixture (date / opponent / venue / home-away).
+// Result/score is edited via the /stats endpoint above; auth mirrors it.
+app.patch('/api/ext-league/games/:gameId', authenticateToken, async (req, res) => {
+    try {
+        const g = await pool.query(
+            `SELECT id, tenant_id, external_league_id, assigned_coach_player_id, is_home
+               FROM games WHERE id = $1 AND external_league_id IS NOT NULL`, [req.params.gameId]);
+        if (!g.rows.length) return res.status(404).json({ error: 'Not an external-league fixture' });
+        const game = g.rows[0];
+        if (!(await _extLeagueCanManage(req, game.tenant_id, game.assigned_coach_player_id)))
+            return res.status(403).json({ error: 'Not allowed' });
+        const b = req.body || {};
+        const sets = [], vals = []; let pi = 1;
+        if (b.game_date !== undefined) {
+            const when = new Date(b.game_date);
+            if (isNaN(when.getTime())) return res.status(400).json({ error: 'Valid fixture date/time required' });
+            sets.push(`game_date = $${pi++}`); vals.push(when.toISOString());
+        }
+        if (b.opponent_id !== undefined) {
+            const opp = await pool.query('SELECT id, name FROM opponents WHERE id = $1', [b.opponent_id]);
+            if (!opp.rows.length) return res.status(400).json({ error: 'Unknown opponent' });
+            sets.push(`opponent_id = $${pi++}`); vals.push(opp.rows[0].id);
+            sets.push(`external_opponent = $${pi++}`); vals.push(opp.rows[0].name);
+        }
+        const isHome = b.is_home === undefined ? game.is_home : (b.is_home !== false);
+        if (b.is_home !== undefined) { sets.push(`is_home = $${pi++}`); vals.push(isHome); }
+        if (isHome && b.venue_id !== undefined) {
+            if (!b.venue_id) return res.status(400).json({ error: 'Home fixture needs a venue' });
+            sets.push(`venue_id = $${pi++}`); vals.push(b.venue_id);
+            sets.push(`away_venue_name = NULL`, `away_postcode = NULL`, `away_pitch_pin = NULL`, `away_parking_pin = NULL`, `away_pitch_type = NULL`);
+        }
+        if (!isHome && (b.away_venue_name !== undefined || b.is_home === false)) {
+            const avn = b.away_venue_name !== undefined ? String(b.away_venue_name || '').trim() : '';
+            if (!avn) return res.status(400).json({ error: 'Away fixture needs a venue name' });
+            sets.push(`away_venue_name = $${pi++}`); vals.push(avn.slice(0, 100));
+            if (b.away_postcode !== undefined) { sets.push(`away_postcode = $${pi++}`); vals.push(b.away_postcode ? String(b.away_postcode).trim().slice(0, 12) : null); }
+        }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(game.id);
+        await pool.query(`UPDATE games SET ${sets.join(', ')} WHERE id = $${pi}`, vals);
+        await auditLog(pool, req.user.playerId, 'ext_fixture_edited', null,
+            `fixture ${game.id} edited (${sets.length} field group(s))`, game.tenant_id).catch(() => {});
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('D ext-fixture edit error:', e.message);
+        res.status(500).json({ error: 'Could not update fixture' });
     }
 });
 
@@ -41667,9 +41569,9 @@ app.get('/api/players/me/trainings', authenticateToken, async (req, res) => {
 //   • platform admin / superadmin → the FIX-340 root tenant (TF_COVENTRY_TENANT_ID),
 //     EXACTLY the tenant a standard/draft/external/tournament create is pinned to;
 //   • otherwise → the caller's active tenant_admin membership (oldest joined_at).
-// Gate matches /api/admin/games (requireCLMAdmin): anyone who can open the
+// Gate matches /api/admin/games (requireAdmin): anyone who can open the
 // Manage Games form can resolve. No SQL migration needed.
-app.get('/api/admin/wizard-tenant', authenticateToken, requireCLMAdmin, async (req, res) => {
+app.get('/api/admin/wizard-tenant', authenticateToken, requireAdmin, async (req, res) => {
     try {
         if (req.user.role === 'admin' || req.user.role === 'superadmin') {
             const t = await pool.query('SELECT id, short_id, name FROM tenants WHERE id = $1', [TF_COVENTRY_TENANT_ID]);
@@ -44881,18 +44783,21 @@ app.post('/api/t/:tenant_short_id/admin/leagues', authenticateToken, requireTena
         const name = String(b.name || '').trim();
         if (!name) return res.status(400).json({ error: 'name required' });
         const format = (b.format === 'random_evenly') ? 'random_evenly' : 'round_robin';
-        const rounds = Math.max(1, Math.min(10, parseInt(b.rounds, 10) || 1));
-        const teamCount = parseInt(b.team_count, 10);
-        if (!Number.isFinite(teamCount) || teamCount < 2 || teamCount > 32) {
-            return res.status(400).json({ error: 'team_count must be 2–32' });
+        const teamCount = _strictInt(b.team_count, 2, 32);
+        if (teamCount === null) {
+            return res.status(400).json({ error: 'team_count must be a whole number between 2 and 32' });
         }
+        const rounds = _intOpt(b.rounds, 1, 10, 1);
         const startDate = b.start_date ? new Date(b.start_date) : null;
         if (!startDate || isNaN(startDate.getTime())) return res.status(400).json({ error: 'valid start_date required' });
-        const gamesPerTeam = (format === 'random_evenly') ? (parseInt(b.games_per_team, 10) || null) : null;
-        const cadence = Math.max(1, Math.min(60, parseInt(b.cadence_days, 10) || 7));
-        const pWin  = Number.isFinite(parseInt(b.points_for_win, 10))  ? parseInt(b.points_for_win, 10)  : 3;
-        const pDraw = Number.isFinite(parseInt(b.points_for_draw, 10)) ? parseInt(b.points_for_draw, 10) : 1;
-        const pLoss = Number.isFinite(parseInt(b.points_for_loss, 10)) ? parseInt(b.points_for_loss, 10) : 0;
+        const gamesPerTeam = (format === 'random_evenly') ? _intOpt(b.games_per_team, 1, 99, null) : null;
+        const cadence = _intOpt(b.cadence_days, 1, 60, 7);
+        const pWin  = _intOpt(b.points_for_win, 0, 100, 3);
+        const pDraw = _intOpt(b.points_for_draw, 0, 100, 1);
+        const pLoss = _intOpt(b.points_for_loss, 0, 100, 0);
+        if ([rounds, gamesPerTeam, cadence, pWin, pDraw, pLoss].some(v => Number.isNaN(v))) {
+            return res.status(400).json({ error: 'League numbers (rounds, games per team, cadence, points) must be whole numbers within range' });
+        }
         // FIX-410h (audit v2): tie-break order. Whitelisted; default keeps the old
         // behaviour (GD then GF, no head-to-head). Read-time sanitised in _orderLeagueStandings.
         const _VALID_TB = ['goal_diff,goals_for', 'goal_diff,h2h,goals_for', 'h2h,goal_diff,goals_for'];
@@ -45005,7 +44910,8 @@ app.post('/api/t/:tenant_short_id/admin/leagues/:id/teams', authenticateToken, r
         if (Array.isArray(b.names) && b.names.length) {
             names = b.names.map(n => String(n).trim()).filter(Boolean).slice(0, 32);
         } else {
-            const count = Math.max(1, Math.min(32, parseInt(b.count, 10) || 0));
+            const count = _intOpt(b.count, 1, 32, null);
+            if (Number.isNaN(count)) return res.status(400).json({ error: 'count must be a whole number between 1 and 32' });
             if (!count) return res.status(400).json({ error: 'provide names[] or count' });
             const existing = await pool.query('SELECT COUNT(*)::int AS n FROM league_teams WHERE league_id=$1', [lid]);
             const start = existing.rows[0].n;
@@ -46284,7 +46190,10 @@ app.post('/api/t/:tenant_short_id/admin/cups', authenticateToken, requireTenantA
         const defaultLegs = (parseInt(b.default_legs, 10) === 2) ? 2 : 1;
         const _VALID_BREAK = ['h2h,gd,gs', 'gd,h2h,gs', 'gd,gs,h2h'];
         const breakOrder = _VALID_BREAK.includes(b.league_break_order) ? b.league_break_order : 'gd,gs,h2h';
-        const cadence = Math.max(1, Math.min(60, parseInt(b.cadence_days, 10) || 7));
+        const cadence = _intOpt(b.cadence_days, 1, 60, 7);
+        if (Number.isNaN(cadence)) {
+            return res.status(400).json({ error: 'cadence_days must be a whole number between 1 and 60' });
+        }
         const startDate = b.start_date ? new Date(b.start_date) : null;
         if (b.start_date && (!startDate || isNaN(startDate.getTime()))) return res.status(400).json({ error: 'invalid start_date' });
         const shortId = await _genCupShortId();
@@ -46590,10 +46499,11 @@ app.post('/api/t/:tenant_short_id/admin/cup-fixtures/:id/confirm-score', authent
         const fid = req.params.id;
         if (!isValidUuid(fid)) { client.release(); return res.status(400).json({ error: 'invalid_id' }); }
         const b = req.body || {};
-        const hs = parseInt(b.home_score, 10), as = parseInt(b.away_score, 10);
-        if (!Number.isFinite(hs) || !Number.isFinite(as) || hs < 0 || as < 0) { client.release(); return res.status(400).json({ error: 'scores_required' }); }
-        const hp = (b.home_pens == null || b.home_pens === '') ? null : parseInt(b.home_pens, 10);
-        const ap = (b.away_pens == null || b.away_pens === '') ? null : parseInt(b.away_pens, 10);
+        const hs = _strictInt(b.home_score, 0, 999), as = _strictInt(b.away_score, 0, 999);
+        if (hs === null || as === null) { client.release(); return res.status(400).json({ error: 'scores_required' }); }
+        const hp = (b.home_pens == null || b.home_pens === '') ? null : _strictInt(b.home_pens, 0, 999);
+        const ap = (b.away_pens == null || b.away_pens === '') ? null : _strictInt(b.away_pens, 0, 999);
+        if ((b.home_pens != null && b.home_pens !== '' && hp === null) || (b.away_pens != null && b.away_pens !== '' && ap === null)) { client.release(); return res.status(400).json({ error: 'pens must be whole numbers' }); }
         await client.query('BEGIN');
         const fr = await client.query(
             `SELECT f.id, f.cup_id, f.round_id, f.group_id, f.bracket_slot, f.is_bye, f.status,
@@ -46983,7 +46893,8 @@ app.post('/api/leagues/fixtures/:id/split', authenticateToken, async (req, res) 
         const costPence = Math.round((parseFloat(fx.cost_per_player) || 0) * 100);
         const b = req.body || {};
         const inSplits = Array.isArray(b.splits) ? b.splits : [];
-        const absorb = Math.max(0, parseInt(b.absorb_pence, 10) || 0);
+        const absorb = _intOpt(b.absorb_pence, 0, 100000000, 0);
+        if (Number.isNaN(absorb)) { client.release(); return res.status(400).json({ error: 'absorb_pence must be a whole number \u2265 0' }); }
 
         // squad membership set (only active squad players are valid payers)
         const squad = await client.query(`SELECT player_id FROM league_team_players WHERE league_team_id=$1 AND status='active'`, [teamId]);
@@ -48747,9 +48658,8 @@ async function _wonderfulAutoRegister(pmt) {
         }
 
         // Exclusivity badge check
-        if (game.exclusivity === 'clm' || game.exclusivity === 'allstars' || game.exclusivity === 'misfits') {
-            const badgeName = game.exclusivity === 'clm' ? 'CLM'
-                            : game.exclusivity === 'allstars' ? 'TF All Star'
+        if (game.exclusivity === 'allstars' || game.exclusivity === 'misfits') {
+            const badgeName = game.exclusivity === 'allstars' ? 'TF All Star'
                             : 'Misfits';
             const badgeRes = await pool.query(`
                 SELECT 1 FROM player_badges pb
@@ -51874,15 +51784,15 @@ app.put('/api/admin/shop/products/:id', authenticateToken, requireSuperAdmin, as
             }
         }
         if (req.body.price_credits !== undefined) {
-            const p = parseInt(req.body.price_credits, 10);
-            if (!Number.isInteger(p) || p < 0) {
-                return res.status(400).json({ error: 'price_credits must be a non-negative integer' });
+            const p = _strictInt(req.body.price_credits, 0, 100000000);
+            if (p === null) {
+                return res.status(400).json({ error: 'price_credits must be a whole non-negative number' });
             }
             fields.push(`price_credits = $${pi++}`); vals.push(p);
         }
         if (req.body.sort_order !== undefined) {
-            const s = parseInt(req.body.sort_order, 10);
-            if (!Number.isInteger(s)) return res.status(400).json({ error: 'sort_order must be integer' });
+            const s = _strictInt(req.body.sort_order, -1000000, 1000000);
+            if (s === null) return res.status(400).json({ error: 'sort_order must be a whole number' });
             fields.push(`sort_order = $${pi++}`); vals.push(s);
         }
         if (req.body.active !== undefined) {
@@ -52071,9 +51981,9 @@ app.put('/api/admin/shop/designs/:id', authenticateToken, requireSuperAdmin, asy
                 : (typeof v === 'string' ? v.trim().slice(0, 500) : null));
         }
         if (req.body.sort_order !== undefined) {
-            const s = parseInt(req.body.sort_order, 10);
-            if (!Number.isInteger(s)) {
-                return res.status(400).json({ error: 'sort_order must be integer' });
+            const s = _strictInt(req.body.sort_order, -1000000, 1000000);
+            if (s === null) {
+                return res.status(400).json({ error: 'sort_order must be a whole number' });
             }
             fields.push(`sort_order = $${pi++}`);
             vals.push(s);
@@ -55872,6 +55782,15 @@ function _strictInt(raw, min = -Infinity, max = Infinity) {
     return (Number.isInteger(n) && n >= min && n <= max) ? n : null;
 }
 
+// Strict int with a default for empty/absent input. Returns the integer, the
+// default when the field is omitted/blank, or NaN when a value is supplied but
+// isn't a whole number within [min,max]. Callers 400 on NaN via Number.isNaN.
+function _intOpt(raw, min = -Infinity, max = Infinity, dflt = null) {
+    if (raw === undefined || raw === null || raw === '') return dflt;
+    const n = _strictInt(raw, min, max);
+    return n === null ? NaN : n;
+}
+
 // Slug helper: deterministic, URL-safe, capped at 60 chars.
 function _fix322Slugify(name) {
     if (!name) return '';
@@ -55957,13 +55876,13 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
     const signupYearsOff  = (b.signupYearsOff !== undefined) ? b.signupYearsOff : b.signup_years_off;
 
     if (tenantName.length < 3 || tenantName.length > 60) return res.status(400).json({ error: 'Organisation name must be 3–60 characters' });
-    if (!firstName || !lastName) return res.status(400).json({ error: 'First and last name are required' });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
     if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     if (!region || !VALID_TENANT_REGIONS.has(region)) return res.status(400).json({ error: 'Please choose your region from the list' });
-    if (!Array.isArray(signupPositions) || signupPositions.length === 0) return res.status(400).json({ error: 'Please choose at least one position' });
-    if (!signupLevel || FIX244_LEVEL_OVR_MAP[signupLevel] === undefined) return res.status(400).json({ error: 'Please choose your level' });
     if (!acceptTcs) return res.status(400).json({ error: 'You must accept the Tenant Terms & Conditions to continue' });
+    // first/last name + playing profile are only required when a NEW player will be
+    // created — validated below, once we know whether this email already has a player.
+    // (start.html skips "About you" for existing accounts, so it won't send them.)
 
     // Derive the founder's ratings exactly like the player register flow; casual fallback mirrors register.
     const st = _deriveSignupStats(signupPositions, signupPrimary, signupLevel, signupYearsOff) || START_SKILL_MAP.casual;
@@ -55982,8 +55901,18 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
             existingAccount = true;
             const ok = await bcrypt.compare(password, user.password_hash || '');
             if (!ok) return res.status(401).json({ error: 'An account with this email already exists and the password doesn\'t match. Log in at totalfooty.co.uk first, or use the correct password.' });
-            const pRes = await pool.query('SELECT id, alias, is_clm_admin, is_organiser FROM players WHERE user_id = $1', [user.id]);
+            const pRes = await pool.query('SELECT id, alias, is_organiser FROM players WHERE user_id = $1', [user.id]);
             existingPlayer = pRes.rows[0] || null; // may be null -> we fill the gap inside the txn (no more 409 orphans)
+        }
+
+        // B-fix: only require founder identity/profile when we'll actually create a
+        // player (brand-new account, or an existing user with no player row). An
+        // existing player keeps their profile untouched, so these aren't sent for them.
+        if (!existingPlayer) {
+            if (!firstName || !lastName) return res.status(400).json({ error: 'First and last name are required' });
+            if (!phone) return res.status(400).json({ error: 'A mobile number is required' });
+            if (!Array.isArray(signupPositions) || signupPositions.length === 0) return res.status(400).json({ error: 'Please choose at least one position' });
+            if (!signupLevel || FIX244_LEVEL_OVR_MAP[signupLevel] === undefined) return res.status(400).json({ error: 'Please choose your level' });
         }
 
         // ── Slug (best-effort unique; a late collision becomes a retryable 503) ──
@@ -56022,7 +55951,7 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
                              $8, $9, $10, $11, $12, $13, $14, $15, $16,
                              $17, $18, $19, $20,
                              $21, $22, $23, $24)
-                     RETURNING id, alias, is_clm_admin, is_organiser`,
+                     RETURNING id, alias, is_organiser`,
                     [user.id, (firstName + ' ' + lastName).trim(), firstName, lastName, alias || firstName, phone,
                      (st._signupPrimary || 'outfield'),
                      st.gk, st.def, st.str, st.fit, st.pac, st.dec, st.ast, st.sht, st.overall,
@@ -56098,7 +56027,6 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
         const token = jwt.sign(
             {
                 userId: user.id, playerId: player.id, email: user.email, role: user.role,
-                isCLMAdmin: player.is_clm_admin || false,
                 isOrganiser: player.is_organiser || false,
                 tokenVersion: user.token_version || 0
             },
@@ -56455,6 +56383,38 @@ app.post('/api/admin/tenants/:id/admins', authenticateToken, requireSuperAdmin, 
         setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_admin_granted', playerId,
             `Granted ${role} to ${displayName} for tenant ${tRes.rows[0].name}`, req.params.id));
 
+        // Notify the player by email with CRM access details (non-fatal).
+        if (role === 'tenant_admin') {
+            const _tenantName = tRes.rows[0].name;
+            setImmediate(async () => {
+                try {
+                    const uRes = await pool.query(
+                        'SELECT u.email FROM users u JOIN players p ON p.user_id = u.id WHERE p.id = $1', [playerId]);
+                    const toEmail = uRes.rows[0]?.email;
+                    if (!toEmail) return;
+                    const bodyHtml = `
+                        <h2 style="margin:0 0 12px;">You're now a tenant admin 🏛️</h2>
+                        <p>Hi ${displayName},</p>
+                        <p>You've been made an <strong>admin of ${_tenantName}</strong> on TotalFooty.</p>
+                        <p>That means you can now run ${_tenantName} from the tenant CRM — games, leagues,
+                           refund policy, bank details, awards and more.</p>
+                        <p style="margin:18px 0;">
+                          <a href="https://totalfooty.co.uk/crm.html"
+                             style="background:#3a8ad6;color:#fff;padding:12px 22px;border-radius:8px;
+                                    text-decoration:none;font-weight:900;">OPEN THE CRM</a>
+                        </p>
+                        <p>Log in with your existing TotalFooty account (${toEmail}). If you have any
+                           questions, just reply to this email.</p>`;
+                    await emailTransporter.sendMail({
+                        from: '"Total Footy" <totalfooty19@gmail.com>',
+                        to: toEmail,
+                        subject: `You're now an admin of ${_tenantName} on TotalFooty`,
+                        html: (typeof wrapEmailHtml === 'function') ? wrapEmailHtml(bodyHtml) : bodyHtml
+                    });
+                } catch (e) { console.error('tenant-admin grant email failed (non-fatal):', e.message); }
+            });
+        }
+
         res.status(201).json({ membership: ins.rows[0] });
     } catch (e) {
         console.error('FIX-322 grant admin failed:', e.message);
@@ -56741,12 +56701,13 @@ app.put('/api/t/:tenant_short_id/admin/bank-details',
             return res.status(400).json({ error: 'bank_account_number must be exactly 8 digits' });
         }
 
-        // Accept sort codes with hyphens or spaces — normalise to 6 digits
-        const sortRaw = typeof body.bank_sort_code === 'string'
-            ? body.bank_sort_code.trim().replace(/[\s-]+/g, '') : '';
-        if (!/^\d{6}$/.test(sortRaw)) {
-            return res.status(400).json({ error: 'bank_sort_code must be 6 digits (e.g. 123456 or 12-34-56)' });
+        // Sort code: accept ONLY 6 plain digits or strict XX-XX-XX. Reject hyphens
+        // in any other position (e.g. '1-23456' or '12--34-56'). Normalise to 6 digits.
+        const sortInput = typeof body.bank_sort_code === 'string' ? body.bank_sort_code.trim() : '';
+        if (!/^\d{6}$/.test(sortInput) && !/^\d{2}-\d{2}-\d{2}$/.test(sortInput)) {
+            return res.status(400).json({ error: 'bank_sort_code must be 6 digits or in the format XX-XX-XX (e.g. 123456 or 12-34-56)' });
         }
+        const sortRaw = sortInput.replace(/-/g, '');
 
         try {
             const r = await pool.query(
@@ -59346,12 +59307,9 @@ app.post('/api/t/:tenant_short_id/admin/refund-player',
         if (!isValidUuid(playerId)) {
             return res.status(400).json({ error: 'player_id must be a valid UUID' });
         }
-        const amountPence = parseInt(body.amount_pence, 10);
-        if (!Number.isFinite(amountPence) || amountPence <= 0) {
-            return res.status(400).json({ error: 'amount_pence must be a positive integer' });
-        }
-        if (amountPence > 100000) {  // £1000 cap per refund
-            return res.status(400).json({ error: 'amount_pence too large (max £1000 per refund — split into multiple if needed)' });
+        const amountPence = _strictInt(body.amount_pence, 1, 100000);
+        if (amountPence === null) {
+            return res.status(400).json({ error: 'amount_pence must be a whole number of pence between 1 and 100000 (max £1000 per refund)' });
         }
         const reason = (typeof body.reason === 'string') ? body.reason.trim().slice(0, 1000) : '';
         if (!reason) return res.status(400).json({ error: 'reason is required' });
@@ -59461,9 +59419,9 @@ app.post('/api/t/:tenant_short_id/admin/refund-player',
 app.post('/api/t/:tenant_short_id/admin/withdraw-request',
     authenticateToken, requireTenantAdmin, async (req, res) => {
         const body = req.body || {};
-        const amountPence = parseInt(body.amount_pence, 10);
-        if (!Number.isFinite(amountPence) || amountPence <= 0) {
-            return res.status(400).json({ error: 'amount_pence must be a positive integer' });
+        const amountPence = _strictInt(body.amount_pence, 1, 100000000);
+        if (amountPence === null) {
+            return res.status(400).json({ error: 'amount_pence must be a whole number of pence \u2265 1' });
         }
         const notes = (typeof body.notes === 'string') ? body.notes.trim().slice(0, 1000) : '';
 
@@ -60519,8 +60477,8 @@ app.post('/api/admin/invoices/:id/line-items', authenticateToken, requireSuperAd
     const description = String(body.description || '').trim();
     if (!description) return res.status(400).json({ error: 'description is required' });
     if (description.length > 500) return res.status(400).json({ error: 'description too long (max 500)' });
-    const amount = parseInt(body.amount_pence, 10);
-    if (!Number.isFinite(amount)) return res.status(400).json({ error: 'amount_pence must be an integer' });
+    const amount = _strictInt(body.amount_pence);
+    if (amount === null) return res.status(400).json({ error: 'amount_pence must be a whole number' });
     // manual_credit stored as negative for clarity; manual_adjustment positive
     const signedAmount = lineType === 'manual_credit' ? -Math.abs(amount) : Math.abs(amount);
 
@@ -60704,9 +60662,9 @@ app.post('/api/admin/invoices/:id/record-payment',
         // paid_amount_pence: default to invoice total if not provided
         let paidAmount = null;
         if (body.paid_amount_pence !== undefined) {
-            paidAmount = parseInt(body.paid_amount_pence, 10);
-            if (!Number.isFinite(paidAmount) || paidAmount < 0) {
-                return res.status(400).json({ error: 'paid_amount_pence must be a non-negative integer' });
+            paidAmount = _strictInt(body.paid_amount_pence, 0);
+            if (paidAmount === null) {
+                return res.status(400).json({ error: 'paid_amount_pence must be a whole number \u2265 0' });
             }
         }
 
@@ -64872,7 +64830,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web83-inputvld`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web89-tenantadmin`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
