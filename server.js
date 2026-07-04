@@ -11370,42 +11370,520 @@ app.get('/api/t/:tenant_short_id/admin/upload-token', authenticateToken, require
     res.json({ token: ts + '.' + sig, expires_in: 600 });
 });
 
-// FIX-503: tenant gallery — record/list/delete. Uploads go browser →
-// tf-upload-gallery.php (HMAC-token sidecar on Namecheap); only URLs recorded
-// HERE (tenant-admin gated) are ever displayed, and only from our own
-// uploads/gallery path — an orphan file uploaded by a token-holder who isn't a
-// tenant admin can never surface.
+// FIX-503 -> FIX-508: tenant gallery v2 -- albums, ordering, captions, member
+// submissions + moderation (B), video links + collections (C). Uploads still go
+// browser -> tf-upload-gallery.php (HMAC-token sidecar on Namecheap); only URLs
+// recorded HERE are ever displayed, and only from our own uploads/gallery path --
+// an orphan file uploaded by a token-holder who isn't a member/admin can never
+// surface. All admin routes: authenticateToken + requireTenantAdmin (superadmin
+// passes automatically); B1 is the one member-facing route (inline member check).
+const GALLERY_MAX_PER_ALBUM = parseInt(process.env.GALLERY_MAX_PER_ALBUM || '250', 10);
+const GALLERY_MAX_TENANT    = parseInt(process.env.GALLERY_MAX_TENANT    || '1000', 10);
+const GALLERY_URL_PREFIX    = 'https://totalfooty.co.uk/uploads/gallery/';
+
+// FIX-508 (A8): fire-and-forget physical file delete via the sidecar's delete
+// action. The server mints the same ts.sig token the mint endpoints issue.
+// Never blocks or fails the caller -- cleanup is best-effort by design; a miss
+// leaves an orphan file (the pre-508 status quo for every delete).
+function _galleryFileDelete(url) {
+    try {
+        const secret = process.env.TF_UPLOAD_SECRET;
+        if (!secret || !url || !String(url).startsWith(GALLERY_URL_PREFIX)) return;
+        const rest = String(url).slice(GALLERY_URL_PREFIX.length).split('/');
+        if (rest.length !== 2) return;
+        const tenant = rest[0], name = rest[1];
+        if (!/^[A-Za-z0-9_-]{3,16}$/.test(tenant)) return;
+        if (!/^[a-f0-9]{24}\.(jpg|png|webp)$/.test(name)) return;
+        const ts = String(Math.floor(Date.now() / 1000));
+        const sig = require('crypto').createHmac('sha256', secret).update(ts).digest('hex');
+        fetch('https://totalfooty.co.uk/tf-upload-gallery.php', {
+            method: 'POST',
+            body: new URLSearchParams({ token: ts + '.' + sig, action: 'delete', tenant, name }),
+        }).then(r => { if (!r.ok) console.error('gallery file delete HTTP', r.status, name); })
+          .catch(e => console.error('gallery file delete failed:', e.message));
+    } catch (e) { console.error('gallery file delete failed:', e.message); }
+}
+
+// FIX-508 (C1): normalise a YouTube/Vimeo link to a canonical watch URL.
+// Anything else -> null (clean 400). Embed URLs are derived client-side from
+// the canonical shape (youtube-nocookie / player.vimeo iframes).
+function _galleryCanonicalVideoUrl(raw) {
+    let u;
+    try { u = new URL(String(raw || '').trim()); } catch (_) { return null; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+    const okId = id => /^[A-Za-z0-9_-]{6,20}$/.test(id || '');
+    if (host === 'youtu.be') {
+        const id = (u.pathname.slice(1).split('/')[0] || '');
+        return okId(id) ? ('https://www.youtube.com/watch?v=' + id) : null;
+    }
+    if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'music.youtube.com') {
+        let id = u.searchParams.get('v') || '';
+        if (!id && u.pathname.startsWith('/shorts/')) id = u.pathname.split('/')[2] || '';
+        if (!id && u.pathname.startsWith('/embed/'))  id = u.pathname.split('/')[2] || '';
+        if (!id && u.pathname.startsWith('/live/'))   id = u.pathname.split('/')[2] || '';
+        return okId(id) ? ('https://www.youtube.com/watch?v=' + id) : null;
+    }
+    if (host === 'vimeo.com' || host === 'player.vimeo.com') {
+        const m = u.pathname.match(/(\d{6,12})/);
+        return m ? ('https://vimeo.com/' + m[1]) : null;
+    }
+    return null;
+}
+
+// A1 -- everything in one call: albums (live + pending, admin view), all items,
+// collections, pending count, caps. Ordered exactly as the public page renders.
 app.get('/api/t/:tenant_short_id/admin/gallery', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
-        const r = await pool.query(
-            `SELECT id, url, caption, created_at FROM tenant_gallery
-              WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100`, [req.tenant.id]);
-        res.json({ items: r.rows });
+        const [al, it, co] = await Promise.all([
+            pool.query(
+                `SELECT a.id, a.title, a.sort_order, a.visibility, a.status,
+                        a.submitted_by, a.game_id, a.collection_id, a.cover_photo_id, a.created_at,
+                        p.alias AS submitted_by_alias, p.full_name AS submitted_by_name,
+                        (SELECT COUNT(*) FROM tenant_gallery g
+                          WHERE g.album_id = a.id AND g.item_type = 'photo' AND g.status <> 'rejected') AS photo_count
+                   FROM tenant_gallery_albums a
+                   LEFT JOIN players p ON p.id = a.submitted_by
+                  WHERE a.tenant_id = $1 AND a.status <> 'rejected'
+                  ORDER BY a.sort_order ASC, a.id ASC`, [req.tenant.id]),
+            pool.query(
+                `SELECT id, album_id, url, caption, sort_order, status, item_type, video_url, created_at
+                   FROM tenant_gallery
+                  WHERE tenant_id = $1 AND status <> 'rejected'
+                  ORDER BY album_id ASC NULLS LAST, sort_order ASC, id ASC`, [req.tenant.id]),
+            pool.query(
+                `SELECT id, title, sort_order, featured FROM tenant_gallery_collections
+                  WHERE tenant_id = $1 ORDER BY sort_order ASC, id ASC`, [req.tenant.id]),
+        ]);
+        res.json({
+            albums: al.rows.map(a => ({
+                id: a.id, title: a.title, sort_order: a.sort_order,
+                visibility: a.visibility, status: a.status,
+                submitted_by_alias: a.submitted_by_alias || a.submitted_by_name || null,
+                game_id: a.game_id || null, collection_id: a.collection_id || null,
+                cover_photo_id: a.cover_photo_id || null,
+                photo_count: parseInt(a.photo_count, 10) || 0,
+            })),
+            items: it.rows.map(g => ({
+                id: g.id, album_id: g.album_id || null, url: g.url,
+                caption: g.caption || null, sort_order: g.sort_order,
+                status: g.status, item_type: g.item_type || 'photo',
+                video_url: g.video_url || null,
+            })),
+            collections: co.rows.map(c => ({
+                id: c.id, title: c.title, sort_order: c.sort_order, featured: !!c.featured,
+            })),
+            pending_count: al.rows.filter(a => a.status === 'pending').length,
+            caps: { per_album: GALLERY_MAX_PER_ALBUM, tenant: GALLERY_MAX_TENANT },
+        });
     } catch (e) { console.error('gallery list error:', e.message); res.status(500).json({ error: 'Failed to load gallery' }); }
 });
+
+// A2 -- create album
+app.post('/api/t/:tenant_short_id/admin/gallery/albums', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const title = String(req.body.title || '').trim().slice(0, 80);
+        if (!title) return res.status(400).json({ error: 'Album title required' });
+        const visibility = req.body.visibility === 'members' ? 'members' : 'public';
+        const r = await pool.query(
+            `INSERT INTO tenant_gallery_albums (tenant_id, title, visibility, sort_order)
+             VALUES ($1, $2, $3, COALESCE((SELECT MAX(sort_order) + 1 FROM tenant_gallery_albums WHERE tenant_id = $1), 0))
+             RETURNING id`, [req.tenant.id, title, visibility]);
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('album create error:', e.message); res.status(500).json({ error: 'Failed to create album' }); }
+});
+
+// A4 -- bulk album reorder (one txn). Registered before /albums/:id handlers is
+// unnecessary (different methods / segment counts) but kept adjacent for reading.
+app.post('/api/t/:tenant_short_id/admin/gallery/albums/reorder', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const order = Array.isArray(req.body.order) ? req.body.order.map(x => parseInt(x, 10) || 0) : [];
+    if (!order.length) return res.status(400).json({ error: 'order array required' });
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (let i = 0; i < order.length; i++) {
+            await client.query('UPDATE tenant_gallery_albums SET sort_order = $1 WHERE id = $2 AND tenant_id = $3', [i, order[i], req.tenant.id]);
+        }
+        await client.query('COMMIT');
+        res.json({ success: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('album reorder error:', e.message); res.status(500).json({ error: 'Failed to reorder albums' });
+    } finally { client.release(); }
+});
+
+// A3 -- edit album (title / visibility / cover / collection). Cover must belong
+// to the album; collection must belong to the tenant (FIX-508c).
+app.patch('/api/t/:tenant_short_id/admin/gallery/albums/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const own = await pool.query('SELECT id FROM tenant_gallery_albums WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Album not found' });
+        const sets = []; const vals = []; let n = 1;
+        if (req.body.title !== undefined) {
+            const title = String(req.body.title || '').trim().slice(0, 80);
+            if (!title) return res.status(400).json({ error: 'Album title required' });
+            sets.push('title = $' + (n++)); vals.push(title);
+        }
+        if (req.body.visibility !== undefined) {
+            if (req.body.visibility !== 'public' && req.body.visibility !== 'members') {
+                return res.status(400).json({ error: "visibility must be 'public' or 'members'" });
+            }
+            sets.push('visibility = $' + (n++)); vals.push(req.body.visibility);
+        }
+        if (req.body.cover_photo_id !== undefined) {
+            if (req.body.cover_photo_id === null) { sets.push('cover_photo_id = NULL'); }
+            else {
+                const pid = parseInt(req.body.cover_photo_id, 10) || 0;
+                const ph = await pool.query(
+                    `SELECT id FROM tenant_gallery WHERE id = $1 AND tenant_id = $2 AND album_id = $3 AND item_type = 'photo'`,
+                    [pid, req.tenant.id, id]);
+                if (!ph.rows.length) return res.status(400).json({ error: 'Cover photo must belong to this album' });
+                sets.push('cover_photo_id = $' + (n++)); vals.push(pid);
+            }
+        }
+        if (req.body.collection_id !== undefined) { // FIX-508c
+            if (req.body.collection_id === null) { sets.push('collection_id = NULL'); }
+            else {
+                const cid = parseInt(req.body.collection_id, 10) || 0;
+                const c = await pool.query('SELECT id FROM tenant_gallery_collections WHERE id = $1 AND tenant_id = $2', [cid, req.tenant.id]);
+                if (!c.rows.length) return res.status(400).json({ error: 'Collection not found' });
+                sets.push('collection_id = $' + (n++)); vals.push(cid);
+            }
+        }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(id, req.tenant.id);
+        await pool.query('UPDATE tenant_gallery_albums SET ' + sets.join(', ') + ' WHERE id = $' + (n++) + ' AND tenant_id = $' + n, vals);
+        res.json({ success: true });
+    } catch (e) { console.error('album edit error:', e.message); res.status(500).json({ error: 'Failed to update album' }); }
+});
+
+// B2 -- moderate a member-submitted album. Approve: album+photos live (+optional
+// visibility). Reject: album+photos 'rejected' AND the files are physically
+// deleted (A8 mechanism per photo) -- rejected content never lingers on disk.
+app.post('/api/t/:tenant_short_id/admin/gallery/albums/:id/moderate', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const action = req.body.action;
+        if (action !== 'approve' && action !== 'reject') return res.status(400).json({ error: "action must be 'approve' or 'reject'" });
+        const own = await pool.query('SELECT id FROM tenant_gallery_albums WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Album not found' });
+        if (action === 'approve') {
+            const vis = (req.body.visibility === 'members' || req.body.visibility === 'public') ? req.body.visibility : null;
+            if (vis) {
+                await pool.query(`UPDATE tenant_gallery_albums SET status = 'live', visibility = $3 WHERE id = $1 AND tenant_id = $2`, [id, req.tenant.id, vis]);
+            } else {
+                await pool.query(`UPDATE tenant_gallery_albums SET status = 'live' WHERE id = $1 AND tenant_id = $2`, [id, req.tenant.id]);
+            }
+            await pool.query(`UPDATE tenant_gallery SET status = 'live' WHERE album_id = $1 AND tenant_id = $2 AND status = 'pending'`, [id, req.tenant.id]);
+            return res.json({ success: true, status: 'live' });
+        }
+        const ph = await pool.query(
+            `UPDATE tenant_gallery SET status = 'rejected' WHERE album_id = $1 AND tenant_id = $2 RETURNING url, item_type`,
+            [id, req.tenant.id]);
+        await pool.query(`UPDATE tenant_gallery_albums SET status = 'rejected' WHERE id = $1 AND tenant_id = $2`, [id, req.tenant.id]);
+        ph.rows.filter(r2 => r2.item_type === 'photo').forEach(r2 => _galleryFileDelete(r2.url));
+        res.json({ success: true, status: 'rejected' });
+    } catch (e) { console.error('album moderate error:', e.message); res.status(500).json({ error: 'Failed to moderate album' }); }
+});
+
+// A5 -- delete album. ?photos=keep (default: photos -> Unsorted) | delete
+// (rows AND files go). DB work is one txn; file deletes fire after COMMIT.
+app.delete('/api/t/:tenant_short_id/admin/gallery/albums/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const id = parseInt(req.params.id, 10) || 0;
+    const mode = req.query.photos === 'delete' ? 'delete' : 'keep';
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const own = await client.query('SELECT id FROM tenant_gallery_albums WHERE id = $1 AND tenant_id = $2 FOR UPDATE', [id, req.tenant.id]);
+        if (!own.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Album not found' }); }
+        let files = [];
+        if (mode === 'delete') {
+            const ph = await client.query('DELETE FROM tenant_gallery WHERE album_id = $1 AND tenant_id = $2 RETURNING url, item_type', [id, req.tenant.id]);
+            files = ph.rows.filter(r2 => r2.item_type === 'photo').map(r2 => r2.url);
+        } else {
+            await client.query('UPDATE tenant_gallery SET album_id = NULL WHERE album_id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        }
+        await client.query('DELETE FROM tenant_gallery_albums WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        await client.query('COMMIT');
+        files.forEach(u => _galleryFileDelete(u));
+        res.json({ success: true, photos: mode });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('album delete error:', e.message); res.status(500).json({ error: 'Failed to delete album' });
+    } finally { client.release(); }
+});
+
+// A6 -- record a photo (extends the FIX-503 endpoint: album_id + caps + ordering).
+// The URL-prefix check is the display gate: only our own sidecar uploads render.
 app.post('/api/t/:tenant_short_id/admin/gallery', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
         const url = String(req.body.url || '').trim();
         const caption = String(req.body.caption || '').trim().slice(0, 140) || null;
-        if (!url.startsWith('https://totalfooty.co.uk/uploads/gallery/')) {
+        if (!url.startsWith(GALLERY_URL_PREFIX)) {
             return res.status(400).json({ error: 'URL must be a TotalFooty gallery upload' });
         }
-        const count = await pool.query('SELECT COUNT(*) AS c FROM tenant_gallery WHERE tenant_id = $1', [req.tenant.id]);
-        if (parseInt(count.rows[0].c, 10) >= 60) return res.status(400).json({ error: 'Gallery is full (60 photos max) — delete some first' });
+        let albumId = null;
+        if (req.body.album_id !== undefined && req.body.album_id !== null) {
+            albumId = parseInt(req.body.album_id, 10) || 0;
+            const a = await pool.query('SELECT id FROM tenant_gallery_albums WHERE id = $1 AND tenant_id = $2', [albumId, req.tenant.id]);
+            if (!a.rows.length) return res.status(400).json({ error: 'Album not found' });
+        }
+        const counts = await pool.query(
+            `SELECT COUNT(*) FILTER (WHERE item_type = 'photo') AS tenant_total,
+                    COUNT(*) FILTER (WHERE item_type = 'photo' AND album_id IS NOT DISTINCT FROM $2) AS album_total
+               FROM tenant_gallery WHERE tenant_id = $1 AND status <> 'rejected'`, [req.tenant.id, albumId]);
+        if (parseInt(counts.rows[0].tenant_total, 10) >= GALLERY_MAX_TENANT) {
+            return res.status(400).json({ error: 'Gallery is full (' + GALLERY_MAX_TENANT + ' photos max for your tenant) \u2014 delete some first' });
+        }
+        if (parseInt(counts.rows[0].album_total, 10) >= GALLERY_MAX_PER_ALBUM) {
+            return res.status(400).json({ error: 'Album is full (' + GALLERY_MAX_PER_ALBUM + ' photos max) \u2014 start another album' });
+        }
         const r = await pool.query(
-            `INSERT INTO tenant_gallery (tenant_id, url, caption, created_by)
-             VALUES ($1, $2, $3, $4) RETURNING id`,
-            [req.tenant.id, url, caption, req.user.playerId]);
+            `INSERT INTO tenant_gallery (tenant_id, url, caption, created_by, album_id, sort_order, status, item_type)
+             VALUES ($1, $2, $3, $4, $5,
+                     COALESCE((SELECT MAX(sort_order) + 1 FROM tenant_gallery WHERE tenant_id = $1 AND album_id IS NOT DISTINCT FROM $5), 0),
+                     'live', 'photo')
+             RETURNING id`,
+            [req.tenant.id, url, caption, req.user.playerId, albumId]);
         res.json({ success: true, id: r.rows[0].id });
     } catch (e) { console.error('gallery add error:', e.message); res.status(500).json({ error: 'Failed to save photo' }); }
 });
+
+// A9 -- bulk photo reorder within one album (album_id null = Unsorted), one txn.
+app.post('/api/t/:tenant_short_id/admin/gallery/reorder', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const albumId = (req.body.album_id === null || req.body.album_id === undefined) ? null : (parseInt(req.body.album_id, 10) || 0);
+    const order = Array.isArray(req.body.order) ? req.body.order.map(x => parseInt(x, 10) || 0) : [];
+    if (!order.length) return res.status(400).json({ error: 'order array required' });
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (let i = 0; i < order.length; i++) {
+            await client.query(
+                'UPDATE tenant_gallery SET sort_order = $1 WHERE id = $2 AND tenant_id = $3 AND album_id IS NOT DISTINCT FROM $4',
+                [i, order[i], req.tenant.id, albumId]);
+        }
+        await client.query('COMMIT');
+        res.json({ success: true });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('gallery reorder error:', e.message); res.status(500).json({ error: 'Failed to reorder photos' });
+    } finally { client.release(); }
+});
+
+// C1 -- add a video LINK (YouTube/Vimeo only; deliberate deviation from
+// Pitchero's file hosting -- see FIX-508 design section 9). Videos never count
+// toward the photo caps.
+app.post('/api/t/:tenant_short_id/admin/gallery/videos', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const canonical = _galleryCanonicalVideoUrl(req.body.video_url);
+        if (!canonical) return res.status(400).json({ error: 'Only YouTube and Vimeo links are supported' });
+        const caption = String(req.body.caption || '').trim().slice(0, 140) || null;
+        let albumId = null;
+        if (req.body.album_id !== undefined && req.body.album_id !== null) {
+            albumId = parseInt(req.body.album_id, 10) || 0;
+            const a = await pool.query('SELECT id FROM tenant_gallery_albums WHERE id = $1 AND tenant_id = $2', [albumId, req.tenant.id]);
+            if (!a.rows.length) return res.status(400).json({ error: 'Album not found' });
+        }
+        const r = await pool.query(
+            `INSERT INTO tenant_gallery (tenant_id, url, caption, created_by, album_id, sort_order, status, item_type, video_url)
+             VALUES ($1, $2, $3, $4, $5,
+                     COALESCE((SELECT MAX(sort_order) + 1 FROM tenant_gallery WHERE tenant_id = $1 AND album_id IS NOT DISTINCT FROM $5), 0),
+                     'live', 'video', $2)
+             RETURNING id`,
+            [req.tenant.id, canonical, caption, req.user.playerId, albumId]);
+        res.json({ success: true, id: r.rows[0].id, video_url: canonical });
+    } catch (e) { console.error('gallery video error:', e.message); res.status(500).json({ error: 'Failed to save video link' }); }
+});
+
+// C2 -- create collection
+app.post('/api/t/:tenant_short_id/admin/gallery/collections', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const title = String(req.body.title || '').trim().slice(0, 80);
+        if (!title) return res.status(400).json({ error: 'Collection title required' });
+        const featured = req.body.featured === true;
+        const r = await pool.query(
+            `INSERT INTO tenant_gallery_collections (tenant_id, title, featured, sort_order)
+             VALUES ($1, $2, $3, COALESCE((SELECT MAX(sort_order) + 1 FROM tenant_gallery_collections WHERE tenant_id = $1), 0))
+             RETURNING id`, [req.tenant.id, title, featured]);
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('collection create error:', e.message); res.status(500).json({ error: 'Failed to create collection' }); }
+});
+
+// C3 -- edit collection (title / featured / sort_order)
+app.patch('/api/t/:tenant_short_id/admin/gallery/collections/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const own = await pool.query('SELECT id FROM tenant_gallery_collections WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Collection not found' });
+        const sets = []; const vals = []; let n = 1;
+        if (req.body.title !== undefined) {
+            const title = String(req.body.title || '').trim().slice(0, 80);
+            if (!title) return res.status(400).json({ error: 'Collection title required' });
+            sets.push('title = $' + (n++)); vals.push(title);
+        }
+        if (req.body.featured !== undefined) { sets.push('featured = $' + (n++)); vals.push(req.body.featured === true); }
+        if (req.body.sort_order !== undefined) { sets.push('sort_order = $' + (n++)); vals.push(parseInt(req.body.sort_order, 10) || 0); }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(id, req.tenant.id);
+        await pool.query('UPDATE tenant_gallery_collections SET ' + sets.join(', ') + ' WHERE id = $' + (n++) + ' AND tenant_id = $' + n, vals);
+        res.json({ success: true });
+    } catch (e) { console.error('collection edit error:', e.message); res.status(500).json({ error: 'Failed to update collection' }); }
+});
+
+// C4 -- delete collection (albums keep living; their collection_id clears)
+app.delete('/api/t/:tenant_short_id/admin/gallery/collections/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        await pool.query('UPDATE tenant_gallery_albums SET collection_id = NULL WHERE collection_id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        const r = await pool.query('DELETE FROM tenant_gallery_collections WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        res.json({ success: true, deleted: r.rowCount });
+    } catch (e) { console.error('collection delete error:', e.message); res.status(500).json({ error: 'Failed to delete collection' }); }
+});
+
+// A8 -- delete a single item. DB delete first, then fire-and-forget physical
+// file delete (photos only -- videos are just links). Registered LAST of the
+// /gallery/* deletes so the more specific /albums and /collections paths above
+// read first (Express matches by shape either way; this is for the reader).
 app.delete('/api/t/:tenant_short_id/admin/gallery/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
+        const id = parseInt(req.params.id, 10) || 0;
         const r = await pool.query(
-            'DELETE FROM tenant_gallery WHERE id = $1 AND tenant_id = $2',
-            [parseInt(req.params.id, 10) || 0, req.tenant.id]);
+            'DELETE FROM tenant_gallery WHERE id = $1 AND tenant_id = $2 RETURNING url, item_type',
+            [id, req.tenant.id]);
+        if (r.rows.length && r.rows[0].item_type === 'photo') _galleryFileDelete(r.rows[0].url);
         res.json({ success: true, deleted: r.rowCount });
     } catch (e) { console.error('gallery delete error:', e.message); res.status(500).json({ error: 'Failed to delete photo' }); }
+});
+
+// A7 -- edit a single item: caption and/or move to another album (move resets
+// sort_order to the end of the target album; target cap enforced).
+app.patch('/api/t/:tenant_short_id/admin/gallery/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const own = await pool.query('SELECT id, item_type FROM tenant_gallery WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Photo not found' });
+        const sets = []; const vals = []; let n = 1;
+        if (req.body.caption !== undefined) {
+            sets.push('caption = $' + (n++)); vals.push(String(req.body.caption || '').trim().slice(0, 140) || null);
+        }
+        if (req.body.album_id !== undefined) {
+            let target = null;
+            if (req.body.album_id !== null) {
+                target = parseInt(req.body.album_id, 10) || 0;
+                const a = await pool.query('SELECT id FROM tenant_gallery_albums WHERE id = $1 AND tenant_id = $2', [target, req.tenant.id]);
+                if (!a.rows.length) return res.status(400).json({ error: 'Album not found' });
+                if (own.rows[0].item_type === 'photo') {
+                    const c = await pool.query(
+                        `SELECT COUNT(*) AS c FROM tenant_gallery
+                          WHERE tenant_id = $1 AND album_id = $2 AND item_type = 'photo' AND status <> 'rejected'`,
+                        [req.tenant.id, target]);
+                    if (parseInt(c.rows[0].c, 10) >= GALLERY_MAX_PER_ALBUM) {
+                        return res.status(400).json({ error: 'Album is full (' + GALLERY_MAX_PER_ALBUM + ' photos max)' });
+                    }
+                }
+            }
+            const nx = await pool.query(
+                'SELECT COALESCE(MAX(sort_order) + 1, 0) AS nx FROM tenant_gallery WHERE tenant_id = $1 AND album_id IS NOT DISTINCT FROM $2',
+                [req.tenant.id, target]);
+            sets.push('album_id = $' + (n++)); vals.push(target);
+            sets.push('sort_order = $' + (n++)); vals.push(parseInt(nx.rows[0].nx, 10) || 0);
+        }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(id, req.tenant.id);
+        await pool.query('UPDATE tenant_gallery SET ' + sets.join(', ') + ' WHERE id = $' + (n++) + ' AND tenant_id = $' + n, vals);
+        res.json({ success: true });
+    } catch (e) { console.error('gallery edit error:', e.message); res.status(500).json({ error: 'Failed to update photo' }); }
+});
+
+// B1 -- MEMBER route (NOT admin): submit an album from the public tenant page.
+// Gate: any active player_tenants row in THIS tenant. Album + photos land as
+// 'pending'; tenant admins get a wrapEmailHtml notification; nothing shows on
+// the public page until an admin approves (B2).
+const tfGallerySubmitLimiter = rateLimit({
+    windowMs: 30 * 60 * 1000,
+    max: 4,
+    message: { error: 'Too many gallery submissions \u2014 try again later.' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.post('/api/t/:tenant_short_id/gallery/submit', authenticateToken, tfGallerySubmitLimiter, async (req, res) => {
+    try {
+        if (req.user.role !== 'superadmin') {
+            const mem = await pool.query(
+                `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'active' LIMIT 1`,
+                [req.user.playerId, req.tenant.id]);
+            if (!mem.rows.length) return res.status(403).json({ error: 'Members only \u2014 join this team to share photos' });
+        }
+        const title = String(req.body.album_title || '').trim().slice(0, 80);
+        if (!title) return res.status(400).json({ error: 'Album title required' });
+        const photos = Array.isArray(req.body.photos) ? req.body.photos.slice(0, GALLERY_MAX_PER_ALBUM) : [];
+        if (!photos.length) return res.status(400).json({ error: 'At least one photo required' });
+        for (const p of photos) {
+            if (!p || typeof p.url !== 'string' || !p.url.startsWith(GALLERY_URL_PREFIX)) {
+                return res.status(400).json({ error: 'Every photo must be a TotalFooty gallery upload' });
+            }
+        }
+        const cnt = await pool.query(
+            `SELECT COUNT(*) AS c FROM tenant_gallery WHERE tenant_id = $1 AND item_type = 'photo' AND status <> 'rejected'`,
+            [req.tenant.id]);
+        if (parseInt(cnt.rows[0].c, 10) + photos.length > GALLERY_MAX_TENANT) {
+            return res.status(400).json({ error: 'The team gallery is full \u2014 ask an admin to make room' });
+        }
+        const client = await pool.connect();
+        let albumId;
+        try {
+            await client.query('BEGIN');
+            const ar = await client.query(
+                `INSERT INTO tenant_gallery_albums (tenant_id, title, visibility, status, submitted_by, sort_order)
+                 VALUES ($1, $2, 'public', 'pending', $3,
+                         COALESCE((SELECT MAX(sort_order) + 1 FROM tenant_gallery_albums WHERE tenant_id = $1), 0))
+                 RETURNING id`, [req.tenant.id, title, req.user.playerId]);
+            albumId = ar.rows[0].id;
+            for (let i = 0; i < photos.length; i++) {
+                await client.query(
+                    `INSERT INTO tenant_gallery (tenant_id, url, caption, created_by, album_id, sort_order, status, item_type)
+                     VALUES ($1, $2, $3, $4, $5, $6, 'pending', 'photo')`,
+                    [req.tenant.id, photos[i].url,
+                     String(photos[i].caption || '').trim().slice(0, 140) || null,
+                     req.user.playerId, albumId, i]);
+            }
+            await client.query('COMMIT');
+        } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            client.release();
+            console.error('gallery submit error:', e.message);
+            return res.status(500).json({ error: 'Failed to submit album' });
+        }
+        client.release();
+        // Notify every tenant admin (fire-and-forget; failure never blocks the member)
+        (async () => {
+            try {
+                const admins = await pool.query(
+                    `SELECT DISTINCT u.email FROM player_tenants pt
+                       JOIN players p ON p.id = pt.player_id
+                       JOIN users u ON u.id = p.user_id
+                      WHERE pt.tenant_id = $1 AND pt.role = 'tenant_admin' AND pt.status = 'active'
+                        AND u.email IS NOT NULL`, [req.tenant.id]);
+                if (!admins.rows.length) return;
+                const who = await pool.query('SELECT alias, full_name FROM players WHERE id = $1', [req.user.playerId]);
+                const memberName = who.rows[0]?.alias || who.rows[0]?.full_name || 'A member';
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    to: admins.rows.map(a => a.email).join(','),
+                    subject: '\ud83d\udcf8 New photo album awaiting review \u2014 ' + req.tenant.name,
+                    html: wrapEmailHtml(`
+                        <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 16px;">NEW ALBUM TO REVIEW \ud83d\udcf8</h2>
+                        <p style="color:#ccc;font-size:15px;margin:0 0 12px;"><strong style="color:#fff;">${htmlEncode(memberName)}</strong> has submitted a photo album \u2014 <strong style="color:#fff;">"${htmlEncode(title)}"</strong> (${photos.length} photo${photos.length === 1 ? '' : 's'}) \u2014 to the ${htmlEncode(req.tenant.name)} gallery.</p>
+                        <p style="color:#ccc;font-size:14px;margin:0 0 24px;">It won't appear on your public page until an admin approves it. Open the Gallery tile in your CRM to review.</p>
+                        <a href="https://totalfooty.co.uk/crm.html#gallery" style="display:block;text-align:center;padding:14px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:15px;">REVIEW IN THE GALLERY \u2192</a>
+                    `)
+                });
+            } catch (e) { console.error('gallery submit email failed:', e.message); }
+        })();
+        res.json({ success: true, album_id: albumId, status: 'pending' });
+    } catch (e) { console.error('gallery submit error:', e.message); res.status(500).json({ error: 'Failed to submit album' }); }
 });
 
 // FIX-461c: any logged-in PLAYER can mint a token for their own profile photo// FIX-461c: any logged-in PLAYER can mint a token for their own profile photo
@@ -62710,7 +63188,7 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
 // Accepts slug OR short_id. Explicit columns only; exposes nothing beyond what
 // the public game pages already show. Distinct from /api/public/club (the
 // internal-leagues CLUB entity) — tenants and clubs are different systems.
-app.get('/api/public/tenant/:slug', publicPlayerLimiter, async (req, res) => {
+app.get('/api/public/tenant/:slug', publicPlayerLimiter, optionalAuth, async (req, res) => { // FIX-508b: optionalAuth for members-only albums
     try {
         const key = String(req.params.slug || '').trim().toLowerCase();
         if (!/^[a-z0-9-]{2,60}$/.test(key)) return res.status(400).json({ error: 'invalid_slug' });
@@ -62746,13 +63224,97 @@ app.get('/api/public/tenant/:slug', publicPlayerLimiter, async (req, res) => {
               ORDER BY g.game_date DESC
               LIMIT 5`, [t.id]);
 
-        const gallery = await pool.query(
-            `SELECT url, caption FROM tenant_gallery
-              WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 12`, [t.id]
-        ).catch(() => ({ rows: [] })); // FIX-503: 42P01-safe on unmigrated DBs
+        // FIX-508b: viewer membership -- a logged-in active member of THIS tenant
+        // also sees members-only albums and gets the SUBMIT PHOTOS entry point.
+        // The tf_token cookie rides same-site to api.totalfooty.co.uk (FIX-468d);
+        // tenant.html fetches with credentials:'include'.
+        let viewerIsMember = false;
+        if (req.user && req.user.playerId) {
+            try {
+                const m = await pool.query(
+                    `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'active' LIMIT 1`,
+                    [req.user.playerId, t.id]);
+                viewerIsMember = m.rows.length > 0;
+            } catch (_) { /* treat as guest */ }
+        }
+
+        // FIX-508: albums + items + collections, all 42P01/42703-safe on
+        // unmigrated DBs (bootstrap self-heals on boot; a cold DB just renders
+        // no gallery). Explicit columns only (burn list).
+        const galAlbums = await pool.query(
+            `SELECT id, title, visibility, collection_id, cover_photo_id, sort_order
+               FROM tenant_gallery_albums
+              WHERE tenant_id = $1 AND status = 'live'
+                AND (visibility = 'public'` + (viewerIsMember ? ` OR visibility = 'members'` : ``) + `)
+              ORDER BY sort_order ASC, id ASC`, [t.id]
+        ).catch(() => ({ rows: [] }));
+        const galItems = await pool.query(
+            `SELECT id, album_id, url, caption, item_type, video_url, sort_order
+               FROM tenant_gallery
+              WHERE tenant_id = $1 AND status = 'live'
+              ORDER BY album_id ASC NULLS LAST, sort_order ASC, id ASC`, [t.id]
+        ).catch(() => ({ rows: [] }));
+        const galCollections = await pool.query(
+            `SELECT id, title, featured, sort_order FROM tenant_gallery_collections
+              WHERE tenant_id = $1 ORDER BY sort_order ASC, id ASC`, [t.id]
+        ).catch(() => ({ rows: [] }));
+
+        // Assemble: live items grouped under visible albums; NULL album_id is the
+        // implicit "Unsorted" bucket (renders last); items whose album the viewer
+        // cannot see (members-only, logged out) are dropped with their album.
+        const _visAlbumIds = new Set(galAlbums.rows.map(a => a.id));
+        const _byAlbum = {};
+        const _unsorted = [];
+        for (const g of galItems.rows) {
+            const item = {
+                url: g.url, caption: g.caption || null,
+                type: g.item_type || 'photo', video_url: g.video_url || null,
+            };
+            if (g.album_id == null) _unsorted.push(item);
+            else if (_visAlbumIds.has(g.album_id)) (_byAlbum[g.album_id] = _byAlbum[g.album_id] || []).push(item);
+        }
+        const _coverFor = (a) => {
+            const ph = _byAlbum[a.id] || [];
+            if (a.cover_photo_id) {
+                const cv = galItems.rows.find(g => g.id === a.cover_photo_id && (g.item_type || 'photo') === 'photo' && g.album_id === a.id);
+                if (cv) return cv.url;
+            }
+            const first = ph.find(p => p.type === 'photo');
+            return first ? first.url : null;
+        };
+        const galleryAlbums = galAlbums.rows
+            .map(a => ({
+                title: a.title,
+                members_only: a.visibility === 'members',
+                cover_url: _coverFor(a),
+                photos: _byAlbum[a.id] || [],
+                _cid: a.collection_id || null,
+            }))
+            .filter(a => a.photos.length);
+        if (_unsorted.length) {
+            galleryAlbums.push({
+                title: '', members_only: false,
+                cover_url: (_unsorted.find(p => p.type === 'photo') || {}).url || null,
+                photos: _unsorted, _cid: null,
+            });
+        }
+        const galleryCollections = galCollections.rows
+            .map(c => ({
+                title: c.title, featured: !!c.featured,
+                albums: galleryAlbums
+                    .filter(a => a._cid === c.id && a.cover_url)
+                    .map(a => ({ title: a.title, cover_url: a.cover_url })),
+            }))
+            .filter(c => c.albums.length);
+        galleryAlbums.forEach(a => { delete a._cid; }); // internal key, never exposed
 
         res.json({
-            gallery: gallery.rows.map(g => ({ url: g.url, caption: g.caption || null })), // FIX-503
+            // FIX-508: explicit v2 gallery payload. The FIX-503 flat `gallery:`
+            // array is REMOVED -- tenant.html ships with this build and reads
+            // gallery_albums (design doc section 5, phase A note).
+            gallery_albums: galleryAlbums,        // [{title, members_only, cover_url, photos:[{url, caption, type, video_url}]}]
+            collections: galleryCollections,      // FIX-508c: [{title, featured, albums:[{title, cover_url}]}]
+            viewer_is_member: viewerIsMember,     // FIX-508b: drives SUBMIT PHOTOS + members badges
             tenant: {
                 name: t.name, slug: t.slug, short_id: t.short_id,
                 logo_url: t.logo_url || null, primary_color: t.primary_color || null,
@@ -64136,6 +64698,47 @@ async function bootstrapTenantFreeCredits() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_tgal_tenant ON tenant_gallery (tenant_id, created_at DESC)`);
         console.log('✅ tenant_gallery ready (FIX-503)');
 
+        // FIX-508: Tenant Gallery v2 — albums, ordering, member submissions,
+        // moderation, video links, collections. All self-bootstrapping; no PSQL.
+        // tenant_id mirrors the FIX-503 style (UUID, no cross-table FK); the
+        // album_id FK is intra-feature (both tables live in this bootstrap).
+        // Phase A — albums + ordering:
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_gallery_albums (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                title TEXT NOT NULL,
+                sort_order INT NOT NULL DEFAULT 0,
+                visibility TEXT NOT NULL DEFAULT 'public',
+                status TEXT NOT NULL DEFAULT 'live',
+                submitted_by UUID,
+                game_id UUID,
+                collection_id INT,
+                cover_photo_id INT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_tga_tenant ON tenant_gallery_albums (tenant_id, sort_order)`);
+        await pool.query(`ALTER TABLE tenant_gallery ADD COLUMN IF NOT EXISTS album_id INT REFERENCES tenant_gallery_albums(id) ON DELETE SET NULL`);
+        await pool.query(`ALTER TABLE tenant_gallery ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 0`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_tgal_album ON tenant_gallery (tenant_id, album_id, sort_order)`);
+        console.log('✅ gallery v2 phase A ready (FIX-508a)');
+        // Phase B — member submissions + moderation + members-only visibility:
+        await pool.query(`ALTER TABLE tenant_gallery ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'live'`);
+        console.log('✅ gallery v2 phase B ready (FIX-508b)');
+        // Phase C — video links + collections:
+        await pool.query(`ALTER TABLE tenant_gallery ADD COLUMN IF NOT EXISTS item_type TEXT NOT NULL DEFAULT 'photo'`);
+        await pool.query(`ALTER TABLE tenant_gallery ADD COLUMN IF NOT EXISTS video_url TEXT`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_gallery_collections (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                title TEXT NOT NULL,
+                sort_order INT NOT NULL DEFAULT 0,
+                featured BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        console.log('✅ gallery v2 phase C ready (FIX-508c)');
+
         // FIX-504 (FA-sync S1): fixture provenance — stable import identity +
         // snapshot of external values at last import (the 3-way-merge base for S3).
         await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS ext_source_key TEXT`);
@@ -65425,7 +66028,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web90-fixpack1`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web91-gallery-c`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
