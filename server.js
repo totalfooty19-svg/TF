@@ -3208,6 +3208,7 @@ async function getGameDataForNotification(gameId) {
 const NOTIF_TEMPLATES = {
     // FIX-357: Lock-preempt warning push to the admin holding a game lock.
     lock_preempt:      d => ({ title: '⏳ Player waiting',       body: `${d.playerName || 'A player'} is trying to sign up — game will unlock in ${d.graceSeconds || 15}s.` }),
+    signup_queue_outcome: d => ({ title: d.title || "Sign-up update", body: d.body || "There's an update on your queued sign-up." }),
     game_registered:   d => ({ title: 'Signed Up! ⚽',          body: `You're in for ${d.day} at ${d.venue}. £${(d.cost||0).toFixed(2)} deducted.` }),
     backup_added:      d => ({ title: 'On the Backup List ⏳',  body: `You're on backup for ${d.day} at ${d.venue}.` }),
     dropout_confirmed: d => ({ title: 'Dropped Out ✅',          body: `You've been removed from ${d.day} at ${d.venue}.` }),
@@ -6332,7 +6333,7 @@ app.post('/api/auth/register', async (req, res) => {
 
         // Validate age range — required for insurance purposes
         // Validate region
-        const VALID_REGIONS = ['Coventry', 'Birmingham', 'Leamington & Warwick', 'Nuneaton', 'Manchester']; // FIX-107
+        const VALID_REGIONS = UK_REGIONS; // FIX-493: signup accepts every canonical UK region (was FIX-107 5-town list)
 
         // FIX-366 (Web66): multi-region support. Frontend wizard sends
         // `regions: [...]` array (one or more regions the player intends to
@@ -7540,6 +7541,143 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
     }
 });
 
+// FIX-494 (FC-11/APP-04): per-game spendable — the display twin of
+// _spendableForGameRows, so what the player SEES matches what applyGameFee can
+// actually draw for THIS game (cash + Original free + this game's tenant
+// bucket). Unknown/tenantless game → tenant portion is 0 (Original-only), same
+// as the charge path. Explicit fields only.
+app.get('/api/games/:gameId/my-spendable', authenticateToken, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const r = await pool.query(
+            `SELECT COALESCE(c.balance,0) AS cash,
+                    COALESCE(c.free_credit_balance,0) AS free_original,
+                    COALESCE((SELECT ptfc.balance FROM player_tenant_free_credits ptfc
+                                JOIN games g2 ON g2.id = $2 AND g2.tenant_id = ptfc.tenant_id
+                               WHERE ptfc.player_id = $1),0) AS free_tenant
+               FROM credits c WHERE c.player_id = $1`,
+            [req.user.playerId, gameId]);
+        const row = r.rows[0] || { cash: 0, free_original: 0, free_tenant: 0 };
+        const cash = parseFloat(row.cash) || 0;
+        const freeOriginal = parseFloat(row.free_original) || 0;
+        const freeTenant = parseFloat(row.free_tenant) || 0;
+        res.json({
+            cash,
+            free_original: freeOriginal,
+            free_tenant: freeTenant,
+            free_for_game: freeOriginal + freeTenant,
+            total_for_game: cash + freeOriginal + freeTenant,
+        });
+    } catch (error) {
+        console.error('my-spendable error:', error);
+        res.status(500).json({ error: 'Failed to get spendable balance' });
+    }
+});
+
+// FIX-501: shared cross-tenant people-list filter.
+// ?tenants= absent|'all' → no filter (back-compat for the app and any
+// un-updated caller); 'none' → players in NO active tenant; CSV of UUIDs →
+// active membership in ANY listed tenant. Returns a clause to AND into an
+// existing (parenthesised!) WHERE plus the params to append.
+function _tenantsFilter(req, playerAlias, nextParamIdx) {
+    const raw = String(req.query.tenants || '').trim();
+    if (!raw || raw.toLowerCase() === 'all') return { clause: '', params: [] };
+    if (raw.toLowerCase() === 'none') {
+        return {
+            clause: ` AND NOT EXISTS (SELECT 1 FROM player_tenants _pt WHERE _pt.player_id = ${playerAlias}.id AND _pt.status = 'active')`,
+            params: [],
+        };
+    }
+    const ids = raw.split(',').map(s => s.trim()).filter(s => isValidUuid(s));
+    if (!ids.length) return { clause: '', params: [] };
+    return {
+        clause: ` AND EXISTS (SELECT 1 FROM player_tenants _pt WHERE _pt.player_id = ${playerAlias}.id AND _pt.tenant_id = ANY($${nextParamIdx}::uuid[]) AND _pt.status = 'active')`,
+        params: [ids],
+    };
+}
+// FIX-501: light tenant list for the filter popup — any authed caller (tenant
+// admins need it to expand). Names only, no config exposed.
+app.get('/api/tenants/list-for-filter', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, name FROM tenants ORDER BY name ASC NULLS LAST`); // FIX-501b: no status column on tenants — audit caught COALESCE(status,…) would 500; shape matches the proven web80 list query
+        res.json({ tenants: r.rows, default_tenant_id: await _resolveCallerLinkTenant(req.user) });
+    } catch (e) {
+        console.error('tenants list-for-filter error:', e.message);
+        res.status(500).json({ error: 'Failed to load tenants' });
+    }
+});
+
+// FIX-498: WhatsApp link validation — chat invite or wa.me only, sane length.
+function _isValidWhatsAppLink(u) {
+    return typeof u === 'string' && u.length <= 300
+        && /^https:\/\/(chat\.whatsapp\.com\/|wa\.me\/)[A-Za-z0-9+_\-\/?=&.]+$/.test(u.trim()); // FIX-498b: allow wa.me/+44… and wa.me/message/…
+}
+// FIX-498: resolve the calling admin's tenant for the saved-links library.
+// superadmin/admin → TF Coventry; otherwise the first tenant where the caller
+// is tenant_admin. Returns null if none (403 upstream).
+async function _resolveCallerLinkTenant(user) {
+    if (user.role === 'admin' || user.role === 'superadmin') return TF_COVENTRY_TENANT_ID;
+    try {
+        const r = await pool.query(
+            `SELECT tenant_id FROM player_tenants
+              WHERE player_id = $1 AND role = 'tenant_admin'
+              ORDER BY created_at ASC LIMIT 1`,
+            [user.playerId]);
+        return r.rows[0]?.tenant_id || null;
+    } catch (_) { return null; }
+}
+// FIX-498: saved WhatsApp links library (per tenant).
+app.get('/api/admin/whatsapp-links', authenticateToken, async (req, res) => {
+    try {
+        const tenantId = await _resolveCallerLinkTenant(req.user);
+        if (!tenantId) return res.status(403).json({ error: 'No tenant context' });
+        const r = await pool.query(
+            `SELECT id, label, url FROM tenant_whatsapp_links
+              WHERE tenant_id = $1 ORDER BY label ASC`,
+            [tenantId]);
+        res.json({ links: r.rows });
+    } catch (e) {
+        console.error('whatsapp-links list error:', e.message);
+        res.status(500).json({ error: 'Failed to load links' });
+    }
+});
+app.post('/api/admin/whatsapp-links', authenticateToken, async (req, res) => {
+    try {
+        const tenantId = await _resolveCallerLinkTenant(req.user);
+        if (!tenantId) return res.status(403).json({ error: 'No tenant context' });
+        const label = String(req.body.label || '').trim().slice(0, 80);
+        const url = String(req.body.url || '').trim();
+        if (!label) return res.status(400).json({ error: 'Label is required' });
+        if (!_isValidWhatsAppLink(url)) return res.status(400).json({ error: 'Link must be a https://chat.whatsapp.com/… or https://wa.me/… URL' });
+        const dupe = await pool.query(
+            'SELECT id FROM tenant_whatsapp_links WHERE tenant_id = $1 AND url = $2 LIMIT 1',
+            [tenantId, url]);
+        if (dupe.rows.length) return res.json({ success: true, id: dupe.rows[0].id, deduped: true });
+        const r = await pool.query(
+            `INSERT INTO tenant_whatsapp_links (tenant_id, label, url)
+             VALUES ($1, $2, $3) RETURNING id`,
+            [tenantId, label, url]);
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) {
+        console.error('whatsapp-links save error:', e.message);
+        res.status(500).json({ error: 'Failed to save link' });
+    }
+});
+app.delete('/api/admin/whatsapp-links/:id', authenticateToken, async (req, res) => {
+    try {
+        const tenantId = await _resolveCallerLinkTenant(req.user);
+        if (!tenantId) return res.status(403).json({ error: 'No tenant context' });
+        const r = await pool.query(
+            'DELETE FROM tenant_whatsapp_links WHERE id = $1 AND tenant_id = $2',
+            [parseInt(req.params.id, 10) || 0, tenantId]);
+        res.json({ success: true, deleted: r.rowCount });
+    } catch (e) {
+        console.error('whatsapp-links delete error:', e.message);
+        res.status(500).json({ error: 'Failed to delete link' });
+    }
+});
+
 app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res) => {
     const _t0 = Date.now(); // PERF instrumentation — see logs below
     try {
@@ -7550,6 +7688,10 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
         // basic identity + rating + balance. ~100x faster than full mode.
         // Heavy mode preserved for manage-players grid + public directory.
         const isLight = req.query.light === '1' || req.query.light === 'true';
+        // FIX-501c: tenant filter for LIGHT mode only — every picker (add
+        // player, friends, relationships, new-message, tournament entry) uses
+        // light=1; full mode feeds leaderboards, which stay global by design.
+        const _tfPl = _tenantsFilter(req, 'p', 1);
         const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
 
         if (isLight) {
@@ -7571,9 +7713,10 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
                 FROM players p
                 LEFT JOIN credits c ON c.player_id = p.id
                 LEFT JOIN users u ON u.id = p.user_id
+                WHERE TRUE${_tfPl.clause} /* FIX-501c */
                 ORDER BY p.squad_number NULLS LAST, p.full_name
                 LIMIT 5000
-            `);
+            `, _tfPl.params);
             console.log(`[/api/players] light=1 rows=${lightResult.rows.length} ms=${Date.now()-_t0} pool(total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount})`);
             if (isAdmin) {
                 return res.json(lightResult.rows);
@@ -7712,12 +7855,13 @@ app.get('/api/players', authenticateToken, playerLookupLimiter, async (req, res)
 // the gates on the forms that consume it.
 app.get('/api/players/organisers', authenticateToken, requireAdmin, async (req, res) => {
     try {
+        const _tfOrg = _tenantsFilter(req, 'p', 1); // FIX-501
         const result = await pool.query(`
             SELECT p.id, p.full_name, p.alias, p.squad_number
             FROM players p
-            WHERE p.is_organiser = TRUE
+            WHERE p.is_organiser = TRUE${_tfOrg.clause} /* FIX-501 */
             ORDER BY COALESCE(NULLIF(p.alias, ''), p.full_name) ASC
-        `);
+        `, _tfOrg.params);
         res.json({ organisers: result.rows });
     } catch (error) {
         console.error('Organisers list error:', error);
@@ -7746,25 +7890,27 @@ app.get('/api/admin/players/search', authenticateToken, requireAdmin, async (req
         // does not exist, 500-ing the endpoint (and the 4 features that call it).
         // Rewritten to LEFT JOIN users (matches the grid query convention just below;
         // LEFT so players without a user row still appear). Explicit columns, no SELECT *.
+        // FIX-501: tenant filter — param index depends on branch ($3 numeric, $2 text)
+        const _tf = _tenantsFilter(req, 'p', isNumeric ? 3 : 2);
         const sql = isNumeric
             ? `SELECT p.id, p.alias, p.full_name, p.squad_number, u.email
                  FROM players p
                  LEFT JOIN users u ON u.id = p.user_id
-                WHERE LOWER(p.alias)     LIKE $1
+                WHERE (LOWER(p.alias)   LIKE $1
                    OR LOWER(p.full_name) LIKE $1
                    OR LOWER(u.email)     LIKE $1
-                   OR p.squad_number = $2
+                   OR p.squad_number = $2)${_tf.clause} /* FIX-501: parens so the tenant AND binds the whole OR-chain */
                 ORDER BY (p.squad_number = $2) DESC, p.alias NULLS LAST, p.full_name
                 LIMIT 50`
             : `SELECT p.id, p.alias, p.full_name, p.squad_number, u.email
                  FROM players p
                  LEFT JOIN users u ON u.id = p.user_id
-                WHERE LOWER(p.alias)     LIKE $1
+                WHERE (LOWER(p.alias)   LIKE $1
                    OR LOWER(p.full_name) LIKE $1
-                   OR LOWER(u.email)     LIKE $1
+                   OR LOWER(u.email)     LIKE $1)${_tf.clause} /* FIX-501 */
                 ORDER BY p.alias NULLS LAST, p.full_name
                 LIMIT 50`;
-        const params = isNumeric ? [like, squadNum] : [like];
+        const params = isNumeric ? [like, squadNum, ..._tf.params] : [like, ..._tf.params]; // FIX-501
 
         const result = await pool.query(sql, params);
         res.json({ players: result.rows });
@@ -8201,7 +8347,9 @@ app.get('/api/players/:playerId/games', authenticateToken, async (req, res) => {
         // Get completed games
         const completedResult = await pool.query(`
             SELECT g.id, g.game_date, g.game_url, g.winning_team,
-                   g.score_team_a, g.score_team_b,
+                   -- FIX-492: removed the two phantom score columns (exist nowhere in the
+                   -- schema or the rest of the code); selecting them 500'd this endpoint so
+                   -- the profile upcoming/completed games sections were permanently blank.
                    v.name as venue_name,
                    -- Did this player win?
                    CASE WHEN g.winning_team IS NOT NULL AND g.winning_team != '' AND EXISTS (
@@ -8684,7 +8832,7 @@ app.put('/api/players/me', authenticateToken, async (req, res) => {
 // Shared position/region whitelists
 const _PREFS_ALLOWED_POSITIONS = new Set(['GK','LB','RB','CB','DM','CM','AM','LM','RM','CF']);
 const _PREFS_ALLOWED_AREAS     = new Set(['defence','midfield','attack']);
-const _PREFS_ALLOWED_LOCATIONS = new Set(['Birmingham','Coventry','Manchester','Nuneaton','Leamington & Warwick']); // FIX-107
+const _PREFS_ALLOWED_LOCATIONS = new Set(UK_REGIONS); // FIX-493: prefs accept every canonical UK region (was FIX-107 5-town list)
 
 // GET /api/player/preferences — returns all prefs for current player
 app.get('/api/player/preferences', authenticateToken, async (req, res) => {
@@ -8989,8 +9137,8 @@ app.delete('/api/player/favourite-venues/:venueId', authenticateToken, async (re
 // endpoints (e.g. /api/games) remain untouched so the live dashboard keeps
 // working until v2 is confirmed and replaces it.
 //
-// Region semantics: matches _PREFS_ALLOWED_LOCATIONS — Coventry, Birmingham,
-// Leamington & Warwick, Nuneaton, Manchester. 'ALL' returns all regions
+// Region semantics: matches _PREFS_ALLOWED_LOCATIONS — every canonical UK
+// region since FIX-493 (was the 5-town FIX-107 list). 'ALL' returns all regions
 // (used as the brand-new-player default).
 //
 // Tier visibility: bronze=24h ahead, silver=7d, gold=28d, white/black=banned.
@@ -9023,7 +9171,7 @@ function _resolveSliderRegion(player, requestedRegion) {
 // where left of the cursor = past games, right = upcoming.
 //
 // Query params:
-//   ?region=Coventry|...|ALL    Override player's default region
+//   ?region=<any canonical UK region>|ALL    Override player's default region (FIX-493)
 //   ?upcoming=20                 How many upcoming games to fetch (default 20, max 50)
 //   ?recent=20                   How many recently-completed games (default 20, max 50)
 //
@@ -9335,7 +9483,7 @@ app.get('/api/dashboard/my-booked-games', authenticateToken, async (req, res) =>
 // frontend-friendly metadata for the new horizontal Timeline component.
 //
 // Query params:
-//   ?region=Coventry|Birmingham|Manchester|Nuneaton|Leamington & Warwick|ALL
+//   ?region=<any canonical UK region>|ALL    Override player's default region (FIX-493)
 //          Override player's profile region for this request only (does not save)
 //   ?search=<keyword>
 //          Optional substring filter: matches venue name, format string, or
@@ -11222,7 +11370,45 @@ app.get('/api/t/:tenant_short_id/admin/upload-token', authenticateToken, require
     res.json({ token: ts + '.' + sig, expires_in: 600 });
 });
 
-// FIX-461c: any logged-in PLAYER can mint a token for their own profile photo
+// FIX-503: tenant gallery — record/list/delete. Uploads go browser →
+// tf-upload-gallery.php (HMAC-token sidecar on Namecheap); only URLs recorded
+// HERE (tenant-admin gated) are ever displayed, and only from our own
+// uploads/gallery path — an orphan file uploaded by a token-holder who isn't a
+// tenant admin can never surface.
+app.get('/api/t/:tenant_short_id/admin/gallery', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, url, caption, created_at FROM tenant_gallery
+              WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100`, [req.tenant.id]);
+        res.json({ items: r.rows });
+    } catch (e) { console.error('gallery list error:', e.message); res.status(500).json({ error: 'Failed to load gallery' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/gallery', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const url = String(req.body.url || '').trim();
+        const caption = String(req.body.caption || '').trim().slice(0, 140) || null;
+        if (!url.startsWith('https://totalfooty.co.uk/uploads/gallery/')) {
+            return res.status(400).json({ error: 'URL must be a TotalFooty gallery upload' });
+        }
+        const count = await pool.query('SELECT COUNT(*) AS c FROM tenant_gallery WHERE tenant_id = $1', [req.tenant.id]);
+        if (parseInt(count.rows[0].c, 10) >= 60) return res.status(400).json({ error: 'Gallery is full (60 photos max) — delete some first' });
+        const r = await pool.query(
+            `INSERT INTO tenant_gallery (tenant_id, url, caption, created_by)
+             VALUES ($1, $2, $3, $4) RETURNING id`,
+            [req.tenant.id, url, caption, req.user.playerId]);
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('gallery add error:', e.message); res.status(500).json({ error: 'Failed to save photo' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/gallery/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            'DELETE FROM tenant_gallery WHERE id = $1 AND tenant_id = $2',
+            [parseInt(req.params.id, 10) || 0, req.tenant.id]);
+        res.json({ success: true, deleted: r.rowCount });
+    } catch (e) { console.error('gallery delete error:', e.message); res.status(500).json({ error: 'Failed to delete photo' }); }
+});
+
+// FIX-461c: any logged-in PLAYER can mint a token for their own profile photo// FIX-461c: any logged-in PLAYER can mint a token for their own profile photo
 // (kind=player). Rate-limited; the PHP kind whitelist + image validation bound
 // the exposure to exactly what the old base64 endpoint already allowed.
 const tfPlayerUploadLimiter = rateLimit({
@@ -12648,8 +12834,14 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
             earlyBirdPrice, superEarlyBirdPrice,
             opponentId,
             pitchCost,   // P2.1
-            defaultOrganiserId   // P3 — auto-add this player as comped organiser on each created game
+            defaultOrganiserId,   // P3 — auto-add this player as comped organiser on each created game
+            whatsappLink   // FIX-498 — optional per-game WhatsApp group link
         } = req.body;
+        // FIX-498: early-reject an invalid link before any DB work.
+        const _waLink = (whatsappLink != null && String(whatsappLink).trim() !== '') ? String(whatsappLink).trim() : null;
+        if (_waLink && !_isValidWhatsAppLink(_waLink)) {
+            return res.status(400).json({ error: 'WhatsApp link must be a https://chat.whatsapp.com/… or https://wa.me/… URL' });
+        }
         const parsedEarlyBird      = earlyBirdPrice      != null && earlyBirdPrice      !== '' ? parseFloat(earlyBirdPrice)      : null;
         const parsedSuperEarlyBird = superEarlyBirdPrice != null && superEarlyBirdPrice !== '' ? parseFloat(superEarlyBirdPrice) : null;
         // P2.1: pitch_cost validation. Optional in this server release — frontend
@@ -12789,8 +12981,8 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                             early_bird_price, super_early_bird_price, opponent_id,
                             pitch_cost,
                             default_organiser_id,
-                            tenant_id /* FIX-340 */
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) /* FIX-340: $30 = tenant_id */
+                            tenant_id /* FIX-340 */, whatsapp_link /* FIX-498 */
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31) /* FIX-340: $30 = tenant_id; FIX-498: $31 = whatsapp_link */
                         RETURNING id`,
                         [
                             venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly', 
@@ -12811,7 +13003,7 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                             resolvedOpponentId,
                             parsedPitchCost,   // P2.1
                             parsedOrganiserId, // P3
-                            TF_COVENTRY_TENANT_ID /* FIX-340 */
+                            TF_COVENTRY_TENANT_ID /* FIX-340 */, _waLink /* FIX-498 */
                         ]
                     ).catch(async (err) => {
                         // P3 — Pre-migration safety: default_organiser_id column missing? Re-run without it.
@@ -12827,8 +13019,8 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                                     refs_required, ref_pay, requires_organiser,
                                     early_bird_price, super_early_bird_price, opponent_id,
                                     pitch_cost,
-                                    tenant_id /* FIX-340 */
-                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29) /* FIX-340: $29 = tenant_id */
+                                    tenant_id /* FIX-340 */, whatsapp_link /* FIX-498 */
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) /* FIX-340: $29 = tenant_id; FIX-498: $30 = whatsapp_link */
                                 RETURNING id`,
                                 [
                                     venueId, weekDate.toISOString(), maxPlayers, costPerPlayer, format, 'weekly',
@@ -12848,7 +13040,7 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                                     parsedSuperEarlyBird,
                                     resolvedOpponentId,
                                     parsedPitchCost,
-                                    TF_COVENTRY_TENANT_ID /* FIX-340 */
+                                    TF_COVENTRY_TENANT_ID /* FIX-340 */, _waLink /* FIX-498 */
                                 ]
                             );
                         }
@@ -12912,8 +13104,8 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                     early_bird_price, super_early_bird_price, opponent_id,
                     pitch_cost,
                     default_organiser_id,
-                    tenant_id /* FIX-340 */
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) /* FIX-340: $30 = tenant_id */
+                    tenant_id /* FIX-340 */, whatsapp_link /* FIX-498 */
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31) /* FIX-340: $30 = tenant_id; FIX-498: $31 = whatsapp_link */
                 RETURNING id`,
                 [
                     venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -12934,7 +13126,7 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                     resolvedOpponentId,
                     parsedPitchCost,   // P2.1
                     parsedOrganiserId, // P3
-                    TF_COVENTRY_TENANT_ID /* FIX-340 */
+                    TF_COVENTRY_TENANT_ID /* FIX-340 */, _waLink /* FIX-498 */
                 ]
             ).catch(async (err) => {
                 // Pre-migration safety: default_organiser_id column missing? Re-run without it.
@@ -12949,8 +13141,8 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                             refs_required, ref_pay, requires_organiser,
                             early_bird_price, super_early_bird_price, opponent_id,
                             pitch_cost,
-                            tenant_id /* FIX-340 */
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29) /* FIX-340: $29 = tenant_id */
+                            tenant_id /* FIX-340 */, whatsapp_link /* FIX-498 */
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) /* FIX-340: $29 = tenant_id; FIX-498: $30 = whatsapp_link */
                         RETURNING id`,
                         [
                             venueId, gameDate, maxPlayers, costPerPlayer, format, 'one-off', 
@@ -12970,7 +13162,7 @@ app.post('/api/admin/games', authenticateToken, requireAdmin, async (req, res) =
                             parsedSuperEarlyBird,
                             resolvedOpponentId,
                             parsedPitchCost,
-                            TF_COVENTRY_TENANT_ID /* FIX-340 */
+                            TF_COVENTRY_TENANT_ID /* FIX-340 */, _waLink /* FIX-498 */
                         ]
                     );
                 }
@@ -13108,6 +13300,35 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
         );
         const newSeriesId = newSeries.rows[0].id;
 
+        // FIX-496: recreation is a CONTINUATION — inherit the tenant from the
+        // parent series' games instead of hardcoding TF Coventry (the FIX-340
+        // shortcut stamped a recreated tenant series' new games as Coventry).
+        // Fallback to TF Coventry only if the parent has no tenant-tagged games.
+        let _inheritedTenantId = TF_COVENTRY_TENANT_ID;
+        try {
+            const tRes = await client.query(
+                `SELECT tenant_id FROM games
+                  WHERE series_id = $1 AND tenant_id IS NOT NULL
+                  ORDER BY game_date DESC LIMIT 1`,
+                [parent_series_id]);
+            if (tRes.rows.length && tRes.rows[0].tenant_id) _inheritedTenantId = tRes.rows[0].tenant_id;
+        } catch (_) { /* keep Coventry fallback */ }
+        // FIX-498: carry the WhatsApp link too — explicit template value wins,
+        // else inherit the parent series' most recent game's link.
+        let _inheritedWaLink = null;
+        if (game_template.whatsappLink && _isValidWhatsAppLink(String(game_template.whatsappLink).trim())) {
+            _inheritedWaLink = String(game_template.whatsappLink).trim();
+        } else {
+            try {
+                const wRes = await client.query(
+                    `SELECT whatsapp_link FROM games
+                      WHERE series_id = $1 AND whatsapp_link IS NOT NULL
+                      ORDER BY game_date DESC LIMIT 1`,
+                    [parent_series_id]);
+                if (wRes.rows.length) _inheritedWaLink = wRes.rows[0].whatsapp_link;
+            } catch (_) { /* none */ }
+        }
+
         // Create N weekly games using template values (reuse addWeeksLondon for DST safety)
         const createdGames = [];
         for (let i = 0; i < gamesToCreate; i++) {
@@ -13124,8 +13345,8 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
                     early_bird_price, super_early_bird_price, opponent_id,
                     is_venue_clash, venue_clash_team1_name, venue_clash_team2_name,
                     tournament_team_count, tournament_name, external_opponent,
-                    tenant_id /* FIX-340 */
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28) /* FIX-340: $28 = tenant_id */
+                    tenant_id /* FIX-340 */, whatsapp_link /* FIX-498 */
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) /* FIX-340: $28 = tenant_id; FIX-498: $29 = whatsapp_link */
                 RETURNING id, game_url
             `, [
                 game_template.venue_id, gameDate.toISOString(),
@@ -13157,14 +13378,25 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
                 game_template.tournament_team_count || null,
                 game_template.tournament_name || null,
                 game_template.external_opponent || null,
-                TF_COVENTRY_TENANT_ID /* FIX-340 */
+                _inheritedTenantId /* FIX-496: inherited from parent series (was FIX-340 hardcoded Coventry) */,
+                _inheritedWaLink /* FIX-498 */
             ]);
             createdGames.push(inserted.rows[0]);
         }
 
-        // Copy favourites if requested
+        // FIX-496: recreation carries the old series' data forward BY DEFAULT —
+        // the whole point of "recreate" is continuation, not a blank fork.
+        // History (series_trophy_results, finalized standings) stays with the
+        // finished parent season; CONFIG and MEMBERSHIP carry:
+        //   • favourites         — now default ON (send copy_favourites:false to skip)
+        //   • lineup editors     — series_lineup_editors grants
+        //   • fixed teams        — player_fixed_teams assignments (venue-clash continuity)
+        //   • trophy definitions — series_trophies rows (results do NOT copy)
+        // All inside the same transaction; bare ON CONFLICT DO NOTHING is a
+        // belt-and-braces no-op on a fresh series id. 42P01 (table not migrated
+        // on an older DB) skips that carry instead of failing the recreate.
         let favouritesCopied = 0;
-        if (copy_favourites === true || copy_favourites === 'true') {
+        if (copy_favourites !== false && copy_favourites !== 'false') {
             const copied = await client.query(
                 `INSERT INTO player_favourite_series (player_id, series_id)
                  SELECT player_id, $1
@@ -13175,6 +13407,34 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
             );
             favouritesCopied = copied.rowCount;
         }
+        let editorsCopied = 0, fixedTeamsCopied = 0, trophyDefsCopied = 0;
+        try {
+            const ed = await client.query(
+                `INSERT INTO series_lineup_editors (series_id, player_id, added_by)
+                 SELECT $1, player_id, added_by
+                   FROM series_lineup_editors WHERE series_id = $2
+                 ON CONFLICT DO NOTHING`,
+                [newSeriesId, parent_series_id]);
+            editorsCopied = ed.rowCount;
+        } catch (e) { if (e.code !== '42P01') throw e; }
+        try {
+            const ft = await client.query(
+                `INSERT INTO player_fixed_teams (player_id, series_id, fixed_team)
+                 SELECT player_id, $1, fixed_team
+                   FROM player_fixed_teams WHERE series_id = $2
+                 ON CONFLICT DO NOTHING`,
+                [newSeriesId, parent_series_id]);
+            fixedTeamsCopied = ft.rowCount;
+        } catch (e) { if (e.code !== '42P01') throw e; }
+        try {
+            const td = await client.query(
+                `INSERT INTO series_trophies (series_id, metric_id, calculation_type, tier)
+                 SELECT $1, metric_id, calculation_type, tier
+                   FROM series_trophies WHERE series_id = $2
+                 ON CONFLICT DO NOTHING`,
+                [newSeriesId, parent_series_id]);
+            trophyDefsCopied = td.rowCount;
+        } catch (e) { if (e.code !== '42P01') throw e; }
 
         await client.query('COMMIT');
 
@@ -13268,6 +13528,10 @@ app.post('/api/admin/game-series/recreate', authenticateToken, requireGameManage
             new_series_id: newSeriesId,
             games_created: createdGames.length,
             favourites_copied: favouritesCopied,
+            lineup_editors_copied: editorsCopied,        // FIX-496
+            fixed_teams_copied: fixedTeamsCopied,        // FIX-496
+            trophy_definitions_copied: trophyDefsCopied, // FIX-496
+            tenant_id: _inheritedTenantId,               // FIX-496
             games: createdGames,
         });
     } catch (e) {
@@ -21249,10 +21513,32 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
             );
             seriesName = seriesNameResult.rows[0]?.series_name || 'Unknown';
 
+            // FIX-495: a recreated/continued series is a CHAIN of game_series rows
+            // (child.parent_series_id -> parent, see /api/admin/game-series/recreate).
+            // Deleting by the anchor's single series_id only removed one segment of
+            // the chain, leaving the rest to be deleted manually. Select the whole
+            // FAMILY instead: walk UP to the root (depth-capped straight line), then
+            // recursively DOWN through every descendant (UNION dedup = cycle-safe).
+            // Same mechanism FIX-427 used for reminder scoping. Strict superset of
+            // the old behaviour: an unrecreated series is a family of one.
             seriesGames = await client.query(`
+                WITH RECURSIVE up AS (
+                    SELECT id, parent_series_id, 0 AS depth
+                      FROM game_series WHERE id = $1
+                  UNION ALL
+                    SELECT s.id, s.parent_series_id, up.depth + 1
+                      FROM game_series s JOIN up ON s.id = up.parent_series_id
+                     WHERE up.depth < 50
+                ), rootpick AS (
+                    SELECT id FROM up ORDER BY depth DESC LIMIT 1
+                ), fam AS (
+                    SELECT id FROM rootpick
+                  UNION
+                    SELECT s.id FROM game_series s JOIN fam ON s.parent_series_id = fam.id
+                )
                 SELECT id FROM games
-                WHERE series_id = $1
-                AND game_date > CURRENT_TIMESTAMP
+                 WHERE series_id IN (SELECT id FROM fam)
+                   AND game_date > CURRENT_TIMESTAMP
             `, [game.series_id]);
         } else {
             // Legacy path: game was created before series_id was added.
@@ -21294,6 +21580,14 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
         const cost = parseFloat(game.cost_per_player);
         
         for (const gid of gameIds) {
+            // FIX-497: legacy-fallback refunds (rows with no amount_paid recorded)
+            // must use THIS game's price, not the anchor's — with FIX-495 the loop
+            // now spans a recreated chain whose segments can carry different prices.
+            let gCost = cost;
+            try {
+                const gcRes = await client.query('SELECT cost_per_player FROM games WHERE id = $1', [gid]);
+                if (gcRes.rows.length && gcRes.rows[0].cost_per_player != null) gCost = parseFloat(gcRes.rows[0].cost_per_player);
+            } catch (_) { /* anchor cost fallback */ }
             // Refund all players who paid (confirmed + confirmed_backup).
             // web47 round 2 — W-71b fix: include amount_paid_free portion (mirrors
             // single-game cancellation fix above).
@@ -21312,7 +21606,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
                 const refundPaid = parseFloat(reg.amount_paid || 0);
                 const refundFree = parseFloat(reg.amount_paid_free || 0);
                 const useFallback = !reg.amount_paid && !reg.amount_paid_free;
-                const realRefund = useFallback ? cost : refundPaid;
+                const realRefund = useFallback ? gCost : refundPaid; // FIX-497
                 const refundTarget = reg.registered_by_player_id || reg.player_id;
                 if (realRefund > 0) {
                     await client.query(
@@ -25261,6 +25555,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                    g.regularity, g.star_rating, g.star_rating_locked, g.min_rating_enabled,
                    g.position_type,
                    g.external_league_id, g.is_home, g.away_venue_name, g.away_postcode,
+                   g.whatsapp_link, /* FIX-498 */
                    g.away_pitch_pin, g.away_parking_pin, g.away_pitch_type,
                    g.assigned_coach_player_id, g.ext_tf_score, g.ext_opp_score,
                    g.teams_generated,
@@ -25464,6 +25759,7 @@ app.get('/api/public/game/:gameUrl/details', async (req, res) => {
                 }
             }
         res.json({
+            whatsapp_link: game.whatsapp_link || null, // FIX-498
             id: game.id,
             game_url: game.game_url,
             league: _leagueBlock, // FIX-405 Block N: null for normal games
@@ -26214,6 +26510,7 @@ app.get('/api/public/games/completed', async (req, res) => {
 // squad_number only. Sorted by alias for predictable dropdown + search.
 app.get('/api/admin/players/picker', authenticateToken, requireAdmin, async (req, res) => {
     try {
+        const _tfPk = _tenantsFilter(req, 'p', 1); // FIX-501
         const result = await pool.query(`
             SELECT id, alias, full_name, photo_url, squad_number
               FROM players
@@ -26247,10 +26544,10 @@ app.get('/api/public/players/leaderboard', async (req, res) => {
                     FROM player_badges pb JOIN badges b ON pb.badge_id = b.id
                     WHERE pb.player_id = p.id) AS badges
             FROM players p
-            WHERE p.total_appearances > 0
+            WHERE p.total_appearances > 0${_tfPk.clause} /* FIX-501 */
             ORDER BY (p.total_wins + p.total_draws * 0.5) DESC, p.total_appearances DESC
             LIMIT 50
-        `);
+        `, _tfPk.params);
         res.json(result.rows);
     } catch (error) {
         console.error('Public leaderboard error:', error);
@@ -39719,6 +40016,7 @@ async function sendCoachingEmail(playerIds, subject, htmlBody) {
 // ══════════════════════════════════════════════════════════════
 app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req, res) => {
     try {
+        const _tfCo = _tenantsFilter(req, 'p', 1); // FIX-501c (public: absent param = all, unchanged)
         const result = await pool.query(`
             SELECT p.id, p.full_name AS player_name, p.alias, p.photo_url AS profile_photo,
                    p.coach_certifications, p.coach_experience,
@@ -39729,11 +40027,12 @@ app.get('/api/coaching/coaches', optionalAuth, publicEndpointLimiter, async (req
             JOIN player_badges pb ON pb.player_id = p.id
             JOIN badges b ON b.id = pb.badge_id AND b.name = 'Coach'
             LEFT JOIN coaching_feedback cf ON cf.coach_player_id = p.id
+            WHERE TRUE${_tfCo.clause} /* FIX-501c */
             GROUP BY p.id, p.full_name, p.alias, p.photo_url,
                      p.coach_certifications, p.coach_experience,
                      p.coach_min_hourly_rate, p.coaching_appearances
             ORDER BY p.coaching_appearances DESC
-        `);
+        `, _tfCo.params);
         res.json(result.rows);
     } catch (e) {
         console.error('GET /api/coaching/coaches:', e.message);
@@ -41286,6 +41585,69 @@ app.put('/api/t/:tenant_short_id/admin/external-awards', authenticateToken, requ
 
 // ADD FIXTURE — pick a date on the calendar, set the opponent, create the game.
 // Inserts a normal vs_external game (RSVP/payments work as standard) + ext fields.
+// FIX-504 (FA-sync S1): the FIX-463 fixture-creation logic, extracted verbatim
+// into a shared core so the CSV importer reuses it instead of duplicating the
+// INSERT (venue-placeholder + pitch-cost pinning semantics stay in ONE place).
+// db = pool (single create) or a transaction client (bulk import).
+// Throws { status, error } for validation failures.
+async function _extCreateFixtureCore(db, tenant, L, b) {
+    const when = new Date(b.game_date);
+    if (isNaN(when.getTime())) throw { status: 400, error: 'Valid fixture date/time required' };
+    if (!b.opponent_id) throw { status: 400, error: 'Opponent is required for every fixture' };
+    const opp = await db.query('SELECT id, name FROM opponents WHERE id = $1', [b.opponent_id]);
+    if (!opp.rows.length) throw { status: 400, error: 'Unknown opponent' };
+    const isHome = b.is_home !== false;
+    let venueId = null;
+    if (isHome) {
+        venueId = b.venue_id || L.default_venue_id;
+        if (!venueId) throw { status: 400, error: 'Home fixture needs a venue (set a league default or pick one)' };
+    } else {
+        if (!b.away_venue_name || !String(b.away_venue_name).trim()) throw { status: 400, error: 'Away fixture needs a venue name' };
+        // FIX-463 audit: games.venue_id nullability is unconfirmed on live. Away
+        // fixtures carry the league's default venue id as a harmless placeholder
+        // (the /details endpoint substitutes the manual away_* fields for ALL
+        // display surfaces, so the placeholder never renders). NULL would be
+        // cleaner but risks a 23502 on a NOT NULL constraint.
+        venueId = L.default_venue_id || null;
+    }
+    const maxPlayers = _intOpt(b.max_players, 1, 999, 16);
+    if (Number.isNaN(maxPlayers)) throw { status: 400, error: 'max_players must be a whole number' };
+    const cost = b.cost_per_player === undefined || b.cost_per_player === '' ? 0 : parseFloat(b.cost_per_player);
+    if (isNaN(cost) || cost < 0 || cost > 500) throw { status: 400, error: 'Cost must be 0-500' };
+    const coachId = b.assigned_coach_player_id || L.default_coach_player_id || null;
+    const gameUrl = 'xg-' + Math.random().toString(36).slice(2, 10);
+    // star_rating is NULL (not 0): games_star_rating_check enforces 1-5 OR NULL; external fixtures are unrated.
+    const ins = await db.query(`
+        INSERT INTO games (
+            venue_id, game_date, max_players, cost_per_player, format, regularity,
+            exclusivity, position_type, game_url,
+            team_selection_type, external_opponent, opponent_id,
+            refs_required, ref_pay, requires_organiser,
+            star_rating, star_rating_locked, tenant_id,
+            external_league_id, is_home, away_venue_name, away_postcode,
+            away_pitch_pin, away_parking_pin, away_pitch_type, assigned_coach_player_id,
+            pitch_cost
+        ) VALUES ($1,$2,$3,$4,$5,'one-off','everyone','outfield_gk',$6,
+                  'vs_external',$7,$8,0,0,false,NULL,false,$9,
+                  $10,$11,$12,$13,$14,$15,$16,$17,$18)
+        RETURNING id, game_url`,
+        [venueId, when.toISOString(), maxPlayers, cost,
+         b.format ? String(b.format).slice(0, 20) : '11-a-side',
+         gameUrl, opp.rows[0].name, opp.rows[0].id, tenant.id,
+         L.id, isHome,
+         isHome ? null : String(b.away_venue_name).trim().slice(0, 100),
+         isHome ? null : (b.away_postcode ? String(b.away_postcode).trim().slice(0, 12) : null),
+         isHome ? null : (b.away_pitch_pin ? String(b.away_pitch_pin).trim().slice(0, 200) : null),
+         isHome ? null : (b.away_parking_pin ? String(b.away_parking_pin).trim().slice(0, 200) : null),
+         isHome ? null : (b.away_pitch_type ? String(b.away_pitch_type).trim().slice(0, 30) : null),
+         coachId,
+         // FIX-463 audit: away fixtures pin pitch_cost to 0 so the placeholder
+         // home venue's default cannot leak phantom costs into finance.
+         // Home fixtures stay NULL -> venue default, editable in Finance.
+         isHome ? null : 0]);
+    return { game_id: ins.rows[0].id, game_url: ins.rows[0].game_url, opponent_name: opp.rows[0].name, when, isHome };
+}
+
 app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fixtures', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
         const xl = await pool.query(
@@ -41293,68 +41655,125 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fixtures', authenticateT
               WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
         if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
         const L = xl.rows[0];
-        const b = req.body || {};
-        const when = new Date(b.game_date);
-        if (isNaN(when.getTime())) return res.status(400).json({ error: 'Valid fixture date/time required' });
-        if (!b.opponent_id) return res.status(400).json({ error: 'Opponent is required for every fixture' });
-        const opp = await pool.query('SELECT id, name FROM opponents WHERE id = $1', [b.opponent_id]);
-        if (!opp.rows.length) return res.status(400).json({ error: 'Unknown opponent' });
-        const isHome = b.is_home !== false;
-        let venueId = null;
-        if (isHome) {
-            venueId = b.venue_id || L.default_venue_id;
-            if (!venueId) return res.status(400).json({ error: 'Home fixture needs a venue (set a league default or pick one)' });
-        } else {
-            if (!b.away_venue_name || !String(b.away_venue_name).trim()) return res.status(400).json({ error: 'Away fixture needs a venue name' });
-            // FIX-463 audit: games.venue_id nullability is unconfirmed on live. Away
-            // fixtures carry the league's default venue id as a harmless placeholder
-            // (the /details endpoint substitutes the manual away_* fields for ALL
-            // display surfaces, so the placeholder never renders). NULL would be
-            // cleaner but risks a 23502 on a NOT NULL constraint.
-            venueId = L.default_venue_id || null;
-        }
-        const maxPlayers = _intOpt(b.max_players, 1, 999, 16);
-        if (Number.isNaN(maxPlayers)) return res.status(400).json({ error: 'max_players must be a whole number' });
-        const cost = b.cost_per_player === undefined || b.cost_per_player === '' ? 0 : parseFloat(b.cost_per_player);
-        if (isNaN(cost) || cost < 0 || cost > 500) return res.status(400).json({ error: 'Cost must be 0-500' });
-        const coachId = b.assigned_coach_player_id || L.default_coach_player_id || null;
-        const gameUrl = 'xg-' + Math.random().toString(36).slice(2, 10);
-        // star_rating is NULL (not 0): games_star_rating_check enforces 1-5 OR NULL; external fixtures are unrated.
-        const ins = await pool.query(`
-            INSERT INTO games (
-                venue_id, game_date, max_players, cost_per_player, format, regularity,
-                exclusivity, position_type, game_url,
-                team_selection_type, external_opponent, opponent_id,
-                refs_required, ref_pay, requires_organiser,
-                star_rating, star_rating_locked, tenant_id,
-                external_league_id, is_home, away_venue_name, away_postcode,
-                away_pitch_pin, away_parking_pin, away_pitch_type, assigned_coach_player_id,
-                pitch_cost
-            ) VALUES ($1,$2,$3,$4,$5,'one-off','everyone','outfield_gk',$6,
-                      'vs_external',$7,$8,0,0,false,NULL,false,$9,
-                      $10,$11,$12,$13,$14,$15,$16,$17,$18)
-            RETURNING id, game_url`,
-            [venueId, when.toISOString(), maxPlayers, cost,
-             b.format ? String(b.format).slice(0, 20) : '11-a-side',
-             gameUrl, opp.rows[0].name, opp.rows[0].id, req.tenant.id,
-             L.id, isHome,
-             isHome ? null : String(b.away_venue_name).trim().slice(0, 100),
-             isHome ? null : (b.away_postcode ? String(b.away_postcode).trim().slice(0, 12) : null),
-             isHome ? null : (b.away_pitch_pin ? String(b.away_pitch_pin).trim().slice(0, 200) : null),
-             isHome ? null : (b.away_parking_pin ? String(b.away_parking_pin).trim().slice(0, 200) : null),
-             isHome ? null : (b.away_pitch_type ? String(b.away_pitch_type).trim().slice(0, 30) : null),
-             coachId,
-             // FIX-463 audit: away fixtures pin pitch_cost to 0 so the placeholder
-             // home venue's default cannot leak phantom costs into finance.
-             // Home fixtures stay NULL -> venue default, editable in Finance.
-             isHome ? null : 0]);
+        const out = await _extCreateFixtureCore(pool, req.tenant, L, req.body || {});
         await auditLog(pool, req.user.playerId, 'ext_fixture_created', null,
-            `${L.name}: vs ${opp.rows[0].name} ${when.toISOString()} (${isHome ? 'H' : 'A'})`, req.tenant.id).catch(() => {});
-        res.status(201).json({ ok: true, game_id: ins.rows[0].id, game_url: ins.rows[0].game_url,
-            game_link: 'https://api.totalfooty.co.uk/g/' + ins.rows[0].game_url });
+            `${L.name}: vs ${out.opponent_name} ${out.when.toISOString()} (${out.isHome ? 'H' : 'A'})`, req.tenant.id).catch(() => {});
+        res.status(201).json({ ok: true, game_id: out.game_id, game_url: out.game_url,
+            game_link: 'https://api.totalfooty.co.uk/g/' + out.game_url });
     } catch (e) {
+        if (e && e.status) return res.status(e.status).json({ error: e.error });
         console.error('FIX-463 fixture error:', e.message);
         res.status(500).json({ error: 'Could not create fixture' });
+    }
+});
+
+// FIX-504 (FA-sync S1): CSV import. Stable row identity (league | date-day |
+// opponent | H/A) for dedupe now and the S3 three-way merge later.
+function _extImportKey(leagueId, row) {
+    const d = new Date(row.game_date);
+    const day = isNaN(d.getTime()) ? 'bad' : d.toISOString().slice(0, 10);
+    const raw = `${leagueId}|${day}|${String(row.opponent || '').trim().toLowerCase()}|${row.is_home === false ? 'A' : 'H'}`;
+    return require('crypto').createHash('sha256').update(raw).digest('hex').slice(0, 32);
+}
+function _extNormaliseRow(r) {
+    return {
+        game_date: r.game_date, opponent: String(r.opponent || '').trim().slice(0, 80),
+        is_home: r.is_home !== false && String(r.is_home).toLowerCase() !== 'false',
+        venue_id: r.venue_id || null,
+        away_venue_name: r.away_venue_name ? String(r.away_venue_name).trim().slice(0, 100) : null,
+        cost_per_player: r.cost_per_player, max_players: r.max_players, format: r.format,
+    };
+}
+// Preview: READ-ONLY categorisation — writes nothing.
+app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/import-preview', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const xl = await pool.query(
+            `SELECT id, name, default_venue_id FROM external_leagues
+              WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        const L = xl.rows[0];
+        const rows = Array.isArray(req.body.rows) ? req.body.rows.slice(0, 200) : [];
+        if (!rows.length) return res.status(400).json({ error: 'No rows supplied' });
+        const items = rows.map(r => {
+            const n = _extNormaliseRow(r);
+            const d = new Date(n.game_date);
+            let problem = null;
+            if (isNaN(d.getTime())) problem = 'Bad date';
+            else if (!n.opponent) problem = 'Missing opponent';
+            else if (n.is_home && !n.venue_id && !L.default_venue_id) problem = 'Home fixture needs a venue (no league default)';
+            else if (!n.is_home && !n.away_venue_name) problem = 'Away fixture needs a venue name';
+            return { row: n, key: _extImportKey(L.id, n), problem };
+        });
+        const keys = items.filter(x => !x.problem).map(x => x.key);
+        const dupes = keys.length ? await pool.query(
+            `SELECT ext_source_key FROM games
+              WHERE external_league_id = $1 AND ext_source_key = ANY($2::text[])`,
+            [L.id, keys]) : { rows: [] };
+        const dupeSet = new Set(dupes.rows.map(r => r.ext_source_key));
+        res.json({
+            league: L.name,
+            items: items.map(x => ({
+                row: x.row, key: x.key,
+                status: x.problem ? 'invalid' : (dupeSet.has(x.key) ? 'already_imported' : 'new'),
+                problem: x.problem || null,
+            })),
+        });
+    } catch (e) {
+        console.error('import-preview error:', e.message);
+        res.status(500).json({ error: 'Preview failed' });
+    }
+});
+// Apply: all-or-nothing transaction over the ticked rows.
+app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/import-apply', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const xl = await client.query(
+            `SELECT id, name, default_venue_id, default_coach_player_id FROM external_leagues
+              WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
+        if (!xl.rows.length) { client.release(); return res.status(404).json({ error: 'League not found' }); }
+        const L = xl.rows[0];
+        const rows = Array.isArray(req.body.rows) ? req.body.rows.slice(0, 200) : [];
+        if (!rows.length) { client.release(); return res.status(400).json({ error: 'No rows supplied' }); }
+        await client.query('BEGIN');
+        const created = [], skipped = [];
+        for (const r of rows) {
+            const n = _extNormaliseRow(r);
+            const key = _extImportKey(L.id, n);
+            const dupe = await client.query(
+                'SELECT id FROM games WHERE external_league_id = $1 AND ext_source_key = $2 LIMIT 1', [L.id, key]);
+            if (dupe.rows.length) { skipped.push({ key, reason: 'already imported' }); continue; }
+            let oppId;
+            const found = await client.query('SELECT id FROM opponents WHERE LOWER(name) = LOWER($1) LIMIT 1', [n.opponent]);
+            if (found.rows.length) oppId = found.rows[0].id;
+            else {
+                try {
+                    const insOpp = await client.query(
+                        'INSERT INTO opponents (name, logo_url, star_rating, social_instagram, social_twitter, social_website) VALUES ($1,NULL,NULL,NULL,NULL,NULL) RETURNING id',
+                        [n.opponent]);
+                    oppId = insOpp.rows[0].id;
+                } catch (oe) {
+                    if (oe.code !== '23505') throw oe;
+                    const again = await client.query('SELECT id FROM opponents WHERE LOWER(name) = LOWER($1) LIMIT 1', [n.opponent]);
+                    oppId = again.rows[0].id;
+                }
+            }
+            const out = await _extCreateFixtureCore(client, req.tenant, L, { ...n, opponent_id: oppId });
+            await client.query(
+                'UPDATE games SET ext_source_key = $1, ext_snapshot = $2 WHERE id = $3',
+                [key, JSON.stringify({ game_date: n.game_date, opponent: n.opponent, is_home: n.is_home, imported_at: new Date().toISOString(), source: 'csv' }), out.game_id]);
+            created.push({ game_id: out.game_id, game_url: out.game_url, opponent: n.opponent });
+        }
+        await client.query('COMMIT');
+        await auditLog(pool, req.user.playerId, 'ext_fixtures_imported', null,
+            `${L.name}: ${created.length} imported, ${skipped.length} skipped (CSV)`, req.tenant.id).catch(() => {});
+        res.json({ success: true, created, skipped });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        const msg = (e && e.status) ? e.error : 'Import failed — nothing was created';
+        console.error('import-apply error:', e.error || e.message);
+        res.status(e && e.status ? e.status : 500).json({ error: msg });
+    } finally {
+        client.release();
     }
 });
 
@@ -62287,6 +62706,80 @@ app.get('/api/admin/run-migration/:step', async (req, res) => {
 });
 
 // ---- Club profile (public, clickable everywhere) — identity + squad + competition history + honours ----
+// FIX-502 (PH-parity): public tenant home — totalfooty.co.uk/<slug>.
+// Accepts slug OR short_id. Explicit columns only; exposes nothing beyond what
+// the public game pages already show. Distinct from /api/public/club (the
+// internal-leagues CLUB entity) — tenants and clubs are different systems.
+app.get('/api/public/tenant/:slug', publicPlayerLimiter, async (req, res) => {
+    try {
+        const key = String(req.params.slug || '').trim().toLowerCase();
+        if (!/^[a-z0-9-]{2,60}$/.test(key)) return res.status(400).json({ error: 'invalid_slug' });
+        const tr = await pool.query(
+            `SELECT id, name, slug, short_id, logo_url, primary_color
+               FROM tenants
+              WHERE LOWER(slug) = $1 OR LOWER(short_id) = $1
+              LIMIT 1`, [key]);
+        if (!tr.rows.length) return res.status(404).json({ error: 'tenant_not_found' });
+        const t = tr.rows[0];
+
+        const upcoming = await pool.query(
+            `SELECT g.id, g.game_url, g.game_date, g.cost_per_player, g.max_players,
+                    g.game_type, g.external_opponent, g.is_home, g.whatsapp_link,
+                    v.name AS venue_name, v.region AS venue_region,
+                    (SELECT COUNT(*) FROM registrations r
+                      WHERE r.game_id = g.id AND r.status IN ('confirmed','rsvp')) AS current_players
+               FROM games g
+               LEFT JOIN venues v ON v.id = g.venue_id
+              WHERE g.tenant_id = $1
+                AND g.game_date > CURRENT_TIMESTAMP
+                AND g.game_status IN ('available','confirmed')
+              ORDER BY g.game_date ASC
+              LIMIT 10`, [t.id]);
+
+        const results = await pool.query(
+            `SELECT g.id, g.game_url, g.game_date, g.game_type, g.winning_team,
+                    g.external_opponent, g.is_home, g.ext_tf_score, g.ext_opp_score,
+                    v.name AS venue_name
+               FROM games g
+               LEFT JOIN venues v ON v.id = g.venue_id
+              WHERE g.tenant_id = $1 AND g.game_status = 'completed'
+              ORDER BY g.game_date DESC
+              LIMIT 5`, [t.id]);
+
+        const gallery = await pool.query(
+            `SELECT url, caption FROM tenant_gallery
+              WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 12`, [t.id]
+        ).catch(() => ({ rows: [] })); // FIX-503: 42P01-safe on unmigrated DBs
+
+        res.json({
+            gallery: gallery.rows.map(g => ({ url: g.url, caption: g.caption || null })), // FIX-503
+            tenant: {
+                name: t.name, slug: t.slug, short_id: t.short_id,
+                logo_url: t.logo_url || null, primary_color: t.primary_color || null,
+            },
+            upcoming: upcoming.rows.map(g => ({
+                game_url: g.game_url, game_date: g.game_date,
+                cost_per_player: g.cost_per_player, max_players: g.max_players,
+                current_players: parseInt(g.current_players, 10) || 0,
+                game_type: g.game_type, external_opponent: g.external_opponent || null,
+                is_home: g.is_home, whatsapp_link: g.whatsapp_link || null,
+                venue_name: g.venue_name || null, venue_region: g.venue_region || null,
+            })),
+            results: results.rows.map(g => ({
+                game_url: g.game_url, game_date: g.game_date, game_type: g.game_type,
+                winning_team: g.winning_team || null,
+                external_opponent: g.external_opponent || null, is_home: g.is_home,
+                ext_tf_score: g.ext_tf_score, ext_opp_score: g.ext_opp_score,
+                venue_name: g.venue_name || null,
+            })),
+            join_url: `https://totalfooty.co.uk/${t.short_id}/signup`,
+        });
+    } catch (e) {
+        console.error('public tenant page error:', e.message);
+        res.status(500).json({ error: 'Failed to load team' });
+    }
+});
+
 app.get('/api/public/club/:id', publicPlayerLimiter, async (req, res) => {
     try {
         const cid = req.params.id;
@@ -63616,6 +64109,49 @@ async function bootstrapTenantFreeCredits() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_ptfc_player ON player_tenant_free_credits (player_id)`);
         _ptFreeCreditsReady = true;
         console.log('✅ player_tenant_free_credits ready (FIX-398)');
+
+        // FIX-498: per-game WhatsApp links + tenant saved-links library.
+        await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS whatsapp_link TEXT`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_whatsapp_links (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                label TEXT NOT NULL,
+                url TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_twl_tenant ON tenant_whatsapp_links (tenant_id)`);
+        console.log('✅ tenant_whatsapp_links ready (FIX-498)');
+
+        // FIX-503: tenant photo gallery.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_gallery (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                url TEXT NOT NULL,
+                caption TEXT,
+                created_by UUID,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_tgal_tenant ON tenant_gallery (tenant_id, created_at DESC)`);
+        console.log('✅ tenant_gallery ready (FIX-503)');
+
+        // FIX-504 (FA-sync S1): fixture provenance — stable import identity +
+        // snapshot of external values at last import (the 3-way-merge base for S3).
+        await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS ext_source_key TEXT`);
+        await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS ext_snapshot JSONB`);
+        // FIX-504b (audit): UNIQUE — the dedupe SELECT inside the apply txn is
+        // not concurrency-safe on its own; the constraint makes double-import
+        // structurally impossible (a losing concurrent batch 23505s and rolls
+        // back whole, presenting as ALREADY IN on retry). Safe: rows predating
+        // FIX-504 all have NULL keys, which the partial index excludes.
+        await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_games_ext_source
+            ON games (external_league_id, ext_source_key) WHERE ext_source_key IS NOT NULL`);
+        console.log('✅ ext fixture provenance ready (FIX-504)');
+
+        // FIX-501: cross-tenant people-list filter — supporting indexes (speed).
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_tenant_player ON player_tenants (tenant_id, player_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_pt_player_status ON player_tenants (player_id, status)`);
     } catch (e) {
         console.error('bootstrapTenantFreeCredits failed (non-fatal):', e.message);
     }
@@ -64556,12 +65092,24 @@ function _clearPendingLockRelease(gameId) {
 }
 
 // FIX-357b — outcome email for a queued signup action.
-async function _emailQueueOutcome(playerId, gameId, intentType, outcome) {
+async function _notifyQueueOutcome(playerId, gameId, intentType, outcome) {
+    // FIX-491: deliver the queued-signup outcome on the channel the player
+    // actually uses — push if they're an app user (has a live FCM token),
+    // otherwise email. Every non-success outcome reassures that no charge was
+    // taken (the queue only ever auto-confirms free games, so it is always true).
     try {
         const pr = await pool.query('SELECT email, alias, full_name FROM players WHERE id = $1', [playerId]);
-        const to = pr.rows[0] && pr.rows[0].email;
-        if (!to) return;
-        const name = (pr.rows[0].alias || pr.rows[0].full_name || 'there');
+        if (!pr.rows[0]) return;
+        const to = pr.rows[0].email;
+        const name = (pr.rows[0].alias || pr.rows[0].full_name || "there");
+
+        // Channel detection: any live FCM token means the player is on the app.
+        let hasPush = false;
+        try {
+            const tok = await pool.query('SELECT 1 FROM fcm_tokens WHERE player_id = $1 LIMIT 1', [playerId]);
+            hasPush = tok.rows.length > 0;
+        } catch (_) { /* fcm_tokens missing — fall back to email */ }
+
         const gr = await pool.query(
             `SELECT g.game_date, g.game_url, v.name AS venue_name
                FROM games g LEFT JOIN venues v ON v.id = g.venue_id WHERE g.id = $1`,
@@ -64570,20 +65118,57 @@ async function _emailQueueOutcome(playerId, gameId, intentType, outcome) {
         const g = gr.rows[0] || {};
         const when = g.game_date
             ? new Date(g.game_date).toLocaleString('en-GB', { weekday:'short', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' })
-            : 'the scheduled time';
-        const venue = g.venue_name || 'the venue';
-        const link = g.game_url ? `https://api.totalfooty.co.uk/g/${g.game_url}` : 'https://totalfooty.co.uk';
+            : "the scheduled time";
+        const venue = g.venue_name || "the venue";
+        const link = g.game_url ? `https://api.totalfooty.co.uk/g/${g.game_url}` : "https://totalfooty.co.uk";
+
+        // Reassurance appended to every non-success outcome.
+        const NC_HTML = "<br><br>You have not been charged.";
+        const NC_PUSH = " You have not been charged.";
+
+        // Per-outcome copy: s/b = email subject/body-html, pt/pb = push title/body.
         const M = {
-            registered:       { s: "\u2705 You're in \u2014 spot confirmed",          b: `Hi ${name},<br><br>The game you tried to join was locked by an admin, so your request was queued. It has now gone through \u2014 <strong>you're confirmed</strong> for ${when} at ${venue}.<br><br><a href="${link}">View the game</a>` },
-            payment_required: { s: "Your spot is waiting \u2014 payment needed",       b: `Hi ${name},<br><br>The game you tried to join was locked, so your request was queued. It's open again, but it's a paid game \u2014 please reopen it to confirm and pay for your spot before it fills.<br><br><a href="${link}">Grab your spot</a>` },
-            full:             { s: "The game filled up while it was locked",        b: `Hi ${name},<br><br>The game you tried to join was locked and filled up before it reopened. You can still reopen it to join as a backup.<br><br><a href="${link}">Join as backup</a>` },
-            game_closed:      { s: "That game is no longer open",                   b: `Hi ${name},<br><br>The game you tried to join is no longer accepting sign-ups (it was cancelled or completed while locked).<br><br><a href="${link}">View the game</a>` },
-            reopen_drop:      { s: "Finish dropping out",                          b: `Hi ${name},<br><br>The game was locked when you tried to drop out, so the action was queued. It's open again \u2014 please reopen it to complete dropping out (and any refund).<br><br><a href="${link}">Open the game</a>` },
-            reopen_guest:     { s: "Finish your guest change",                     b: `Hi ${name},<br><br>The game was locked when you tried to update a guest, so the action was queued. It's open again \u2014 please reopen it to re-add or remove your guest.<br><br><a href="${link}">Open the game</a>` },
-            reopen:           { s: "The game is open again",                       b: `Hi ${name},<br><br>The game was locked when you made your request, so it was queued. It's open again now \u2014 please reopen it to complete what you were doing.<br><br><a href="${link}">Open the game</a>` },
-            error:            { s: "The game is open again",                       b: `Hi ${name},<br><br>The game was locked when you made your request. It's open again now \u2014 please reopen it to complete what you were doing.<br><br><a href="${link}">Open the game</a>` },
+            registered:       { s: "✅ You're in — spot confirmed",
+                                b: `Hi ${name},<br><br>The game you tried to join was locked by an admin, so your request was queued. It has now gone through — <strong>you're confirmed</strong> for ${when} at ${venue}.<br><br><a href="${link}">View the game</a>`,
+                                pt: "✅ You're in — spot confirmed",
+                                pb: `You're confirmed for ${when} at ${venue}.` },
+            payment_required: { s: "Your spot is waiting — payment needed",
+                                b: `Hi ${name},<br><br>The game you tried to join was locked, so your request was queued. It's open again, but it's a paid game — please reopen it to confirm and pay for your spot before it fills.${NC_HTML}<br><br><a href="${link}">Grab your spot</a>`,
+                                pt: "Your spot is waiting — payment needed",
+                                pb: `The locked game reopened — reopen it to pay and confirm your spot.${NC_PUSH}` },
+            full:             { s: "Sign-up failed — the game filled up",
+                                b: `Hi ${name},<br><br>The game you tried to join was locked and filled up before it reopened, so your sign-up didn't go through. Please try again — you can still reopen it to join as a backup.${NC_HTML}<br><br><a href="${link}">Join as backup</a>`,
+                                pt: "Sign-up failed — game full",
+                                pb: `The locked game filled up before it reopened, so your sign-up didn't go through — reopen to join as backup.${NC_PUSH}` },
+            game_closed:      { s: "Sign-up failed — game no longer open",
+                                b: `Hi ${name},<br><br>The game you tried to join is no longer accepting sign-ups (it was cancelled or completed while locked), so your sign-up didn't go through. Please try again on another game.${NC_HTML}<br><br><a href="${link}">View the game</a>`,
+                                pt: "Sign-up failed — game closed",
+                                pb: `The game you tried to join is no longer open, so your sign-up didn't go through.${NC_PUSH}` },
+            reopen_drop:      { s: "Finish dropping out",
+                                b: `Hi ${name},<br><br>The game was locked when you tried to drop out, so the action was queued. It's open again — please reopen it to complete dropping out (and any refund).<br><br><a href="${link}">Open the game</a>`,
+                                pt: "Finish dropping out",
+                                pb: `The game reopened — reopen it to finish dropping out.` },
+            reopen_guest:     { s: "Finish your guest change",
+                                b: `Hi ${name},<br><br>The game was locked when you tried to update a guest, so the action was queued. It's open again — please reopen it to re-add or remove your guest.<br><br><a href="${link}">Open the game</a>`,
+                                pt: "Finish your guest change",
+                                pb: `The game reopened — reopen it to finish your guest change.` },
+            reopen:           { s: "The game is open again",
+                                b: `Hi ${name},<br><br>The game was locked when you made your request, so it was queued. It's open again now — please reopen it to complete what you were doing.${NC_HTML}<br><br><a href="${link}">Open the game</a>`,
+                                pt: "The game is open again",
+                                pb: `The locked game reopened — reopen it to finish what you started.${NC_PUSH}` },
+            error:            { s: "The game is open again",
+                                b: `Hi ${name},<br><br>The game was locked when you made your request. It's open again now — please reopen it to complete what you were doing.${NC_HTML}<br><br><a href="${link}">Open the game</a>`,
+                                pt: "The game is open again",
+                                pb: `The locked game reopened — reopen it to finish what you started.${NC_PUSH}` },
         };
         const m = M[outcome.code] || M.reopen;
+
+        // App user → push (Expo). No token → email. Push replaces email, per spec.
+        if (hasPush) {
+            await sendNotification('signup_queue_outcome', playerId, { title: m.pt, body: m.pb, gameId });
+            return;
+        }
+        if (!to) return;
         await emailTransporter.sendMail({
             from: '"TotalFooty" <totalfooty19@gmail.com>',
             to,
@@ -64591,7 +65176,7 @@ async function _emailQueueOutcome(playerId, gameId, intentType, outcome) {
             html: (typeof wrapEmailHtml === 'function') ? wrapEmailHtml(m.b) : m.b,
         });
     } catch (e) {
-        console.warn('[FIX-357b] outcome email failed:', e.message);
+        console.warn('[FIX-491] outcome notify failed:', e.message);
     }
 }
 
@@ -64732,7 +65317,7 @@ async function _processSignupQueue(gameId) {
             client.release();
         }
         if (outcome.code !== 'already_in') {
-            setImmediate(() => _emailQueueOutcome(intent.player_id, gameId, intent.intent_type, outcome).catch(() => {}));
+            setImmediate(() => _notifyQueueOutcome(intent.player_id, gameId, intent.intent_type, outcome).catch(() => {}));
         }
     }
 }
@@ -64768,9 +65353,19 @@ async function _recordSignupIntent(gameId, playerId, intentType) {
         setImmediate(() => _notifyAdminOfWaitingPlayer(gameId, playerId));
     }
 
+    // FIX-491: word the queued message for the channel the outcome will arrive
+    // on — app users (have an FCM token) hear "we'll notify you"; else email.
+    let _qHasPush = false;
+    try {
+        const _qt = await pool.query('SELECT 1 FROM fcm_tokens WHERE player_id = $1 LIMIT 1', [playerId]);
+        _qHasPush = _qt.rows.length > 0;
+    } catch (_) { /* fcm_tokens missing — default to email wording */ }
+
     return {
         code: 'GAME_LOCKED_QUEUED',
-        error: 'This game is currently locked by an admin. Your request is queued — please check back for confirmation. We\'ll email you the outcome.',
+        error: _qHasPush
+            ? "This game is currently locked by an admin. Your request has been queued — we'll notify you as soon as it's confirmed."
+            : "This game is currently locked by an admin. Your request has been queued — we'll email you the outcome.",
         retry_after_seconds: LOCK_PREEMPT_GRACE_SECONDS,
         queued: true,
     };
@@ -64830,7 +65425,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web89-tenantadmin`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web90-fixpack1`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
