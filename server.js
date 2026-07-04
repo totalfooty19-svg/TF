@@ -22158,7 +22158,21 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
 app.put('/api/admin/games/:gameId/settings', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const { gameId } = req.params;
-        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name, early_bird_price, super_early_bird_price, opponent_id: edit_opp_id, pitch_cost, default_organiser_id } = req.body;
+        const { game_date, venue_id, max_players, cost_per_player, star_rating, tournament_team_count, min_rating_enabled, refs_required, ref_pay, requires_organiser, external_opponent, tf_kit_color, opp_kit_color, position_type, format, exclusivity, tournament_name, early_bird_price, super_early_bird_price, opponent_id: edit_opp_id, pitch_cost, default_organiser_id, whatsapp_link } = req.body; // FIX-512: whatsapp_link added
+        // FIX-512: whatsapp_link tri-state (same contract as pitch_cost/organiser):
+        // undefined = leave unchanged — edit surfaces that don't send the field can
+        // NEVER wipe a link; null/'' = clear to NULL (button disappears everywhere);
+        // non-empty must pass _isValidWhatsAppLink. Validated HERE, before any
+        // UPDATE runs, so a bad link rejects the whole save atomically.
+        let waLinkUpdateMode = 'unchanged';
+        let parsedWaLinkEdit = null;
+        if (whatsapp_link !== undefined) {
+            parsedWaLinkEdit = String(whatsapp_link || '').trim() || null;
+            if (parsedWaLinkEdit && !_isValidWhatsAppLink(parsedWaLinkEdit)) {
+                return res.status(400).json({ error: 'Link must be a https://chat.whatsapp.com/… or https://wa.me/… URL' });
+            }
+            waLinkUpdateMode = 'set'; // covers clear (parsedWaLinkEdit === null)
+        }
         // P2.1: pitch_cost — undefined = leave unchanged; null/empty = clear; number = set
         const parsedPitchCostEdit = pitch_cost === undefined
             ? null   // sentinel: COALESCE keeps existing
@@ -22338,6 +22352,12 @@ app.put('/api/admin/games/:gameId/settings', authenticateToken, requireAdmin, as
                     pitch_cost = COALESCE($21, pitch_cost)   -- P2.1
                 WHERE id = $7
             `, [venue_id, max_players, cost_per_player, starRatingForDb, tournament_team_count || null, min_rating_enabled !== undefined ? min_rating_enabled : null, gameId, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, requires_organiser !== undefined ? !!requires_organiser : null, resolvedEditOppName, tf_kit_color || null, opp_kit_color || null, position_type || null, format || null, exclusivity || null, tournament_name || null, parsedEB, parsedSEB, resolvedEditOppId, pitchCostUpdateMode === 'set' ? parsedPitchCostEdit : null]);
+        }
+
+        // FIX-512: separate UPDATE (deliberate P3 precedent — no renumbering of the
+        // two big UPDATE branches above; this endpoint's params have burned before).
+        if (waLinkUpdateMode === 'set') {
+            await pool.query('UPDATE games SET whatsapp_link = $1 WHERE id = $2', [parsedWaLinkEdit, gameId]);
         }
 
         // P3 (default organiser) — separate UPDATE so we don't have to refactor
@@ -42104,10 +42124,10 @@ async function _extCreateFixtureCore(db, tenant, L, b) {
             star_rating, star_rating_locked, tenant_id,
             external_league_id, is_home, away_venue_name, away_postcode,
             away_pitch_pin, away_parking_pin, away_pitch_type, assigned_coach_player_id,
-            pitch_cost
+            pitch_cost, whatsapp_link
         ) VALUES ($1,$2,$3,$4,$5,'one-off','everyone','outfield_gk',$6,
                   'vs_external',$7,$8,0,0,false,NULL,false,$9,
-                  $10,$11,$12,$13,$14,$15,$16,$17,$18)
+                  $10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
         RETURNING id, game_url`,
         [venueId, when.toISOString(), maxPlayers, cost,
          b.format ? String(b.format).slice(0, 20) : '11-a-side',
@@ -42122,7 +42142,10 @@ async function _extCreateFixtureCore(db, tenant, L, b) {
          // FIX-463 audit: away fixtures pin pitch_cost to 0 so the placeholder
          // home venue's default cannot leak phantom costs into finance.
          // Home fixtures stay NULL -> venue default, editable in Finance.
-         isHome ? null : 0]);
+         isHome ? null : 0,
+         // FIX-512: per-game WhatsApp link. Trim-or-null; CSV import-apply passes
+         // no link so imported fixtures are born NULL by design (linked via edit).
+         (b.whatsapp_link && String(b.whatsapp_link).trim()) || null]);
     return { game_id: ins.rows[0].id, game_url: ins.rows[0].game_url, opponent_name: opp.rows[0].name, when, isHome };
 }
 
@@ -42133,6 +42156,12 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fixtures', authenticateT
               WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
         if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
         const L = xl.rows[0];
+        // FIX-512: validate the optional per-fixture WhatsApp link here (the core
+        // trims-or-nulls but does not validate; import-apply never sends one).
+        if (req.body && req.body.whatsapp_link && String(req.body.whatsapp_link).trim()
+            && !_isValidWhatsAppLink(String(req.body.whatsapp_link).trim())) {
+            return res.status(400).json({ error: 'Link must be a https://chat.whatsapp.com/… or https://wa.me/… URL' });
+        }
         const out = await _extCreateFixtureCore(pool, req.tenant, L, req.body || {});
         await auditLog(pool, req.user.playerId, 'ext_fixture_created', null,
             `${L.name}: vs ${out.opponent_name} ${out.when.toISOString()} (${out.isHome ? 'H' : 'A'})`, req.tenant.id).catch(() => {});
@@ -66028,7 +66057,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web91-gallery-c`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web92-walinks`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
