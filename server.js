@@ -11380,6 +11380,7 @@ app.get('/api/t/:tenant_short_id/admin/upload-token', authenticateToken, require
 const GALLERY_MAX_PER_ALBUM = parseInt(process.env.GALLERY_MAX_PER_ALBUM || '250', 10);
 const GALLERY_MAX_TENANT    = parseInt(process.env.GALLERY_MAX_TENANT    || '1000', 10);
 const GALLERY_URL_PREFIX    = 'https://totalfooty.co.uk/uploads/gallery/';
+const DOCS_URL_PREFIX       = 'https://totalfooty.co.uk/uploads/docs/'; // FIX-515
 
 // FIX-508 (A8): fire-and-forget physical file delete via the sidecar's delete
 // action. The server mints the same ts.sig token the mint endpoints issue.
@@ -11388,17 +11389,22 @@ const GALLERY_URL_PREFIX    = 'https://totalfooty.co.uk/uploads/gallery/';
 function _galleryFileDelete(url) {
     try {
         const secret = process.env.TF_UPLOAD_SECRET;
-        if (!secret || !url || !String(url).startsWith(GALLERY_URL_PREFIX)) return;
-        const rest = String(url).slice(GALLERY_URL_PREFIX.length).split('/');
+        if (!secret || !url) return;
+        // FIX-515: area-aware — gallery images OR docs PDFs, regex-locked per area.
+        let area = null, prefix = null;
+        if (String(url).startsWith(GALLERY_URL_PREFIX)) { area = 'gallery'; prefix = GALLERY_URL_PREFIX; }
+        else if (String(url).startsWith(DOCS_URL_PREFIX)) { area = 'docs'; prefix = DOCS_URL_PREFIX; }
+        else return;
+        const rest = String(url).slice(prefix.length).split('/');
         if (rest.length !== 2) return;
         const tenant = rest[0], name = rest[1];
         if (!/^[A-Za-z0-9_-]{3,16}$/.test(tenant)) return;
-        if (!/^[a-f0-9]{24}\.(jpg|png|webp)$/.test(name)) return;
+        if (area === 'docs' ? !/^[a-f0-9]{24}\.pdf$/.test(name) : !/^[a-f0-9]{24}\.(jpg|png|webp)$/.test(name)) return;
         const ts = String(Math.floor(Date.now() / 1000));
         const sig = require('crypto').createHmac('sha256', secret).update(ts).digest('hex');
         fetch('https://totalfooty.co.uk/tf-upload-gallery.php', {
             method: 'POST',
-            body: new URLSearchParams({ token: ts + '.' + sig, action: 'delete', tenant, name }),
+            body: new URLSearchParams({ token: ts + '.' + sig, action: 'delete', tenant, name, area }),
         }).then(r => { if (!r.ok) console.error('gallery file delete HTTP', r.status, name); })
           .catch(e => console.error('gallery file delete failed:', e.message));
     } catch (e) { console.error('gallery file delete failed:', e.message); }
@@ -11885,6 +11891,933 @@ app.post('/api/t/:tenant_short_id/gallery/submit', authenticateToken, tfGalleryS
         res.json({ success: true, album_id: albumId, status: 'pending' });
     } catch (e) { console.error('gallery submit error:', e.message); res.status(500).json({ error: 'Failed to submit album' }); }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-513 — Club Page pack: news/match reports, sponsors, socials, squad toggle.
+// All admin routes: authenticateToken + requireTenantAdmin (superadmin passes).
+// Images (news covers, sponsor logos) reuse the FIX-503/508 gallery sidecar and
+// URL-prefix display gate; physical deletes reuse _galleryFileDelete (A8).
+// ═══════════════════════════════════════════════════════════════════════════
+const NEWS_MAX_PER_TENANT = parseInt(process.env.NEWS_MAX_PER_TENANT || '200', 10);
+const SPONSORS_MAX_PER_TENANT = parseInt(process.env.SPONSORS_MAX_PER_TENANT || '12', 10);
+
+// FIX-513: platform-locked social URL check. https only; host must match.
+function _isValidSocialUrl(kind, raw) {
+    let u;
+    try { u = new URL(String(raw || '').trim()); } catch (_) { return false; }
+    if (u.protocol !== 'https:') return false;
+    const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+    const ok = {
+        facebook:  ['facebook.com', 'fb.com'],
+        instagram: ['instagram.com'],
+        x:         ['x.com', 'twitter.com'],
+        youtube:   ['youtube.com', 'youtu.be'],
+    }[kind] || [];
+    return ok.includes(host);
+}
+
+// ── NEWS ────────────────────────────────────────────────────────────────────
+app.get('/api/t/:tenant_short_id/admin/news', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT n.id, n.title, n.body, n.cover_url, n.game_id, n.status,
+                    n.published_at, n.created_at,
+                    g.external_opponent, g.ext_tf_score, g.ext_opp_score, g.game_date
+               FROM tenant_news n
+               LEFT JOIN games g ON g.id = n.game_id
+              WHERE n.tenant_id = $1
+              ORDER BY COALESCE(n.published_at, n.created_at) DESC
+              LIMIT 200`, [req.tenant.id]);
+        res.json({ items: r.rows });
+    } catch (e) { console.error('news list error:', e.message); res.status(500).json({ error: 'Failed to load news' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/news', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const title = String(req.body.title || '').trim().slice(0, 120);
+        const body = String(req.body.body || '').trim().slice(0, 10000);
+        if (!title || !body) return res.status(400).json({ error: 'Title and body are both required' });
+        const cover = String(req.body.cover_url || '').trim() || null;
+        if (cover && !cover.startsWith(GALLERY_URL_PREFIX)) {
+            return res.status(400).json({ error: 'Cover must be a TotalFooty gallery upload' });
+        }
+        let gameId = null;
+        if (req.body.game_id) {
+            if (!isValidUuid(String(req.body.game_id))) return res.status(400).json({ error: 'Invalid game id' });
+            const g = await pool.query('SELECT id FROM games WHERE id = $1 AND tenant_id = $2', [req.body.game_id, req.tenant.id]);
+            if (!g.rows.length) return res.status(400).json({ error: 'Game not found in your tenant' });
+            gameId = req.body.game_id;
+        }
+        const cnt = await pool.query('SELECT COUNT(*) AS c FROM tenant_news WHERE tenant_id = $1', [req.tenant.id]);
+        if (parseInt(cnt.rows[0].c, 10) >= NEWS_MAX_PER_TENANT) {
+            return res.status(400).json({ error: 'News archive is full (' + NEWS_MAX_PER_TENANT + ' max) \u2014 delete old posts first' });
+        }
+        const publish = req.body.status === 'published';
+        const r = await pool.query(
+            `INSERT INTO tenant_news (tenant_id, title, body, cover_url, game_id, status, created_by, published_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+            [req.tenant.id, title, body, cover, gameId,
+             publish ? 'published' : 'draft', req.user.playerId, publish ? new Date() : null]);
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('news create error:', e.message); res.status(500).json({ error: 'Failed to save post' }); }
+});
+app.patch('/api/t/:tenant_short_id/admin/news/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const own = await pool.query('SELECT id, status, published_at FROM tenant_news WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Post not found' });
+        const sets = []; const vals = []; let n = 1;
+        if (req.body.title !== undefined) {
+            const title = String(req.body.title || '').trim().slice(0, 120);
+            if (!title) return res.status(400).json({ error: 'Title required' });
+            sets.push('title = $' + (n++)); vals.push(title);
+        }
+        if (req.body.body !== undefined) {
+            const body = String(req.body.body || '').trim().slice(0, 10000);
+            if (!body) return res.status(400).json({ error: 'Body required' });
+            sets.push('body = $' + (n++)); vals.push(body);
+        }
+        if (req.body.cover_url !== undefined) {
+            const cover = String(req.body.cover_url || '').trim() || null;
+            if (cover && !cover.startsWith(GALLERY_URL_PREFIX)) {
+                return res.status(400).json({ error: 'Cover must be a TotalFooty gallery upload' });
+            }
+            sets.push('cover_url = $' + (n++)); vals.push(cover);
+        }
+        if (req.body.game_id !== undefined) {
+            if (req.body.game_id === null || req.body.game_id === '') { sets.push('game_id = NULL'); }
+            else {
+                if (!isValidUuid(String(req.body.game_id))) return res.status(400).json({ error: 'Invalid game id' });
+                const g = await pool.query('SELECT id FROM games WHERE id = $1 AND tenant_id = $2', [req.body.game_id, req.tenant.id]);
+                if (!g.rows.length) return res.status(400).json({ error: 'Game not found in your tenant' });
+                sets.push('game_id = $' + (n++)); vals.push(req.body.game_id);
+            }
+        }
+        if (req.body.status !== undefined) {
+            if (req.body.status !== 'published' && req.body.status !== 'draft') {
+                return res.status(400).json({ error: "status must be 'published' or 'draft'" });
+            }
+            sets.push('status = $' + (n++)); vals.push(req.body.status);
+            if (req.body.status === 'published' && !own.rows[0].published_at) {
+                sets.push('published_at = NOW()'); // first publish stamps the date; re-publish keeps it
+            }
+        }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(id, req.tenant.id);
+        await pool.query('UPDATE tenant_news SET ' + sets.join(', ') + ' WHERE id = $' + (n++) + ' AND tenant_id = $' + n, vals);
+        res.json({ success: true });
+    } catch (e) { console.error('news edit error:', e.message); res.status(500).json({ error: 'Failed to update post' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/news/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const r = await pool.query('DELETE FROM tenant_news WHERE id = $1 AND tenant_id = $2 RETURNING cover_url', [id, req.tenant.id]);
+        if (r.rows.length && r.rows[0].cover_url) _galleryFileDelete(r.rows[0].cover_url); // FIX-508 A8 reuse
+        res.json({ success: true, deleted: r.rowCount });
+    } catch (e) { console.error('news delete error:', e.message); res.status(500).json({ error: 'Failed to delete post' }); }
+});
+
+// ── SPONSORS ────────────────────────────────────────────────────────────────
+app.get('/api/t/:tenant_short_id/admin/sponsors', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, name, logo_url, website_url, sort_order FROM tenant_sponsors
+              WHERE tenant_id = $1 ORDER BY sort_order ASC, id ASC`, [req.tenant.id]);
+        res.json({ items: r.rows, cap: SPONSORS_MAX_PER_TENANT });
+    } catch (e) { console.error('sponsors list error:', e.message); res.status(500).json({ error: 'Failed to load sponsors' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/sponsors', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const name = String(req.body.name || '').trim().slice(0, 60);
+        if (!name) return res.status(400).json({ error: 'Sponsor name required' });
+        const logo = String(req.body.logo_url || '').trim() || null;
+        if (logo && !logo.startsWith(GALLERY_URL_PREFIX)) {
+            return res.status(400).json({ error: 'Logo must be a TotalFooty gallery upload' });
+        }
+        let site = String(req.body.website_url || '').trim() || null;
+        if (site) {
+            try { const u = new URL(site); if (u.protocol !== 'https:' && u.protocol !== 'http:') throw 0; }
+            catch (_) { return res.status(400).json({ error: 'Website must be a valid http(s) URL' }); }
+        }
+        const cnt = await pool.query('SELECT COUNT(*) AS c FROM tenant_sponsors WHERE tenant_id = $1', [req.tenant.id]);
+        if (parseInt(cnt.rows[0].c, 10) >= SPONSORS_MAX_PER_TENANT) {
+            return res.status(400).json({ error: 'Sponsor limit reached (' + SPONSORS_MAX_PER_TENANT + ')' });
+        }
+        const r = await pool.query(
+            `INSERT INTO tenant_sponsors (tenant_id, name, logo_url, website_url, sort_order)
+             VALUES ($1, $2, $3, $4, COALESCE((SELECT MAX(sort_order) + 1 FROM tenant_sponsors WHERE tenant_id = $1), 0))
+             RETURNING id`, [req.tenant.id, name, logo, site]);
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('sponsor create error:', e.message); res.status(500).json({ error: 'Failed to save sponsor' }); }
+});
+app.patch('/api/t/:tenant_short_id/admin/sponsors/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const own = await pool.query('SELECT id FROM tenant_sponsors WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Sponsor not found' });
+        const sets = []; const vals = []; let n = 1;
+        if (req.body.name !== undefined) {
+            const name = String(req.body.name || '').trim().slice(0, 60);
+            if (!name) return res.status(400).json({ error: 'Sponsor name required' });
+            sets.push('name = $' + (n++)); vals.push(name);
+        }
+        if (req.body.website_url !== undefined) {
+            let site = String(req.body.website_url || '').trim() || null;
+            if (site) {
+                try { const u = new URL(site); if (u.protocol !== 'https:' && u.protocol !== 'http:') throw 0; }
+                catch (_) { return res.status(400).json({ error: 'Website must be a valid http(s) URL' }); }
+            }
+            sets.push('website_url = $' + (n++)); vals.push(site);
+        }
+        if (req.body.sort_order !== undefined) { sets.push('sort_order = $' + (n++)); vals.push(parseInt(req.body.sort_order, 10) || 0); }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(id, req.tenant.id);
+        await pool.query('UPDATE tenant_sponsors SET ' + sets.join(', ') + ' WHERE id = $' + (n++) + ' AND tenant_id = $' + n, vals);
+        res.json({ success: true });
+    } catch (e) { console.error('sponsor edit error:', e.message); res.status(500).json({ error: 'Failed to update sponsor' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/sponsors/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const r = await pool.query('DELETE FROM tenant_sponsors WHERE id = $1 AND tenant_id = $2 RETURNING logo_url', [id, req.tenant.id]);
+        if (r.rows.length && r.rows[0].logo_url) _galleryFileDelete(r.rows[0].logo_url); // FIX-508 A8 reuse
+        res.json({ success: true, deleted: r.rowCount });
+    } catch (e) { console.error('sponsor delete error:', e.message); res.status(500).json({ error: 'Failed to delete sponsor' }); }
+});
+
+// ── DOCUMENTS (FIX-514: links-only v1 — the club handbook/policies pattern) ──
+const DOCS_MAX_PER_TENANT = parseInt(process.env.DOCS_MAX_PER_TENANT || '20', 10);
+app.get('/api/t/:tenant_short_id/admin/documents', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, title, url, sort_order FROM tenant_documents
+              WHERE tenant_id = $1 ORDER BY sort_order ASC, id ASC`, [req.tenant.id]);
+        res.json({ items: r.rows, cap: DOCS_MAX_PER_TENANT });
+    } catch (e) { console.error('docs list error:', e.message); res.status(500).json({ error: 'Failed to load documents' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/documents', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const title = String(req.body.title || '').trim().slice(0, 80);
+        const url = String(req.body.url || '').trim();
+        if (!title) return res.status(400).json({ error: 'Document title required' });
+        try { const u = new URL(url); if (u.protocol !== 'https:') throw 0; }
+        catch (_) { return res.status(400).json({ error: 'Document link must be an https URL' }); }
+        if (url.length > 500) return res.status(400).json({ error: 'Document link is too long (500 chars max)' }); // FIX-514 audit: reject, never truncate into a broken link
+        const cnt = await pool.query('SELECT COUNT(*) AS c FROM tenant_documents WHERE tenant_id = $1', [req.tenant.id]);
+        if (parseInt(cnt.rows[0].c, 10) >= DOCS_MAX_PER_TENANT) {
+            return res.status(400).json({ error: 'Document limit reached (' + DOCS_MAX_PER_TENANT + ')' });
+        }
+        const r = await pool.query(
+            `INSERT INTO tenant_documents (tenant_id, title, url, sort_order)
+             VALUES ($1, $2, $3, COALESCE((SELECT MAX(sort_order) + 1 FROM tenant_documents WHERE tenant_id = $1), 0))
+             RETURNING id`, [req.tenant.id, title, url]);
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('doc create error:', e.message); res.status(500).json({ error: 'Failed to save document' }); }
+});
+app.patch('/api/t/:tenant_short_id/admin/documents/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const own = await pool.query('SELECT id FROM tenant_documents WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Document not found' });
+        const sets = []; const vals = []; let n = 1;
+        if (req.body.title !== undefined) {
+            const title = String(req.body.title || '').trim().slice(0, 80);
+            if (!title) return res.status(400).json({ error: 'Document title required' });
+            sets.push('title = $' + (n++)); vals.push(title);
+        }
+        if (req.body.url !== undefined) {
+            const url = String(req.body.url || '').trim();
+            try { const u = new URL(url); if (u.protocol !== 'https:') throw 0; }
+            catch (_) { return res.status(400).json({ error: 'Document link must be an https URL' }); }
+            if (url.length > 500) return res.status(400).json({ error: 'Document link is too long (500 chars max)' }); // FIX-514 audit
+            sets.push('url = $' + (n++)); vals.push(url);
+        }
+        if (req.body.sort_order !== undefined) { sets.push('sort_order = $' + (n++)); vals.push(parseInt(req.body.sort_order, 10) || 0); }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(id, req.tenant.id);
+        await pool.query('UPDATE tenant_documents SET ' + sets.join(', ') + ' WHERE id = $' + (n++) + ' AND tenant_id = $' + n, vals);
+        res.json({ success: true });
+    } catch (e) { console.error('doc edit error:', e.message); res.status(500).json({ error: 'Failed to update document' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/documents/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        const r = await pool.query('DELETE FROM tenant_documents WHERE id = $1 AND tenant_id = $2 RETURNING url', [id, req.tenant.id]);
+        if (r.rows.length && String(r.rows[0].url || '').startsWith(DOCS_URL_PREFIX)) _galleryFileDelete(r.rows[0].url); // FIX-515: hosted PDFs are cleaned up; external links untouched
+        res.json({ success: true, deleted: r.rowCount });
+    } catch (e) { console.error('doc delete error:', e.message); res.status(500).json({ error: 'Failed to delete document' }); }
+});
+
+// ── CLUB PAGE SETTINGS (socials + squad toggle) ─────────────────────────────
+app.get('/api/t/:tenant_short_id/admin/club-page', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT public_squad_enabled, social_facebook, social_instagram,
+                    social_x, social_youtube, contact_email_public, about_text
+               FROM tenants WHERE id = $1`, [req.tenant.id]);
+        res.json(r.rows[0] || {});
+    } catch (e) {
+        if (e && e.code === '42703') return res.json({}); // pre-migration: bootstrap heals on boot
+        console.error('club-page read error:', e.message); res.status(500).json({ error: 'Failed to load settings' });
+    }
+});
+app.patch('/api/t/:tenant_short_id/admin/club-page', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const sets = []; const vals = []; let n = 1;
+        if (req.body.public_squad_enabled !== undefined) {
+            sets.push('public_squad_enabled = $' + (n++)); vals.push(req.body.public_squad_enabled === true);
+        }
+        const socials = [['social_facebook', 'facebook'], ['social_instagram', 'instagram'], ['social_x', 'x'], ['social_youtube', 'youtube']];
+        for (const [col, kind] of socials) {
+            if (req.body[col] !== undefined) {
+                const v = String(req.body[col] || '').trim() || null;
+                if (v && !_isValidSocialUrl(kind, v)) {
+                    return res.status(400).json({ error: 'The ' + kind + ' link must be an https ' + kind + ' URL' });
+                }
+                sets.push(col + ' = $' + (n++)); vals.push(v);
+            }
+        }
+        if (req.body.about_text !== undefined) { // FIX-514
+            sets.push('about_text = $' + (n++));
+            vals.push(String(req.body.about_text || '').trim().slice(0, 4000) || null);
+        }
+        if (req.body.contact_email_public !== undefined) {
+            const em = String(req.body.contact_email_public || '').trim() || null;
+            if (em && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return res.status(400).json({ error: 'Contact email is not a valid address' });
+            sets.push('contact_email_public = $' + (n++)); vals.push(em);
+        }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(req.tenant.id);
+        await pool.query('UPDATE tenants SET ' + sets.join(', ') + ' WHERE id = $' + n, vals);
+        res.json({ success: true });
+    } catch (e) { console.error('club-page save error:', e.message); res.status(500).json({ error: 'Failed to save settings' }); }
+});
+
+// FIX-519: MESSAGE MEMBERS — tenant admin emails chosen members (or all), with an
+// optional club-document attachment link. BCC in chunks (addresses never exposed),
+// recipients hard-scoped to THIS tenant's active members, everything logged.
+const tfTenantMessageLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    message: { error: 'Message limit reached (5/hour) \u2014 try again later.' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.post('/api/t/:tenant_short_id/admin/message', authenticateToken, requireTenantAdmin, tfTenantMessageLimiter, async (req, res) => {
+    try {
+        const subject = String(req.body.subject || '').trim().slice(0, 100);
+        const body = String(req.body.body || '').trim().slice(0, 5000);
+        if (!subject || !body) return res.status(400).json({ error: 'Subject and message are both required' });
+
+        // Optional attachment: must be one of THIS tenant's documents.
+        let doc = null;
+        if (req.body.document_id !== undefined && req.body.document_id !== null && req.body.document_id !== '') {
+            const did = parseInt(req.body.document_id, 10) || 0;
+            const dr = await pool.query('SELECT id, title, url FROM tenant_documents WHERE id = $1 AND tenant_id = $2', [did, req.tenant.id]);
+            if (!dr.rows.length) return res.status(400).json({ error: 'Attached document not found' });
+            doc = dr.rows[0];
+        }
+
+        // Recipients: 'all' active members, or an id list INTERSECTED with the
+        // tenant's active members (cross-tenant ids silently drop — never leak).
+        const wantAll = req.body.recipients === 'all' || req.body.recipients === undefined;
+        let ids = [];
+        if (!wantAll) {
+            ids = (Array.isArray(req.body.recipients) ? req.body.recipients : []).filter(x => isValidUuid(String(x))).slice(0, 2000);
+            if (!ids.length) return res.status(400).json({ error: 'Pick at least one recipient' });
+        }
+        const rec = await pool.query(
+            `SELECT DISTINCT u.email
+               FROM player_tenants pt
+               JOIN players p ON p.id = pt.player_id
+               JOIN users u ON u.id = p.user_id
+              WHERE pt.tenant_id = $1 AND pt.status = 'active'
+                AND u.email IS NOT NULL AND u.email <> ''
+                ${wantAll ? '' : 'AND p.id = ANY($2)'}`,
+            wantAll ? [req.tenant.id] : [req.tenant.id, ids]);
+        const emails = rec.rows.map(r => r.email);
+        if (!emails.length) return res.status(400).json({ error: 'No recipients with an email address' });
+
+        const docBlock = doc ? `
+            <div style="margin:20px 0;padding:14px;border:1px solid #333;border-radius:10px;">
+                <p style="color:#ccc;font-size:13px;margin:0 0 10px;">\ud83d\udcc4 Attached document: <strong style="color:#fff;">${htmlEncode(doc.title)}</strong></p>
+                <a href="${htmlEncode(doc.url)}" style="display:block;text-align:center;padding:12px;background:#c0c0c0;color:#000;font-weight:900;border-radius:8px;text-decoration:none;font-size:14px;">VIEW DOCUMENT \u2192</a>
+            </div>` : '';
+        const html = wrapEmailHtml(`
+            <h2 style="color:#c0c0c0;font-size:22px;font-weight:900;margin:0 0 6px;">${htmlEncode(subject.toUpperCase())}</h2>
+            <p style="color:#777;font-size:12px;letter-spacing:1px;font-weight:900;margin:0 0 16px;">FROM ${htmlEncode(String(req.tenant.name || 'YOUR TEAM').toUpperCase())}</p>
+            <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 12px;">${htmlEncode(body).replace(/\n/g, '<br>')}</p>
+            ${docBlock}
+        `);
+
+        // BCC in chunks of 80 (provider-safe). A mid-run failure reports partial count.
+        let sent = 0;
+        for (let c = 0; c < emails.length; c += 80) {
+            const chunk = emails.slice(c, c + 80);
+            try {
+                await emailTransporter.sendMail({
+                    from: '"TotalFooty" <totalfooty19@gmail.com>',
+                    bcc: chunk.join(', '),
+                    subject: '[' + (req.tenant.name || 'TotalFooty') + '] ' + subject,
+                    html,
+                });
+                sent += chunk.length;
+            } catch (e) {
+                console.error('member message chunk failed:', e.message);
+                break; // stop on provider failure; report what actually went
+            }
+        }
+        await pool.query(
+            `INSERT INTO tenant_messages (tenant_id, subject, body, document_id, recipient_count, sent_by)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [req.tenant.id, subject, body, doc ? doc.id : null, sent, req.user.playerId]).catch(() => {});
+        await auditLog(pool, req.user.playerId, 'tenant_message_sent', null,
+            `"${subject}" \u2192 ${sent} member(s)`, req.tenant.id).catch(() => {});
+        res.json({ success: true, sent, of: emails.length });
+    } catch (e) { console.error('member message error:', e.message); res.status(500).json({ error: 'Failed to send message' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-518 — multi-team (sibling tenants). A club running several squads =
+// several tenants under the same admin; every per-tenant feature (slug page,
+// gallery, club page, WhatsApp library, finances) comes free. Zero DDL.
+// ═══════════════════════════════════════════════════════════════════════════
+const tfAddTeamLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, max: 3,
+    message: { error: 'Team-creation limit reached (3/hour).' },
+    keyGenerator: (req) => req.user?.playerId || req.ip,
+    standardHeaders: true, legacyHeaders: false,
+});
+
+// ADD A NEW TEAM — the caller (tenant_admin of the CURRENT tenant, or superadmin)
+// creates a sibling tenant and becomes its tenant_admin. Mirrors the start-tenant
+// creation core exactly: short_id retry loop, slug, T&C stamp (explicit tick
+// required), tenant_admin row, post-commit monthly starter seed.
+app.post('/api/t/:tenant_short_id/admin/add-team', authenticateToken, requireTenantAdmin, tfAddTeamLimiter, async (req, res) => {
+    try {
+        const name = String(req.body.name || '').trim();
+        if (name.length < 3 || name.length > 200) return res.status(400).json({ error: 'Team name must be 3-200 characters' });
+        if (req.body.accept_tcs !== true) return res.status(400).json({ error: 'You must accept the tenant terms for the new team' });
+        const copyBranding = req.body.copy_branding === true;
+        const copyWaLinks = req.body.copy_wa_links === true;
+
+        const srcT = await pool.query(
+            `SELECT region, reply_to_email, logo_url, primary_color FROM tenants WHERE id = $1`, [req.tenant.id]);
+        const srcRow = srcT.rows[0] || {};
+        const baseSlug = _fix322Slugify(name);
+        if (!baseSlug) return res.status(400).json({ error: 'Unable to derive a page address from that name' });
+        const slug = await _fix322UniqueSlug(baseSlug);
+
+        let tenant = null;
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            let created = false;
+            for (let attempt = 0; attempt < 5 && !created; attempt++) {
+                const shortId = String(Math.floor(Math.random() * 90000) + 10000); // 10000-99999, start-tenant convention
+                try {
+                    const tr = await client.query(
+                        `INSERT INTO tenants (short_id, name, slug, logo_url, primary_color, reply_to_email, status,
+                                              region, accepted_tenant_tcs_version, accepted_tenant_tcs_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, NOW())
+                         RETURNING id, short_id, name, slug`,
+                        [shortId, name, slug,
+                         copyBranding ? (srcRow.logo_url || null) : null,
+                         copyBranding ? (srcRow.primary_color || null) : null,
+                         srcRow.reply_to_email || null, srcRow.region || null,
+                         CURRENT_TENANT_TCS_VERSION]);
+                    tenant = tr.rows[0];
+                    created = true;
+                } catch (e) {
+                    if (e && e.code === '23505' && attempt < 4) continue; // short_id collision -> retry
+                    throw e;
+                }
+            }
+            if (!tenant) throw new Error('short_id space exhausted');
+            await client.query(
+                `INSERT INTO player_tenants (player_id, tenant_id, role, status, joined_at,
+                                             show_in_dashboard, allow_tenant_contact)
+                 VALUES ($1, $2, 'tenant_admin', 'active', NOW(), TRUE, TRUE)
+                 ON CONFLICT (player_id, tenant_id)
+                 DO UPDATE SET role = 'tenant_admin', status = 'active'`,
+                [req.user.playerId, tenant.id]);
+            await client.query('COMMIT');
+        } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw e;
+        } finally { client.release(); }
+
+        // Post-commit, non-critical (start-tenant parity): monthly starter seed.
+        pool.query(
+            `INSERT INTO tenant_monthly_config (tenant_id, enabled, metric_ids)
+             VALUES ($1, TRUE, $2) ON CONFLICT (tenant_id) DO NOTHING`,
+            [tenant.id, MONTHLY_STARTER_METRIC_IDS]).catch(e => console.error('add-team monthly seed failed:', e.message));
+        // Optional: copy the WhatsApp link library across (dedupe by URL).
+        if (copyWaLinks) {
+            pool.query(
+                `INSERT INTO tenant_whatsapp_links (tenant_id, label, url, created_by)
+                 SELECT $1, l.label, l.url, $2 FROM tenant_whatsapp_links l
+                  WHERE l.tenant_id = $3
+                    AND NOT EXISTS (SELECT 1 FROM tenant_whatsapp_links x WHERE x.tenant_id = $1 AND x.url = l.url)`,
+                [tenant.id, req.user.playerId, req.tenant.id]).catch(e => console.error('add-team wa-links copy failed:', e.message));
+        }
+        await auditLog(pool, req.user.playerId, 'sibling_team_created', null,
+            `"${name}" (${tenant.short_id}) from ${req.tenant.name}`, tenant.id).catch(() => {});
+        res.status(201).json({ success: true, short_id: tenant.short_id, slug: tenant.slug, name: tenant.name,
+            public_link: 'https://totalfooty.co.uk/' + tenant.slug });
+    } catch (e) { console.error('add-team error:', e.message); res.status(500).json({ error: 'Could not create the team' }); }
+});
+
+// IMPORT MEMBERS from another team the caller also administers. Both-sides
+// admin check is the gate (superadmin bypasses); ids are intersected with the
+// SOURCE tenant's active members, so cross-tenant ids silently drop.
+app.post('/api/t/:tenant_short_id/admin/import-members', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const fromShort = String(req.body.from_tenant_short_id || '').trim();
+        if (!fromShort) return res.status(400).json({ error: 'from_tenant_short_id required' });
+        const ft = await pool.query(`SELECT id, name FROM tenants WHERE short_id = $1 AND status = 'active'`, [fromShort]);
+        if (!ft.rows.length) return res.status(404).json({ error: 'Source team not found' });
+        const fromTenant = ft.rows[0];
+        if (fromTenant.id === req.tenant.id) return res.status(400).json({ error: 'Source and destination are the same team' });
+        if (req.user.role !== 'superadmin') {
+            const adm = await pool.query(
+                `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND role = 'tenant_admin' AND status = 'active'`,
+                [req.user.playerId, fromTenant.id]);
+            if (!adm.rows.length) return res.status(403).json({ error: 'You must be an admin of the source team too' });
+        }
+        const wantAll = req.body.player_ids === 'all' || req.body.player_ids === undefined;
+        let ids = [];
+        if (!wantAll) {
+            ids = (Array.isArray(req.body.player_ids) ? req.body.player_ids : []).filter(x => isValidUuid(String(x))).slice(0, 2000);
+            if (!ids.length) return res.status(400).json({ error: 'Pick at least one player' });
+        }
+        const r = await pool.query(
+            `INSERT INTO player_tenants (player_id, tenant_id, role, status, joined_at, show_in_dashboard, allow_tenant_contact)
+             SELECT pt.player_id, $1, 'player', 'active', NOW(), TRUE, TRUE
+               FROM player_tenants pt
+              WHERE pt.tenant_id = $2 AND pt.status = 'active'
+                ${wantAll ? '' : 'AND pt.player_id = ANY($3)'}
+             ON CONFLICT (player_id, tenant_id) DO NOTHING`,
+            wantAll ? [req.tenant.id, fromTenant.id] : [req.tenant.id, fromTenant.id, ids]);
+        await auditLog(pool, req.user.playerId, 'members_imported', null,
+            `${r.rowCount} member(s) from ${fromTenant.name}`, req.tenant.id).catch(() => {});
+        res.json({ success: true, added: r.rowCount });
+    } catch (e) { console.error('import-members error:', e.message); res.status(500).json({ error: 'Failed to import members' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-521 — FA Full-Time: fixtures PULL (feeds the existing FIX-504
+// preview→tick→apply pipeline; same dedupe keys as CSV so the two paths can
+// never double-import) + full division TABLE (parsed natively, cached 6h).
+// Parsers built against real saved markup (Derby Gazers FC / CMAL, Jul 2026)
+// and written DEFENSIVE: on an FA markup change they fail loudly with a
+// "send me the page" error instead of importing garbage. Zero new deps.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// FIX-522: superadmin email the moment the FA integration breaks for anyone —
+// markup change (FA_PARSE) or fetch failure. Throttled ONE alert per league per
+// 24h (in-memory; resets on restart, which is fine — a still-broken league
+// re-alerts after the next restart+hit). Fire-and-forget, never blocks a reply.
+const _faAlertLog = new Map(); // leagueId -> ts
+function _faAlertSuperadmin(ctx, source, errMsg) {
+    try {
+        if (!ctx || !ctx.id) return;
+        const last = _faAlertLog.get(String(ctx.id)) || 0;
+        if (Date.now() - last < 24 * 60 * 60 * 1000) return;
+        _faAlertLog.set(String(ctx.id), Date.now());
+        const html = wrapEmailHtml(`
+            <h2 style="color:#ff6b6b;font-size:20px;font-weight:900;margin:0 0 10px;">\u26a0\ufe0f FA INTEGRATION FAILURE</h2>
+            <p style="color:#ccc;font-size:14px;line-height:1.6;">
+                <strong>Where:</strong> ${htmlEncode(source)}<br>
+                <strong>League:</strong> ${htmlEncode(ctx.name || '?')} (id ${htmlEncode(String(ctx.id))})<br>
+                <strong>Tenant:</strong> ${htmlEncode(ctx.tenant || '\u2014')}<br>
+                <strong>FA link:</strong> ${htmlEncode(ctx.url || '\u2014')}<br>
+                <strong>Error:</strong> ${htmlEncode(String(errMsg || '').slice(0, 300))}
+            </p>
+            <p style="color:#888;font-size:12px;">FA_PARSE errors usually mean the FA changed their page layout \u2014 save the page and feed it to the next build session. Fetch errors may be transient. Throttled: one email per league per 24h.</p>
+        `);
+        emailTransporter.sendMail({
+            from: '"TotalFooty" <totalfooty19@gmail.com>',
+            to: 'totalfooty19@gmail.com',
+            subject: '\u26a0\ufe0f FA break \u2014 ' + (ctx.name || 'league') + ' (' + source + ')',
+            html,
+        }).catch(e => console.error('fa alert email failed:', e.message));
+    } catch (e) { console.error('fa alert failed:', e.message); }
+}
+
+// Accepts only the canonical shape the admin pastes:
+// https://fulltime.thefa.com/displayTeam.html?divisionseason=NNN&teamID=NNN
+function _faParseTeamUrl(raw) {
+    let u;
+    try { u = new URL(String(raw || '').trim()); } catch (_) { return null; }
+    if (u.protocol !== 'https:') return null;
+    if (u.hostname.replace(/^www\./i, '').toLowerCase() !== 'fulltime.thefa.com') return null;
+    if (!/displayTeam\.html$/i.test(u.pathname)) return null;
+    const div = u.searchParams.get('divisionseason') || '';
+    const team = u.searchParams.get('teamID') || '';
+    if (!/^\d{4,15}$/.test(div) || !/^\d{4,15}$/.test(team)) return null;
+    return { divisionseason: div, teamID: team };
+}
+
+async function _faFetch(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+        const r = await fetch(url, {
+            headers: {
+                'User-Agent': 'TotalFootyBot/1.0 (+https://totalfooty.co.uk; grassroots club tool)',
+                'Accept': 'text/html',
+            },
+            signal: controller.signal,
+        });
+        if (!r.ok) throw new Error('FA responded HTTP ' + r.status);
+        return await r.text();
+    } finally { clearTimeout(timer); }
+}
+
+function _faStrip(html) { // tags -> text, entities we actually meet, squashed whitespace
+    return String(html || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ')
+        .replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"')
+        .replace(/\s+/g, ' ').trim();
+}
+
+// TEAM PAGE -> fixture rows in the FIX-504 preview payload shape.
+// Row anatomy (verified): td[comp] · td[dd/mm/yy + hh:mm spans] · home-team td
+// (displayFixture link) · logo td · td[score "X - Y" | "H - W"/"A - W" | blank]
+// · logo td · road-team td · td[status/venue].
+function _faParseFixtures(html) {
+    const ourName = (() => {
+        const m = String(html).match(/<title>\s*([^|<]+?)\s*[|<]/i);
+        return m ? _faStrip(m[1]) : null;
+    })();
+    if (!ourName) throw new Error('FA_PARSE: could not find the team name in the page title');
+    const rows = [];
+    const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let tr;
+    while ((tr = trRe.exec(html)) !== null) {
+        const body = tr[1];
+        if (body.indexOf('displayFixture.html') === -1) continue;      // not a fixture row
+        if (body.indexOf('recent-form-details') !== -1) continue;      // form tooltip, skip (results dup)
+        const tds = [];
+        const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+        let td; while ((td = tdRe.exec(body)) !== null) tds.push(td[1]);
+        if (tds.length < 7) continue;
+        const dm = _faStrip(tds[1]).match(/(\d{2}\/\d{2}\/\d{2,4})\s*(\d{2}:\d{2})?/);
+        if (!dm) continue;
+        const home = _faStrip(tds[2]);
+        const away = _faStrip(tds[6]);
+        if (!home || !away) continue;
+        const mid = _faStrip(tds[4]);
+        const last = _faStrip(tds[tds.length - 1]);
+        const score = mid.match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
+        const walkover = /^[HA]\s*-\s*W/i.test(mid);
+        const isHome = home.toLowerCase() === ourName.toLowerCase();
+        const isAway = away.toLowerCase() === ourName.toLowerCase();
+        if (!isHome && !isAway) continue; // e.g. another team's row leaked in — never import it
+        const dparts = dm[1].split('/');
+        const yy = dparts[2].length === 2 ? '20' + dparts[2] : dparts[2];
+        rows.push({
+            game_date: yy + '-' + dparts[1] + '-' + dparts[0] + 'T' + (dm[2] || '14:00'),
+            opponent: isHome ? away : home,
+            is_home: isHome,
+            away_venue_name: (!isHome && last && !/walkover|postponed|abandoned/i.test(last)) ? last.slice(0, 120) : null,
+            comp: _faStrip(tds[0]) || null,
+            fa_score: score ? { home: parseInt(score[1], 10), away: parseInt(score[2], 10) } : null,
+            fa_walkover: walkover,
+            fa_status: last || null,
+        });
+    }
+    if (!rows.length) throw new Error('FA_PARSE: no fixture rows recognised \u2014 the FA page layout may have changed; save the page and send it over');
+    return { team_name: ourName, rows };
+}
+
+// TABLE PAGE -> standings. Verified header: POS | Team | P | W | D | L | GD | PTS.
+function _faParseTable(html) {
+    // FIX-521 audit hardening: proven (by execution, on the saved Stat-leaders
+    // page) that a permissive tbody scan parses shaped GARBAGE from the wrong
+    // page type. Require the exact standings header signature first, and only
+    // read the tbody that follows THAT header — wrong pages now fail loudly.
+    const headM = String(html).match(/<thead[^>]*>[\s\S]*?<th>\s*POS\s*<\/th>[\s\S]*?<th[^>]*>\s*Team\s*<\/th>[\s\S]*?<th>\s*PTS\s*<\/th>[\s\S]*?<\/thead>/i);
+    if (!headM) throw new Error('FA_PARSE: standings header not found \u2014 wrong page or the FA layout changed; save the page and send it over');
+    const after = String(html).slice(String(html).indexOf(headM[0]) + headM[0].length);
+    const bodyM = after.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
+    if (!bodyM) throw new Error('FA_PARSE: no table body found');
+    const out = [];
+    const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let tr;
+    while ((tr = trRe.exec(bodyM[1])) !== null) {
+        const tds = [];
+        const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+        let td; while ((td = tdRe.exec(tr[1])) !== null) tds.push(td[1]);
+        if (tds.length < 8) continue;
+        const teamIdM = tds[1].match(/teamID=(\d+)/);
+        const row = {
+            pos: parseInt(_faStrip(tds[0]), 10) || 0,
+            team: _faStrip(tds[1]),
+            team_id: teamIdM ? teamIdM[1] : null,
+            p: parseInt(_faStrip(tds[2]), 10) || 0,
+            w: parseInt(_faStrip(tds[3]), 10) || 0,
+            d: parseInt(_faStrip(tds[4]), 10) || 0,
+            l: parseInt(_faStrip(tds[5]), 10) || 0,
+            gd: parseInt(_faStrip(tds[6]), 10) || 0,
+            pts: parseInt(_faStrip(tds[7]), 10) || 0,
+        };
+        if (row.team && row.pos && !/^\d+$/.test(row.team) && row.pts <= row.p * 3 + 3) out.push(row); // audit: numeric 'teams' + impossible points = garbage
+    }
+    if (!out.length) throw new Error('FA_PARSE: no standings rows recognised \u2014 the FA page layout may have changed; save the page and send it over');
+    return out;
+}
+
+// PULL FROM FA — returns rows in the exact CSV-preview payload shape; the client
+// feeds them to the SAME import-preview/apply endpoints. Nothing writes here.
+app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-pull', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        let faCtx = null; // FIX-522
+        const xl = await pool.query(
+            `SELECT id, name, fa_team_url FROM external_leagues
+              WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        const parsed = _faParseTeamUrl(xl.rows[0].fa_team_url);
+        if (!parsed) return res.status(400).json({ error: 'Save a valid FA team link first (fulltime.thefa.com/displayTeam.html?\u2026)' });
+        faCtx = { id: xl.rows[0].id, name: xl.rows[0].name, url: xl.rows[0].fa_team_url, tenant: req.tenant && req.tenant.name }; // FIX-522
+        const html = await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + parsed.teamID);
+        const data = _faParseFixtures(html);
+        res.json({ success: true, team_name: data.team_name, count: data.rows.length, rows: data.rows });
+    } catch (e) {
+        console.error('fa-pull error:', e.message);
+        _faAlertSuperadmin(faCtx, 'fa-pull', e.message); // FIX-522
+        const friendly = /^FA_PARSE/.test(e.message) ? e.message.replace(/^FA_PARSE:\s*/, '') : 'Could not reach the FA right now \u2014 try again in a minute';
+        res.status(502).json({ error: friendly });
+    }
+});
+
+// PUBLIC division table — parsed natively, cached in-memory 6h per league so the
+// public page never hammers the FA. Clean 502 on fetch/parse failure.
+const _faTableCache = new Map(); // leagueId -> { at, data }
+const FA_TABLE_TTL_MS = 6 * 60 * 60 * 1000;
+app.get('/api/public/ext-league-table/:leagueId', publicPlayerLimiter, async (req, res) => {
+    try {
+        let faCtx = null; // FIX-522
+        const xl = await pool.query(
+            `SELECT id, name, fa_team_url FROM external_leagues WHERE id = $1 AND status = 'active'`, [req.params.leagueId]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        const parsed = _faParseTeamUrl(xl.rows[0].fa_team_url);
+        if (!parsed) return res.status(404).json({ error: 'This league has no FA table link' });
+        faCtx = { id: xl.rows[0].id, name: xl.rows[0].name, url: xl.rows[0].fa_team_url, tenant: null }; // FIX-522
+        const hit = _faTableCache.get(String(xl.rows[0].id));
+        if (hit && (Date.now() - hit.at) < FA_TABLE_TTL_MS) return res.json(hit.data);
+        const html = await _faFetch('https://fulltime.thefa.com/table.html?divisionseason=' + parsed.divisionseason);
+        const rows = _faParseTable(html);
+        const data = { league: xl.rows[0].name, our_team_id: parsed.teamID, rows, fetched_at: new Date().toISOString() };
+        _faTableCache.set(String(xl.rows[0].id), { at: Date.now(), data });
+        res.json(data);
+    } catch (e) {
+        console.error('fa-table error:', e.message);
+        _faAlertSuperadmin(faCtx, 'fa-table', e.message); // FIX-522
+        res.status(502).json({ error: 'League table unavailable right now' });
+    }
+});
+
+// FIX-524: squad-stats parser. The displayTeam page carries the full squad table
+// (verified on two real leagues). Row = player-name th with a
+// statsForPlayer.html?personID=N link, then stat tds:
+// Apps | Overall Goals | Goals | Pens | Assists | Yellow | Red | 2ndY | SinBin | Started | SubOn | SubOff.
+// The page renders the table twice (tabs) — dedupe by personID, first wins.
+function _faParseSquad(html) {
+    if (!/Overall\s+Goals/i.test(String(html))) {
+        throw new Error('FA_PARSE: squad statistics table not found on the page');
+    }
+    const seen = new Set();
+    const out = [];
+    const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let tr;
+    while ((tr = trRe.exec(html)) !== null) {
+        const body = tr[1];
+        const pm = body.match(/statsForPlayer\.html\?personID=(\d+)[^>]*>\s*([^<]+?)\s*</);
+        if (!pm) continue;
+        if (body.indexOf('team-name-logo') !== -1) continue; // leaders-style row (team column) — never a squad row
+        const personId = pm[1];
+        if (seen.has(personId)) continue;
+        const tds = [];
+        const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+        let td; while ((td = tdRe.exec(body)) !== null) tds.push(_faStrip(td[1]));
+        if (tds.length < 5) continue;
+        let name = _faStrip(pm[2]);
+        const cm = name.match(/^([^,]+),\s*(.+)$/); // "Surname, Forename" -> "Forename Surname"
+        if (cm) name = cm[2] + ' ' + cm[1];
+        seen.add(personId);
+        out.push({
+            person_id: personId,
+            name: name.slice(0, 60),
+            apps: parseInt(tds[0], 10) || 0,
+            goals: parseInt(tds[1], 10) || 0,   // Overall Goals (incl. pens)
+            assists: parseInt(tds[4], 10) || 0,
+        });
+    }
+    if (!out.length) throw new Error('FA_PARSE: no squad rows recognised \u2014 the FA page layout may have changed; save the page and send it over');
+    return out;
+}
+
+// PULL PLAYERS — same fetch as the fixtures pull; returns the parsed squad plus
+// a status per player: already-imported ghost, possible member match, or new.
+app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-squad-pull', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        let faCtx = null; // FIX-522
+        const xl = await pool.query(
+            `SELECT id, name, fa_team_url FROM external_leagues
+              WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        const parsed = _faParseTeamUrl(xl.rows[0].fa_team_url);
+        if (!parsed) return res.status(400).json({ error: 'Save a valid FA team link first (fulltime.thefa.com/displayTeam.html?\u2026)' });
+        faCtx = { id: xl.rows[0].id, name: xl.rows[0].name, url: xl.rows[0].fa_team_url, tenant: req.tenant && req.tenant.name }; // FIX-522
+        const html = await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + parsed.teamID);
+        const squad = _faParseSquad(html);
+        const ghosts = await pool.query('SELECT fa_person_id FROM tenant_ghost_players WHERE tenant_id = $1', [req.tenant.id]);
+        const ghostIds = new Set(ghosts.rows.map(g => String(g.fa_person_id)));
+        const members = await pool.query(
+            `SELECT LOWER(p.alias) AS a FROM player_tenants pt JOIN players p ON p.id = pt.player_id
+              WHERE pt.tenant_id = $1 AND pt.status = 'active' AND p.alias IS NOT NULL`, [req.tenant.id]);
+        const aliasSet = new Set(members.rows.map(m => m.a));
+        const items = squad.map(s => ({
+            ...s,
+            status: ghostIds.has(String(s.person_id)) ? 'already_ghost'
+                : aliasSet.has(s.name.toLowerCase()) ? 'possible_member'
+                : 'new',
+        }));
+        res.json({ success: true, count: items.length, items });
+    } catch (e) {
+        console.error('fa-squad-pull error:', e.message);
+        _faAlertSuperadmin(faCtx, 'fa-squad-pull', e.message); // FIX-522
+        const friendly = /^FA_PARSE/.test(e.message) ? e.message.replace(/^FA_PARSE:\s*/, '') : 'Could not reach the FA right now \u2014 try again in a minute';
+        res.status(502).json({ error: friendly });
+    }
+});
+
+// APPLY — upsert the ticked ghosts. Re-import refreshes stats (the point of
+// the unique index); cap guards runaway tenants.
+const GHOSTS_MAX_PER_TENANT = parseInt(process.env.GHOSTS_MAX_PER_TENANT || '80', 10);
+app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-squad-apply', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const own = await pool.query(
+            `SELECT id FROM external_leagues WHERE id = $1 AND tenant_id = $2`, [req.params.id, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'League not found' });
+        const list = (Array.isArray(req.body.players) ? req.body.players : []).slice(0, 100);
+        if (!list.length) return res.status(400).json({ error: 'Nothing ticked' });
+        const cnt = await pool.query('SELECT COUNT(*) AS c FROM tenant_ghost_players WHERE tenant_id = $1', [req.tenant.id]);
+        if (parseInt(cnt.rows[0].c, 10) >= GHOSTS_MAX_PER_TENANT) {
+            return res.status(400).json({ error: 'Ghost roster is full (' + GHOSTS_MAX_PER_TENANT + ') \u2014 remove some first' });
+        }
+        let upserted = 0;
+        for (const p of list) {
+            const pid = String(p.person_id || '').trim();
+            const name = String(p.name || '').trim().slice(0, 60);
+            if (!/^\d{4,15}$/.test(pid) || !name) continue;
+            await pool.query(
+                `INSERT INTO tenant_ghost_players (tenant_id, league_id, fa_person_id, name, apps, goals, assists)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (tenant_id, fa_person_id)
+                 DO UPDATE SET name = EXCLUDED.name, apps = EXCLUDED.apps,
+                               goals = EXCLUDED.goals, assists = EXCLUDED.assists`,
+                [req.tenant.id, req.params.id, pid, name,
+                 parseInt(p.apps, 10) || 0, parseInt(p.goals, 10) || 0, parseInt(p.assists, 10) || 0]);
+            upserted++;
+        }
+        await auditLog(pool, req.user.playerId, 'ghost_roster_imported', null,
+            upserted + ' ghost player(s) from FA', req.tenant.id).catch(() => {});
+        res.json({ success: true, upserted });
+    } catch (e) { console.error('fa-squad-apply error:', e.message); res.status(500).json({ error: 'Failed to import players' }); }
+});
+
+// Ghost management: list + delete (CRM Club Page panel uses these).
+app.get('/api/t/:tenant_short_id/admin/ghost-players', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT id, name, apps, goals, assists FROM tenant_ghost_players
+              WHERE tenant_id = $1 ORDER BY apps DESC, name ASC`, [req.tenant.id]);
+        res.json({ items: r.rows });
+    } catch (e) { console.error('ghost list error:', e.message); res.status(500).json({ error: 'Failed to load ghost players' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/ghost-players/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query('DELETE FROM tenant_ghost_players WHERE id = $1 AND tenant_id = $2', [parseInt(req.params.id, 10) || 0, req.tenant.id]);
+        res.json({ success: true, deleted: r.rowCount });
+    } catch (e) { console.error('ghost delete error:', e.message); res.status(500).json({ error: 'Failed to remove ghost player' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-523 — TotalFooty -> tenant-admin notices. Superadmin composes in Manage
+// Tenants (ALL tenants or one); tenant admins get a popup on their next scoped
+// CRM sign-in; OK acknowledges per-admin and it never shows again.
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/tenant-notices', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT n.id, n.tenant_id, t.name AS tenant_name, n.title, n.body, n.active, n.created_at,
+                    (SELECT COUNT(*) FROM tenant_notice_acks a WHERE a.notice_id = n.id)::int AS ack_count
+               FROM tenant_admin_notices n
+               LEFT JOIN tenants t ON t.id = n.tenant_id
+              ORDER BY n.created_at DESC LIMIT 100`);
+        res.json({ items: r.rows });
+    } catch (e) { console.error('notices list error:', e.message); res.status(500).json({ error: 'Failed to load notices' }); }
+});
+app.post('/api/admin/tenant-notices', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const title = String(req.body.title || '').trim().slice(0, 100);
+        const body = String(req.body.body || '').trim().slice(0, 2000);
+        if (!title || !body) return res.status(400).json({ error: 'Title and message are both required' });
+        let tenantId = null;
+        if (req.body.tenant_id) {
+            if (!isValidUuid(String(req.body.tenant_id))) return res.status(400).json({ error: 'Invalid tenant' });
+            const t = await pool.query('SELECT id FROM tenants WHERE id = $1', [req.body.tenant_id]);
+            if (!t.rows.length) return res.status(400).json({ error: 'Tenant not found' });
+            tenantId = req.body.tenant_id;
+        }
+        const r = await pool.query(
+            `INSERT INTO tenant_admin_notices (tenant_id, title, body, created_by)
+             VALUES ($1, $2, $3, $4) RETURNING id`,
+            [tenantId, title, body, req.user.playerId]);
+        await auditLog(pool, req.user.playerId, 'tenant_notice_created', null,
+            `"${title}" -> ${tenantId ? 'one tenant' : 'ALL tenants'}`, tenantId).catch(() => {});
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('notice create error:', e.message); res.status(500).json({ error: 'Failed to save notice' }); }
+});
+app.delete('/api/admin/tenant-notices/:id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        await pool.query('DELETE FROM tenant_notice_acks WHERE notice_id = $1', [id]);
+        const r = await pool.query('DELETE FROM tenant_admin_notices WHERE id = $1', [id]);
+        res.json({ success: true, deleted: r.rowCount });
+    } catch (e) { console.error('notice delete error:', e.message); res.status(500).json({ error: 'Failed to delete notice' }); }
+});
+
+// Tenant-admin side: unseen notices for the popup + per-admin ack.
+app.get('/api/t/:tenant_short_id/admin/notices/unseen', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT n.id, n.title, n.body, n.created_at
+               FROM tenant_admin_notices n
+              WHERE n.active = TRUE
+                AND (n.tenant_id IS NULL OR n.tenant_id = $1)
+                AND NOT EXISTS (SELECT 1 FROM tenant_notice_acks a WHERE a.notice_id = n.id AND a.player_id = $2)
+              ORDER BY n.created_at ASC LIMIT 5`, [req.tenant.id, req.user.playerId]);
+        res.json({ items: r.rows });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ items: [] }); // pre-migration boot heals
+        console.error('notices unseen error:', e.message); res.status(500).json({ error: 'Failed to load notices' });
+    }
+});
+app.post('/api/t/:tenant_short_id/admin/notices/:id/ack', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        await pool.query(
+            `INSERT INTO tenant_notice_acks (notice_id, player_id) VALUES ($1, $2)
+             ON CONFLICT (notice_id, player_id) DO NOTHING`,
+            [parseInt(req.params.id, 10) || 0, req.user.playerId]);
+        res.json({ success: true });
+    } catch (e) { console.error('notice ack error:', e.message); res.status(500).json({ error: 'Failed to acknowledge' }); }
+});
+
 
 // FIX-461c: any logged-in PLAYER can mint a token for their own profile photo// FIX-461c: any logged-in PLAYER can mint a token for their own profile photo
 // (kind=player). Rate-limited; the PHP kind whitelist + image validation bound
@@ -41972,19 +42905,28 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues', authenticateToken, require
             const v = await pool.query('SELECT 1 FROM venues WHERE id = $1', [b.default_venue_id]);
             if (!v.rows.length) return res.status(400).json({ error: 'Unknown venue' });
         }
+        // FIX-516: optional league-level default WhatsApp link
+        let _xlDefaultWaLink = null;
+        if (b.default_whatsapp_link) {
+            _xlDefaultWaLink = String(b.default_whatsapp_link).trim() || null;
+            if (_xlDefaultWaLink && !_isValidWhatsAppLink(_xlDefaultWaLink)) {
+                return res.status(400).json({ error: 'Link must be a https://chat.whatsapp.com/… or https://wa.me/… URL' });
+            }
+        }
         const id = require('crypto').randomUUID();
         await pool.query(`
             INSERT INTO external_leagues
               (id, tenant_id, kind, name, parent_league_name, external_website_url, public_slug,
                default_venue_id, default_coach_player_id, series_awards_enabled, game_awards_enabled,
-               award_goals, award_assists, created_by, status, created_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, 'active', NOW())`,
+               award_goals, award_assists, default_whatsapp_link, created_by, status, created_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, 'active', NOW())`,
             [id, req.tenant.id, kind, name,
              b.parent_league_name ? String(b.parent_league_name).slice(0, 80) : null,
              b.external_website_url ? String(b.external_website_url).slice(0, 300) : null,
              slug, b.default_venue_id || null, b.default_coach_player_id || null,
              b.series_awards_enabled !== false, b.game_awards_enabled !== false,
-             b.award_goals === true, b.award_assists === true, req.user.playerId]);
+             b.award_goals === true, b.award_assists === true,
+             _xlDefaultWaLink, req.user.playerId]);
         await auditLog(pool, req.user.playerId, 'ext_league_created', null,
             `${kind} "${name}"`, req.tenant.id).catch(() => {});
         res.status(201).json({ ok: true, id, public_slug: slug,
@@ -42034,6 +42976,16 @@ app.patch('/api/t/:tenant_short_id/admin/ext-leagues/:id', authenticateToken, re
         if (b.game_awards_enabled !== undefined) put('game_awards_enabled', b.game_awards_enabled === true);
         if (b.award_goals !== undefined) put('award_goals', b.award_goals === true);
         if (b.award_assists !== undefined) put('award_assists', b.award_assists === true);
+        if (b.default_whatsapp_link !== undefined) { // FIX-516
+            const wa = String(b.default_whatsapp_link || '').trim() || null;
+            if (wa && !_isValidWhatsAppLink(wa)) return res.status(400).json({ error: 'Link must be a https://chat.whatsapp.com/… or https://wa.me/… URL' });
+            put('default_whatsapp_link', wa);
+        }
+        if (b.fa_team_url !== undefined) { // FIX-521
+            const v = String(b.fa_team_url || '').trim() || null;
+            if (v && !_faParseTeamUrl(v)) return res.status(400).json({ error: 'That link must be your team\'s FA page: fulltime.thefa.com/displayTeam.html?divisionseason=…&teamID=…' });
+            put('fa_team_url', v);
+        }
         if (b.status !== undefined) put('status', b.status === 'archived' ? 'archived' : 'active');
         if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
         vals.push(req.params.id);
@@ -42143,16 +43095,16 @@ async function _extCreateFixtureCore(db, tenant, L, b) {
          // home venue's default cannot leak phantom costs into finance.
          // Home fixtures stay NULL -> venue default, editable in Finance.
          isHome ? null : 0,
-         // FIX-512: per-game WhatsApp link. Trim-or-null; CSV import-apply passes
-         // no link so imported fixtures are born NULL by design (linked via edit).
-         (b.whatsapp_link && String(b.whatsapp_link).trim()) || null]);
+         // FIX-512: per-game WhatsApp link, trim-or-null. FIX-516: when the fixture
+         // carries no link (CSV import-apply included), the league's default applies.
+         (b.whatsapp_link && String(b.whatsapp_link).trim()) || (L && L.default_whatsapp_link) || null]);
     return { game_id: ins.rows[0].id, game_url: ins.rows[0].game_url, opponent_name: opp.rows[0].name, when, isHome };
 }
 
 app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fixtures', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
         const xl = await pool.query(
-            `SELECT id, name, default_venue_id, default_coach_player_id FROM external_leagues
+            `SELECT id, name, default_venue_id, default_coach_player_id, default_whatsapp_link FROM external_leagues
               WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
         if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
         const L = xl.rows[0];
@@ -42235,7 +43187,7 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/import-apply', authentic
     const client = await pool.connect();
     try {
         const xl = await client.query(
-            `SELECT id, name, default_venue_id, default_coach_player_id FROM external_leagues
+            `SELECT id, name, default_venue_id, default_coach_player_id, default_whatsapp_link FROM external_leagues
               WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
         if (!xl.rows.length) { client.release(); return res.status(404).json({ error: 'League not found' }); }
         const L = xl.rows[0];
@@ -56727,10 +57679,17 @@ function _fix322Slugify(name) {
 }
 
 // Ensure slug is unique by appending -2, -3, ... if needed.
+// FIX-521 audit: reserved words are treated as TAKEN — the Cloudflare worker
+// routes these paths itself (/start = wizard, /tcs, /api, …), so a tenant slug
+// matching one would shadow its own public page. Set mirrors csp-worker.js;
+// keep the two in sync when reserving new paths. Covers ALL creation paths
+// (add-team, superadmin create, start-tenant, slug edit) via this chokepoint.
+const _TF_RESERVED_SLUGS = new Set(['start', 'tcs', 'vibecoding', 'assets', 'api', 'g', 'index', 'admin']);
 async function _fix322UniqueSlug(baseSlug, excludeTenantId = null) {
     let slug = baseSlug || `tenant-${Date.now()}`;
     for (let i = 1; i <= 50; i++) {
         const candidate = i === 1 ? slug : `${slug}-${i}`;
+        if (_TF_RESERVED_SLUGS.has(candidate)) continue; // worker-owned path -> next suffix
         const params = excludeTenantId ? [candidate, excludeTenantId] : [candidate];
         const q = excludeTenantId
             ? 'SELECT 1 FROM tenants WHERE slug = $1 AND id != $2 LIMIT 1'
@@ -63288,6 +64247,80 @@ app.get('/api/public/tenant/:slug', publicPlayerLimiter, optionalAuth, async (re
               WHERE tenant_id = $1 ORDER BY sort_order ASC, id ASC`, [t.id]
         ).catch(() => ({ rows: [] }));
 
+        // FIX-513: Club Page public data. All 42P01/42703-safe pre-migration.
+        // Explicit columns only (burn list). Bodies render as escaped text.
+        const cpNews = await pool.query(
+            `SELECT n.id, n.title, n.body, n.cover_url, n.published_at,
+                    g.external_opponent, g.ext_tf_score, g.ext_opp_score, g.game_date, g.is_home
+               FROM tenant_news n
+               LEFT JOIN games g ON g.id = n.game_id
+              WHERE n.tenant_id = $1 AND n.status = 'published'
+              ORDER BY n.published_at DESC NULLS LAST, n.id DESC
+              LIMIT 6`, [t.id]
+        ).catch(() => ({ rows: [] }));
+        const cpSponsors = await pool.query(
+            `SELECT name, logo_url, website_url FROM tenant_sponsors
+              WHERE tenant_id = $1 ORDER BY sort_order ASC, id ASC LIMIT 12`, [t.id]
+        ).catch(() => ({ rows: [] }));
+        const cpSettings = await pool.query(
+            `SELECT public_squad_enabled, social_facebook, social_instagram,
+                    social_x, social_youtube, contact_email_public, about_text
+               FROM tenants WHERE id = $1`, [t.id]
+        ).catch(() => ({ rows: [{}] }));
+        const cpDocs = await pool.query(
+            `SELECT title, url FROM tenant_documents
+              WHERE tenant_id = $1 ORDER BY sort_order ASC, id ASC LIMIT 20`, [t.id]
+        ).catch(() => ({ rows: [] })); // FIX-514
+        const cp = cpSettings.rows[0] || {};
+        // Season record per active external league — OUR results only. A full
+        // opponents-included table needs the whole division's results (FA-sync
+        // S2 territory, on the roadmap); this is the honest computable subset.
+        const cpLeagues = await pool.query(
+            `SELECT xl.id, xl.name, (xl.fa_team_url IS NOT NULL) AS has_fa,
+                    COUNT(*) FILTER (WHERE g.ext_tf_score IS NOT NULL AND g.ext_opp_score IS NOT NULL) AS played,
+                    COUNT(*) FILTER (WHERE g.ext_tf_score > g.ext_opp_score) AS won,
+                    COUNT(*) FILTER (WHERE g.ext_tf_score = g.ext_opp_score AND g.ext_tf_score IS NOT NULL) AS drawn,
+                    COUNT(*) FILTER (WHERE g.ext_tf_score < g.ext_opp_score) AS lost,
+                    COALESCE(SUM(g.ext_tf_score), 0) AS gf,
+                    COALESCE(SUM(g.ext_opp_score), 0) AS ga
+               FROM external_leagues xl
+               JOIN games g ON g.external_league_id = xl.id AND g.game_status = 'completed' AND g.tenant_id = $1
+              WHERE xl.tenant_id = $1 AND xl.status = 'active'
+              GROUP BY xl.id, xl.name
+              ORDER BY xl.name ASC`, [t.id]
+        ).catch(() => ({ rows: [] }));
+        // Squad: alias + appearances ONLY, and ONLY when the tenant has switched
+        // it on (default OFF — aliases are already public on game pages, but the
+        // roster listing is opt-in by design).
+        let cpSquad = { rows: [] };
+        let cpGhosts = { rows: [] }; // FIX-524
+        if (cp.public_squad_enabled === true) {
+            // FIX-514: scalar subselects, NOT joins — a second LEFT JOIN would
+            // fan out the rows and inflate the apps COUNT. Goals/assists come
+            // from ext_league_player_stats scoped to this tenant's fixtures.
+            cpSquad = await pool.query(
+                `SELECT p.alias,
+                        (SELECT COUNT(*) FROM registrations r
+                          WHERE r.player_id = p.id AND r.status = 'confirmed'
+                            AND r.game_id IN (SELECT id FROM games WHERE tenant_id = $1 AND game_status = 'completed')) AS apps,
+                        (SELECT COALESCE(SUM(s.goals), 0) FROM ext_league_player_stats s
+                          WHERE s.player_id = p.id
+                            AND s.game_id IN (SELECT id FROM games WHERE tenant_id = $1 AND game_status = 'completed')) AS goals,
+                        (SELECT COALESCE(SUM(s.assists), 0) FROM ext_league_player_stats s
+                          WHERE s.player_id = p.id
+                            AND s.game_id IN (SELECT id FROM games WHERE tenant_id = $1 AND game_status = 'completed')) AS assists
+                   FROM player_tenants pt
+                   JOIN players p ON p.id = pt.player_id
+                  WHERE pt.tenant_id = $1 AND pt.status = 'active' AND p.alias IS NOT NULL AND p.alias <> ''
+                  ORDER BY apps DESC, p.alias ASC
+                  LIMIT 40`, [t.id]
+            ).catch(() => ({ rows: [] }));
+            cpGhosts = await pool.query(
+                `SELECT name, apps, goals, assists FROM tenant_ghost_players
+                  WHERE tenant_id = $1 ORDER BY apps DESC LIMIT 60`, [t.id]
+            ).catch(() => ({ rows: [] })); // FIX-524
+        }
+
         // Assemble: live items grouped under visible albums; NULL album_id is the
         // implicit "Unsorted" bucket (renders last); items whose album the viewer
         // cannot see (members-only, logged out) are dropped with their album.
@@ -63343,6 +64376,48 @@ app.get('/api/public/tenant/:slug', publicPlayerLimiter, optionalAuth, async (re
             // gallery_albums (design doc section 5, phase A note).
             gallery_albums: galleryAlbums,        // [{title, members_only, cover_url, photos:[{url, caption, type, video_url}]}]
             collections: galleryCollections,      // FIX-508c: [{title, featured, albums:[{title, cover_url}]}]
+            // FIX-513: Club Page payload — all explicit
+            news: cpNews.rows.map(nw => ({
+                id: nw.id, title: nw.title, body: nw.body,
+                cover_url: nw.cover_url || null, published_at: nw.published_at,
+                game: nw.external_opponent ? {
+                    opponent: nw.external_opponent, is_home: nw.is_home,
+                    tf_score: nw.ext_tf_score, opp_score: nw.ext_opp_score,
+                    game_date: nw.game_date,
+                } : null,
+            })),
+            league_record: cpLeagues.rows.map(l => ({
+                id: l.id, has_fa_table: l.has_fa === true, // FIX-521
+                name: l.name,
+                played: parseInt(l.played, 10) || 0,
+                won: parseInt(l.won, 10) || 0,
+                drawn: parseInt(l.drawn, 10) || 0,
+                lost: parseInt(l.lost, 10) || 0,
+                gf: parseInt(l.gf, 10) || 0,
+                ga: parseInt(l.ga, 10) || 0,
+                points: (parseInt(l.won, 10) || 0) * 3 + (parseInt(l.drawn, 10) || 0),
+            })),
+            about: (cp.about_text || null),   // FIX-514
+            documents: cpDocs.rows.map(dd => ({ title: dd.title, url: dd.url })), // FIX-514
+            squad: (() => { // FIX-524: merge ghost players in (toggle already gated cpSquad; ghosts obey the same gate)
+                const real = cpSquad.rows.map(s => ({
+                    alias: s.alias, apps: parseInt(s.apps, 10) || 0,
+                    goals: parseInt(s.goals, 10) || 0, assists: parseInt(s.assists, 10) || 0, // FIX-514
+                }));
+                if (cp.public_squad_enabled !== true) return real;
+                const taken = new Set(real.map(r => String(r.alias || '').toLowerCase()));
+                const gh = (cpGhosts.rows || []).filter(g => !taken.has(String(g.name).toLowerCase()))
+                    .map(g => ({ alias: g.name, apps: g.apps, goals: g.goals, assists: g.assists }));
+                return real.concat(gh).sort((a, b) => (b.apps - a.apps) || String(a.alias).localeCompare(String(b.alias))).slice(0, 60);
+            })(),
+            sponsors: cpSponsors.rows.map(s => ({ name: s.name, logo_url: s.logo_url || null, website_url: s.website_url || null })),
+            socials: {
+                facebook: cp.social_facebook || null,
+                instagram: cp.social_instagram || null,
+                x: cp.social_x || null,
+                youtube: cp.social_youtube || null,
+                contact_email: cp.contact_email_public || null,
+            },
             viewer_is_member: viewerIsMember,     // FIX-508b: drives SUBMIT PHOTOS + members badges
             tenant: {
                 name: t.name, slug: t.slug, short_id: t.short_id,
@@ -64768,6 +65843,114 @@ async function bootstrapTenantFreeCredits() {
             )`);
         console.log('✅ gallery v2 phase C ready (FIX-508c)');
 
+        // FIX-513: Club Page pack (PH parity) — news/match reports, sponsors,
+        // socials, public-squad toggle. Self-bootstrapping; no PSQL ever.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_news (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                cover_url TEXT,
+                game_id UUID,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_by UUID,
+                published_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_tnews_tenant ON tenant_news (tenant_id, status, published_at DESC)`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_sponsors (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                name TEXT NOT NULL,
+                logo_url TEXT,
+                website_url TEXT,
+                sort_order INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_tsponsors_tenant ON tenant_sponsors (tenant_id, sort_order)`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS public_squad_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS social_facebook TEXT`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS social_instagram TEXT`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS social_x TEXT`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS social_youtube TEXT`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS contact_email_public TEXT`);
+        // FIX-514: PH pack — about block + links-only club documents.
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS about_text TEXT`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_documents (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL,
+                sort_order INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_tdocs_tenant ON tenant_documents (tenant_id, sort_order)`);
+        // FIX-516: per-league default WhatsApp link (auto-applied to new fixtures,
+        // CSV imports included; per-game edit via FIX-512 always wins afterwards).
+        await pool.query(`ALTER TABLE external_leagues ADD COLUMN IF NOT EXISTS default_whatsapp_link TEXT`);
+        console.log('✅ ph extras ready (FIX-515/516/517)');
+        // FIX-519: member messaging — sent-message log (accountability + rate context)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_messages (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                document_id INT,
+                recipient_count INT NOT NULL DEFAULT 0,
+                sent_by UUID,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_tmsg_tenant ON tenant_messages (tenant_id, created_at DESC)`);
+        console.log('✅ member messaging ready (FIX-519)');
+        // FIX-521: FA Full-Time integration — the league stores its own team's
+        // displayTeam URL; fixtures pull + division table both derive from it.
+        await pool.query(`ALTER TABLE external_leagues ADD COLUMN IF NOT EXISTS fa_team_url TEXT`);
+        console.log('✅ fa tables ready (FIX-521)');
+        // FIX-524: own-roster ghost import — name-only placeholder players parsed
+        // from the tenant's OWN FA team page (team-scoped source; other clubs'
+        // players are structurally absent). Separate table by design: ghosts can
+        // never leak into RSVP/pickers/messaging. Re-pull upserts stats.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_ghost_players (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                league_id UUID,
+                fa_person_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                apps INT NOT NULL DEFAULT 0,
+                goals INT NOT NULL DEFAULT 0,
+                assists INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (tenant_id, fa_person_id)
+            )`);
+        console.log('✅ ghost roster ready (FIX-524)');
+        // FIX-523: TotalFooty -> tenant-admin notices (popup on next CRM sign-in).
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_admin_notices (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_by UUID,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_notice_acks (
+                notice_id INT NOT NULL,
+                player_id UUID NOT NULL,
+                seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (notice_id, player_id)
+            )`);
+        console.log('✅ tenant notices ready (FIX-523)');
+        console.log('✅ fa alerts armed (FIX-522)');
+        console.log('✅ ph pack ready (FIX-514)');
+        console.log('✅ club page ready (FIX-513)');
+
         // FIX-504 (FA-sync S1): fixture provenance — stable import identity +
         // snapshot of external values at last import (the 3-way-merge base for S3).
         await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS ext_source_key TEXT`);
@@ -66057,7 +67240,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web92-walinks`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web100-notices`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
