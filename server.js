@@ -1736,6 +1736,9 @@ const AUDIT_TAG_TABLE = {
     shop_order:               { cat: 'shop', sub: 'order_placed',   actor: 'player', sev: 'low'  },
     wonderful_initiated:      { cat: 'credits', sub: 'payment',  actor: 'player', sev: 'med'  },
     wonderful_credited:       { cat: 'credits', sub: 'payment',  actor: 'system', sev: 'med'  },
+    fines_settled:            { cat: 'credits', sub: 'payment',  actor: 'system', sev: 'med'  }, // FIX-533
+    fine_attached:            { cat: 'tenant',  sub: 'fines',    actor: 'admin',  sev: 'low'  }, // FIX-533
+    card_recorded:            { cat: 'tenant',  sub: 'fines',    actor: 'admin',  sev: 'low'  }, // FIX-533
     balance_adjustment:       { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
     credit_adjustment:        { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
     admin_adjustment:         { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
@@ -3240,6 +3243,8 @@ const NOTIF_TEMPLATES = {
     award_wall:           d => ({ title: '🧱 Brick Wall!',                body: `Voted Brick Wall for ${d.day} at ${d.venue}.` }),
     award_reckless:       d => ({ title: '🚑 Reckless Tackler',           body: `You won Reckless Tackler for ${d.day}. You know what you did.` }),
     award_moaner:         d => ({ title: '😩 The Moaner',                 body: `You won The Moaner for ${d.day}. The team appreciated your encouragement.` }),
+    fine_issued:          d => ({ title: '💸 You have been fined!',      body: `${d.label} - £${d.amount} (${d.tenant}). Outstanding total £${d.total}. Settle it from your dashboard.` }),
+    fines_settled_push:   d => ({ title: '✅ Fines settled',               body: `£${Number(d.amount).toFixed(2)} paid - you are all square. Good as gold.` }),
     award_donkey:         d => ({ title: '🐴 Donkey Award',               body: `You won the Donkey Award for ${d.day}. EEEYYY-OOORRREEE.` }),
     // NEW — Batch 5 awards revamp
     award_cold_moment:    d => ({ title: '🥶 Cold Moment!',               body: `You won the Cold Moment Award for ${d.day} at ${d.venue}. One moment that left us amazed.` }),
@@ -12744,6 +12749,292 @@ app.delete('/api/t/:tenant_short_id/admin/ghost-players/:id', authenticateToken,
         const r = await pool.query('DELETE FROM tenant_ghost_players WHERE id = $1 AND tenant_id = $2', [parseInt(req.params.id, 10) || 0, req.tenant.id]);
         res.json({ success: true, deleted: r.rowCount });
     } catch (e) { console.error('ghost delete error:', e.message); res.status(500).json({ error: 'Failed to remove ghost player' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-533 — FINES & CARDS. Ledger-only money (mark-paid); Wonderful settle is
+// a separate purpose branch. Multiple fines per player per game by design.
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/t/:tenant_short_id/admin/fines-config', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const t = await pool.query(
+            `SELECT fines_enabled, cards_enabled, card_yellow_fine_id, card_red_fine_id FROM tenants WHERE id = $1`, [req.tenant.id]);
+        const lib = await pool.query(
+            `SELECT id, name, amount, active FROM tenant_fines WHERE tenant_id = $1 ORDER BY active DESC, name ASC`, [req.tenant.id]);
+        const map = await pool.query(
+            `SELECT award_key, fine_id FROM tenant_award_fines WHERE tenant_id = $1`, [req.tenant.id]);
+        res.json({ settings: t.rows[0] || {}, fines: lib.rows, award_map: map.rows, award_types: AWARD_TYPES });
+    } catch (e) { console.error('fines-config error:', e.message); res.status(500).json({ error: 'Failed to load fines config' }); }
+});
+app.put('/api/t/:tenant_short_id/admin/fines-config', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const yl = b.card_yellow_fine_id ? parseInt(b.card_yellow_fine_id, 10) || null : null;
+        const rd = b.card_red_fine_id ? parseInt(b.card_red_fine_id, 10) || null : null;
+        for (const fid of [yl, rd].filter(Boolean)) {
+            const own = await pool.query('SELECT 1 FROM tenant_fines WHERE id = $1 AND tenant_id = $2', [fid, req.tenant.id]);
+            if (!own.rows.length) return res.status(400).json({ error: 'Card fine must be one of your own fines' });
+        }
+        await pool.query(
+            `UPDATE tenants SET fines_enabled = $1, cards_enabled = $2, card_yellow_fine_id = $3, card_red_fine_id = $4 WHERE id = $5`,
+            [b.fines_enabled === true, b.cards_enabled === true, yl, rd, req.tenant.id]);
+        res.json({ success: true });
+    } catch (e) { console.error('fines-config save error:', e.message); res.status(500).json({ error: 'Failed to save fines config' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/fines', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const name = String(req.body.name || '').trim().slice(0, 60);
+        const amount = parseFloat(req.body.amount);
+        if (!name) return res.status(400).json({ error: 'Fine name required' });
+        if (isNaN(amount) || amount < 0 || amount > 1000) return res.status(400).json({ error: 'Amount must be \u00a30\u2013\u00a31000' });
+        const cnt = await pool.query('SELECT COUNT(*) AS c FROM tenant_fines WHERE tenant_id = $1', [req.tenant.id]);
+        if (parseInt(cnt.rows[0].c, 10) >= 60) return res.status(400).json({ error: 'Fines library is full (60)' });
+        const r = await pool.query(
+            `INSERT INTO tenant_fines (tenant_id, name, amount) VALUES ($1, $2, $3) RETURNING id`,
+            [req.tenant.id, name, amount.toFixed(2)]);
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('fine create error:', e.message); res.status(500).json({ error: 'Failed to save fine' }); }
+});
+app.patch('/api/t/:tenant_short_id/admin/fines/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const sets = []; const vals = [];
+        if (req.body.name !== undefined) { const n = String(req.body.name).trim().slice(0, 60); if (!n) return res.status(400).json({ error: 'Name cannot be empty' }); vals.push(n); sets.push(`name = $${vals.length}`); }
+        if (req.body.amount !== undefined) { const a = parseFloat(req.body.amount); if (isNaN(a) || a < 0 || a > 1000) return res.status(400).json({ error: 'Amount must be \u00a30\u2013\u00a31000' }); vals.push(a.toFixed(2)); sets.push(`amount = $${vals.length}`); }
+        if (req.body.active !== undefined) { vals.push(req.body.active === true); sets.push(`active = $${vals.length}`); }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+        vals.push(parseInt(req.params.id, 10) || 0); vals.push(req.tenant.id);
+        const r = await pool.query(`UPDATE tenant_fines SET ${sets.join(', ')} WHERE id = $${vals.length - 1} AND tenant_id = $${vals.length}`, vals);
+        if (!r.rowCount) return res.status(404).json({ error: 'Fine not found' });
+        res.json({ success: true });
+    } catch (e) { console.error('fine update error:', e.message); res.status(500).json({ error: 'Failed to update fine' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/fines/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query('UPDATE tenant_fines SET active = FALSE WHERE id = $1 AND tenant_id = $2', [parseInt(req.params.id, 10) || 0, req.tenant.id]);
+        if (!r.rowCount) return res.status(404).json({ error: 'Fine not found' });
+        res.json({ success: true });
+    } catch (e) { console.error('fine delete error:', e.message); res.status(500).json({ error: 'Failed to remove fine' }); }
+});
+app.put('/api/t/:tenant_short_id/admin/fines-award-map', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const key = String(req.body.award_key || '');
+        if (!AWARD_TYPES.includes(key)) return res.status(400).json({ error: 'Unknown award' });
+        const fid = req.body.fine_id ? parseInt(req.body.fine_id, 10) || null : null;
+        if (fid === null) {
+            await pool.query('DELETE FROM tenant_award_fines WHERE tenant_id = $1 AND award_key = $2', [req.tenant.id, key]);
+        } else {
+            const own = await pool.query('SELECT 1 FROM tenant_fines WHERE id = $1 AND tenant_id = $2 AND active = TRUE', [fid, req.tenant.id]);
+            if (!own.rows.length) return res.status(400).json({ error: 'Pick one of your own active fines' });
+            await pool.query(
+                `INSERT INTO tenant_award_fines (tenant_id, award_key, fine_id) VALUES ($1, $2, $3)
+                 ON CONFLICT (tenant_id, award_key) DO UPDATE SET fine_id = EXCLUDED.fine_id`, [req.tenant.id, key, fid]);
+        }
+        res.json({ success: true });
+    } catch (e) { console.error('award map error:', e.message); res.status(500).json({ error: 'Failed to save award fine' }); }
+});
+// FIX-533: attach-time message - push + email with the outstanding total and
+// a pointer to the dashboard settle strip. Fire-and-forget at every attach
+// point (manual, one-off, card auto-fine, award auto-fine).
+async function _finesNotify(playerId, tenantId, label, amount) {
+    try {
+        const tot = await pool.query(
+            `SELECT COALESCE(SUM(amount), 0) AS t FROM game_fines WHERE player_id = $1 AND tenant_id = $2 AND paid = FALSE`,
+            [playerId, tenantId]);
+        const tn = await pool.query('SELECT name FROM tenants WHERE id = $1', [tenantId]);
+        const total = parseFloat(tot.rows[0].t).toFixed(2);
+        const tenantName = (tn.rows[0] || {}).name || 'your team';
+        sendNotification('fine_issued', playerId, { label, amount: parseFloat(amount).toFixed(2), tenant: tenantName, total }).catch(() => {});
+        const pr = await pool.query(
+            `SELECT COALESCE(u.email, '') AS email FROM players p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $1`, [playerId]);
+        if (pr.rows.length && pr.rows[0].email) {
+            const html = wrapEmailHtml(`
+                <h2 style="color:#ffc850;font-size:20px;font-weight:900;margin:0 0 10px;">💸 YOU HAVE BEEN FINED</h2>
+                <p style="color:#ccc;font-size:14px;line-height:1.7;">
+                    <strong>${htmlEncode(label)}</strong> - £${htmlEncode(String(parseFloat(amount).toFixed(2)))}<br>
+                    From: ${htmlEncode(tenantName)}<br>
+                    <strong>Outstanding total: £${htmlEncode(total)}</strong>
+                </p>
+                <p style="color:#ccc;font-size:14px;line-height:1.6;">Settle it in seconds - open your dashboard and hit <strong>SETTLE NOW</strong> under your balance:</p>
+                <p><a href="https://totalfooty.co.uk/" style="display:inline-block;padding:12px 22px;background:#00cc66;color:#000;border-radius:8px;font-weight:900;text-decoration:none;">OPEN MY DASHBOARD</a></p>
+                <p style="color:#888;font-size:12px;">Fines are set by your team admins - speak to them if something looks wrong. Cash settles are fine too; they will mark it paid.</p>
+            `);
+            emailTransporter.sendMail({
+                from: '"TotalFooty" <totalfooty19@gmail.com>',
+                to: pr.rows[0].email,
+                subject: `💸 Fine: ${label} - £${parseFloat(amount).toFixed(2)} (${tenantName})`,
+                html,
+            }).catch(e => console.error('fine email failed:', e.message));
+        }
+    } catch (e) { console.error('fines notify failed:', e.message); }
+}
+async function _finesGameGuard(gameId, tenantId) {
+    const g = await pool.query('SELECT id, tenant_id, external_league_id FROM games WHERE id = $1 AND tenant_id = $2', [gameId, tenantId]);
+    return g.rows[0] || null;
+}
+app.get('/api/t/:tenant_short_id/admin/games/:gameId/fines-cards', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const g = await _finesGameGuard(req.params.gameId, req.tenant.id);
+        if (!g) return res.status(404).json({ error: 'Game not found' });
+        const fines = await pool.query(
+            `SELECT gf.id, gf.player_id, p.alias, gf.label, gf.amount, gf.source, gf.paid, gf.card_id
+               FROM game_fines gf JOIN players p ON p.id = gf.player_id
+              WHERE gf.game_id = $1 AND gf.tenant_id = $2 ORDER BY gf.created_at ASC`, [g.id, req.tenant.id]);
+        const cards = await pool.query(
+            `SELECT gc.id, gc.player_id, p.alias, gc.card, gc.season
+               FROM game_cards gc JOIN players p ON p.id = gc.player_id
+              WHERE gc.game_id = $1 AND gc.tenant_id = $2 ORDER BY gc.created_at ASC`, [g.id, req.tenant.id]);
+        res.json({ fines: fines.rows, cards: cards.rows });
+    } catch (e) { console.error('fines-cards list error:', e.message); res.status(500).json({ error: 'Failed to load fines & cards' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/games/:gameId/fines', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const t = await pool.query('SELECT fines_enabled FROM tenants WHERE id = $1', [req.tenant.id]);
+        if (!t.rows[0] || t.rows[0].fines_enabled !== true) return res.status(400).json({ error: 'Fines are turned off for this team' });
+        const g = await _finesGameGuard(req.params.gameId, req.tenant.id);
+        if (!g) return res.status(404).json({ error: 'Game not found' });
+        const playerId = String(req.body.player_id || '');
+        if (!isValidUuid(playerId)) return res.status(400).json({ error: 'Pick a player' });
+        const member = await pool.query(
+            `SELECT p.alias FROM player_tenants pt JOIN players p ON p.id = pt.player_id
+              WHERE pt.player_id = $1 AND pt.tenant_id = $2 AND pt.status = 'active'`, [playerId, req.tenant.id]);
+        if (!member.rows.length) return res.status(400).json({ error: 'Player is not a member of this team' });
+        let label, amount, fineId = null;
+        if (req.body.fine_id) {
+            const f = await pool.query('SELECT id, name, amount FROM tenant_fines WHERE id = $1 AND tenant_id = $2 AND active = TRUE', [parseInt(req.body.fine_id, 10) || 0, req.tenant.id]);
+            if (!f.rows.length) return res.status(400).json({ error: 'Fine not found in your library' });
+            fineId = f.rows[0].id; label = f.rows[0].name; amount = f.rows[0].amount;
+        } else {
+            label = String(req.body.label || '').trim().slice(0, 60);
+            const a = parseFloat(req.body.amount);
+            if (!label) return res.status(400).json({ error: 'Describe the one-off fine' });
+            if (isNaN(a) || a < 0 || a > 1000) return res.status(400).json({ error: 'Amount must be \u00a30\u2013\u00a31000' });
+            amount = a.toFixed(2);
+        }
+        const r = await pool.query(
+            `INSERT INTO game_fines (tenant_id, game_id, player_id, fine_id, label, amount, source, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+            [req.tenant.id, g.id, playerId, fineId, label, amount, fineId ? 'manual' : 'oneoff', req.user.playerId]);
+        await auditLog(pool, req.user.playerId, 'fine_attached', null, `${label} \u00a3${amount} -> ${member.rows[0].alias}`, req.tenant.id).catch(() => {});
+        _finesNotify(playerId, req.tenant.id, label, amount); // FIX-533: instant message
+        res.json({ success: true, id: r.rows[0].id });
+    } catch (e) { console.error('fine attach error:', e.message); res.status(500).json({ error: 'Failed to attach fine' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/game-fines/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query('DELETE FROM game_fines WHERE id = $1 AND tenant_id = $2 AND paid = FALSE', [parseInt(req.params.id, 10) || 0, req.tenant.id]);
+        if (!r.rowCount) return res.status(404).json({ error: 'Fine not found (paid fines cannot be deleted \u2014 unmark first)' });
+        res.json({ success: true });
+    } catch (e) { console.error('fine remove error:', e.message); res.status(500).json({ error: 'Failed to remove fine' }); }
+});
+app.patch('/api/t/:tenant_short_id/admin/game-fines/:id/paid', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const paid = req.body.paid === true;
+        const r = await pool.query(
+            `UPDATE game_fines SET paid = $1, paid_at = CASE WHEN $1 THEN NOW() ELSE NULL END WHERE id = $2 AND tenant_id = $3`,
+            [paid, parseInt(req.params.id, 10) || 0, req.tenant.id]);
+        if (!r.rowCount) return res.status(404).json({ error: 'Fine not found' });
+        res.json({ success: true });
+    } catch (e) { console.error('fine paid error:', e.message); res.status(500).json({ error: 'Failed to update' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/games/:gameId/cards', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const t = await pool.query('SELECT cards_enabled, fines_enabled, card_yellow_fine_id, card_red_fine_id FROM tenants WHERE id = $1', [req.tenant.id]);
+        if (!t.rows[0] || t.rows[0].cards_enabled !== true) return res.status(400).json({ error: 'Cards are turned off for this team' });
+        const g = await _finesGameGuard(req.params.gameId, req.tenant.id);
+        if (!g) return res.status(404).json({ error: 'Game not found' });
+        const playerId = String(req.body.player_id || '');
+        const card = req.body.card === 'red' ? 'red' : req.body.card === 'yellow' ? 'yellow' : null;
+        if (!isValidUuid(playerId) || !card) return res.status(400).json({ error: 'Pick a player and a card' });
+        const member = await pool.query(
+            `SELECT p.alias FROM player_tenants pt JOIN players p ON p.id = pt.player_id
+              WHERE pt.player_id = $1 AND pt.tenant_id = $2 AND pt.status = 'active'`, [playerId, req.tenant.id]);
+        if (!member.rows.length) return res.status(400).json({ error: 'Player is not a member of this team' });
+        let season = null;
+        if (g.external_league_id) {
+            const s = await pool.query('SELECT season_label FROM external_leagues WHERE id = $1', [g.external_league_id]);
+            season = (s.rows[0] && s.rows[0].season_label) || null;
+        }
+        const cr = await pool.query(
+            `INSERT INTO game_cards (tenant_id, game_id, player_id, card, season, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [req.tenant.id, g.id, playerId, card, season, req.user.playerId]);
+        let fineAttached = null;
+        const fid = card === 'yellow' ? t.rows[0].card_yellow_fine_id : t.rows[0].card_red_fine_id;
+        if (t.rows[0].fines_enabled === true && fid) {
+            const f = await pool.query('SELECT id, name, amount FROM tenant_fines WHERE id = $1 AND tenant_id = $2 AND active = TRUE', [fid, req.tenant.id]);
+            if (f.rows.length) {
+                await pool.query(
+                    `INSERT INTO game_fines (tenant_id, game_id, player_id, fine_id, card_id, label, amount, source, created_by)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                    [req.tenant.id, g.id, playerId, f.rows[0].id, cr.rows[0].id, f.rows[0].name, f.rows[0].amount, 'card_' + card, req.user.playerId]);
+                fineAttached = { label: f.rows[0].name, amount: f.rows[0].amount };
+                _finesNotify(playerId, req.tenant.id, f.rows[0].name, f.rows[0].amount); // FIX-533
+            }
+        }
+        await auditLog(pool, req.user.playerId, 'card_recorded', null, `${card} card -> ${member.rows[0].alias}${fineAttached ? ' (+\u00a3' + fineAttached.amount + ' fine)' : ''}`, req.tenant.id).catch(() => {});
+        res.json({ success: true, id: cr.rows[0].id, fine: fineAttached });
+    } catch (e) { console.error('card record error:', e.message); res.status(500).json({ error: 'Failed to record card' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/game-cards/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10) || 0;
+        await pool.query('DELETE FROM game_fines WHERE card_id = $1 AND tenant_id = $2 AND paid = FALSE', [id, req.tenant.id]);
+        const r = await pool.query('DELETE FROM game_cards WHERE id = $1 AND tenant_id = $2', [id, req.tenant.id]);
+        if (!r.rowCount) return res.status(404).json({ error: 'Card not found' });
+        res.json({ success: true });
+    } catch (e) { console.error('card remove error:', e.message); res.status(500).json({ error: 'Failed to remove card' }); }
+});
+// FIX-533: the caller's own outstanding fines, grouped per tenant - feeds the
+// dashboard SETTLE NOW strip. Explicit fields only.
+app.get('/api/player/fines-outstanding', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT gf.tenant_id, t.name AS tenant_name,
+                    COALESCE(SUM(gf.amount), 0) AS total, COUNT(*)::int AS count
+               FROM game_fines gf JOIN tenants t ON t.id = gf.tenant_id
+              WHERE gf.player_id = $1 AND gf.paid = FALSE
+              GROUP BY gf.tenant_id, t.name ORDER BY total DESC`, [req.user.playerId]);
+        res.json({ items: r.rows.map(x => ({ tenant_id: x.tenant_id, tenant_name: x.tenant_name, total: parseFloat(x.total).toFixed(2), count: x.count })) });
+    } catch (e) { console.error('fines outstanding error:', e.message); res.status(500).json({ error: 'Failed to load fines' }); }
+});
+app.get('/api/t/:tenant_short_id/admin/fines-ledger', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const season = req.query.season !== undefined && req.query.season !== '' ? String(req.query.season).slice(0, 20) : null;
+        if (req.query.player_id && isValidUuid(String(req.query.player_id))) {
+            const rows = await pool.query(
+                `SELECT gf.id, gf.label, gf.amount, gf.source, gf.paid, gf.created_at, g.game_date
+                   FROM game_fines gf JOIN games g ON g.id = gf.game_id
+                  WHERE gf.tenant_id = $1 AND gf.player_id = $2 ORDER BY gf.created_at DESC LIMIT 200`,
+                [req.tenant.id, req.query.player_id]);
+            return res.json({ items: rows.rows });
+        }
+        const totals = await pool.query(
+            `SELECT p.id AS player_id, p.alias,
+                    COALESCE(SUM(gf.amount) FILTER (WHERE NOT gf.paid), 0) AS outstanding,
+                    COALESCE(SUM(gf.amount) FILTER (WHERE gf.paid), 0) AS paid_total,
+                    COUNT(gf.id)::int AS fines_count
+               FROM game_fines gf JOIN players p ON p.id = gf.player_id
+              WHERE gf.tenant_id = $1 GROUP BY p.id, p.alias`, [req.tenant.id]);
+        const cards = await pool.query(
+            `SELECT gc.player_id,
+                    COUNT(*) FILTER (WHERE gc.card = 'yellow' AND ($2::text IS NULL OR gc.season = $2))::int AS yellows,
+                    COUNT(*) FILTER (WHERE gc.card = 'red'    AND ($2::text IS NULL OR gc.season = $2))::int AS reds,
+                    COUNT(*) FILTER (WHERE gc.card = 'yellow')::int AS yellows_career,
+                    COUNT(*) FILTER (WHERE gc.card = 'red')::int AS reds_career
+               FROM game_cards gc WHERE gc.tenant_id = $1 GROUP BY gc.player_id`, [req.tenant.id, season]);
+        const seasons = await pool.query(
+            `SELECT DISTINCT season FROM game_cards WHERE tenant_id = $1 AND season IS NOT NULL ORDER BY season DESC`, [req.tenant.id]);
+        const cByP = {}; cards.rows.forEach(c => { cByP[c.player_id] = c; });
+        const players = totals.rows.map(tt => ({ ...tt, ...(cByP[tt.player_id] || { yellows: 0, reds: 0, yellows_career: 0, reds_career: 0 }) }));
+        for (const pid of Object.keys(cByP)) {
+            if (!players.some(x => x.player_id === pid)) {
+                const a = await pool.query('SELECT alias FROM players WHERE id = $1', [pid]);
+                players.push({ player_id: pid, alias: (a.rows[0] || {}).alias || '?', outstanding: 0, paid_total: 0, fines_count: 0, ...cByP[pid] });
+            }
+        }
+        players.sort((a, b) => (b.outstanding - a.outstanding) || String(a.alias).localeCompare(String(b.alias)));
+        res.json({ players, seasons: seasons.rows.map(s => s.season) });
+    } catch (e) { console.error('fines ledger error:', e.message); res.status(500).json({ error: 'Failed to load the ledger' }); }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -23835,17 +24126,52 @@ app.post('/api/admin/games/:gameId/registrations/:regId/drop-no-refund', authent
 });
 
 // Update ALL future games in a weekly series (venue, players, cost, star rating, time)
+// FIX-529 audit fix: series-settings is all-or-nothing BY CONTRACT (requires
+// venue/max/cost; unsent fields would overwrite). The apply-to-series prompt
+// therefore gets its own link-ONLY writer — same auth as the single-game
+// settings PUT the caller just used, same future-games scope as series-settings.
+app.put('/api/admin/games/:gameId/series-whatsapp', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const wa = req.body.whatsapp_link;
+        let val = null;
+        if (wa !== undefined && wa !== null && String(wa).trim() !== '') {
+            const w = String(wa).trim();
+            if (!_isValidWhatsAppLink(w)) return res.status(400).json({ error: 'WhatsApp link must be a chat.whatsapp.com or wa.me URL' });
+            val = w;
+        }
+        const g = await pool.query('SELECT series_id FROM games WHERE id = $1', [req.params.gameId]);
+        if (!g.rows.length) return res.status(404).json({ error: 'Game not found' });
+        if (!g.rows[0].series_id) return res.status(400).json({ error: 'This game is not part of a series' });
+        const r = await pool.query(
+            `UPDATE games SET whatsapp_link = $2 WHERE series_id = $1 AND game_date > NOW()`,
+            [g.rows[0].series_id, val]);
+        res.json({ success: true, updated: r.rowCount });
+    } catch (e) { console.error('series-whatsapp error:', e.message); res.status(500).json({ error: 'Failed to update the series link' }); }
+});
+
 app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { gameId } = req.params;
-        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser, format, position_type, refs_required, ref_pay, early_bird_price: eb_s, super_early_bird_price: seb_s, opponent_id: series_opp_id, pitch_cost: pitch_cost_s, default_organiser_id: organiser_s } = req.body;
+        const { venue_id, max_players, cost_per_player, star_rating, new_time, min_rating_enabled, requires_organiser, format, position_type, refs_required, ref_pay, early_bird_price: eb_s, super_early_bird_price: seb_s, opponent_id: series_opp_id, pitch_cost: pitch_cost_s, default_organiser_id: organiser_s, whatsapp_link: wa_s } = req.body; // FIX-529
         // P2.1: pitch_cost — undefined = leave unchanged; null/empty/invalid handled by COALESCE
         const parsedPitchCostSeries = pitch_cost_s === undefined
             ? null
             : (pitch_cost_s === null || pitch_cost_s === '' ? null : parseFloat(pitch_cost_s));
         if (pitch_cost_s !== undefined && pitch_cost_s !== null && pitch_cost_s !== '' && (isNaN(parsedPitchCostSeries) || parsedPitchCostSeries < 0)) {
             return res.status(400).json({ error: 'Pitch cost must be a number ≥ 0' });
+        }
+        // FIX-529: tri-state — undefined = leave every game's link unchanged;
+        // '' / null = clear across the series' future games; value = validate + set.
+        let waSeriesMode = 'skip';
+        let waSeriesVal = null;
+        if (wa_s !== undefined) {
+            if (wa_s === null || String(wa_s).trim() === '') { waSeriesMode = 'clear'; }
+            else {
+                const w = String(wa_s).trim();
+                if (!_isValidWhatsAppLink(w)) return res.status(400).json({ error: 'WhatsApp link must be a chat.whatsapp.com or wa.me URL' });
+                waSeriesMode = 'set'; waSeriesVal = w;
+            }
         }
         // P3 (default organiser) — same tri-state pattern as pitch_cost
         let parsedOrganiserIdSeries = null;
@@ -23934,6 +24260,13 @@ app.put('/api/admin/games/:gameId/series-settings', authenticateToken, requireAd
                     [venue_id, max_players, cost_per_player, starRatingForDb, min_rating_enabled !== undefined ? min_rating_enabled : null, g.id, requires_organiser !== undefined ? !!requires_organiser : null, format || null, position_type || null, refs_required !== undefined ? parseInt(refs_required) : null, ref_pay !== undefined ? parseFloat(ref_pay) : null, parsedEB_s, parsedSEB_s, resolvedSeriesOppId, resolvedSeriesOppName, parsedPitchCostSeries]
                 );
             }
+        }
+        // FIX-529: propagate the WhatsApp link over the SAME future-games scope,
+        // as its own statement so the big settings UPDATE stays untouched.
+        if (waSeriesMode !== 'skip') {
+            await client.query(
+                `UPDATE games SET whatsapp_link = $2 WHERE series_id = $1 AND game_date > NOW()`,
+                [seriesId, waSeriesMode === 'set' ? waSeriesVal : null]);
         }
 
         await client.query('COMMIT');
@@ -29339,6 +29672,33 @@ async function checkAndGrantAwardBadge(playerId, awardType) {
 // duplicating work (emails, badge checks) even though FIX-154 prevents
 // duplicate DB writes. Lock is per-game so different games still parallelise.
 const _closeAwardsInFlight = new Set();
+// FIX-533: award-winner auto-fines. Runs AFTER closeAwards persists winners:
+// idempotent (NOT EXISTS on source+player+game), tenant-scoped, only when the
+// tenant has fines enabled and mapped this award. Fire-and-forget.
+async function _finesApplyAwardFines(gameId) {
+    try {
+        const g = await pool.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+        if (!g.rows.length || !g.rows[0].tenant_id) return;
+        const tenantId = g.rows[0].tenant_id;
+        const t = await pool.query('SELECT fines_enabled FROM tenants WHERE id = $1', [tenantId]);
+        if (!t.rows[0] || t.rows[0].fines_enabled !== true) return;
+        const winners = await pool.query(
+            `SELECT ga.recipient_player_id, ga.award_type, tf.id AS fine_id, tf.name, tf.amount
+               FROM game_awards ga
+               JOIN tenant_award_fines taf ON taf.tenant_id = $2 AND taf.award_key = ga.award_type
+               JOIN tenant_fines tf ON tf.id = taf.fine_id AND tf.tenant_id = $2 AND tf.active = TRUE
+              WHERE ga.game_id = $1 AND NOT ga.removed_due_to_team_drop`, [gameId, tenantId]);
+        for (const w of winners.rows) {
+            const ins = await pool.query(
+                `INSERT INTO game_fines (tenant_id, game_id, player_id, fine_id, label, amount, source)
+                 SELECT $1, $2, $3, $4, $5, $6, $7
+                  WHERE NOT EXISTS (SELECT 1 FROM game_fines
+                                     WHERE game_id = $2 AND player_id = $3 AND source = $7)`,
+                [tenantId, gameId, w.recipient_player_id, w.fine_id, w.name, w.amount, 'award:' + w.award_type]);
+            if (ins.rowCount) _finesNotify(w.recipient_player_id, tenantId, w.name, w.amount); // FIX-533: fresh inserts only
+        }
+    } catch (e) { console.error('award fines error:', e.message); }
+}
 async function closeAwards(gameId) {
     if (_closeAwardsInFlight.has(gameId)) {
         console.log(`[FIX-157] closeAwards(${gameId}) skipped — concurrent run in flight`);
@@ -29603,6 +29963,7 @@ async function closeAwards(gameId) {
         // FIX-157: release the in-process lock so this game can be retried by a
         // later cron tick. Without this, an exception would pin the gameId in
         // _closeAwardsInFlight permanently.
+        _finesApplyAwardFines(gameId).catch(() => {}); // FIX-533: after winners persist
         _closeAwardsInFlight.delete(gameId);
     }
 }
@@ -31236,6 +31597,35 @@ app.post('/api/admin/raf/backfill', authenticateToken, requireSuperAdmin, async 
 // MANAGE GAMES (scoped for Organiser)
 // ==========================================
 
+// FIX-530: management standing — which tenants' games can this caller list in
+// Manage Games? Distinct from getVisibleTenantContext (player visibility /
+// discovery preferences): this is authority. superadmin = all tenants;
+// role='admin' and global organisers = every tenant they're an ACTIVE member
+// of; tenant admins = tenants where player_tenants.role = 'tenant_admin'.
+// 42P01-safe pre-migration (returns empty standing).
+async function _manageableTenants(playerId, userRole, isOrganiser) {
+    if (userRole === 'superadmin') {
+        const all = await pool.query(
+            `SELECT id, name, region, short_id FROM tenants WHERE status = 'active' ORDER BY name`); // FIX-533: short_id lets the client hit /api/t/:short/... for the game's tenant
+        return { all: true, tenants: all.rows };
+    }
+    try {
+        const r = await pool.query(
+            `SELECT t.id, t.name, t.region, t.short_id, pt.role AS pt_role
+               FROM player_tenants pt
+               JOIN tenants t ON t.id = pt.tenant_id AND t.status = 'active'
+              WHERE pt.player_id = $1 AND pt.status = 'active'
+              ORDER BY t.name`, [playerId]);
+        const broad = userRole === 'admin' || isOrganiser === true;
+        return { all: false, tenants: r.rows
+            .filter(x => broad || x.pt_role === 'tenant_admin')
+            .map(x => ({ id: x.id, name: x.name, region: x.region, short_id: x.short_id })) };
+    } catch (e) {
+        if (e && e.code === '42P01') return { all: false, tenants: [] };
+        throw e;
+    }
+}
+
 app.get('/api/manage/games', authenticateToken, async (req, res) => {
     try {
         const playerId = req.user.playerId;
@@ -31245,11 +31635,32 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
         );
         const player = playerResult.rows[0];
         if (!player) return res.status(403).json({ error: 'Player not found' });
-        if (!isFullAdmin && !player.is_organiser) {
+        // FIX-530: compute standing + parse the 🏢 filter. Pure tenant admins
+        // (not organisers, not platform admins) now pass the gate — their own
+        // tenant's games are exactly what this list is for.
+        const mgScope = await _manageableTenants(playerId, req.user.role, player.is_organiser === true);
+        const _mgAllowedIds = mgScope.tenants.map(t => t.id);
+        const _mgPicked = String(req.query.tenants || '').split(',')
+            .map(s => s.trim()).filter(s => s && isValidUuid(s))
+            .filter(id => mgScope.all || _mgAllowedIds.includes(id));
+        if (!isFullAdmin && !player.is_organiser && !_mgAllowedIds.length) {
             return res.status(403).json({ error: 'No management access' });
         }
         
         let query, params;
+        // FIX-530: row scoping for the full-admin query. superadmin = everything
+        // (picked filter optional); role='admin' = their active-membership tenants,
+        // with NULL-tenant legacy rows preserved unless a filter is actively picked.
+        let _mgWhere = '';
+        const _mgParams = [];
+        if (isFullAdmin) {
+            if (req.user.role === 'superadmin') {
+                if (_mgPicked.length) { _mgWhere = 'AND g.tenant_id = ANY($2::uuid[])'; _mgParams.push(_mgPicked); }
+            } else {
+                _mgWhere = 'AND (g.tenant_id = ANY($2::uuid[]) OR (g.tenant_id IS NULL AND $3::boolean = TRUE))';
+                _mgParams.push(_mgPicked.length ? _mgPicked : _mgAllowedIds, _mgPicked.length === 0);
+            }
+        }
         if (isFullAdmin) {
             query = `SELECT g.*, opp_mgr.logo_url AS opponent_logo_url, v.name as venue_name,
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
@@ -31350,16 +31761,32 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                     OR g.game_date >= NOW() - INTERVAL '30 days'
                     OR $1::boolean = TRUE
                 )
+                ${_mgWhere /* FIX-530 */}
                 ORDER BY g.game_date DESC`;
-            params = [req.query.include_history === '1' || req.query.include_history === 'true'];
+            params = [req.query.include_history === '1' || req.query.include_history === 'true', ..._mgParams];
         } else {
-            // Build OR conditions for each role the player has
+            // Build OR conditions for each role the player has (FIX-530: params
+            // built alongside so tenant conditions can join dynamically).
             const conditions = [];
+            params = [];
             if (player.is_organiser) {
+                params.push(playerId);
                 conditions.push(`EXISTS (
                     SELECT 1 FROM registrations r 
-                    WHERE r.game_id = g.id AND r.player_id = $1 AND r.status = 'confirmed'
+                    WHERE r.game_id = g.id AND r.player_id = $${params.length} AND r.status = 'confirmed'
                 )`);
+            }
+            // FIX-530: standing tenants (tenant_admin role / organiser memberships)
+            // OR'd in — a tenant admin sees their whole tenant without needing a
+            // registration in each game. An active 🏢 pick replaces the OR-set
+            // strictly (filtering means filtering).
+            if (_mgPicked.length) {
+                conditions.length = 0;
+                params = [_mgPicked];
+                conditions.push('g.tenant_id = ANY($1::uuid[])');
+            } else if (_mgAllowedIds.length) {
+                params.push(_mgAllowedIds);
+                conditions.push(`g.tenant_id = ANY($${params.length}::uuid[])`);
             }
             query = `SELECT g.*, opp_clm.logo_url AS opponent_logo_url, v.name as venue_name,
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
@@ -31446,7 +31873,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 LEFT JOIN game_series gs ON gs.id = g.series_id
                 WHERE (${conditions.join(' OR ')})
                 ORDER BY g.game_date DESC LIMIT 50`;
-            params = player.is_organiser ? [playerId] : [];
+            /* FIX-530: params built with the conditions above */
         }
         
         const result = await pool.query(query, params);
@@ -31519,6 +31946,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
 
         res.json({
             games: sanitisedRows,
+            manage_scope: { all: mgScope.all, tenants: mgScope.tenants }, // FIX-530
             managerRole: isFullAdmin ? 'admin' : 'organiser',
             is_superadmin: isSuperadmin,
             permissions: {
@@ -41534,6 +41962,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                    cs.max_players, cs.session_date, cs.status, cs.duration_hours,
                    cs.min_price, cs.max_price, cs.is_full, cs.session_notes,
                    cs.coach_confirmed, cs.created_at, cs.pitch_number,
+                   cs.whatsapp_link,
                    p.id AS coach_id, p.full_name AS coach_name,
                    p.alias AS coach_alias, p.photo_url AS coach_photo,
                    p.coach_certifications, p.coaching_appearances,
@@ -41588,6 +42017,7 @@ app.get('/api/coaching/session/:url', optionalAuth, publicEndpointLimiter, async
                 fee: session.fee, recurs_weekly: session.recurs_weekly,
                 discipline_affects_tiers: session.discipline_affects_tiers,
                 session_notes: session.session_notes,
+                whatsapp_link: session.whatsapp_link || null, // FIX-529 (explicit per the burn rule)
                 /* FIX-470: full coach profile block for the session page */
                 coach_id: session.coach_id, coach_name: session.coach_name,
                 coach_alias: session.coach_alias, coach_photo: session.coach_photo,
@@ -42986,6 +43416,9 @@ app.patch('/api/t/:tenant_short_id/admin/ext-leagues/:id', authenticateToken, re
             if (v && !_faParseTeamUrl(v)) return res.status(400).json({ error: 'That link must be your team\'s FA page: fulltime.thefa.com/displayTeam.html?divisionseason=…&teamID=…' });
             put('fa_team_url', v);
         }
+        if (b.season_label !== undefined) { // FIX-533: per-league season for cards
+            put('season_label', b.season_label === null ? null : String(b.season_label).trim().slice(0, 20) || null);
+        }
         if (b.status !== undefined) put('status', b.status === 'archived' ? 'archived' : 'active');
         if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
         vals.push(req.params.id);
@@ -43778,6 +44211,13 @@ app.post('/api/t/:tenant_short_id/admin/trainings', authenticateToken, requireTe
         const fee = b.fee === undefined || b.fee === null || b.fee === '' ? 0 : parseFloat(b.fee);
         if (isNaN(fee) || fee < 0 || fee > 500) return res.status(400).json({ error: 'Fee must be 0-500' });
         const duration = parseFloat(b.duration_hours) > 0 ? parseFloat(b.duration_hours) : 1;
+        // FIX-529: optional WhatsApp group link, same validation as games (FIX-498).
+        let waLink = null;
+        if (b.whatsapp_link !== undefined && b.whatsapp_link !== null && String(b.whatsapp_link).trim() !== '') {
+            const w = String(b.whatsapp_link).trim();
+            if (!_isValidWhatsAppLink(w)) return res.status(400).json({ error: 'WhatsApp link must be a chat.whatsapp.com or wa.me URL' });
+            waLink = w;
+        }
         const recurs = b.recurs_weekly === true;
         let disciplineToggle = b.discipline_affects_tiers === true;
         if (disciplineToggle) { // per-session toggle only meaningful when tenant master switch is on
@@ -43806,12 +44246,12 @@ app.post('/api/t/:tenant_short_id/admin/trainings', authenticateToken, requireTe
               (session_url, session_kind, tenant_id, title, fee, recurs_weekly, series_id,
                discipline_affects_tiers, coach_player_id, created_by, duration_hours,
                activity_type, group_type, max_players, session_date, session_notes, status,
-               confirmed_venue_id)
-            VALUES ($1,'training',$2,$3,$4,$5,$6,$7,$8,$9,$10,'training','training',NULL,$11,$12,'open',$13)
+               confirmed_venue_id, whatsapp_link)
+            VALUES ($1,'training',$2,$3,$4,$5,$6,$7,$8,$9,$10,'training','training',NULL,$11,$12,'open',$13,$14)
             RETURNING id, session_url`,
             [sessionUrl, req.tenant.id, title, fee, recurs, seriesId, disciplineToggle,
              coachId, req.user.playerId, duration, when.toISOString(),
-             b.notes ? String(b.notes).slice(0, 1000) : null, venueId]);
+             b.notes ? String(b.notes).slice(0, 1000) : null, venueId, waLink]); // FIX-529: $14
         await auditLog(pool, req.user.playerId, 'training_created', null,
             `Training "${title}" ${when.toISOString()} fee £${fee}${recurs ? ' (weekly)' : ''}`, req.tenant.id).catch(() => {});
         res.status(201).json({ ok: true, id: ins.rows[0].id, session_url: ins.rows[0].session_url,
@@ -49951,13 +50391,13 @@ async function sendWonderfulCreditEmail(playerId, pounds, ref, balAfter = null) 
 app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiateLimiter, async (req, res) => {
     if (!WONDERFUL_API_KEY) return res.status(503).json({ error: 'Online payments are temporarily unavailable' });
     try {
-        const { amount_pounds, game_id, position_preference, backup_type, league_split_id } = req.body;
+        const { amount_pounds, game_id, position_preference, backup_type, league_split_id, fines_tenant_id } = req.body; // FIX-533
         const playerId = req.user.playerId;
 
         // FIX-410b (Block N Phase 6 online): a league split-share payment derives its
         // amount + game from the split row (server-controlled — the client can't set
         // the price). Skips the whole-pound rule so exact shares (e.g. £4.50) work.
-        let pounds, amountPence, _splitId = null, _splitGameId = null;
+        let pounds, amountPence, _splitId = null, _splitGameId = null, _finesTid = null, _finesIds = null; // FIX-533
         if (league_split_id) {
             const _sp = await pool.query(
                 `SELECT s.id, s.amount_owed_pence, s.amount_paid_pence, f.game_id
@@ -49970,6 +50410,22 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
             pounds = amountPence / 100;
             _splitId = _sp.rows[0].id;
             _splitGameId = _sp.rows[0].game_id || null;
+        } else if (fines_tenant_id) {
+            // FIX-533: fines settle - SERVER-controlled amount: the caller's own
+            // unpaid fines for that tenant, snapshotted by id so fines added
+            // after this moment are never marked by this payment. Mirrors the
+            // split pattern (exact pence allowed, no whole-pound rule).
+            if (!isValidUuid(String(fines_tenant_id))) return res.status(400).json({ error: 'Invalid team' });
+            const _fr = await pool.query(
+                `SELECT id, amount FROM game_fines WHERE player_id = $1 AND tenant_id = $2 AND paid = FALSE ORDER BY id`,
+                [playerId, fines_tenant_id]);
+            if (!_fr.rows.length) return res.status(400).json({ error: 'No outstanding fines for that team' });
+            amountPence = Math.round(_fr.rows.reduce((s, r) => s + parseFloat(r.amount), 0) * 100);
+            if (amountPence < 100) return res.status(400).json({ error: 'Outstanding total is under £1 - settle it in cash with your admin' });
+            if (amountPence > 50000) return res.status(400).json({ error: 'Outstanding total is over £500 - contact your admin' });
+            pounds = amountPence / 100;
+            _finesTid = fines_tenant_id;
+            _finesIds = _fr.rows.map(r => r.id);
         } else {
             // Validate amount: £1–£200 in whole pounds
             pounds = parseFloat(amount_pounds);
@@ -50052,10 +50508,10 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
         const insertRes = await pool.query(
             `INSERT INTO wonderful_payments
                 (wonderful_payment_id, merchant_reference, player_id, amount_pence, status, game_id, pay_link,
-                 position_preference, backup_type, league_split_id)
-             VALUES (NULL, $1, $2, $3, 'init_pending', $4, NULL, $5, $6, $7)
+                 position_preference, backup_type, league_split_id, fines_tenant_id, fines_ids)
+             VALUES (NULL, $1, $2, $3, 'init_pending', $4, NULL, $5, $6, $7, $8, $9)
              RETURNING id`,
-            [merchantRef, playerId, amountPence, effectiveGameId, validPos, validBackupType, _splitId]
+            [merchantRef, playerId, amountPence, effectiveGameId, validPos, validBackupType, _splitId, _finesTid, _finesIds] // FIX-533
         );
         const pmtRowId = insertRes.rows[0].id;
         console.log(`[WF initiate] inserted init_pending row ${pmtRowId} · ref ${merchantRef} · £${pounds.toFixed(2)}${game_id ? ` · game ${game_id}` : ''}`);
@@ -50834,7 +51290,7 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
     // Atomic claim + credit. Rollback on any failure — payment stays non-credited
     // so the reconciler / next webhook can retry safely.
     const client = await pool.connect();
-    let pounds, balBefore, balAfter, freshPmt, isLeagueShare = false;
+    let pounds, balBefore, balAfter, freshPmt, isLeagueShare = false, isFinesSettle = false; // FIX-533
     try {
         await client.query('BEGIN');
         const claim = await client.query(
@@ -50858,7 +51314,8 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
         // the wallet credit + every credit-only side-effect; status flip + in-tx split
         // mark + audit + admin-notify still happen.
         isLeagueShare = !!freshPmt.league_split_id;
-        if (!isLeagueShare) {
+        isFinesSettle = !!freshPmt.fines_tenant_id; // FIX-533: settle purpose - never a wallet credit
+        if (!isLeagueShare && !isFinesSettle) { // FIX-533: fines settles never touch the wallet
             const balRes = await client.query(
                 'SELECT COALESCE(balance, 0) AS balance FROM credits WHERE player_id = $1',
                 [freshPmt.player_id]
@@ -50896,6 +51353,25 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
                   WHERE id = $1`,
                 [freshPmt.league_split_id, freshPmt.amount_pence]);
         }
+        // FIX-533: fines settle - mark exactly the snapshotted ids paid, inside
+        // the SAME claim transaction (the claim's status guard makes this
+        // idempotent across webhook/reconciler races).
+        if (isFinesSettle && Array.isArray(freshPmt.fines_ids) && freshPmt.fines_ids.length) {
+            const _fmark = await client.query(
+                `UPDATE game_fines SET paid = TRUE, paid_at = NOW()
+                  WHERE id = ANY($1::int[]) AND tenant_id = $2 AND player_id = $3 AND paid = FALSE`,
+                [freshPmt.fines_ids, freshPmt.fines_tenant_id, freshPmt.player_id]);
+            // FIX-533 audit: RULE-5 double-settle detector. Two pay links created
+            // >10s apart can BOTH be paid; the second marks zero rows (all already
+            // paid) and the money would vanish silently. Detect and alert for a
+            // manual refund - mirrors the PAID-not-credited alert pattern.
+            if (_fmark.rowCount === 0) {
+                _securityAlertEmail('\ud83d\udcb8 PAID fines settle marked ZERO fines',
+                    `<p>A paid Wonderful fines settle marked <strong>no fines</strong> as paid - every snapshotted fine was already settled (classic stale-second-link double payment).</p>` +
+                    `<p><strong>Player:</strong> ${freshPmt.player_id}<br><strong>Tenant:</strong> ${freshPmt.fines_tenant_id}<br><strong>Amount:</strong> \u00a3${(freshPmt.amount_pence / 100).toFixed(2)}<br><strong>Ref:</strong> ${freshPmt.merchant_reference}</p>` +
+                    `<p><strong>Action:</strong> refund this payment in the Wonderful dashboard - the player has paid the same fines twice.</p>`);
+            }
+        }
         await client.query('COMMIT');
     } catch (txErr) {
         await client.query('ROLLBACK').catch(() => {});
@@ -50913,6 +51389,11 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
         // email / RAF / credit push. Audit-log the fee payment for the money trail.
         await auditLog(pool, auditActor, 'league_share_paid', freshPmt.player_id,
             `£${pounds.toFixed(2)} league match-fee share paid via Wonderful (no wallet credit) · split ${freshPmt.league_split_id} · Ref: ${freshPmt.merchant_reference}`);
+    } else if (isFinesSettle) {
+        // FIX-533: no wallet credit, no top-up ledger - audit the settle.
+        await auditLog(pool, auditActor, 'fines_settled', freshPmt.player_id,
+            `£${pounds.toFixed(2)} fines settled via Wonderful (${(freshPmt.fines_ids || []).length} fine(s), no wallet credit) - Ref: ${freshPmt.merchant_reference}`,
+            freshPmt.fines_tenant_id);
     } else {
         await recordCreditTransaction(pool, freshPmt.player_id, pounds, 'wonderful_topup',
             `Wonderful bank payment${ctxSuffix} — ref ${freshPmt.merchant_reference}`, adminId);
@@ -50949,6 +51430,10 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
             );
             if (claim.rows.length === 0) {
                 // Someone else (another webhook/reconciler hit) already pushed.
+                return;
+            }
+            if (isFinesSettle) { // FIX-533: settle gets its own message
+                await sendNotification('fines_settled_push', freshPmt.player_id, { amount: pounds });
                 return;
             }
             await sendNotification('wonderful_credited', freshPmt.player_id, {
@@ -65948,6 +66433,65 @@ async function bootstrapTenantFreeCredits() {
             )`);
         console.log('✅ tenant notices ready (FIX-523)');
         console.log('✅ fa alerts armed (FIX-522)');
+        console.log('✅ manage-games scope ready (FIX-530)');
+        // FIX-533: FINES & CARDS — per-tenant fines library, per-game fines
+        // (multiple per player, one-offs allowed), yellow/red cards with a
+        // per-league season label, award-winner auto-fines, ledger. Money is
+        // LEDGER-ONLY here; the Wonderful settle flow is a separate purpose
+        // branch (never a wallet credit).
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_fines (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                name TEXT NOT NULL,
+                amount NUMERIC(8,2) NOT NULL DEFAULT 0,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS game_fines (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                game_id UUID NOT NULL,
+                player_id UUID NOT NULL,
+                fine_id INT,
+                card_id INT,
+                label TEXT NOT NULL,
+                amount NUMERIC(8,2) NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'manual',
+                paid BOOLEAN NOT NULL DEFAULT FALSE,
+                paid_at TIMESTAMPTZ,
+                created_by UUID,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS game_cards (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                game_id UUID NOT NULL,
+                player_id UUID NOT NULL,
+                card TEXT NOT NULL CHECK (card IN ('yellow','red')),
+                season TEXT,
+                created_by UUID,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_award_fines (
+                tenant_id UUID NOT NULL,
+                award_key TEXT NOT NULL,
+                fine_id INT NOT NULL,
+                PRIMARY KEY (tenant_id, award_key)
+            )`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS fines_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS cards_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS card_yellow_fine_id INT`);
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS card_red_fine_id INT`);
+        await pool.query(`ALTER TABLE external_leagues ADD COLUMN IF NOT EXISTS season_label TEXT`);
+        console.log('✅ fines & cards ready (FIX-533)');
+        // FIX-529: WhatsApp v3 — trainings (and every coaching_sessions kind)
+        // can carry a group link; series-edit propagates links to future games.
+        await pool.query(`ALTER TABLE coaching_sessions ADD COLUMN IF NOT EXISTS whatsapp_link TEXT`);
+        console.log('✅ whatsapp v3 ready (FIX-529)');
         console.log('✅ ph pack ready (FIX-514)');
         console.log('✅ club page ready (FIX-513)');
 
@@ -66641,6 +67185,8 @@ async function fix401BootstrapLeagues() {
         // 6) games.league_id — links a game row to its league (UUID → leagues.id).
         await pool.query(`ALTER TABLE games ADD COLUMN IF NOT EXISTS league_id UUID REFERENCES leagues(id) ON DELETE SET NULL`);
         await pool.query(`ALTER TABLE wonderful_payments ADD COLUMN IF NOT EXISTS league_split_id UUID`); // FIX-410b: online split-share link
+        await pool.query(`ALTER TABLE wonderful_payments ADD COLUMN IF NOT EXISTS fines_tenant_id UUID`); // FIX-533: fines settle purpose
+        await pool.query(`ALTER TABLE wonderful_payments ADD COLUMN IF NOT EXISTS fines_ids INT[]`); // FIX-533: snapshot of the settled fine ids
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_games_league_id ON games(league_id) WHERE league_id IS NOT NULL`);
 
         // 7) CUPS (FIX-489 Phase 3) — multi-league knockout / groups+knockout on top of the clubs identity.
@@ -67240,7 +67786,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web100-notices`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web104-fines`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
