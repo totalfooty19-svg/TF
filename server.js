@@ -1737,6 +1737,13 @@ const AUDIT_TAG_TABLE = {
     wonderful_initiated:      { cat: 'credits', sub: 'payment',  actor: 'player', sev: 'med'  },
     wonderful_credited:       { cat: 'credits', sub: 'payment',  actor: 'system', sev: 'med'  },
     fines_settled:            { cat: 'credits', sub: 'payment',  actor: 'system', sev: 'med'  }, // FIX-533
+    tenant_topup_claimed:     { cat: 'credits', sub: 'payment',  actor: 'player', sev: 'low'  }, // FIX-534
+    tenant_topup_granted:     { cat: 'credits', sub: 'payment',  actor: 'admin',  sev: 'med'  }, // FIX-534
+    tenant_topup_dismissed:   { cat: 'credits', sub: 'payment',  actor: 'admin',  sev: 'low'  }, // FIX-534
+    tenant_credits_adjusted:  { cat: 'credits', sub: 'payment',  actor: 'admin',  sev: 'med'  }, // FIX-534
+    tenant_payment_mode_set:  { cat: 'tenant',  sub: 'billing',  actor: 'admin',  sev: 'high' }, // FIX-534
+    wonderful_hold_released:  { cat: 'payment', sub: 'wonderful', actor: 'admin',  sev: 'high' }, // FIX-538
+    wonderful_hold_writeoff:  { cat: 'payment', sub: 'wonderful', actor: 'admin',  sev: 'high' }, // FIX-538
     fine_attached:            { cat: 'tenant',  sub: 'fines',    actor: 'admin',  sev: 'low'  }, // FIX-533
     card_recorded:            { cat: 'tenant',  sub: 'fines',    actor: 'admin',  sev: 'low'  }, // FIX-533
     balance_adjustment:       { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
@@ -2111,11 +2118,52 @@ async function applyGameFee(db, playerId, cost, description, tenantId = null, ga
 
     // FIX-398: if a gameId is supplied and no explicit tenantId, resolve the game's tenant
     // so the correct per-tenant free-credit bucket is spent. Fail-safe to Original on error.
+    // FIX-534: also resolve the tenant's payment_mode - 'manual' games spend ONLY the
+    // tenant's buckets (tenant free -> tenant credits); the global wallet is BARRED.
+    let _payMode = 'tf';
     if (tenantId === null && gameId) {
         try {
-            const gt = await db.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+            const gt = await db.query(
+                `SELECT g.tenant_id, COALESCE(t.payment_mode, 'tf') AS payment_mode
+                   FROM games g LEFT JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1`, [gameId]);
             tenantId = gt.rows.length ? (gt.rows[0].tenant_id || null) : null;
-        } catch (_) { tenantId = null; }
+            _payMode = gt.rows.length ? (gt.rows[0].payment_mode || 'tf') : 'tf';
+        } catch (_) { tenantId = null; _payMode = 'tf'; }
+    } else if (tenantId) {
+        try {
+            const tm = await db.query(`SELECT COALESCE(payment_mode, 'tf') AS payment_mode FROM tenants WHERE id = $1`, [tenantId]);
+            _payMode = tm.rows.length ? (tm.rows[0].payment_mode || 'tf') : 'tf';
+        } catch (_) { _payMode = 'tf'; }
+    }
+
+    // ── FIX-534 MANUAL branch: siloed spend, no global wallet, no original free ──
+    if (_payMode === 'manual' && tenantId) {
+        const tFree = await getTenantFreeCredits(playerId, tenantId, db);
+        const tCash = await getTenantCredits(playerId, tenantId, db);
+        const costC = Math.round(cost * 100);
+        const freeC = Math.min(Math.round(tFree * 100), costC);
+        const cashC = Math.min(Math.round(tCash * 100), costC - freeC);
+        if (freeC + cashC < costC) throw new Error('INSUFFICIENT_CREDITS');
+        const freeUsedM = freeC / 100, tenantUsedM = cashC / 100;
+        // (tenant-FREE spend keeps the FIX-398 clamped helper - the clamp race is a
+        //  pre-existing, accepted risk for promo money; real money below is guarded.)
+        if (freeUsedM > 0) await adjustTenantFreeCredits(playerId, tenantId, -freeUsedM, db);
+        if (tenantUsedM > 0) {
+            // FIX-534 audit fix: a guarded UPDATE, NOT the clamped helper. The
+            // GREATEST(0,...) clamp lets a racing second spend 'succeed' while
+            // deducting nothing (balance floors at 0, the <0 check never fires).
+            // WHERE balance >= amount serialises exactly like the wallet's guard;
+            // rowCount 0 (raced OR no row) rolls the caller's txn back.
+            const _ded = await db.query(
+                `UPDATE player_tenant_credits
+                    SET balance = balance - $3, last_updated = NOW()
+                  WHERE player_id = $1 AND tenant_id = $2 AND balance >= $3`,
+                [playerId, tenantId, tenantUsedM]);
+            if (_ded.rowCount === 0) throw new Error('INSUFFICIENT_CREDITS');
+        }
+        if (freeUsedM > 0) await recordCreditTransaction(db, playerId, -freeUsedM, 'free_credit', `${description} (tenant free credit)`);
+        if (tenantUsedM > 0) await recordCreditTransaction(db, playerId, -tenantUsedM, 'tenant_credit', `${description} (tenant credit)`);
+        return { realCharged: 0, freeCharged: freeUsedM, tenantCharged: tenantUsedM };
     }
 
     // Read real balance + Original (legacy) free bucket atomically.
@@ -2177,7 +2225,7 @@ async function applyGameFee(db, playerId, cost, description, tenantId = null, ga
         await recordCreditTransaction(db, playerId, -realCharged, 'game_fee', description);
     }
 
-    return { realCharged, freeCharged: freeUsed };
+    return { realCharged, freeCharged: freeUsed, tenantCharged: 0 }; // FIX-534: tf-mode never touches the silo
 }
 
 // ── POSITION RESOLUTION HELPER (audit fix May 2026) ──────────────────────────
@@ -2525,6 +2573,31 @@ async function _spendableForGameRows(db, playerId, gameId) {
 // Wave 3b: return a refunded FREE-credit portion to the ORIGINATING game's tenant
 // bucket (tenant-locked). Falls back to the global Original bucket if the game or
 // its tenant can't be resolved, so a refund path can never error out on this.
+// FIX-534: return a refunded TENANT-credit portion to the ORIGINATING game's
+// tenant silo. Mirrors _refundFreeToGame but with NO global fallback - silo
+// money must never leak to the universal wallet. An unresolvable tenant
+// (impossible in practice: games are never hard-deleted) alerts superadmin
+// instead of silently dropping the player's money.
+async function _refundTenantToGame(db, playerId, tenantAmount, gameId) {
+    const amt = parseFloat(tenantAmount || 0);
+    if (!amt || amt <= 0) return;
+    let tenantId = null;
+    try {
+        if (gameId) {
+            const g = await db.query('SELECT tenant_id FROM games WHERE id = $1', [gameId]);
+            tenantId = g.rows[0]?.tenant_id || null;
+        }
+    } catch (_) { tenantId = null; }
+    if (!tenantId) {
+        _securityAlertEmail('\u26a0\ufe0f Tenant-credit refund could not resolve its tenant',
+            `<p>A refund of <strong>\u00a3${amt.toFixed(2)}</strong> tenant credit for player ${playerId} (game ${gameId || '(none)'}) could not resolve the owning tenant. The credit was NOT returned - action it manually via the CRM Payments tile.</p>`);
+        return;
+    }
+    await adjustTenantCredits(playerId, tenantId, amt, db);
+    try {
+        await recordCreditTransaction(db, playerId, amt, 'tenant_credit', `Refund to team credit (game ${gameId})`);
+    } catch (_) {}
+}
 async function _refundFreeToGame(db, playerId, freeAmount, gameId) {
     const amt = parseFloat(freeAmount || 0);
     if (!amt || amt <= 0) return;
@@ -3244,6 +3317,7 @@ const NOTIF_TEMPLATES = {
     award_reckless:       d => ({ title: '🚑 Reckless Tackler',           body: `You won Reckless Tackler for ${d.day}. You know what you did.` }),
     award_moaner:         d => ({ title: '😩 The Moaner',                 body: `You won The Moaner for ${d.day}. The team appreciated your encouragement.` }),
     fine_issued:          d => ({ title: '💸 You have been fined!',      body: `${d.label} - £${d.amount} (${d.tenant}). Outstanding total £${d.total}. Settle it from your dashboard.` }),
+    tenant_credited:      d => ({ title: '💳 Credits added!',           body: `£${d.amount} team credit added - spendable on your team's games.` }),
     fines_settled_push:   d => ({ title: '✅ Fines settled',               body: `£${Number(d.amount).toFixed(2)} paid - you are all square. Good as gold.` }),
     award_donkey:         d => ({ title: '🐴 Donkey Award',               body: `You won the Donkey Award for ${d.day}. EEEYYY-OOORRREEE.` }),
     // NEW — Batch 5 awards revamp
@@ -4148,7 +4222,10 @@ async function _fix330BuildTenantInvoice(tenant, periodStart, periodEnd) {
 
         // Snapshot platform_fee_pence at this moment (frozen for this invoice)
         const platformFee = parseInt(tenant.platform_fee_pence || 12, 10);
-        const subtotal = regCount * platformFee;
+        // FIX-535: fixed monthly charge, snapshotted at generation like the platform
+        // fee. Added to subtotal BEFORE VAT + credit offset so both compose over it.
+        const monthlyFee = parseInt(tenant.monthly_fee_pence || 0, 10) || 0;
+        const subtotal = regCount * platformFee + monthlyFee;
 
         // FIX-332 Day 18: VAT — 20% (2000 basis points) default if registered.
         // Snapshot at generation time so later rate changes don't affect issued.
@@ -4207,6 +4284,21 @@ async function _fix330BuildTenantInvoice(tenant, periodStart, periodEnd) {
                     platformFee,
                     subtotal,
                     JSON.stringify({ period_start: periodStart, period_end: periodEnd, platform_fee_pence: platformFee }),
+                ]
+            );
+        }
+
+        // FIX-535: monthly fixed-fee line item (skipped entirely at 0)
+        if (monthlyFee > 0) {
+            await client.query(
+                `INSERT INTO invoice_line_items
+                    (invoice_id, line_type, description, quantity, unit_price_pence, amount_pence, metadata)
+                 VALUES ($1, 'monthly_fee', $2, 1, $3, $3, $4::jsonb)`,
+                [
+                    invoice.id,
+                    `Monthly platform fee (${periodStart} to ${periodEnd})`,
+                    monthlyFee,
+                    JSON.stringify({ monthly_fee_pence: monthlyFee }),
                 ]
             );
         }
@@ -4275,7 +4367,7 @@ async function _fix330GenerateInvoicesForPeriod(periodStart, periodEnd) {
         let tRes;
         try {
             tRes = await pool.query(
-                `SELECT id, short_id, name, platform_fee_pence,
+                `SELECT id, short_id, name, platform_fee_pence, monthly_fee_pence,
                         vat_registered, vat_rate_basis_points, credit_balance_pence
                    FROM tenants
                   WHERE status = 'active'
@@ -4285,7 +4377,7 @@ async function _fix330GenerateInvoicesForPeriod(periodStart, periodEnd) {
             if (e && e.code === '42703') {
                 // Pre-FIX-332 migration: fall back to legacy SELECT
                 tRes = await pool.query(
-                    `SELECT id, short_id, name, platform_fee_pence
+                    `SELECT id, short_id, name, platform_fee_pence, monthly_fee_pence
                        FROM tenants
                       WHERE status = 'active'
                       ORDER BY name`
@@ -7566,13 +7658,39 @@ app.get('/api/games/:gameId/my-spendable', authenticateToken, async (req, res) =
         const cash = parseFloat(row.cash) || 0;
         const freeOriginal = parseFloat(row.free_original) || 0;
         const freeTenant = parseFloat(row.free_tenant) || 0;
-        res.json({
-            cash,
-            free_original: freeOriginal,
-            free_tenant: freeTenant,
-            free_for_game: freeOriginal + freeTenant,
-            total_for_game: cash + freeOriginal + freeTenant,
-        });
+        // FIX-534: a MANUAL-mode tenant's game spends ONLY the tenant's buckets -
+        // global cash + Original free are barred; the tenant-credit silo joins in.
+        let payMode = 'tf', tenantCredit = 0;
+        try {
+            const gm = await pool.query(
+                `SELECT g.tenant_id, COALESCE(t.payment_mode, 'tf') AS pm
+                   FROM games g LEFT JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1`, [gameId]);
+            if (gm.rows.length && gm.rows[0].tenant_id) {
+                payMode = gm.rows[0].pm || 'tf';
+                if (payMode === 'manual') tenantCredit = await getTenantCredits(req.user.playerId, gm.rows[0].tenant_id);
+            }
+        } catch (_) { payMode = 'tf'; }
+        if (payMode === 'manual') {
+            res.json({
+                cash: 0, // barred at manual-mode tenants
+                free_original: 0,
+                free_tenant: freeTenant,
+                tenant_credit: tenantCredit,
+                payment_mode: 'manual',
+                free_for_game: freeTenant,
+                total_for_game: freeTenant + tenantCredit,
+            });
+        } else {
+            res.json({
+                cash,
+                free_original: freeOriginal,
+                free_tenant: freeTenant,
+                tenant_credit: 0,
+                payment_mode: 'tf',
+                free_for_game: freeOriginal + freeTenant,
+                total_for_game: cash + freeOriginal + freeTenant,
+            });
+        }
     } catch (error) {
         console.error('my-spendable error:', error);
         res.status(500).json({ error: 'Failed to get spendable balance' });
@@ -12986,6 +13104,166 @@ app.delete('/api/t/:tenant_short_id/admin/game-cards/:id', authenticateToken, re
 });
 // FIX-533: the caller's own outstanding fines, grouped per tenant - feeds the
 // dashboard SETTLE NOW strip. Explicit fields only.
+// ═══ FIX-534 phase 1: payments mode + tenant-credit claims ═══
+// Player files an I'VE TOPPED UP claim at a MANUAL-mode tenant -> pending row
+// + superadmin CRM task (FIX-309 pattern) + email to every tenant admin.
+app.post('/api/t/:tenant_short_id/topup-claim', authenticateToken, async (req, res) => {
+    try {
+        const t = await pool.query('SELECT payment_mode, name FROM tenants WHERE id = $1', [req.tenant.id]);
+        if (!t.rows.length || t.rows[0].payment_mode !== 'manual') return res.status(400).json({ error: 'This team does not take manual transfers' });
+        const member = await pool.query(
+            `SELECT p.alias FROM player_tenants pt JOIN players p ON p.id = pt.player_id
+              WHERE pt.player_id = $1 AND pt.tenant_id = $2 AND pt.status = 'active'`, [req.user.playerId, req.tenant.id]);
+        if (!member.rows.length) return res.status(403).json({ error: 'Members only' });
+        const amount = parseFloat(req.body.amount);
+        if (isNaN(amount) || amount < 1 || amount > 500) return res.status(400).json({ error: 'Amount must be £1-£500' });
+        const reference = String(req.body.reference || '').trim().slice(0, 60) || null;
+        const pend = await pool.query(
+            `SELECT COUNT(*) AS c FROM tenant_topup_claims WHERE player_id = $1 AND tenant_id = $2 AND status = 'pending'`,
+            [req.user.playerId, req.tenant.id]);
+        if (parseInt(pend.rows[0].c, 10) >= 3) return res.status(400).json({ error: 'You already have pending claims - your admin needs to action them first' });
+        const ins = await pool.query(
+            `INSERT INTO tenant_topup_claims (tenant_id, player_id, amount, reference) VALUES ($1, $2, $3, $4) RETURNING id`,
+            [req.tenant.id, req.user.playerId, amount.toFixed(2), reference]);
+        // superadmin task inbox (FIX-309 pattern - fire-and-forget)
+        try {
+            await pool.query(`
+                INSERT INTO admin_action_queue
+                    (type, status, title, notes, subject_player_id, flagged_by, recommend_refund)
+                VALUES ('tenant_topup', 'pending', $1, $2, $3, $3, FALSE)
+            `, [
+                `Top-up claim — ${member.rows[0].alias} · £${amount.toFixed(2)} · ${t.rows[0].name}`,
+                `Manual bank-transfer claim at ${t.rows[0].name}.${reference ? ' Reference: ' + reference + '.' : ''} Tenant admins were emailed; they credit it from the CRM Payments tile.`,
+                req.user.playerId,
+            ]);
+        } catch (qe) { console.warn('[FIX-534] topup task insert failed:', qe.message); }
+        // email every tenant admin (fire-and-forget)
+        setImmediate(async () => {
+            try {
+                const admins = await pool.query(
+                    `SELECT COALESCE(u.email, '') AS email FROM player_tenants pt
+                       JOIN players p ON p.id = pt.player_id LEFT JOIN users u ON u.id = p.user_id
+                      WHERE pt.tenant_id = $1 AND pt.status = 'active' AND pt.role = 'tenant_admin'`, [req.tenant.id]);
+                const html = wrapEmailHtml(`
+                    <h2 style="color:#00cc66;font-size:20px;font-weight:900;margin:0 0 10px;">💳 TOP-UP CLAIM</h2>
+                    <p style="color:#ccc;font-size:14px;line-height:1.7;"><strong>${htmlEncode(member.rows[0].alias)}</strong> says they transferred <strong>£${htmlEncode(amount.toFixed(2))}</strong> to ${htmlEncode(t.rows[0].name)}.${reference ? '<br>Reference: <strong>' + htmlEncode(reference) + '</strong>' : ''}</p>
+                    <p style="color:#ccc;font-size:14px;">Check your bank, then credit them from the CRM → <strong>Payments</strong> tile (pending claims list).</p>
+                `);
+                for (const a of admins.rows) {
+                    if (!a.email) continue;
+                    emailTransporter.sendMail({
+                        from: '"TotalFooty" <totalfooty19@gmail.com>', to: a.email,
+                        subject: `💳 Top-up claim: ${member.rows[0].alias} · £${amount.toFixed(2)}`, html,
+                    }).catch(e => console.error('topup claim email failed:', e.message));
+                }
+            } catch (e) { console.error('topup claim emails failed:', e.message); }
+        });
+        await auditLog(pool, req.user.playerId, 'tenant_topup_claimed', null, `£${amount.toFixed(2)}${reference ? ' ref ' + reference : ''}`, req.tenant.id).catch(() => {});
+        res.json({ success: true, id: ins.rows[0].id });
+    } catch (e) { console.error('topup claim error:', e.message); res.status(500).json({ error: 'Failed to file the claim' }); }
+});
+// Scoped admin: pending claims + action/dismiss + manual adjust
+// FIX-534 phase 3: tile config - mode + receiving bank details (explicit cols).
+app.get('/api/t/:tenant_short_id/admin/payments-config', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT COALESCE(payment_mode, 'tf') AS payment_mode, bank_account_holder_name, bank_account_number, bank_sort_code
+               FROM tenants WHERE id = $1`, [req.tenant.id]);
+        res.json(r.rows[0] || { payment_mode: 'tf' });
+    } catch (e) { console.error('payments config error:', e.message); res.status(500).json({ error: 'Failed to load' }); }
+});
+// FIX-534 phase 3: MEMBER-facing payment info for the top-up surface. Bank
+// details are only revealed for manual mode, only to active members.
+app.get('/api/t/:tenant_short_id/payment-info', authenticateToken, async (req, res) => {
+    try {
+        const member = await pool.query(
+            `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'`,
+            [req.user.playerId, req.tenant.id]);
+        if (!member.rows.length && req.user.role !== 'superadmin') return res.status(403).json({ error: 'Members only' });
+        const r = await pool.query(
+            `SELECT name, COALESCE(payment_mode, 'tf') AS payment_mode, bank_account_holder_name, bank_account_number, bank_sort_code
+               FROM tenants WHERE id = $1`, [req.tenant.id]);
+        const t = r.rows[0] || {};
+        const bal = await getTenantCredits(req.user.playerId, req.tenant.id);
+        if (t.payment_mode !== 'manual') return res.json({ payment_mode: t.payment_mode || 'tf', tenant_name: t.name });
+        res.json({
+            payment_mode: 'manual', tenant_name: t.name, tenant_credit: bal.toFixed(2),
+            bank_account_holder_name: t.bank_account_holder_name || null,
+            bank_account_number: t.bank_account_number || null,
+            bank_sort_code: t.bank_sort_code || null,
+        });
+    } catch (e) { console.error('payment info error:', e.message); res.status(500).json({ error: 'Failed to load' }); }
+});
+app.get('/api/t/:tenant_short_id/admin/topup-claims', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT c.id, c.player_id, p.alias, c.amount, c.reference, c.status, c.created_at
+               FROM tenant_topup_claims c JOIN players p ON p.id = c.player_id
+              WHERE c.tenant_id = $1 AND c.status = 'pending' ORDER BY c.created_at ASC`, [req.tenant.id]);
+        res.json({ items: r.rows });
+    } catch (e) { console.error('claims list error:', e.message); res.status(500).json({ error: 'Failed to load claims' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/topup-claims/:id/action', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const grant = req.body.grant === true;
+        const claim = await pool.query(
+            `UPDATE tenant_topup_claims SET status = $1, actioned_by = $2, actioned_at = NOW()
+              WHERE id = $3 AND tenant_id = $4 AND status = 'pending' RETURNING player_id, amount`,
+            [grant ? 'granted' : 'dismissed', req.user.playerId, parseInt(req.params.id, 10) || 0, req.tenant.id]);
+        if (!claim.rows.length) return res.status(404).json({ error: 'Claim not found (already actioned?)' });
+        let balance = null;
+        if (grant) {
+            balance = await adjustTenantCredits(claim.rows[0].player_id, req.tenant.id, parseFloat(claim.rows[0].amount));
+            sendNotification('tenant_credited', claim.rows[0].player_id, { amount: parseFloat(claim.rows[0].amount).toFixed(2) }).catch(() => {});
+        }
+        await auditLog(pool, req.user.playerId, grant ? 'tenant_topup_granted' : 'tenant_topup_dismissed', claim.rows[0].player_id,
+            `£${parseFloat(claim.rows[0].amount).toFixed(2)} claim ${grant ? 'granted' : 'dismissed'}`, req.tenant.id).catch(() => {});
+        res.json({ success: true, balance });
+    } catch (e) { console.error('claim action error:', e.message); res.status(500).json({ error: 'Failed to action the claim' }); }
+});
+app.post('/api/t/:tenant_short_id/admin/tenant-credits/adjust', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const playerId = String(req.body.player_id || '');
+        const delta = parseFloat(req.body.delta);
+        if (!isValidUuid(playerId) || isNaN(delta) || delta === 0 || Math.abs(delta) > 500) return res.status(400).json({ error: 'Pick a player and a non-zero amount (max ±£500)' });
+        const member = await pool.query(
+            `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND status = 'active'`, [playerId, req.tenant.id]);
+        if (!member.rows.length) return res.status(400).json({ error: 'Player is not a member of this team' });
+        const balance = await adjustTenantCredits(playerId, req.tenant.id, delta);
+        await auditLog(pool, req.user.playerId, 'tenant_credits_adjusted', playerId, `${delta > 0 ? '+' : ''}£${delta.toFixed(2)} -> balance £${balance.toFixed(2)}`, req.tenant.id).catch(() => {});
+        res.json({ success: true, balance });
+    } catch (e) { console.error('tenant credits adjust error:', e.message); res.status(500).json({ error: 'Failed to adjust' }); }
+});
+app.put('/api/t/:tenant_short_id/admin/payment-mode', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const mode = req.body.payment_mode === 'manual' ? 'manual' : 'tf';
+        await pool.query('UPDATE tenants SET payment_mode = $1 WHERE id = $2', [mode, req.tenant.id]);
+        await auditLog(pool, req.user.playerId, 'tenant_payment_mode_set', null, mode, req.tenant.id).catch(() => {});
+        res.json({ success: true, payment_mode: mode });
+    } catch (e) { console.error('payment mode error:', e.message); res.status(500).json({ error: 'Failed to set payment mode' }); }
+});
+// FIX-534 phase 3: the caller's manual-mode memberships + silo balances +
+// receiving bank details - feeds the dashboard TEAM CREDIT strip.
+app.get('/api/player/payment-contexts', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT t.id AS tenant_id, t.short_id, t.name,
+                    t.bank_account_holder_name, t.bank_account_number, t.bank_sort_code,
+                    COALESCE(ptc.balance, 0) AS tenant_credit
+               FROM player_tenants pt
+               JOIN tenants t ON t.id = pt.tenant_id AND t.status = 'active' AND COALESCE(t.payment_mode, 'tf') = 'manual'
+               LEFT JOIN player_tenant_credits ptc ON ptc.player_id = pt.player_id AND ptc.tenant_id = t.id
+              WHERE pt.player_id = $1 AND pt.status = 'active'
+              ORDER BY t.name`, [req.user.playerId]);
+        res.json({ items: r.rows.map(x => ({
+            tenant_id: x.tenant_id, short_id: x.short_id, name: x.name,
+            tenant_credit: parseFloat(x.tenant_credit).toFixed(2),
+            bank_account_holder_name: x.bank_account_holder_name || null,
+            bank_account_number: x.bank_account_number || null,
+            bank_sort_code: x.bank_sort_code || null,
+        })) });
+    } catch (e) { console.error('payment contexts error:', e.message); res.status(500).json({ error: 'Failed to load' }); }
+});
 app.get('/api/player/fines-outstanding', authenticateToken, async (req, res) => {
     try {
         const r = await pool.query(
@@ -16192,10 +16470,11 @@ app.post('/api/games/:id/rsvp/pay', authenticateToken, registrationLimiter, asyn
                     amount_paid = $2,
                     amount_paid_free = $3,
                     is_comped = $4,
+                    amount_paid_tenant = $5,
                     rsvp_deadline = NULL,
                     rsvp_warned_at = NULL
               WHERE id = $1`,
-            [reg.rows[0].id, isComped ? 0 : realCharged, isComped ? 0 : freeCharged, isComped]
+            [reg.rows[0].id, isComped ? 0 : realCharged, isComped ? 0 : freeCharged, isComped, isComped ? 0 : (charge.tenantCharged || 0)]
         );
 
         // BFFs/Rivals auto-fill for the newly-confirmed player (matches /claim-spot).
@@ -17252,7 +17531,7 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         }
 
         // Determine registration status
-        let status, regBackupType = null, regAmountPaid = null, regAmountPaidFree = null;
+        let status, regBackupType = null, regAmountPaid = null, regAmountPaidFree = null, regAmountPaidTenant = null; // FIX-534
         
         if (isFull) {
             // Game is full - must be a backup registration
@@ -17290,9 +17569,10 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     
                     // Capture realCharged + freeCharged so amount_paid and amount_paid_free
                     // correctly record both portions — needed for exact EB-aware refund on drop-out
-                    const { realCharged: backupCharged, freeCharged: backupFreeCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Confirmed backup for game ${gameId} (${pricingTier} pricing)`, null, gameId);
+                    const { realCharged: backupCharged, freeCharged: backupFreeCharged, tenantCharged: backupTenantCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Confirmed backup for game ${gameId} (${pricingTier} pricing)`, null, gameId); // FIX-534
                     regAmountPaid = backupCharged;
                     regAmountPaidFree = backupFreeCharged;
+                    regAmountPaidTenant = backupTenantCharged; // FIX-534
                 }
 
                 // FIX-315: ACCELERATOR — first confirmed_backup payment when game
@@ -17361,9 +17641,10 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
                     return res.status(400).json({ error: 'Insufficient credits' });
                 }
                 
-                const { realCharged: selfRegCharged, freeCharged: selfRegFreeCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Registration for game ${gameId} (${pricingTier} pricing)`, null, gameId);
+                const { realCharged: selfRegCharged, freeCharged: selfRegFreeCharged, tenantCharged: selfRegTenantCharged } = await applyGameFee(client, req.user.playerId, effectiveCost, `Registration for game ${gameId} (${pricingTier} pricing)`, null, gameId); // FIX-534
                 regAmountPaid = selfRegCharged;
                 regAmountPaidFree = selfRegFreeCharged;
+                regAmountPaidTenant = selfRegTenantCharged; // FIX-534
             }
         }
         
@@ -17379,15 +17660,18 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
 
         // Register player
         const regResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, venue_clash_team_preference, amount_paid, amount_paid_free, is_comped, position_areas)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, tournament_team_preference, venue_clash_team_preference, amount_paid, amount_paid_free, is_comped, position_areas, amount_paid_tenant)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
             [gameId, req.user.playerId, status, positionValue, regBackupType,
              game.team_selection_type === 'tournament' ? (tournamentTeamPreference || null) : null,
              game.is_venue_clash ? (venueClashTeamPreference || null) : null,
              isComped ? 0 : ((status === 'confirmed' || regBackupType === 'confirmed_backup') ? (regAmountPaid ?? effectiveCost) : 0),
              isComped ? 0 : ((status === 'confirmed' || regBackupType === 'confirmed_backup') ? (regAmountPaidFree ?? 0) : 0),
+             // FIX-534: $12 appended last to keep existing positions untouched
+             
              isComped,
-             sanitisedPositionAreas]
+             sanitisedPositionAreas,
+             isComped ? 0 : ((status === 'confirmed' || regBackupType === 'confirmed_backup') ? (regAmountPaidTenant ?? 0) : 0)]
         );
         
         const registrationId = regResult.rows[0].id;
@@ -17930,6 +18214,7 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
         // Track split across buckets so the INSERT below can record amount_paid_free.
         let _guestRealCharged = 0;
         let _guestFreeCharged = 0;
+        let _guestTenantCharged = 0; // FIX-534
 
         if (effectiveCost > 0) {
             // Option B: affordability = balance + free_credit_balance.
@@ -17941,9 +18226,10 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
             }
             // Deduct credits from the inviting player (free credits first).
             // Capture the split so we can store it on game_guests for correct-bucket refunds.
-            const { realCharged: _guestReal, freeCharged: _guestFree } =
+            const { realCharged: _guestReal, freeCharged: _guestFree, tenantCharged: _guestTenant } =
                 await applyGameFee(client, playerId, effectiveCost, `+1 guest (${guestName.trim()}) for game`, null, gameId);
             _guestRealCharged = _guestReal;
+            _guestTenantCharged = _guestTenant || 0; // FIX-534
             _guestFreeCharged = _guestFree;
         }
 
@@ -17999,8 +18285,8 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
                 relative_rating, position_classification,
                 defending_rating, strength_rating, fitness_rating,
                 pace_rating, shooting_rating, assisting_rating, decisions_rating,
-                goalkeeper_rating, is_admin_override, derived_from_parent_ovr
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+                goalkeeper_rating, is_admin_override, derived_from_parent_ovr, amount_paid_tenant
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
              RETURNING id`,
             [gameId, playerId, guestName.trim(), derived.overall_rating,
              _guestRealCharged, _guestFreeCharged, nextGuestNumber,
@@ -18008,7 +18294,8 @@ app.post('/api/games/:id/add-guest', authenticateToken, async (req, res) => {
              delta, posClass,
              derived.defending_rating, derived.strength_rating, derived.fitness_rating,
              derived.pace_rating, derived.shooting_rating, derived.assisting_rating, derived.decisions_rating,
-             derived.goalkeeper_rating, false, parentOverall]
+             derived.goalkeeper_rating, false, parentOverall,
+             _guestTenantCharged || 0]
         );
         const _newGuestId = _guestInsertRes.rows[0]?.id;
 
@@ -18506,6 +18793,7 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
 
         // Refund the inviting player — split real + free bucket restoration.
         const refundFreeAmt = parseFloat(guest.amount_paid_free ?? 0);
+        const refundTenantAmt = parseFloat(guest.amount_paid_tenant ?? 0); // FIX-534
         if (refundAmt > 0) {
             await client.query(
                 'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
@@ -18515,6 +18803,7 @@ app.delete('/api/games/:id/remove-guest', authenticateToken, async (req, res) =>
         }
         if (refundFreeAmt > 0) {
             await _refundFreeToGame(client, refundTargetId, refundFreeAmt, req.params.id);
+        if (refundTenantAmt > 0) await _refundTenantToGame(client, refundTargetId, refundTenantAmt, gameId); // FIX-534
             await recordCreditTransaction(client, refundTargetId, refundFreeAmt, 'free_credit', `Guest (${guest.guest_name}) removed - free credit restored`);
         }
 
@@ -18776,6 +19065,7 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
         const playerName = reg.alias || reg.full_name;
         const refundAmt = parseFloat(reg.amount_paid || 0);
         const refundFreeAmt = parseFloat(reg.amount_paid_free || 0);
+        const _rmTenantAmt = parseFloat(reg.amount_paid_tenant || 0); // FIX-534
 
         // Delete the registration
         await client.query('DELETE FROM registrations WHERE id = $1', [registrationId]);
@@ -18791,6 +19081,7 @@ app.delete('/api/games/:gameId/remove-my-registration/:registrationId', authenti
         if (refundFreeAmt > 0) {
             // Free-credit refund → free_credit_balance bucket (not real balance).
             await _refundFreeToGame(client, playerId, refundFreeAmt, gameId);
+        if (_rmTenantAmt > 0) await _refundTenantToGame(client, playerId, _rmTenantAmt, gameId); // FIX-534
             await recordCreditTransaction(client, playerId, refundFreeAmt, 'free_credit', `Free credit restored — removed ${playerName} from game`);
         }
 
@@ -18918,8 +19209,8 @@ app.post('/api/games/:id/claim-spot', authenticateToken, registrationLimiter, as
             freeCharged = chargeResult.freeCharged || 0;
             // Record both real-balance and free-credit portions — enables exact drop-out refund.
             await client.query(
-                'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
-                [realCharged, freeCharged, regCheck.rows[0].id]
+                'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2, amount_paid_tenant = $4 WHERE id = $3',
+                [realCharged, freeCharged, regCheck.rows[0].id, chargeResult.tenantCharged || 0]
             );
         }
 
@@ -19154,7 +19445,8 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         }
 
         // Determine status and handle credit deduction from REGISTERING PLAYER
-        let status, regBackupType = null, friendRealCharged = 0, friendFreeCharged = 0;
+        let status, regBackupType = null, friendRealCharged = 0, friendFreeCharged = 0; friendTenantCharged = tenantCharged || 0; // FIX-534
+        let friendTenantCharged = 0; // FIX-534
 
         if (isFull) {
             if (!backupType || !['normal_backup', 'confirmed_backup', 'gk_backup'].includes(backupType)) {
@@ -19183,9 +19475,9 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                     await client.query('ROLLBACK');
                     return res.status(400).json({ error: 'Insufficient credits for confirmed backup' });
                 }
-                const { realCharged, freeCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Confirmed backup for ${friendName} in game ${gameId} (${priceTier} pricing)`, null, gameId);
+                const { realCharged, freeCharged, tenantCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Confirmed backup for ${friendName} in game ${gameId} (${priceTier} pricing)`, null, gameId);
                 friendRealCharged = realCharged;
-                friendFreeCharged = freeCharged || 0;
+                friendFreeCharged = freeCharged || 0; friendTenantCharged = tenantCharged || 0; // FIX-534
             }
         } else {
             status = 'confirmed';
@@ -19196,9 +19488,9 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
                 await client.query('ROLLBACK');
                 return res.status(400).json({ error: 'Insufficient credits' });
             }
-            const { realCharged, freeCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Registration for ${friendName} in game ${gameId} (${priceTier} pricing)`, null, gameId);
+            const { realCharged, freeCharged, tenantCharged } = await applyGameFee(client, registeringPlayerId, effectivePrice, `Registration for ${friendName} in game ${gameId} (${priceTier} pricing)`, null, gameId);
             friendRealCharged = realCharged;
-            friendFreeCharged = freeCharged || 0;
+            friendFreeCharged = freeCharged || 0; friendTenantCharged = tenantCharged || 0; // FIX-534
         }
 
         // Insert registration under friend's player_id, recording who paid.
@@ -19212,14 +19504,15 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
             : 0;
         // FIX-173: capture friend's reg id so we can apply BFFs/Rivals auto-fill if confirmed.
         const friendRegResult = await client.query(
-            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, registered_by_player_id, tournament_team_preference)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+            `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, registered_by_player_id, tournament_team_preference, amount_paid_tenant)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
             [
                 gameId, friendPlayerId, status, positionValue, regBackupType,
                 chargedPrice,
                 friendFreeCharged,
                 registeringPlayerId,
-                tournamentTeamPreference || null
+                tournamentTeamPreference || null,
+                friendTenantCharged || 0
             ]
         );
         const friendRegId = friendRegResult.rows[0].id;
@@ -19978,16 +20271,17 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             // refund is capped at amount_paid (safe — never over-refunds).
             const paidAmt = parseFloat(droppingReg.amount_paid ?? 0);
             const freeAmt = parseFloat(droppingReg.amount_paid_free ?? 0);
+            const tenantAmt = parseFloat(droppingReg.amount_paid_tenant ?? 0); // FIX-534
 
             if (_inPenaltyWindow) {
                 // P2.3: NO refund. Record the kept amount for finance reporting.
                 _keptReal = paidAmt;
                 _keptFree = freeAmt;
-                if (paidAmt > 0 || freeAmt > 0) {
+                if (paidAmt > 0 || freeAmt > 0 || tenantAmt > 0) {
                     await client.query(
-                        `INSERT INTO dropped_no_refund (game_id, player_id, amount_paid_real, amount_paid_free, reason, recorded_by)
-                         VALUES ($1, $2, $3, $4, $5, NULL)`,
-                        [gameId, droppingReg.player_id, paidAmt, freeAmt, _penaltyReason]
+                        `INSERT INTO dropped_no_refund (game_id, player_id, amount_paid_real, amount_paid_free, reason, recorded_by, amount_paid_tenant)
+                         VALUES ($1, $2, $3, $4, $5, NULL, $6)`,
+                        [gameId, droppingReg.player_id, paidAmt, freeAmt, _penaltyReason, tenantAmt]
                     ).catch(err => {
                         // Schema not migrated yet — degrade gracefully (still no refund, just no audit row)
                         if (err.code !== '42P01') throw err;
@@ -19996,7 +20290,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 }
                 // Skip credit_transactions entirely — no money moves.
             } else {
-                totalRefunded = paidAmt + freeAmt;
+                totalRefunded = paidAmt + freeAmt + tenantAmt; // FIX-534
                 const refundDesc = refundTargetId !== req.user.playerId
                     ? `Dropout refund for ${req.user.playerId} (paid by you)`
                     : 'Dropped out of game - refund';
@@ -20006,6 +20300,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 }
                 if (freeAmt > 0) {
                     await _refundFreeToGame(client, refundTargetId, freeAmt, gameId);
+                if (tenantAmt > 0) await _refundTenantToGame(client, refundTargetId, tenantAmt, gameId); // FIX-534
                     await recordCreditTransaction(client, refundTargetId, freeAmt, 'free_credit', `Free credit restored — dropped out of game ${droppingReg.id}`);
                 }
             }
@@ -20228,11 +20523,11 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                 // under the 6-comp cap.
                 const _promotedWasComped = !!promotedPlayer.is_comped;
                 if (promotedPlayer.backup_type !== 'confirmed_backup' && !_promotedWasComped) {
-                    const { realCharged: promotedCharged, freeCharged: promotedFreeCharged } = await applyGameFee(client, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`, null, gameId);
+                    const { realCharged: promotedCharged, freeCharged: promotedFreeCharged, tenantCharged: promotedTenantCharged } = await applyGameFee(client, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`, null, gameId);
                     // Record both portions so drop-out refund is exact.
                     await client.query(
-                        'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
-                        [promotedCharged, promotedFreeCharged || 0, promotedPlayer.id]
+                        'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2, amount_paid_tenant = $4 WHERE id = $3',
+                        [promotedCharged, promotedFreeCharged || 0, promotedPlayer.id, promotedTenantCharged || 0]
                     );
                 }
 
@@ -23110,6 +23405,7 @@ app.delete('/api/admin/games/:gameId', authenticateToken, async (req, res) => {
             // free+real credits lost their free portion on cancellation.
             const refundPaid = parseFloat(reg.amount_paid || 0);
             const refundFree = parseFloat(reg.amount_paid_free || 0);
+            const refundTenant = parseFloat(reg.amount_paid_tenant || 0); // FIX-534
             // Fallback: legacy rows with both amount_paid and amount_paid_free NULL
             // get the old behaviour (full fallback cost as a real refund). Now safe
             // because comped rows are filtered above (their 0/0 would otherwise trip
@@ -23124,19 +23420,22 @@ app.delete('/api/admin/games/:gameId', authenticateToken, async (req, res) => {
             }
             if (!useFallback && refundFree > 0) {
                 await _refundFreeToGame(client, refundTarget, refundFree, gameId);
+            if (refundTenant > 0) await _refundTenantToGame(client, reg.registered_by_player_id || reg.player_id, refundTenant, gameId); // FIX-534
                 await recordCreditTransaction(client, refundTarget, refundFree, 'free_credit', 'Game cancelled - free credit restored');
             }
         }
-        const guests = await client.query('SELECT invited_by, guest_name, amount_paid, amount_paid_free FROM game_guests WHERE game_id = $1', [gameId]);
+        const guests = await client.query('SELECT invited_by, guest_name, amount_paid, amount_paid_free, amount_paid_tenant FROM game_guests WHERE game_id = $1', [gameId]);
         for (const guest of guests.rows) {
             const guestRefund     = parseFloat(guest.amount_paid || 0);
             const guestFreeRefund = parseFloat(guest.amount_paid_free || 0);
+            const guestTenantRefund = parseFloat(guest.amount_paid_tenant || 0); // FIX-534
             if (guestRefund > 0) {
                 await client.query('UPDATE credits SET balance = balance + $1 WHERE player_id = $2', [guestRefund, guest.invited_by]);
                 await recordCreditTransaction(client, guest.invited_by, guestRefund, 'refund', 'Game cancelled - +1 guest refund');
             }
             if (guestFreeRefund > 0) {
                 await _refundFreeToGame(client, guest.invited_by, guestFreeRefund, gameId);
+            if (guestTenantRefund > 0) await _refundTenantToGame(client, guest.invited_by, guestTenantRefund, gameId); // FIX-534
                 await recordCreditTransaction(client, guest.invited_by, guestFreeRefund, 'free_credit', 'Game cancelled - +1 guest free credit restored');
             }
         }
@@ -23307,6 +23606,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
                 }
                 const refundPaid = parseFloat(reg.amount_paid || 0);
                 const refundFree = parseFloat(reg.amount_paid_free || 0);
+                const refundTenant = parseFloat(reg.amount_paid_tenant || 0); // FIX-534
                 const useFallback = !reg.amount_paid && !reg.amount_paid_free;
                 const realRefund = useFallback ? gCost : refundPaid; // FIX-497
                 const refundTarget = reg.registered_by_player_id || reg.player_id;
@@ -23320,6 +23620,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
                 }
                 if (!useFallback && refundFree > 0) {
                     await _refundFreeToGame(client, refundTarget, refundFree, gid);
+                if (refundTenant > 0) await _refundTenantToGame(client, reg.registered_by_player_id || reg.player_id, refundTenant, reg.game_id); // FIX-534
                     await recordCreditTransaction(client, refundTarget, refundFree, 'free_credit', 'Series ' + seriesName + ' cancelled - free credit restored');
                 }
             }
@@ -23332,6 +23633,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
             for (const guest of guests.rows) {
                 const guestRefund     = parseFloat(guest.amount_paid || 0);
                 const guestFreeRefund = parseFloat(guest.amount_paid_free || 0);
+                const guestTenantRefund = parseFloat(guest.amount_paid_tenant || 0); // FIX-534
                 if (guestRefund > 0) {
                     await client.query(
                         'UPDATE credits SET balance = balance + $1 WHERE player_id = $2',
@@ -23341,6 +23643,7 @@ app.delete('/api/admin/games/:gameId/delete-series', authenticateToken, requireA
                 }
                 if (guestFreeRefund > 0) {
                     await _refundFreeToGame(client, guest.invited_by, guestFreeRefund, gid);
+                if (guestTenantRefund > 0) await _refundTenantToGame(client, guest.invited_by, guestTenantRefund, game.id); // FIX-534
                     await recordCreditTransaction(client, guest.invited_by, guestFreeRefund, 'free_credit', 'Series ' + seriesName + ' cancelled - +1 guest free credit restored');
                     guestRefunds++;
                 }
@@ -28873,7 +29176,7 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin,
             }
             await _clearDeadRegistration(txClient, gameId, playerId);
 
-            const { realCharged: adminAddCharged, freeCharged: adminAddFree } = await applyGameFee(txClient, playerId, cost, `Admin added to game ${gameId}`, null, gameId);
+            const { realCharged: adminAddCharged, freeCharged: adminAddFree, tenantCharged: adminAddTenant } = await applyGameFee(txClient, playerId, cost, `Admin added to game ${gameId}`, null, gameId);
         
             // Add player — normalise 'goalkeeper' -> 'GK' to match all server-side position checks
             const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper'
@@ -28881,9 +29184,9 @@ app.post('/api/admin/games/:gameId/add-player', authenticateToken, requireAdmin,
                 : (position || 'outfield');
             // FIX-174: capture reg id so we can apply BFFs/Rivals auto-fill.
             const adminAddRegResult = await txClient.query(
-                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, amount_paid_free)
-                 VALUES ($1, $2, 'confirmed', $3, $4, $5) RETURNING id`,
-                [gameId, playerId, normPosition, adminAddCharged, adminAddFree || 0]
+                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, amount_paid_tenant)
+                 VALUES ($1, $2, 'confirmed', $3, $4, $5, $6) RETURNING id`,
+                [gameId, playerId, normPosition, adminAddCharged, adminAddFree || 0, adminAddTenant || 0]
             );
             // FIX-174: BFFs/Rivals auto-fill — admin always adds as confirmed.
             await applyBffRivalAutoFill(txClient, playerId, gameId, adminAddRegResult.rows[0].id);
@@ -29002,13 +29305,13 @@ app.post('/api/admin/games/:gameId/add-player-discount', authenticateToken, requ
                 return res.status(409).json({ error: 'Player is already registered for this game.' });
             }
             await _clearDeadRegistration(discountClient, gameId, playerId);
-            const { realCharged: customAddCharged, freeCharged: customAddFree } = await applyGameFee(discountClient, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`, null, gameId);
+            const { realCharged: customAddCharged, freeCharged: customAddFree, tenantCharged: customAddTenant } = await applyGameFee(discountClient, playerId, customCharge, `Game registration (custom charge: £${customCharge.toFixed(2)})`, null, gameId);
             const normPosition = (position || 'outfield').toLowerCase() === 'goalkeeper' ? 'GK' : (position || 'outfield');
             // FIX-175: capture reg id so we can apply BFFs/Rivals auto-fill.
             const customDiscRegResult = await discountClient.query(
-                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, amount_paid_free)
-                 VALUES ($1, $2, 'confirmed', $3, $4, $5) RETURNING id`,
-                [gameId, playerId, normPosition, customAddCharged, customAddFree || 0]
+                `INSERT INTO registrations (game_id, player_id, status, position_preference, amount_paid, amount_paid_free, amount_paid_tenant)
+                 VALUES ($1, $2, 'confirmed', $3, $4, $5, $6) RETURNING id`,
+                [gameId, playerId, normPosition, customAddCharged, customAddFree || 0, customAddTenant || 0]
             );
             // FIX-175: BFFs/Rivals auto-fill — admin always adds as confirmed.
             await applyBffRivalAutoFill(discountClient, playerId, gameId, customDiscRegResult.rows[0].id);
@@ -29184,10 +29487,10 @@ app.delete('/api/admin/games/:gameId/remove-player/:registrationId', authenticat
                     if (promotedPlayer.backup_type !== 'confirmed_backup' && !_adminPromoWasComped) {
                         // Charge effective price + record both portions so future dropout
                         // refunds the correct real+free split.
-                        const { realCharged: adminPromoCharged, freeCharged: adminPromoFree } = await applyGameFee(promoClient, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`, null, gameId);
+                        const { realCharged: adminPromoCharged, freeCharged: adminPromoFree, tenantCharged: adminPromoTenant } = await applyGameFee(promoClient, promotedPlayer.player_id, effectiveDebited, `Promoted from backup - game ${gameId}`, null, gameId);
                         await promoClient.query(
-                            'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2 WHERE id = $3',
-                            [adminPromoCharged, adminPromoFree || 0, promotedPlayer.id]
+                            'UPDATE registrations SET amount_paid = $1, amount_paid_free = $2, amount_paid_tenant = $4 WHERE id = $3',
+                            [adminPromoCharged, adminPromoFree || 0, promotedPlayer.id, adminPromoTenant || 0]
                         );
                     }
                     await promoClient.query('COMMIT');
@@ -29699,6 +30002,95 @@ async function _finesApplyAwardFines(gameId) {
         }
     } catch (e) { console.error('award fines error:', e.message); }
 }
+// FIX-537: the legacy MOTM sweep's finalizer vanished in the awards revamp -
+// 'runMotmFinalize is not defined' threw on every 10-minute sweep and expired
+// MOTM votes never closed. Reconstructed with the awards engine's exact MOTM
+// semantics: FOR UPDATE idempotency, external-league motm_wins guard, NULL-
+// guarded winner write, and a REPAIR path for partial legacy state (award row
+// present but motm_winner_id never written). Vote-less expired games get their
+// window NULLed - a legitimate terminal state that stops the eternal resweep.
+async function runMotmFinalize(gameId) {
+    const gRes = await pool.query(
+        `SELECT id, star_rating, external_league_id, motm_winner_id, awards_open, awards_close_at FROM games WHERE id = $1`, [gameId]);
+    if (!gRes.rows.length) return { alreadyFinalized: true, winners: [] };
+    const game = gRes.rows[0];
+    if (game.motm_winner_id) return { alreadyFinalized: true, winners: [] };
+    // FIX-537 audit gate: completion seeds BOTH windows, but the awards engine
+    // (closeAwards, reading game_award_votes) owns MOTM for awards-era games -
+    // motm_votes has NO remaining writers, and the two pools could crown
+    // DIFFERENT winners (double award + double motm_wins). Never grant from the
+    // legacy pool when awards owns the game; just retire the legacy window so
+    // this sweep stops re-picking it. closeAwards sets motm_winner_id itself.
+    if (game.awards_open === true || game.awards_close_at) {
+        await pool.query(`UPDATE games SET motm_voting_ends = NULL WHERE id = $1 AND motm_winner_id IS NULL`, [gameId]);
+        console.log(`[FIX-537] game ${gameId} is awards-era - legacy window retired, closeAwards owns MOTM`);
+        return { alreadyFinalized: true, winners: [] };
+    }
+    const tally = await pool.query(
+        `SELECT n.player_id, COALESCE(p.alias, p.full_name, 'Player') AS name, COUNT(v.id)::int AS votes
+           FROM motm_nominees n
+           JOIN players p ON p.id = n.player_id
+           LEFT JOIN motm_votes v ON v.voted_for_id = n.player_id AND v.game_id = $1
+          WHERE n.game_id = $1
+          GROUP BY n.player_id, p.alias, p.full_name
+          ORDER BY votes DESC`, [gameId]);
+    const rows = tally.rows.filter(r => r.votes > 0);
+    if (!rows.length) {
+        await pool.query(`UPDATE games SET motm_voting_ends = NULL WHERE id = $1 AND motm_winner_id IS NULL`, [gameId]);
+        console.log(`[FIX-537] MOTM window closed with zero votes for game ${gameId} - terminal, no winner`);
+        return { alreadyFinalized: true, winners: [] };
+    }
+    const maxVotes = rows[0].votes;
+    const winners = rows.filter(r => r.votes === maxVotes);
+    const starClass = starClassFromRating(game.star_rating);
+    const confirmed = [];
+    for (const w of winners) {
+        const motmValue = winners.length > 1 ? (1.0 / winners.length) : 1.00;
+        const c = await pool.connect();
+        try {
+            await c.query('BEGIN');
+            const exists = await c.query(
+                `SELECT 1 FROM game_awards WHERE game_id = $1 AND recipient_player_id = $2 AND award_type = 'motm' FOR UPDATE`,
+                [gameId, w.player_id]);
+            if (exists.rows.length) {
+                // REPAIR: award granted previously but the winner write was lost.
+                await c.query(`UPDATE games SET motm_winner_id = $1 WHERE id = $2 AND motm_winner_id IS NULL`, [w.player_id, gameId]);
+                await c.query('COMMIT');
+                continue;
+            }
+            await c.query(
+                `INSERT INTO game_awards (game_id, recipient_player_id, award_type, award_source, motm_value, vote_count, star_class)
+                 VALUES ($1, $2, 'motm', 'voted', $3, $4, $5)`,
+                [gameId, w.player_id, motmValue, w.votes, starClass]);
+            if (!game.external_league_id) {
+                const col = 'motm_wins_' + starClass.toLowerCase();
+                try {
+                    await c.query(`UPDATE players SET motm_wins = motm_wins + $1, ${col} = ${col} + $1 WHERE id = $2`, [motmValue, w.player_id]);
+                } catch (e) {
+                    if (e.code === '42703') await c.query('UPDATE players SET motm_wins = motm_wins + $1 WHERE id = $2', [motmValue, w.player_id]);
+                    else throw e;
+                }
+            }
+            await c.query(`UPDATE games SET motm_winner_id = $1 WHERE id = $2 AND motm_winner_id IS NULL`, [w.player_id, gameId]);
+            await c.query('COMMIT');
+            confirmed.push({ name: w.name, votes: w.votes, playerId: w.player_id });
+        } catch (e) {
+            try { await c.query('ROLLBACK'); } catch (_) {}
+            if (e.code !== '23505') throw e;
+        } finally { c.release(); }
+    }
+    if (confirmed.length) setImmediate(async () => {
+        try {
+            const gd = await getGameDataForNotification(gameId);
+            for (const w of confirmed) {
+                sendNotification('award_motm', w.playerId, gd).catch(() => {});
+                sendAwardEmail(w.playerId, 'motm', { day: gd.day, venue: gd.venue, gameUrl: gd.game_url }).catch(() => {});
+            }
+        } catch (_) { /* notify is non-critical */ }
+    });
+    return { alreadyFinalized: confirmed.length === 0, winners: confirmed };
+}
+
 async function closeAwards(gameId) {
     if (_closeAwardsInFlight.has(gameId)) {
         console.log(`[FIX-157] closeAwards(${gameId}) skipped — concurrent run in flight`);
@@ -44172,8 +44564,13 @@ app.post('/api/training/:id/cancel', authenticateToken, async (req, res) => {
                     await recordCreditTransaction(client, reg.player_id, real, 'refund', `Training cancelled: ${sess.title}`);
                 }
                 if (free > 0) await refundFreeCredits(reg.player_id, free, null, client);
-                if (real > 0 || free > 0) { refundedTotal += real + free; refundedCount++; }
-                await client.query(`UPDATE coaching_registrations SET status = 'cancelled', amount_paid_real = 0, amount_paid_free = 0 WHERE id = $1`, [reg.id]);
+                const _tcTen = parseFloat(reg.amount_paid_tenant || 0); // FIX-534
+                if (_tcTen > 0) {
+                    await adjustTenantCredits(reg.player_id, sess.tenant_id, _tcTen, client);
+                    await recordCreditTransaction(client, reg.player_id, _tcTen, 'tenant_credit', `Training refund (team credit)`);
+                }
+                if (real > 0 || free > 0 || (parseFloat(reg.amount_paid_tenant || 0)) > 0) { refundedTotal += real + free + parseFloat(reg.amount_paid_tenant || 0); refundedCount++; } // FIX-534
+                await client.query(`UPDATE coaching_registrations SET status = 'cancelled', amount_paid_real = 0, amount_paid_free = 0, amount_paid_tenant = 0 WHERE id = $1`, [reg.id]);
                 toNotify.push({ playerId: reg.player_id, title: sess.title, day: dDay });
             }
             await client.query(`UPDATE coaching_sessions SET status = 'cancelled' WHERE id = $1`, [sess.id]);
@@ -44354,10 +44751,10 @@ app.post('/api/training/:id/register', authenticateToken, registrationLimiter, a
             // priorHasKeptFee → the dropped_out row stays as-is (finance keeps it); new row inserted.
             await client.query(
                 `INSERT INTO coaching_registrations
-                   (session_id, player_id, status, amount_paid_real, amount_paid_free, paid_method)
-                 VALUES ($1,$2,$3,$4,$5,$6)`,
+                   (session_id, player_id, status, amount_paid_real, amount_paid_free, paid_method, amount_paid_tenant)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
                 [s.id, req.user.playerId, newStatus, paid.realCharged, paid.freeCharged,
-                 fee > 0 && !late ? 'wallet' : null]);
+                 fee > 0 && !late ? 'wallet' : null, paid.tenantCharged || 0]);
         }
         await client.query('COMMIT');
         res.status(201).json({ ok: true, status: newStatus,
@@ -44454,9 +44851,9 @@ app.post('/api/training/:id/registrations/:rid/decide', authenticateToken, async
             if (fee > 0) paid = await applyGameFee(client, reg.player_id, fee, `Training: ${s.title}`, s.tenant_id, null);
             await client.query(
                 `UPDATE coaching_registrations
-                    SET status = 'registered', amount_paid_real = $1, amount_paid_free = $2, paid_method = $3
+                    SET status = 'registered', amount_paid_real = $1, amount_paid_free = $2, paid_method = $3, amount_paid_tenant = $5
                   WHERE id = $4`,
-                [paid.realCharged, paid.freeCharged, fee > 0 ? 'wallet' : null, reg.id]);
+                [paid.realCharged, paid.freeCharged, fee > 0 ? 'wallet' : null, reg.id, paid.tenantCharged || 0]);
         } else {
             await client.query(`UPDATE coaching_registrations SET status = 'denied' WHERE id = $1`, [reg.id]);
         }
@@ -45216,7 +45613,7 @@ app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, r
     const client = await pool.connect();
     try {
         const sessionResult = await client.query(
-            `SELECT id, coach_player_id, status, cancel_requested, activity_type, session_date
+            `SELECT id, coach_player_id, status, cancel_requested, activity_type, session_date, tenant_id
              FROM coaching_sessions WHERE id=$1`,
             [id]
         );
@@ -45246,8 +45643,13 @@ app.post('/api/admin/coaching/sessions/:id/cancel-approve', authenticateToken, r
                 await recordCreditTransaction(client, reg.player_id, real, 'refund', 'Coaching session cancelled');
             }
             if (free > 0) await refundFreeCredits(reg.player_id, free, null, client);
-            if (real > 0 || free > 0) { refundedTotal += real + free; refundedCount++; }
-            await client.query(`UPDATE coaching_registrations SET status = 'cancelled', amount_paid_real = 0, amount_paid_free = 0 WHERE id = $1`, [reg.id]);
+            const _tcTen = parseFloat(reg.amount_paid_tenant || 0); // FIX-534
+            if (_tcTen > 0) {
+                await adjustTenantCredits(reg.player_id, session.tenant_id, _tcTen, client);
+                await recordCreditTransaction(client, reg.player_id, _tcTen, 'tenant_credit', `Training refund (team credit)`);
+            }
+            if (real > 0 || free > 0 || (parseFloat(reg.amount_paid_tenant || 0)) > 0) { refundedTotal += real + free + parseFloat(reg.amount_paid_tenant || 0); refundedCount++; } // FIX-534
+            await client.query(`UPDATE coaching_registrations SET status = 'cancelled', amount_paid_real = 0, amount_paid_free = 0, amount_paid_tenant = 0 WHERE id = $1`, [reg.id]);
             notifyIds.add(reg.player_id);
         }
 
@@ -50419,6 +50821,11 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
             const _fr = await pool.query(
                 `SELECT id, amount FROM game_fines WHERE player_id = $1 AND tenant_id = $2 AND paid = FALSE ORDER BY id`,
                 [playerId, fines_tenant_id]);
+            // FIX-534 audit fix: a manual-transfer tenant's fines must NOT be card-
+            // settled - the money would land at TF, not the tenant. Cash + ledger
+            // MARK PAID is their settle path.
+            const _ftm = await pool.query(`SELECT COALESCE(payment_mode, 'tf') AS pm FROM tenants WHERE id = $1`, [fines_tenant_id]);
+            if (_ftm.rows.length && _ftm.rows[0].pm === 'manual') return res.status(400).json({ error: 'This team settles fines in cash or by bank transfer - pay your admin and they mark it paid' });
             if (!_fr.rows.length) return res.status(400).json({ error: 'No outstanding fines for that team' });
             amountPence = Math.round(_fr.rows.reduce((s, r) => s + parseFloat(r.amount), 0) * 100);
             if (amountPence < 100) return res.status(400).json({ error: 'Outstanding total is under £1 - settle it in cash with your admin' });
@@ -50435,6 +50842,20 @@ app.post('/api/payments/wonderful/initiate', authenticateToken, wonderfulInitiat
             amountPence = Math.round(pounds * 100);
         }
         const effectiveGameId = (_splitGameId !== null) ? _splitGameId : (game_id || null);
+        // FIX-534: pay-and-join via Wonderful is BARRED for a manual-mode tenant's
+        // game - money must reach the tenant, not the platform. League split-shares
+        // are TF-run and unaffected. Plain top-ups (no game) also unaffected: the
+        // universal wallet can't be spent at manual tenants anyway (applyGameFee).
+        if (effectiveGameId && !_splitId) {
+            try {
+                const _pm = await pool.query(
+                    `SELECT COALESCE(t.payment_mode, 'tf') AS pm FROM games g
+                      LEFT JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1`, [effectiveGameId]);
+                if (_pm.rows.length && _pm.rows[0].pm === 'manual') {
+                    return res.status(400).json({ error: 'This team takes bank transfers, not card payments. Top up your team credit first (see your team admin).' });
+                }
+            } catch (_) { /* fail-open to existing behaviour */ }
+        }
 
         // Fetch player email for Wonderful — LEFT JOIN so legacy accounts without user_id still resolve
         const playerRow = await pool.query(
@@ -50878,11 +51299,16 @@ async function _wonderfulVerifyStatus(pmt) {
             // and wrote 'cancelled' status to our DB, blocking the reconciler permanently.
             // New rule: among ALL matching records, prefer paid/accepted > pending/created
             //          > everything else > cancelled. Tiebreak by most recent updated_at.
-            const matches = arr.filter(p =>
+            let matches = arr.filter(p =>
                 p.merchant_payment_reference === pmt.merchant_reference ||
                 p.merchant_reference === pmt.merchant_reference ||
                 p.reference === pmt.merchant_reference
             );
+            // FIX-536: reference fields have gone dark on Wonderful's side - fall
+            // back to matching this order's payment attempts by order_id.
+            if (!matches.length && pmt.wonderful_order_id) {
+                matches = arr.filter(p => p.order_id === pmt.wonderful_order_id || p.id === pmt.wonderful_order_id);
+            }
             const match = _pickBestWonderfulPayment(matches);
             if (match) {
                 verified = match.status || null;
@@ -50914,10 +51340,17 @@ async function _wonderfulVerifyStatus(pmt) {
     // FIX-360 (Web66): now uses _wonderfulPaginatedListSearch helper. Tries
     // ?status=paid first (most likely to find paid records on busy days),
     // falls back to unfiltered, walks up to 5 pages, stops on first match.
-    if (!verified && pmt.merchant_reference) {
+    if (!verified && (pmt.merchant_reference || pmt.wonderful_order_id)) { // FIX-536: order id alone is enough
         try {
             const { match: found, viaStatusFilter, pagesScanned } = await _wonderfulPaginatedListSearch({
                 merchantRef: pmt.merchant_reference,
+                // FIX-536: Wonderful stopped echoing merchant references (webhookRef
+                // null everywhere; list records match nothing by ref). The ORDER id -
+                // which webhooks DO carry and FIX-450 stores - is the durable key, and
+                // the matcher already knows how to use it (p.order_id === fallback).
+                // This also cures abort-then-retry: the paid RETRY shares the order id
+                // while the stale stored link id stays pinned to the dead first attempt.
+                wpIdForFallback: pmt.wonderful_order_id || null,
                 preferStatusPaid: true,
                 maxPages: 5
             });
@@ -51121,6 +51554,8 @@ async function _wonderfulAutoRegister(pmt) {
                     amountPaid = realCharged;
                     amountPaidFree = freeCharged || 0;
                 }
+                // FIX-534: no amount_paid_tenant BY DESIGN - the initiate guard bars manual-tenant
+                // games, so these Wonderful auto-reg paths only ever run tf-mode (tenantCharged provably 0).
                 await client.query(
                     `INSERT INTO registrations
                         (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, is_comped, registered_at)
@@ -51284,7 +51719,7 @@ async function _wonderfulAutoRegister(pmt) {
 //
 // Returns { credited, alreadyCredited, pounds, balBefore, balAfter, autoRegister:{status,reason} }
 async function creditAndAutoRegisterWonderful(pmt, options = {}) {
-    const { adminId = null, contextLabel = '', verifyWpId = null } = options;
+    const { adminId = null, contextLabel = '', verifyWpId = null, skipAutoRegister = false } = options; // FIX-538: hold-release credits wallet-only
     const ctxSuffix = contextLabel ? ` (${contextLabel})` : '';
 
     // Atomic claim + credit. Rollback on any failure — payment stays non-credited
@@ -51456,7 +51891,7 @@ async function creditAndAutoRegisterWonderful(pmt, options = {}) {
     // (bug fixed web47: previously only the webhook ran this, so recovery/reconcile
     // paths credited the player but left them unregistered for the game they paid to join).
     let autoRegister = { status: null, reason: null };
-    if (freshPmt.game_id) {
+    if (freshPmt.game_id && !skipAutoRegister) { // FIX-538: never auto-register into weeks-old games on hold release
         try {
             autoRegister = await _wonderfulAutoRegister(freshPmt);
         } catch (e) {
@@ -51757,6 +52192,13 @@ app.post('/api/webhooks/wonderful', webhookLimiter, async (req, res) => {
             return console.log('[WF webhook] already credited (' + pmt.status + '), skipping:', pmt.merchant_reference);
         }
 
+        // FIX-538: held rows are frozen until resolved in the CRM - a paid webhook
+        // must not credit around the quarantine.
+        if (pmt.reconcile_hold === true) {
+            console.log('[WF webhook] row on FIX-538 hold - no action, resolve in CRM:', pmt.merchant_reference);
+            return res.status(200).json({ received: true, held: true });
+        }
+
         // FIX-364 (Web66): log the successful match into the audit table.
         // Fires once per webhook that resolves to a row, regardless of what
         // happens next (verify, credit, mirror state). Powers the CRM
@@ -51852,7 +52294,7 @@ app.get('/api/payments/wonderful/status/:ref', authenticateToken, async (req, re
         // client poll (the cancel→paid-within-48h edge stays covered by the background
         // reconciler, FIX-451). Returning the stored status is identical + cheap.
         const _WF_TERMINAL_STATUSES = ['credited', 'credited_manually', 'failed', 'cancelled', 'expired', 'init_failed'];
-        if (!_WF_TERMINAL_STATUSES.includes(p.status) && WONDERFUL_API_KEY) {
+        if (!_WF_TERMINAL_STATUSES.includes(p.status) && p.reconcile_hold !== true && WONDERFUL_API_KEY) { // FIX-538: held rows never recovery-credit
             const { verified, resolvedWpId } = await _wonderfulVerifyStatus(p);
             if (verified === 'paid' || verified === 'accepted') {
                 try {
@@ -51944,7 +52386,7 @@ app.get('/api/admin/payments/wonderful/pending', authenticateToken, requireSuper
         const rows = await pool.query(`
             SELECT wp.id, wp.merchant_reference, wp.wonderful_payment_id,
                    wp.amount_pence, wp.status, wp.created_at, wp.credited_at,
-                   wp.game_id, wp.auto_register_status,
+                   wp.game_id, wp.auto_register_status, wp.reconcile_hold,
                    p.alias, p.full_name, p.id as player_id
             FROM wonderful_payments wp
             JOIN players p ON p.id = wp.player_id
@@ -51956,6 +52398,67 @@ app.get('/api/admin/payments/wonderful/pending', authenticateToken, requireSuper
         console.error('GET wonderful pending error:', e.message);
         res.status(500).json({ error: 'Failed to fetch payments' });
     }
+});
+
+// FIX-538: the hold review list - each held row + the player's credit
+// transactions around the payment date, so a manual comp is visible right
+// next to the claim it covered.
+app.get('/api/admin/payments/wonderful/holds', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const rows = await pool.query(`
+            SELECT wp.id, wp.merchant_reference, wp.wonderful_payment_id, wp.wonderful_order_id,
+                   wp.amount_pence, wp.status, wp.created_at, wp.game_id,
+                   p.alias, p.full_name, p.id AS player_id
+            FROM wonderful_payments wp
+            JOIN players p ON p.id = wp.player_id
+            WHERE wp.reconcile_hold = TRUE
+            ORDER BY wp.created_at DESC
+            LIMIT 100`);
+        const items = [];
+        for (const r of rows.rows) {
+            let tx = [];
+            try {
+                const t = await pool.query(`
+                    SELECT amount, type, description, created_at FROM credit_transactions
+                     WHERE player_id = $1 AND created_at BETWEEN $2::timestamptz - INTERVAL '3 days' AND $2::timestamptz + INTERVAL '14 days'
+                     ORDER BY created_at DESC LIMIT 6`, [r.player_id, r.created_at]);
+                tx = t.rows;
+            } catch (_) {}
+            items.push({ ...r, recent_tx: tx });
+        }
+        res.json({ items });
+    } catch (e) { console.error('WF holds error:', e.message); res.status(500).json({ error: 'Failed to load holds' }); }
+});
+
+// FIX-538: resolve one held row. action='credit' verifies live first and
+// credits WALLET-ONLY (no auto-register into stale games); action='writeoff'
+// marks it credited_manually (handled outside - reconciler-proof forever).
+app.post('/api/admin/payments/wonderful/holds/:id/resolve', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const action = String((req.body || {}).action || '');
+        const row = await pool.query(`SELECT * FROM wonderful_payments WHERE id = $1 AND reconcile_hold = TRUE`, [req.params.id]);
+        if (!row.rows.length) return res.status(404).json({ error: 'Held payment not found (already resolved?)' });
+        const pmt = row.rows[0];
+        if (action === 'writeoff') {
+            await pool.query(`UPDATE wonderful_payments SET status = 'credited_manually', reconcile_hold = FALSE WHERE id = $1 AND status NOT IN ('credited')`, [pmt.id]);
+            auditLog(pool, req.user.playerId, 'wonderful_hold_writeoff', pmt.player_id,
+                `ref:${pmt.merchant_reference} £${(pmt.amount_pence / 100).toFixed(2)} written off (handled outside)`).catch(() => {});
+            return res.json({ ok: true, resolved: 'writeoff' });
+        }
+        if (action === 'credit') {
+            const { verified, resolvedWpId } = await _wonderfulVerifyStatus(pmt);
+            if (verified !== 'paid' && verified !== 'accepted') {
+                return res.status(400).json({ error: `Wonderful says '${verified || 'unknown'}' - not creditable. Write it off, or use force-verify if you KNOW it paid.` });
+            }
+            await pool.query(`UPDATE wonderful_payments SET reconcile_hold = FALSE WHERE id = $1`, [pmt.id]);
+            const result = await creditAndAutoRegisterWonderful(pmt, {
+                adminId: req.user.userId || null, contextLabel: 'FIX-538 hold release', verifyWpId: resolvedWpId, skipAutoRegister: true });
+            auditLog(pool, req.user.playerId, 'wonderful_hold_released', pmt.player_id,
+                `ref:${pmt.merchant_reference} £${(pmt.amount_pence / 100).toFixed(2)} credited wallet-only after live verify`).catch(() => {});
+            return res.json({ ok: true, resolved: 'credited', credited: result.credited, alreadyCredited: result.alreadyCredited });
+        }
+        res.status(400).json({ error: "action must be 'credit' or 'writeoff'" });
+    } catch (e) { console.error('WF hold resolve error:', e.message); res.status(500).json({ error: 'Resolve failed' }); }
 });
 
 // POST /api/admin/payments/wonderful/manual-credit
@@ -58122,6 +58625,7 @@ const _FIX322_INT_FIELDS = [
     // — it's adjusted via dedicated endpoint /api/admin/tenants/:id/credit
     // (audit trail mandatory for cash movements).
     'vat_rate_basis_points',
+    'monthly_fee_pence', // FIX-535
 ];
 const _FIX322_TEXT_FIELDS = [
     'name', 'slug', 'logo_url', 'primary_color',
@@ -66488,6 +66992,63 @@ async function bootstrapTenantFreeCredits() {
         await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS card_red_fine_id INT`);
         await pool.query(`ALTER TABLE external_leagues ADD COLUMN IF NOT EXISTS season_label TEXT`);
         console.log('✅ fines & cards ready (FIX-533)');
+        // FIX-534: PAYMENTS MODE + TENANT CREDITS (the third bucket).
+        // payment_mode: 'tf' (Wonderful, universal wallet - today's behaviour)
+        // or 'manual' (bank transfers direct to the tenant; credits SILOED).
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_mode TEXT NOT NULL DEFAULT 'tf'`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS player_tenant_credits (
+                player_id UUID NOT NULL,
+                tenant_id UUID NOT NULL,
+                balance NUMERIC(10,2) NOT NULL DEFAULT 0,
+                last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (player_id, tenant_id)
+            )`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tenant_topup_claims (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                player_id UUID NOT NULL,
+                amount NUMERIC(8,2) NOT NULL,
+                reference TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                actioned_by UUID,
+                actioned_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )`);
+        // Registrations record WHICH bucket paid: amount_paid = global cash,
+        // amount_paid_free = free buckets, amount_paid_tenant = the tenant silo.
+        // Refunds route by what was ACTUALLY spent - immune to mode flips.
+        await pool.query(`ALTER TABLE registrations ADD COLUMN IF NOT EXISTS amount_paid_tenant NUMERIC(8,2) NOT NULL DEFAULT 0`);
+        await pool.query(`ALTER TABLE game_guests ADD COLUMN IF NOT EXISTS amount_paid_tenant NUMERIC(8,2) NOT NULL DEFAULT 0`);
+        await pool.query(`ALTER TABLE coaching_registrations ADD COLUMN IF NOT EXISTS amount_paid_tenant NUMERIC(8,2) NOT NULL DEFAULT 0`);
+        await pool.query(`ALTER TABLE dropped_no_refund ADD COLUMN IF NOT EXISTS amount_paid_tenant NUMERIC(8,2) NOT NULL DEFAULT 0`);
+        // FIX-535: recurring monthly platform charge (0 = off). Composes with
+        // the per-registration platform_fee_pence in the invoice engine.
+        await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS monthly_fee_pence INTEGER NOT NULL DEFAULT 0`);
+        console.log('✅ payments mode + tenant credits ready (FIX-534 phase 1)');
+        console.log('✅ monthly fixed fee dial ready (FIX-535)');
+        // FIX-538: clean-slate quarantine. The FIX-536 verify fix would let the
+        // reconciler credit EVERY stranded pre-deploy row Wonderful now reports
+        // paid - blind to players already compensated by hand. Hold every row the
+        // reconciler would touch, ONCE, at first boot after deploy; the CRM
+        // Wonderful panel resolves each (CREDIT wallet-only / WRITE OFF).
+        await pool.query(`ALTER TABLE wonderful_payments ADD COLUMN IF NOT EXISTS reconcile_hold BOOLEAN NOT NULL DEFAULT FALSE`);
+        try {
+            const _f538 = await _ratingSettingGet('fix538_hold_applied');
+            if (_f538 !== 'true') {
+                const held = await pool.query(
+                    `UPDATE wonderful_payments SET reconcile_hold = TRUE
+                      WHERE (status NOT IN ('credited', 'credited_manually', 'failed', 'expired', 'init_failed')
+                             OR (status = 'cancelled' AND created_at > NOW() - INTERVAL '48 hours'))
+                        AND status NOT IN ('credited', 'credited_manually')
+                      RETURNING id`);
+                await _ratingSettingSet('fix538_hold_applied', 'true');
+                console.log(`✅ FIX-538 one-time quarantine: ${held.rowCount} legacy payment row(s) held for CRM review`);
+            } else {
+                console.log('✅ FIX-538 quarantine already applied (holds resolve in CRM)');
+            }
+        } catch (e) { console.error('[FIX-538] quarantine failed (non-fatal):', e.message); }
         // FIX-529: WhatsApp v3 — trainings (and every coaching_sessions kind)
         // can carry a group link; series-edit propagates links to future games.
         await pool.query(`ALTER TABLE coaching_sessions ADD COLUMN IF NOT EXISTS whatsapp_link TEXT`);
@@ -66702,6 +67263,29 @@ async function getTenantFreeCredits(playerId, tenantId, db = pool) {
 
 // Adjust a player's tenant free-credit bucket by delta (can be negative). NULL tenant →
 // the Original bucket (credits.free_credit_balance). Clamps at 0. Returns new balance.
+// FIX-534: the TENANT-credits silo (real money, manual-transfer tenants).
+// Mirror of adjustTenantFreeCredits minus the NULL-tenant legacy branch -
+// tenant credits ALWAYS belong to exactly one tenant. Clamped >= 0.
+async function adjustTenantCredits(playerId, tenantId, delta, db = pool) {
+    if (!tenantId) throw new Error('adjustTenantCredits requires a tenantId');
+    await db.query(
+        `INSERT INTO player_tenant_credits (player_id, tenant_id, balance)
+         VALUES ($1, $2, GREATEST(0,$3))
+         ON CONFLICT (player_id, tenant_id) DO UPDATE
+            SET balance = GREATEST(0, player_tenant_credits.balance + $3),
+                last_updated = NOW()`,
+        [playerId, tenantId, delta]);
+    const r = await db.query(
+        'SELECT balance FROM player_tenant_credits WHERE player_id = $1 AND tenant_id = $2',
+        [playerId, tenantId]);
+    return r.rows.length ? parseFloat(r.rows[0].balance) : 0;
+}
+async function getTenantCredits(playerId, tenantId, db = pool) {
+    const r = await db.query(
+        'SELECT balance FROM player_tenant_credits WHERE player_id = $1 AND tenant_id = $2',
+        [playerId, tenantId]);
+    return r.rows.length ? parseFloat(r.rows[0].balance) : 0;
+}
 async function adjustTenantFreeCredits(playerId, tenantId, delta, db = pool) {
     if (!tenantId) {
         await db.query(
@@ -67786,7 +68370,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web104-fines`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web105-paymode`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
@@ -67914,6 +68498,7 @@ app.listen(PORT, () => {
                 `SELECT * FROM wonderful_payments
                  WHERE (status NOT IN ('credited', 'credited_manually', 'failed', 'cancelled', 'expired', 'init_failed')
                         OR (status = 'cancelled' AND created_at > NOW() - INTERVAL '48 hours'))
+                   AND COALESCE(reconcile_hold, FALSE) = FALSE  -- FIX-538
                    ${scope.whereClause}
                  ORDER BY created_at ASC
                  LIMIT 30`
