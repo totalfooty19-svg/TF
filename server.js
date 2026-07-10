@@ -13157,17 +13157,45 @@ function _faAlertSuperadmin(ctx, source, errMsg) {
 }
 
 // Accepts only the canonical shape the admin pastes:
-// https://fulltime.thefa.com/displayTeam.html?divisionseason=NNN&teamID=NNN
+// FIX-601: the FA migrated FullTime to a season-less single-id team URL.
+// Accepted shapes (id == the old teamID; confirmed same team resolves on both):
+//   https://fulltime.thefa.com/displayTeam.html?id=NNN                     (current)
+//   https://fulltime-league.thefa.com/displayTeam.html?id=NNN              (current alt host)
+//   https://fulltime.thefa.com/displayTeam.html?divisionseason=NNN&teamID=NNN  (legacy)
+// Returns { id, teamID (== id), divisionseason|null }. divisionseason only
+// exists on legacy links — the public league-table pull still needs it.
 function _faParseTeamUrl(raw) {
     let u;
     try { u = new URL(String(raw || '').trim()); } catch (_) { return null; }
     if (u.protocol !== 'https:') return null;
-    if (u.hostname.replace(/^www\./i, '').toLowerCase() !== 'fulltime.thefa.com') return null;
+    const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+    if (host !== 'fulltime.thefa.com' && host !== 'fulltime-league.thefa.com') return null; // FIX-601
     if (!/displayTeam\.html$/i.test(u.pathname)) return null;
+    const id = u.searchParams.get('id') || '';
+    if (/^\d{4,15}$/.test(id)) return { id, teamID: id, divisionseason: null }; // FIX-601: new shape
     const div = u.searchParams.get('divisionseason') || '';
     const team = u.searchParams.get('teamID') || '';
     if (!/^\d{4,15}$/.test(div) || !/^\d{4,15}$/.test(team)) return null;
-    return { divisionseason: div, teamID: team };
+    return { id: team, teamID: team, divisionseason: div }; // legacy (id == teamID)
+}
+
+// FIX-601: canonical team-page fetch — id URL first, one legacy retry if the
+// saved link carried the old pair (belt + braces for migration stragglers).
+async function _faFetchTeamPage(parsed) {
+    try {
+        return await _faFetch('https://fulltime.thefa.com/displayTeam.html?id=' + parsed.id);
+    } catch (e1) {
+        // FIX-601b: the league host serves the same team page from different edge
+        // config — one shot there before falling back to the legacy URL shape.
+        try {
+            return await _faFetch('https://fulltime-league.thefa.com/displayTeam.html?id=' + parsed.id);
+        } catch (e2) {
+            if (parsed.divisionseason) {
+                return await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + parsed.teamID);
+            }
+            throw e2;
+        }
+    }
 }
 
 async function _faFetch(url) {
@@ -13176,13 +13204,28 @@ async function _faFetch(url) {
     try {
         const r = await fetch(url, {
             headers: {
-                'User-Agent': 'TotalFootyBot/1.0 (+https://totalfooty.co.uk; grassroots club tool)',
-                'Accept': 'text/html',
+                // FIX-601b: the announced bot UA got connection-reset at the FA's edge
+                // ('fetch failed' — no HTTP status ever arrived), which is WAF bot
+                // filtering. These are the headers a normal browser sends for the same
+                // public page; this is a club admin pulling their OWN team's page on a
+                // button click, not a crawl. Revert to the bot UA only by choice.
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-GB,en;q=0.9',
             },
             signal: controller.signal,
         });
         if (!r.ok) throw new Error('FA responded HTTP ' + r.status);
         return await r.text();
+    } catch (e) {
+        // FIX-601b: undici hides the real network failure (ECONNRESET / ENOTFOUND /
+        // ETIMEDOUT / TLS) behind TypeError 'fetch failed', with the code on e.cause.
+        // Surface it so the Render log names the culprit instead of shrugging.
+        if (e && e.message === 'fetch failed') {
+            const code = (e.cause && (e.cause.code || e.cause.message)) || 'network';
+            throw new Error('FA fetch failed (' + code + ')');
+        }
+        throw e;
     } finally { clearTimeout(timer); }
 }
 
@@ -13300,9 +13343,9 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-pull', authenticateTo
               WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
         if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
         const parsed = _faParseTeamUrl(xl.rows[0].fa_team_url);
-        if (!parsed) return res.status(400).json({ error: 'Save a valid FA team link first (fulltime.thefa.com/displayTeam.html?\u2026)' });
+        if (!parsed) return res.status(400).json({ error: 'Save a valid FA team link first \u2014 fulltime.thefa.com/displayTeam.html?id=\u2026 (or the older ?divisionseason=\u2026&teamID=\u2026 link)' }); // FIX-601
         faCtx = { id: xl.rows[0].id, name: xl.rows[0].name, url: xl.rows[0].fa_team_url, tenant: req.tenant && req.tenant.name }; // FIX-522
-        const html = await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + parsed.teamID);
+        const html = await _faFetchTeamPage(parsed); // FIX-601
         const data = _faParseFixtures(html);
         res.json({ success: true, team_name: data.team_name, count: data.rows.length, rows: data.rows,
                    note: data.no_fixtures ? 'No fixtures published on your FA page yet (pre-season) \u2014 PULL MY SQUAD still works.' : undefined });
@@ -13326,6 +13369,10 @@ app.get('/api/public/ext-league-table/:leagueId', publicPlayerLimiter, async (re
         if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
         const parsed = _faParseTeamUrl(xl.rows[0].fa_team_url);
         if (!parsed) return res.status(404).json({ error: 'This league has no FA table link' });
+        // FIX-601: the new short link (?id=) is season-less — the division table
+        // URL needs divisionseason, which only legacy links carry. No guessing:
+        // say so plainly (fixtures + squad pulls work fine on the new link).
+        if (!parsed.divisionseason) return res.status(424).json({ error: 'League table needs the older FA link format (with divisionseason) \u2014 fixtures & squad pulls work with the new short link.' });
         faCtx = { id: xl.rows[0].id, name: xl.rows[0].name, url: xl.rows[0].fa_team_url, tenant: null }; // FIX-522
         const hit = _faTableCache.get(String(xl.rows[0].id));
         if (hit && (Date.now() - hit.at) < FA_TABLE_TTL_MS) return res.json(hit.data);
@@ -13391,9 +13438,9 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-squad-pull', authenti
               WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
         if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
         const parsed = _faParseTeamUrl(xl.rows[0].fa_team_url);
-        if (!parsed) return res.status(400).json({ error: 'Save a valid FA team link first (fulltime.thefa.com/displayTeam.html?\u2026)' });
+        if (!parsed) return res.status(400).json({ error: 'Save a valid FA team link first \u2014 fulltime.thefa.com/displayTeam.html?id=\u2026 (or the older ?divisionseason=\u2026&teamID=\u2026 link)' }); // FIX-601
         faCtx = { id: xl.rows[0].id, name: xl.rows[0].name, url: xl.rows[0].fa_team_url, tenant: req.tenant && req.tenant.name }; // FIX-522
-        const html = await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + parsed.teamID);
+        const html = await _faFetchTeamPage(parsed); // FIX-601
         const squad = _faParseSquad(html);
         const ghosts = await pool.query('SELECT fa_person_id FROM tenant_ghost_players WHERE tenant_id = $1', [req.tenant.id]);
         const ghostIds = new Set(ghosts.rows.map(g => String(g.fa_person_id)));
@@ -25232,7 +25279,7 @@ app.get('/api/admin/games/:gameId/series-diagnostic', authenticateToken, require
                 `SELECT id, game_url, game_date, game_status FROM games
                   WHERE series_id IS NULL AND venue_id = $1 AND format = $2
                     AND EXTRACT(DOW FROM game_date)::int = $3 AND id <> $4
-                  ORDER BY game_date`, [game.venue_id, game.format, game.dow, gameId])).rows;
+                  ORDER BY game_date`, [game.venue_id, game.format, game.dow, game.id /* FIX-597: was the raw :gameId slug — pg threw 'invalid input syntax for type uuid' the first time the diagnostic was ever run with a page-URL slug */])).rows;
         }
         res.json(out);
     } catch (e) {
@@ -30595,6 +30642,28 @@ async function _fix282SweepStaleLocks(scopeGameId) {
 // so it doesn't compete with normal startup work; non-fatal on failure.
 setTimeout(() => {
     _fix282SweepStaleLocks(null).catch(() => {});
+    // FIX-599: SERIES CANARY. The March-2026 build minted 51 weekly games with no
+    // series (repaired manually 2026-07-10 — TF0030/TF0031; census then clean).
+    // The current wizard makes that structurally impossible (the series INSERT
+    // precedes the game loop inside one transaction), but if ANY future path
+    // regresses, this surfaces it on the VERY NEXT BOOT — with the affected span —
+    // instead of four months later via a player report. Detection only, never
+    // auto-repair: adopting orphans into a series is a human call (see the
+    // 2026-07-10 psql repair for the pattern).
+    (async () => {
+        try {
+            const _sc = await pool.query(
+                `SELECT COUNT(*)::int AS n, MIN(game_date)::date AS first, MAX(game_date)::date AS last
+                   FROM games WHERE regularity = 'weekly' AND series_id IS NULL`);
+            if (_sc.rows[0].n > 0) {
+                console.warn(`\u26a0\ufe0f  SERIES CANARY TRIPPED: ${_sc.rows[0].n} weekly game(s) have NO series (${_sc.rows[0].first} \u2192 ${_sc.rows[0].last}) \u2014 a creation path is dropping series_id again. Diagnose: GET /api/admin/games/:slug/series-diagnostic`);
+                auditLog(pool, null, 'series_canary_tripped', null,
+                    `${_sc.rows[0].n} weekly games without series (${_sc.rows[0].first} -> ${_sc.rows[0].last})`).catch(() => {});
+            } else {
+                console.log('\u2705 series canary clean (every weekly game is series-linked)');
+            }
+        } catch (e) { console.warn('series canary skipped (non-fatal):', e.message); }
+    })();
 }, 5000);
 
 // Lock game for player editing
@@ -45834,7 +45903,7 @@ app.patch('/api/t/:tenant_short_id/admin/ext-leagues/:id', authenticateToken, re
         }
         if (b.fa_team_url !== undefined) { // FIX-521
             const v = String(b.fa_team_url || '').trim() || null;
-            if (v && !_faParseTeamUrl(v)) return res.status(400).json({ error: 'That link must be your team\'s FA page: fulltime.thefa.com/displayTeam.html?divisionseason=…&teamID=…' });
+            if (v && !_faParseTeamUrl(v)) return res.status(400).json({ error: 'That link must be your team\'s FA page \u2014 fulltime.thefa.com/displayTeam.html?id=\u2026 (or the older ?divisionseason=\u2026&teamID=\u2026 link)' }); // FIX-601
             put('fa_team_url', v);
         }
         if (b.season_label !== undefined) { // FIX-533: per-league season for cards
@@ -58376,13 +58445,23 @@ app.get('/api/admin/rating-feedback/suggestions', authenticateToken, requireAdmi
                     [row.subject_player_id, voterIds])
                 : { rows: [] };
             const sub = await _computeSubstantiation(row.subject_player_id, votesR.rows);
+            // FIX-600: surface what APPROVE will actually do (FIX-558b clamps at
+            // approval), not the stale pre-clamp snapshot stored on old pending rows.
+            const _isNew600 = (parseInt(row.total_appearances, 10) || 0) < FIX268_NEW_PLAYER_CUTOFF;
+            const _cap600   = _ratingMaxStep(_isNew600);
+            let _cd600      = parseInt(row.delta_ovr, 10) || 0;
+            if (Math.abs(_cd600) > _cap600) _cd600 = Math.sign(_cd600) * _cap600;
             suggestions.push({
                 id: row.id,
                 subject_player_id: row.subject_player_id,
                 subject_alias: row.subject_alias,
                 current_ovr: row.current_ovr,
-                proposed_delta: row.delta_ovr,
-                proposed_ovr: (row.current_ovr || 0) + (row.delta_ovr || 0),
+                proposed_delta: _cd600 /* FIX-600: capped = truth */,
+                proposed_ovr: (row.current_ovr || 0) + _cd600,
+                raw_delta: row.delta_ovr /* FIX-600 */,
+                delta_capped: _cd600 !== (parseInt(row.delta_ovr, 10) || 0) /* FIX-600 */,
+                step_cap: _cap600 /* FIX-600 */,
+                is_new_player: _isNew600 /* FIX-600 */,
                 stat_changes: row.stat_changes,
                 voter_count: voterIds.length,
                 voter_ids: voterIds,
@@ -61048,7 +61127,16 @@ app.get('/api/admin/players/feedback-diagnostic', authenticateToken, requireSupe
             const movementMag = dominantDir !== 0
                 ? _fix268MovementMagnitude(matchingCount, matchingVoters, isNewPlayer)
                 : 0;
-            const suggestedChange = movementMag * dominantDir;
+            // FIX-600: the panel must show what an approval would ACTUALLY apply.
+            // Every apply path clamps to _ratingMaxStep (FIX-558/558b: est ±1 /
+            // new ±2) but this display mirrored only the magnitude curve — so
+            // admins saw raw tier output (up to ±3+) that the engine can no
+            // longer perform. SUG/Δ now carry the capped value; the raw signal
+            // rides along for the UI to hint at ("more movement banked").
+            const _rawSuggested600 = movementMag * dominantDir;
+            const _stepCap600     = _ratingMaxStep(isNewPlayer);
+            const suggestedChange = Math.abs(_rawSuggested600) > _stepCap600
+                ? Math.sign(_rawSuggested600) * _stepCap600 : _rawSuggested600;
             const suggestedOvr    = (p.overall_rating || 0) + suggestedChange;
 
             // ── confidence: only votes received AFTER the last OVR change count.
@@ -61128,6 +61216,10 @@ app.get('/api/admin/players/feedback-diagnostic', authenticateToken, requireSupe
                 // Diagnostic
                 suggested_change: suggestedChange,
                 suggested_ovr: suggestedOvr,
+                raw_suggested_change: _rawSuggested600 /* FIX-600 */,
+                suggestion_capped: _rawSuggested600 !== suggestedChange /* FIX-600 */,
+                step_cap: _stepCap600 /* FIX-600 */,
+                is_new_player: isNewPlayer /* FIX-600 */,
                 confidence_pct: confidence,
                 confidence_breakdown: {
                     volume:    Math.round(volumeScore),
@@ -70404,9 +70496,14 @@ async function bootstrapTenantFreeCredits() {
                 ['Twinkletoes',       '\ud83e\ude70', '#FFD700', 'Won the Twinkletoes award 3 times.'],
             ];
             for (const b of _andyBadges) {
+                // FIX-598: $1 appeared in two positions (insert value + WHERE name = $1)
+                // and pg deduced clashing types (varchar vs text) — the seed failed on
+                // EVERY boot since web166 with 'inconsistent types deduced for parameter
+                // $1' (proven in the web181 deploy log; the 4 badges were finally seeded
+                // manually). Pass the name twice so each position deduces independently.
                 await pool.query(
                     `INSERT INTO badges (name, icon, color, description)
-                     SELECT $1, $2, $3, $4 WHERE NOT EXISTS (SELECT 1 FROM badges WHERE name = $1)`, b);
+                     SELECT $1, $2, $3, $4 WHERE NOT EXISTS (SELECT 1 FROM badges WHERE name = $5)`, [...b, b[0]]);
             }
         } catch (e) { console.warn('Andy badge seed skipped:', e.message); }
         await pool.query(`
@@ -71893,7 +71990,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web181-bootproven`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web182-truthpatch`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
