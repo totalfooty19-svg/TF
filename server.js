@@ -13249,7 +13249,70 @@ function _faHttpGet(url, redirectsLeft) {
         req.end();
     });
 }
-async function _faFetch(url) { return _faHttpGet(url, 3); }
+// FIX-604: FA relay client. Prod proved the FA edge silently drops Render's
+// connections at network level (UND_ERR_CONNECT_TIMEOUT, then ETIMEDOUT with
+// IPv4 forced) — the SYN is never answered, so no header/UA/family fix can
+// work from this IP. The Namecheap shared host IS served normally, so on a
+// network-class failure the fetch retries once through tf-fa-relay.php there
+// (HMAC ts.sig token — the exact tf-upload.php scheme — plus a hard
+// host+path allowlist in the PHP; not an open proxy). Feature-flagged by the
+// FA_RELAY_URL env var: unset = behave exactly as before.
+function _faRelayFetch(url) {
+    return new Promise((resolve, reject) => {
+        const relay = process.env.FA_RELAY_URL;
+        const secret = process.env.TF_UPLOAD_SECRET;
+        if (!relay || !secret) return reject(new Error('FA relay not configured'));
+        let ru;
+        try { ru = new URL(relay); } catch (_) { return reject(new Error('FA relay misconfigured (bad FA_RELAY_URL)')); }
+        const ts = String(Math.floor(Date.now() / 1000));
+        const sig = require('crypto').createHmac('sha256', secret).update(ts).digest('hex');
+        const body = 'token=' + encodeURIComponent(ts + '.' + sig) + '&url=' + encodeURIComponent(url);
+        const req = require('https').request({
+            hostname: ru.hostname,
+            path: (ru.pathname || '/') + (ru.search || ''),
+            method: 'POST',
+            family: 4,
+            headers: {
+                'Host': ru.hostname,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Length': Buffer.byteLength(body),
+                'User-Agent': 'TotalFooty-API/1.0 (fa-relay client)',
+            },
+            timeout: 25000,
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                if ((res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300) return resolve(text);
+                let msg = 'HTTP ' + res.statusCode;
+                try { msg = (JSON.parse(text).error || msg); } catch (_) { /* body wasn't JSON */ }
+                reject(new Error('FA relay: ' + msg));
+            });
+            res.on('error', (err) => reject(new Error('FA relay: ' + (err.code || err.message))));
+        });
+        req.on('timeout', () => { req.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })); });
+        req.on('error', (err) => reject(new Error('FA relay: ' + ((err && err.code) || (err && err.message) || 'network'))));
+        req.end(body);
+    });
+}
+async function _faFetch(url) {
+    try {
+        return await _faHttpGet(url, 3);
+    } catch (e) {
+        // Relay only network-class deaths ('FA fetch failed (...)'): if the FA
+        // actually ANSWERED (an 'FA responded HTTP N'), relaying won't change it.
+        const networkClass = e && e.message && e.message.indexOf('FA fetch failed') === 0;
+        if (!networkClass || !process.env.FA_RELAY_URL) throw e;
+        try {
+            const html = await _faRelayFetch(url);
+            console.log('[FA] direct fetch failed (' + e.message + ') \u2192 relay served ' + url.slice(0, 90));
+            return html;
+        } catch (re) {
+            throw new Error(e.message + '; relay also failed: ' + re.message);
+        }
+    }
+}
 
 function _faStrip(html) { // tags -> text, entities we actually meet, squashed whitespace
     return String(html || '')
@@ -46493,7 +46556,7 @@ app.get('/api/players/me/trainings', authenticateToken, async (req, res) => {
 //   • otherwise → the caller's active tenant_admin membership (oldest joined_at).
 // Gate matches /api/admin/games (requireAdmin): anyone who can open the
 // Manage Games form can resolve. No SQL migration needed.
-app.get('/api/admin/wizard-tenant', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/wizard-tenant', authenticateToken, requireGameCreator /* FIX-603: was requireAdmin, which 403'd tenant admins at the door — yet the handler below has a whole membership branch built to serve them (FIX-468). requireGameCreator is the FIX-562 gate the create flow itself uses: admins + active tenant admins pass, everyone else 403s. This unbroke tenant-admin external-league/training creation, whose first wizard call is this endpoint. */, async (req, res) => {
     try {
         if (req.user.role === 'admin' || req.user.role === 'superadmin') {
             const t = await pool.query('SELECT id, short_id, name FROM tenants WHERE id = $1', [TF_COVENTRY_TENANT_ID]);
@@ -72079,7 +72142,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web184-ipv4`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web186-relay`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
