@@ -30664,6 +30664,73 @@ setTimeout(() => {
             }
         } catch (e) { console.warn('series canary skipped (non-fatal):', e.message); }
     })();
+    // FIX-602: BADGE RECONCILE. checkAndGrantAwardBadge only fires at award time
+    // and silently no-ops when the badge row is absent — so the 9 badge rows
+    // seeded 2026-07-10 left every player whose counts ALREADY met threshold
+    // owed-but-unpaid (found live: 6x Brick Wall, no badge). This boot sweep
+    // mirrors the grant logic exactly (same map, same thresholds, count >=,
+    // conflict-safe) and back-pays anyone owed. Grants are SILENT by design:
+    // no email/push burst for old wins; bios refresh on their next natural
+    // regen. Idempotent every boot => any future badge seeding self-heals.
+    (async () => {
+        try {
+            const r = await pool.query(`
+                WITH m(award_type, badge_name, threshold) AS (VALUES
+                  ('best_engine','Engine',5), ('brick_wall','Brick Wall',5), ('donkey','Donkey',3),
+                  ('cold_moment','Cold',3), ('pig','Pig',3), ('walker','Walker',2),
+                  ('the_moaner','Moaner',3), ('goalscorer','Goalscorer',5),
+                  ('controlled','Controlled',3), ('tf_ledge','TF Ledge',5), ('assist_king','Assist King',3),
+                  ('howler','Howler',3), ('lucky_bastard','Lucky Bastard',3),
+                  ('invisible_man','Invisible Man',3), ('lost','Lost',3),
+                  ('reckless_tackler','Reckless Tackler',3),
+                  ('turtle','Turtle',3), ('secret_agent','Secret Agent',3), ('butterfingers','Butterfingers',3),
+                  ('nutmeg_king','Nutmeg King',3), ('great_goalkeeping','Great Goalkeeping',3),
+                  ('carried','Carried The Team',3), ('twinkletoes','Twinkletoes',3)
+                ), owed AS (
+                  SELECT ga.recipient_player_id AS player_id, b.id AS badge_id
+                    FROM m
+                    JOIN LATERAL (
+                      SELECT recipient_player_id, COUNT(*) AS cnt
+                        FROM game_awards WHERE award_type = m.award_type
+                       GROUP BY 1) ga ON ga.cnt >= m.threshold
+                    -- badges.name has NO unique constraint; a historical duplicate name
+                    -- would double-grant. Pick exactly one row per name (lowest id),
+                    -- matching the live grant check's first-row behaviour.
+                    JOIN LATERAL (
+                      SELECT id FROM badges WHERE name = m.badge_name
+                       ORDER BY id LIMIT 1) b ON true
+                   WHERE NOT EXISTS (SELECT 1 FROM player_badges pb
+                                      WHERE pb.player_id = ga.recipient_player_id
+                                        AND pb.badge_id = b.id)
+                )
+                INSERT INTO player_badges (player_id, badge_id)
+                SELECT player_id, badge_id FROM owed
+                ON CONFLICT DO NOTHING
+                RETURNING player_id`);
+            if (r.rowCount > 0) {
+                console.log(`\ud83c\udfc5 badge reconcile: granted ${r.rowCount} retroactive badge(s) (FIX-602)`);
+                auditLog(pool, null, 'badge_reconcile_backfill', null,
+                    `${r.rowCount} retroactive award badge(s) granted at boot (FIX-602)`).catch(() => {});
+            } else {
+                console.log('\u2705 badge reconcile clean (nobody owed)');
+            }
+            // FIX-602: a mapped badge NAME with no badges row is invisible to both
+            // the live grant check and the reconcile above — the exact silence that
+            // cost 15x Brick Wall zero badges. Name any gap loudly every boot.
+            const gaps = await pool.query(`
+                SELECT v.name FROM (VALUES
+                  ('Engine'),('Brick Wall'),('Donkey'),('Cold'),('Pig'),('Walker'),
+                  ('Moaner'),('Goalscorer'),('Controlled'),('TF Ledge'),('Assist King'),
+                  ('Howler'),('Lucky Bastard'),('Invisible Man'),('Lost'),
+                  ('Reckless Tackler'),('Turtle'),('Secret Agent'),('Butterfingers'),
+                  ('Nutmeg King'),('Great Goalkeeping'),('Carried The Team'),('Twinkletoes')
+                ) AS v(name)
+                WHERE NOT EXISTS (SELECT 1 FROM badges b WHERE b.name = v.name)`);
+            if (gaps.rows.length > 0) {
+                console.warn(`\u26a0\ufe0f  badge reconcile: ${gaps.rows.length} grantable badge row(s) MISSING from badges \u2014 grants for these silently no-op: ${gaps.rows.map(g => g.name).join(', ')}`);
+            }
+        } catch (e) { console.warn('badge reconcile skipped (non-fatal):', e.message); }
+    })();
 }, 5000);
 
 // Lock game for player editing
@@ -31874,7 +31941,7 @@ async function checkAndGrantAwardBadge(playerId, awardType) {
         if (cnt < threshold) return;
 
         const badgeResult = await pool.query('SELECT id FROM badges WHERE name = $1', [badgeName]);
-        if (badgeResult.rows.length === 0) return;
+        if (badgeResult.rows.length === 0) { console.warn(`\ud83c\udfc5 badge grant skipped: no '${badgeName}' row in badges \u2014 seed it, next boot's reconcile will back-pay (FIX-602)`); return; } // FIX-602: silence here cost a player his Brick Wall for 6 straight wins
         const badgeId = badgeResult.rows[0].id;
 
         const alreadyHas = await pool.query(
@@ -71990,7 +72057,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web182-truthpatch`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web183-badgepay`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
