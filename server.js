@@ -15524,6 +15524,55 @@ app.get('/api/games/needing-refs', authenticateToken, async (req, res) => {
     }
 });
 
+// ── FIX-615: per-tenant team display resolver ────────────────────────────────
+// One source of truth for what 'Red'/'Blue' LOOK like for a tenant. Keyword
+// colours (client maps to hex; 'none' = bibs-less team — neutral chip, the
+// label carries the identity). 60s in-process cache: the public game details
+// endpoint is hot and tenant colours change ~never.
+const _TEAM_COLOR_KEYS = ['red','blue','green','yellow','orange','purple','pink','white','black','grey','none'];
+const _teamDispCache = new Map(); // tenantId -> { at, val }
+async function _teamDisplayForTenant(tenantId) {
+    const DEF = { red: { label: 'RED', color: 'red' }, blue: { label: 'BLUE', color: 'blue' } };
+    if (!tenantId) return DEF;
+    const hit = _teamDispCache.get(tenantId);
+    if (hit && Date.now() - hit.at < 60000) return hit.val;
+    try {
+        const r = await pool.query('SELECT team1_label, team1_color, team2_label, team2_color FROM tenants WHERE id = $1', [tenantId]);
+        const t = r.rows[0] || {};
+        const val = {
+            red:  { label: (t.team1_label || 'RED').slice(0, 14).toUpperCase(),  color: _TEAM_COLOR_KEYS.includes(t.team1_color) ? t.team1_color : 'red' },
+            blue: { label: (t.team2_label || 'BLUE').slice(0, 14).toUpperCase(), color: _TEAM_COLOR_KEYS.includes(t.team2_color) ? t.team2_color : 'blue' },
+        };
+        _teamDispCache.set(tenantId, { at: Date.now(), val });
+        return val;
+    } catch (e) { return DEF; }
+}
+
+// FIX-615: tenant-admin team colour settings (CRM My Tenant card)
+app.get('/api/t/:tenant_short_id/admin/team-colours', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const r = await pool.query('SELECT team1_label, team1_color, team2_label, team2_color FROM tenants WHERE id = $1', [req.tenant.id]);
+        res.json(r.rows[0] || {});
+    } catch (e) { res.status(500).json({ error: 'Failed to load team colours' }); }
+});
+app.patch('/api/t/:tenant_short_id/admin/team-colours', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const clean = (v) => { const s = String(v || '').trim().slice(0, 14); return s || null; };
+        const col   = (v) => _TEAM_COLOR_KEYS.includes(v) ? v : null;
+        await pool.query(
+            `UPDATE tenants SET team1_label = $1, team1_color = $2, team2_label = $3, team2_color = $4 WHERE id = $5`,
+            [clean(req.body.team1_label), col(req.body.team1_color), clean(req.body.team2_label), col(req.body.team2_color), req.tenant.id]
+        );
+        _teamDispCache.delete(req.tenant.id); // config changed — drop the cache NOW
+        setImmediate(() => auditLog(pool, req.user.playerId, 'tenant_team_colours_updated', null,
+            `${req.body.team1_label || 'RED'}/${req.body.team1_color || 'red'} vs ${req.body.team2_label || 'BLUE'}/${req.body.team2_color || 'blue'}`, req.tenant.id).catch(() => {}));
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('team-colours save error:', e.message);
+        res.status(500).json({ error: 'Failed to save team colours' });
+    }
+});
+
 app.get('/api/games/:id', authenticateToken, async (req, res) => {
     try {
         // Reject malformed UUIDs cleanly (truncated URLs, bots, bad clients)
@@ -15749,6 +15798,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             game.venue_address     = null;
         }
 
+        game.team_display = await _teamDisplayForTenant(game.tenant_id); // FIX-615
         res.json(game);
     } catch (error) {
         console.error('Error fetching game:', error);
@@ -17219,7 +17269,13 @@ app.get('/api/games/:id/players', authenticateToken, async (req, res) => {
                 gg.position_classification,
                 NULL::text as tournament_team_preference,
                 gg.team_name,
-                NULL::text as fixed_team,
+                /* FIX-614: was NULL — drafted guests were invisible in every panel
+                   that groups by fixed_team (game.html DM columns, index draft
+                   seeding) even once team_name was set. Derived, not stored:
+                   guests have no series memory. */
+                CASE WHEN LOWER(gg.team_name) = 'red' THEN 'red'
+                     WHEN LOWER(gg.team_name) = 'blue' THEN 'blue'
+                     ELSE NULL END as fixed_team,
                 NULL::integer[] as pairs,
                 NULL::integer[] as avoids,
                 TRUE as is_guest,
@@ -22457,6 +22513,41 @@ app.put('/api/admin/games/:gameId/player/:playerId/preferences', authenticateTok
         const { gameId, playerId } = req.params;
         const { positions, pairs, avoids, fixed_team } = req.body;
 
+        // FIX-614: guests hit this endpoint from the same prefs modal but have no
+        // registration row — they used to die on the 404 below ("crash not
+        // allowing me to save"). Guest path: position -> position_classification,
+        // team -> game_guests.team_name for THIS game only. Pairs/avoids never
+        // apply to guests, and guests never write series memory.
+        if (String(playerId).startsWith('guest_')) {
+            const guestId = String(playerId).replace('guest_', '');
+            const gRow = await client.query(
+                'SELECT id FROM game_guests WHERE id = $1 AND game_id = $2', [guestId, gameId]
+            );
+            if (!gRow.rows.length) {
+                return res.status(404).json({ error: 'Guest not found in this game' }); // finally releases the client
+            }
+            await client.query('BEGIN');
+            if (positions !== undefined) {
+                const cls = String(positions || '').trim().toUpperCase() === 'GK' ? 'gk' : 'outfield';
+                await client.query(
+                    'UPDATE game_guests SET position_classification = $1 WHERE id = $2 AND game_id = $3',
+                    [cls, guestId, gameId]
+                );
+            }
+            if (fixed_team !== undefined) {
+                const tn = fixed_team === 'red' ? 'Red' : fixed_team === 'blue' ? 'Blue' : null;
+                await client.query(
+                    'UPDATE game_guests SET team_name = $1 WHERE id = $2 AND game_id = $3',
+                    [tn, guestId, gameId]
+                );
+            }
+            await client.query('COMMIT');
+            setImmediate(() => gameAuditLog(pool, gameId, req.user.playerId, 'preferences_updated',
+                `Admin updated GUEST prefs (${guestId}): pos=${positions ?? 'unchanged'}${fixed_team !== undefined ? ' team=' + fixed_team : ''}`
+            ).catch(() => {}));
+            return res.json({ ok: true }); // finally releases the client
+        }
+
         // Find the registration — accept confirmed and backup players
         const regResult = await client.query(
             `SELECT r.id, g.team_selection_type, g.series_id, g.teams_generated, g.is_venue_clash
@@ -22583,6 +22674,31 @@ app.put('/api/admin/games/:gameId/player/:playerId/preferences', authenticateTok
                     'DELETE FROM player_fixed_teams WHERE player_id = $1 AND series_id = $2',
                     [playerId, reg.series_id]
                 );
+            }
+            // FIX-613: the block above only wrote the series MEMORY. If this game's
+            // teams are already materialised (draft saved/confirmed), the panel
+            // re-renders from fixed_team and LOOKS right, but team_players still
+            // holds the old assignment — so game awards spaces, lineups and stats
+            // attribution read the stale team. Sync the materialised rows too,
+            // whether the pref changed before OR after the draft completed.
+            if (reg.teams_generated) {
+                await client.query(
+                    `DELETE FROM team_players WHERE player_id = $1
+                       AND team_id IN (SELECT id FROM teams WHERE game_id = $2)`,
+                    [playerId, gameId]
+                );
+                if (fixed_team === 'red' || fixed_team === 'blue') {
+                    const tRow = await client.query(
+                        `SELECT id FROM teams WHERE game_id = $1 AND LOWER(team_name) = $2`,
+                        [gameId, fixed_team === 'red' ? 'red' : 'blue']
+                    );
+                    if (tRow.rows.length) {
+                        await client.query(
+                            'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
+                            [tRow.rows[0].id, playerId]
+                        );
+                    }
+                }
             }
         }
 
@@ -26400,8 +26516,8 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
                 for (const playerId of playerIds) {
                     if (playerId.startsWith && playerId.startsWith('guest_')) {
                         await client.query(
-                            "UPDATE game_guests SET team_name = $1 WHERE id = $2",
-                            [teamName, playerId.replace('guest_', '')]
+                            "UPDATE game_guests SET team_name = $1 WHERE id = $2 AND game_id = $3" /* FIX-614: game_id guard — a forged guest id could previously re-team a guest in ANOTHER game */,
+                            [teamName, playerId.replace('guest_', ''), gameId]
                         );
                     } else {
                         if (!validIds.has(playerId)) continue; // FIX-052: skip unregistered players
@@ -26435,6 +26551,7 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             }
             // Now write only the players who were actually assigned
             for (const playerId of redTeam) {
+                if (String(playerId).startsWith('guest_')) continue; // FIX-614: guests have no series memory — this uuid-cast was THE draft-with-guests crash
                 await client.query(`
                     INSERT INTO player_fixed_teams (player_id, series_id, fixed_team)
                     VALUES ($1, $2, 'red')
@@ -26443,6 +26560,7 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
             }
             
             for (const playerId of blueTeam) {
+                if (String(playerId).startsWith('guest_')) continue; // FIX-614
                 await client.query(`
                     INSERT INTO player_fixed_teams (player_id, series_id, fixed_team)
                     VALUES ($1, $2, 'blue')
@@ -26470,6 +26588,13 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
         
         // Add players to teams — skip any not in confirmed registrations
         for (const playerId of redTeam) {
+            if (String(playerId).startsWith('guest_')) { // FIX-614: guests carry their team on game_guests (players-only team_players stays clean)
+                await client.query(
+                    "UPDATE game_guests SET team_name = 'Red' WHERE id = $1 AND game_id = $2",
+                    [String(playerId).replace('guest_', ''), gameId]
+                );
+                continue;
+            }
             if (!validIds.has(playerId)) continue;
             await client.query(
                 'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
@@ -26478,6 +26603,13 @@ app.post('/api/admin/games/:gameId/save-manual-teams', authenticateToken, requir
         }
         
         for (const playerId of blueTeam) {
+            if (String(playerId).startsWith('guest_')) { // FIX-614
+                await client.query(
+                    "UPDATE game_guests SET team_name = 'Blue' WHERE id = $1 AND game_id = $2",
+                    [String(playerId).replace('guest_', ''), gameId]
+                );
+                continue;
+            }
             if (!validIds.has(playerId)) continue;
             await client.query(
                 'INSERT INTO team_players (team_id, player_id) VALUES ($1, $2)',
@@ -29152,6 +29284,7 @@ app.get('/api/public/game/:gameUrl/teams', async (req, res) => {
         }
         
         res.json({
+            team_display: await _teamDisplayForTenant(game.tenant_id), // FIX-615
             game: {
                 id: game.id,
                 game_url: game.game_url,
@@ -29660,6 +29793,7 @@ app.get('/api/public/game/:gameUrl/details', optionalAuth, async (req, res) => {
         } catch (e) { if (e.code !== '42P01') console.error('FIX-590 cup block:', e.message); }
 
         res.json({
+            team_display: await _teamDisplayForTenant(game.tenant_id !== undefined ? game.tenant_id : (await pool.query('SELECT tenant_id FROM games WHERE id = $1', [game.id])).rows[0]?.tenant_id), // FIX-615: what Red/Blue LOOK like for this tenant (self-sufficient — this payload doesn't always carry tenant_id)
             whatsapp_link: game.whatsapp_link || null, // FIX-498
             id: game.id,
             game_url: game.game_url,
@@ -30733,6 +30867,15 @@ async function _fix282SweepStaleLocks(scopeGameId) {
 // so it doesn't compete with normal startup work; non-fatal on failure.
 setTimeout(() => {
     _fix282SweepStaleLocks(null).catch(() => {});
+    // FIX-609: print a non-reversible fingerprint of TF_UPLOAD_SECRET so a
+    // Render-vs-tf-secret.php mismatch (tonight's 'Bad token' saga) is a
+    // 5-second visual compare against the relay's GET self-check, forever.
+    try {
+        if (process.env.TF_UPLOAD_SECRET) {
+            const _fp609 = require('crypto').createHash('sha256').update(process.env.TF_UPLOAD_SECRET).digest('hex').slice(0, 12);
+            console.log('\ud83d\udd11 [FA] relay secret fingerprint: ' + _fp609 + ' (must equal secret_fingerprint on the relay GET self-check)');
+        }
+    } catch (_) { /* cosmetic only */ }
     // FIX-599: SERIES CANARY. The March-2026 build minted 51 weekly games with no
     // series (repaired manually 2026-07-10 — TF0030/TF0031; census then clean).
     // The current wizard makes that structurally impossible (the series INSERT
@@ -32541,7 +32684,10 @@ async function generatePlayerBio(player, awardsData, recentForm) {
         const motmPct = tfApps > 0
             ? ((player.motm_wins / tfApps) * 100).toFixed(1) : '0.0';
         const awardsText = buildAwardsText(player, awardsData);
-        const formStr = recentForm.map(g => g.won ? 'W' : g.drew ? 'D' : 'L').join(' ');
+        // FIX-610: recentForm is now the _bioRecentForm object (formStr precomputed,
+        // record + streak derived from the same rows).
+        const formStr = recentForm.formStr || '';
+        const formRec = recentForm.rec || { w: 0, d: 0, l: 0 };
         const year = new Date(player.created_at).getFullYear();
         const isGK = (player.position || '').toLowerCase() === 'goalkeeper';
 
@@ -32557,11 +32703,17 @@ async function generatePlayerBio(player, awardsData, recentForm) {
             `- MOTM wins: ${player.motm_wins} (MOTM rate: ${motmPct}%)`,
             `- Member since: ${year}`,
             `- Reliability tier: ${player.reliability_tier || 'new'}`,
-            recentForm.length > 0 ? `- Recent form (last 5 TF games): ${formStr}` : null,
-            awardsData?.currentWinStreak >= 2 ? `- Current win streak: ${awardsData.currentWinStreak} games` : null,
+            recentForm.known > 0 ? `- Recent form (last ${Math.min(recentForm.known, 5)} TF games, newest first): ${formStr}` : null,
+            recentForm.known > 5 ? `- Record over last ${recentForm.known} TF games: ${formRec.w}W-${formRec.d}D-${formRec.l}L` : null,
+            awardsData?.currentWinStreak >= 2 ? `- Current win streak: ${awardsData.currentWinStreak}${recentForm.streakOpenEnded ? '+' : ''} games` : null,
             ``,
             `Awards:`,
             awardsText,
+            ``,
+            // FIX-610: the old bios invented trends ("6 wins from 9" beside a
+            // fabricated losing streak). Every figure is now authoritative and
+            // the model is told so in plain terms.
+            `IMPORTANT: Every number above is exact and authoritative. Use only these figures \u2014 never invent, extrapolate or estimate streaks, trends, or counts that are not listed.`,
         ].filter(l => l !== null).join('\n');
 
         const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -32599,6 +32751,49 @@ async function generatePlayerBio(player, awardsData, recentForm) {
 }
 
 // Fetch awards + recent form for a player, then generate + save bio
+// FIX-610: THE bio recent-form source — both generators use this and ONLY this.
+// The old inline query fanned out (team_players joined on player alone, so team
+// rows from every game multiplied against each completed game; LIMIT 5 then
+// sliced duplicates and NULL-team rows fell into a 'red' guess) — fabricating
+// form like a 5-game losing streak out of one game. It also skipped the
+// r.status='confirmed' filter the all-time stats use, so backup/cancelled regs
+// counted as played. This version: scalar subquery per game (fan-out
+// impossible), confirmed-only (same window as tfApps), 10 games newest-first,
+// UNKNOWN results excluded rather than guessed, and the win streak DERIVED
+// from the same rows so form and streak can never contradict each other.
+async function _bioRecentForm(playerId) {
+    const r = await pool.query(`
+        SELECT g.winning_team,
+               (SELECT t.team_name FROM team_players tp JOIN teams t ON t.id = tp.team_id
+                 WHERE tp.player_id = r.player_id AND t.game_id = g.id LIMIT 1) AS team_name
+          FROM registrations r
+          JOIN games g ON g.id = r.game_id
+         WHERE r.player_id = $1 AND r.status = 'confirmed'
+           AND g.game_status = 'completed' AND g.team_selection_type != 'vs_external'
+         ORDER BY g.game_date DESC LIMIT 10`, [playerId]);
+    const form = [];
+    for (const row of r.rows) {
+        if (row.winning_team === 'draw') { form.push('D'); continue; }
+        if (!row.team_name || !row.winning_team) { form.push(null); continue; } // unknown \u2014 never guess
+        form.push(String(row.winning_team).toLowerCase() === String(row.team_name).toLowerCase() ? 'W' : 'L');
+    }
+    const known = form.filter(x => x !== null);
+    const rec = {
+        w: known.filter(x => x === 'W').length,
+        d: known.filter(x => x === 'D').length,
+        l: known.filter(x => x === 'L').length,
+    };
+    let winStreak = 0;
+    for (const x of form) { if (x === 'W') winStreak++; else break; }
+    return {
+        formStr: form.slice(0, 5).map(x => x || '?').join(' '),
+        known: known.length,
+        rec,
+        winStreak,
+        streakOpenEnded: winStreak === form.length && form.length >= 10,
+    };
+}
+
 async function regeneratePlayerBioForce(playerId, force = false) {
     // Wrapper that bypasses the 5-appearance threshold when force=true
     if (force) {
@@ -32614,10 +32809,9 @@ async function regeneratePlayerBioForce(playerId, force = false) {
             if (!playerRes.rows[0]) return;
             const player = { ...playerRes.rows[0], total_appearances: Math.max(playerRes.rows[0].total_appearances || 0, 5) };
 
-            const [awardsRes, formRes, streakRes, tfStatsRes] = await Promise.all([
+            const [awardsRes, recentForm, tfStatsRes] = await Promise.all([
                 pool.query(`SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1 AND NOT removed_due_to_team_drop /* FIX-410j: exclude dropped-team voided awards from AI bio */`, [playerId]),
-                pool.query(`SELECT g.winning_team, t.team_name FROM registrations r JOIN games g ON g.id = r.game_id LEFT JOIN team_players tp ON tp.player_id = r.player_id LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id WHERE r.player_id = $1 AND g.game_status = 'completed' AND g.team_selection_type != 'vs_external' ORDER BY g.game_date DESC LIMIT 5`, [playerId]),
-                pool.query(`SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]).catch(() => ({ rows: [] })),
+                _bioRecentForm(playerId), // FIX-610: correct + self-consistent form/streak
                 pool.query(
                 `SELECT
                     COUNT(*) FILTER (WHERE r.status = 'confirmed') AS tf_apps,
@@ -32644,14 +32838,7 @@ async function regeneratePlayerBioForce(playerId, force = false) {
             }
             const tfApps = parseInt(tfStatsRes.rows[0]?.tf_apps || 0);
             const tfWins = parseInt(tfStatsRes.rows[0]?.tf_wins || 0);
-            const awardsData = { counts, motmTotal: Math.round(motmTotal * 100) / 100, currentWinStreak: streakRes.rows[0]?.current_win_streak || 0, tfApps, tfWins };
-            const recentForm = formRes.rows.map(r => ({
-                won: r.winning_team === 'draw' ? false
-                    : r.team_name
-                        ? r.winning_team && r.winning_team.toLowerCase() === r.team_name.toLowerCase()
-                        : r.winning_team === 'red', // no team_name = external game, red = TF wins
-                drew: r.winning_team === 'draw',
-            }));
+            const awardsData = { counts, motmTotal: Math.round(motmTotal * 100) / 100, currentWinStreak: recentForm.winStreak /* FIX-610: derived from the SAME rows as form */, tfApps, tfWins };
 
             const bio = await generatePlayerBio(player, awardsData, recentForm);
             if (bio) {
@@ -32681,24 +32868,12 @@ async function regeneratePlayerBio(playerId) {
         const player = playerRes.rows[0];
         if ((player.total_appearances || 0) < 5) return;
 
-        const [awardsRes, formRes, streakRes, tfStatsRes] = await Promise.all([
+        const [awardsRes, recentForm, tfStatsRes] = await Promise.all([
             pool.query(
                 `SELECT award_type, motm_value, vote_count FROM game_awards WHERE recipient_player_id = $1 AND NOT removed_due_to_team_drop /* FIX-410j: exclude dropped-team voided awards from AI bio */`,
                 [playerId]
             ),
-            pool.query(
-                `SELECT g.winning_team, t.team_name
-                 FROM registrations r
-                 JOIN games g ON g.id = r.game_id
-                 LEFT JOIN team_players tp ON tp.player_id = r.player_id
-                 LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
-                 WHERE r.player_id = $1 AND g.game_status = 'completed'
-                 AND g.team_selection_type != 'vs_external'
-                 ORDER BY g.game_date DESC LIMIT 5`, [playerId]
-            ),
-            pool.query(
-                `SELECT current_win_streak FROM player_streaks WHERE player_id = $1`, [playerId]
-            ).catch(() => ({ rows: [] })),
+            _bioRecentForm(playerId), // FIX-610
             pool.query(
                 `SELECT
                     COUNT(*) FILTER (WHERE r.status = 'confirmed') AS tf_apps,
@@ -32728,18 +32903,10 @@ async function regeneratePlayerBio(playerId) {
         const awardsData = {
             counts,
             motmTotal: Math.round(motmTotal * 100) / 100,
-            currentWinStreak: streakRes.rows[0]?.current_win_streak || 0,
+            currentWinStreak: recentForm.winStreak, // FIX-610: derived from the SAME rows as form
             tfApps,
             tfWins,
         };
-
-        const recentForm = formRes.rows.map(r => ({
-            won: r.winning_team === 'draw' ? false
-                : r.team_name
-                    ? r.winning_team && r.winning_team.toLowerCase() === r.team_name.toLowerCase()
-                    : r.winning_team === 'red', // no team_name = external game, red = TF wins
-            drew: r.winning_team === 'draw',
-        }));
 
         const bio = await generatePlayerBio(player, awardsData, recentForm);
         if (bio) {
@@ -32751,8 +32918,10 @@ async function regeneratePlayerBio(playerId) {
         } else {
             console.error(`❌ Bio regen returned null for player ${playerId} — check Anthropic API key and logs above`);
         }
+        return bio; // FIX-611b: truthy on success — lets the bulk runner count honestly
     } catch (e) {
         console.error(`❌ regeneratePlayerBio(${playerId}) failed:`, e.message);
+        return null;
     }
 }
 
@@ -33450,6 +33619,48 @@ app.post('/api/admin/players/:id/regenerate-bio', authenticateToken, requireAdmi
     } catch (e) {
         console.error('Admin regen bio error:', e.message);
         res.status(500).json({ error: 'Failed to start bio regeneration' });
+    }
+});
+
+// FIX-611: POST /api/admin/players/regenerate-all-bios — bulk bio pass.
+// WHY: bios only ever generated on award-badge grants, so most of the 700+
+// players never got one ("only visible on leaderboards" = only badge-winners
+// had bios) — AND every existing bio was built on FIX-610's dud form data, so
+// the whole set needs a rebuild. Sequential with a polite delay (one Anthropic
+// call per player), one run at a time, progress + summary in the log.
+// ?missing_only=true regenerates only players WITHOUT a bio (top-up mode);
+// default regenerates every eligible player (>=5 apps).
+let _bioBulkRunning = false;
+app.post('/api/admin/players/regenerate-all-bios', authenticateToken, requireSuperAdmin, async (req, res) => {
+    if (_bioBulkRunning) return res.status(409).json({ error: 'A bulk bio run is already in progress \u2014 watch the Render log' });
+    const missingOnly = req.query.missing_only === 'true';
+    try {
+        const list = await pool.query(
+            `SELECT id FROM players
+              WHERE COALESCE(total_appearances, 0) >= 5 AND is_active = true
+                ${missingOnly ? 'AND (ai_bio IS NULL OR ai_bio = \'\')' : ''}
+              ORDER BY total_appearances DESC`);
+        const ids = list.rows.map(r => r.id);
+        if (!ids.length) return res.json({ message: 'Nobody eligible', queued: 0 });
+        _bioBulkRunning = true;
+        res.json({ message: `Bulk bio regeneration started for ${ids.length} player(s) \u2014 progress in the Render log (~${Math.ceil(ids.length * 1.5 / 60)} min)`, queued: ids.length });
+        setImmediate(async () => {
+            let ok = 0, fail = 0;
+            console.log(`\ud83e\udde0 [bios] bulk run start: ${ids.length} player(s), missing_only=${missingOnly}`);
+            for (let i = 0; i < ids.length; i++) {
+                try { const b = await regeneratePlayerBio(ids[i]); if (b) ok++; else fail++; } // FIX-611b: null bio = fail, not success
+                catch (e) { fail++; console.warn(`[bios] ${ids[i]} failed:`, e.message); }
+                if ((i + 1) % 25 === 0) console.log(`\ud83e\udde0 [bios] progress ${i + 1}/${ids.length}`);
+                await new Promise(r2 => setTimeout(r2, 1200)); // polite API pacing
+            }
+            console.log(`\ud83e\udde0 [bios] bulk run DONE: ${ok} regenerated, ${fail} failed of ${ids.length}`);
+            auditLog(pool, null, 'bios_bulk_regenerated', null, `${ok} ok / ${fail} failed of ${ids.length} (missing_only=${missingOnly})`).catch(() => {});
+            _bioBulkRunning = false;
+        });
+    } catch (e) {
+        _bioBulkRunning = false;
+        console.error('bulk bios error:', e.message);
+        res.status(500).json({ error: 'Failed to start bulk bio run' });
     }
 });
 
@@ -35907,8 +36118,17 @@ app.get('/api/admin/players/:id/stats-graph', authenticateToken, requireAdmin, a
                     t.team_name
                 FROM registrations r
                 JOIN games g ON g.id = r.game_id
-                LEFT JOIN team_players tp ON tp.player_id = r.player_id
-                LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                /* FIX-610b: same fan-out root as the AI-bio form bug \u2014 tp joined on
+                   player alone multiplied each game by the player's team rows from
+                   EVERY game, so appearances++ counted duplicates (inflated apps,
+                   deflated win rates in the rating-band chart). LATERAL LIMIT 1
+                   makes fan-out mechanically impossible. */
+                LEFT JOIN LATERAL (
+                    SELECT t2.team_name FROM team_players tp2
+                    JOIN teams t2 ON t2.id = tp2.team_id
+                    WHERE tp2.player_id = r.player_id AND t2.game_id = g.id
+                    LIMIT 1
+                ) t ON true
                 WHERE r.player_id = $1
                   AND r.status = 'confirmed'
                   AND g.game_status = 'completed'
@@ -44374,8 +44594,15 @@ app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async 
             FROM registrations r
             JOIN games g ON g.id = r.game_id
             LEFT JOIN venues v ON v.id = g.venue_id
-            LEFT JOIN team_players tp ON tp.player_id = r.player_id
-            LEFT JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+            /* FIX-610b: fan-out sibling (see stats-graph) \u2014 emitted duplicate game
+               rows (one right-team row + N-1 NULL-team rows per game). LATERAL
+               LIMIT 1 keeps the t.team_name alias intact for the SELECT/CASEs. */
+            LEFT JOIN LATERAL (
+                SELECT t2.team_name FROM team_players tp2
+                JOIN teams t2 ON t2.id = tp2.team_id
+                WHERE tp2.player_id = r.player_id AND t2.game_id = g.id
+                LIMIT 1
+            ) t ON true
             WHERE r.player_id = $1 AND r.status = 'confirmed'
             ORDER BY g.game_date DESC
         `, [id]);
@@ -71612,6 +71839,19 @@ async function fix401BootstrapLeagues() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_cup_fixtures_group ON cup_fixtures(group_id)`);
 
         console.log('✅ FIX-401/489 league + cup schema ready');
+        // FIX-615: per-tenant team display (labels + colours). Red/Blue stay the
+        // CANONICAL stored identifiers everywhere (teams, winning_team, fixed_team,
+        // red_wins) — these columns are a pure DISPLAY layer resolved at render
+        // time. NULL = RED/BLUE defaults, so existing tenants change nothing.
+        // Own try/catch: an unrelated neighbour's failure must never skip this
+        // (that exact skip happened on the local test DB and hid the migration).
+        try {
+            await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS team1_label TEXT`);
+            await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS team1_color TEXT`);
+            await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS team2_label TEXT`);
+            await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS team2_color TEXT`);
+            console.log('✅ tenant team colours ready (FIX-615)');
+        } catch (e) { console.error('FIX-615 tenant team colours migration failed:', e.message); }
     } catch (e) {
         console.error('❌ FIX-401 league bootstrap failed:', e.message);
     }
@@ -72148,7 +72388,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web187-relaylog`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web193-tcsmobile`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
@@ -72737,18 +72977,20 @@ app.listen(PORT, () => {
     }, 5 * 60 * 1000);
 
     // ── AI Bio: Sunday 2am batch regeneration ──
-    let bioRunning = false;
+    // FIX-611b: guard is now the SHARED _bioBulkRunning flag — the weekly cron
+    // and the on-demand bulk endpoint (FIX-611) can never run concurrently
+    // (double ~700-call Anthropic runs, racing writes on the same rows).
     setInterval(async () => {
-        if (bioRunning) return;
+        if (_bioBulkRunning) return;
         const now = new Date();
         // Sunday (0) at 2am
         // Render runs UTC — UK is UTC+0 (GMT) or UTC+1 (BST). Check hours 1-2 UTC to cover both.
         if (now.getDay() !== 0 || (now.getHours() !== 1 && now.getHours() !== 2)) return;
-        bioRunning = true;
+        _bioBulkRunning = true;
         console.log('🤖 Starting weekly AI bio generation...');
         try {
             const players = await pool.query(
-                `SELECT id FROM players WHERE total_appearances >= 5 ORDER BY total_appearances DESC`
+                `SELECT id FROM players WHERE COALESCE(total_appearances, 0) >= 5 AND is_active = true ORDER BY total_appearances DESC` /* FIX-611b: is_active parity with the bulk endpoint */
             );
             for (const row of players.rows) {
                 try {
@@ -72763,7 +73005,7 @@ app.listen(PORT, () => {
         } catch (e) {
             console.error('Bio cron failed:', e.message);
         } finally {
-            bioRunning = false;
+            _bioBulkRunning = false;
         }
     }, 60 * 1000); // Check every minute, run only at Sunday 2am
 
