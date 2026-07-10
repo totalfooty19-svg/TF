@@ -13303,6 +13303,12 @@ async function _faFetch(url) {
         // Relay only network-class deaths ('FA fetch failed (...)'): if the FA
         // actually ANSWERED (an 'FA responded HTTP N'), relaying won't change it.
         const networkClass = e && e.message && e.message.indexOf('FA fetch failed') === 0;
+        // FIX-607: the unconfigured-relay skip was SILENT — prod showed a bare
+        // 'FA fetch failed (ETIMEDOUT)' and nothing said whether the relay ran
+        // and failed, or never ran. Now the log always names the reason.
+        if (networkClass && !process.env.FA_RELAY_URL) {
+            console.warn('[FA] direct fetch failed (' + e.message + ') and FA_RELAY_URL is UNSET \u2014 relay skipped. Set the env var to enable the Namecheap fallback (see DEPLOY-ORDER web186).');
+        }
         if (!networkClass || !process.env.FA_RELAY_URL) throw e;
         try {
             const html = await _faRelayFetch(url);
@@ -72142,7 +72148,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web186-relay`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web187-relaylog`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
