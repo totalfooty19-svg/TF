@@ -13198,36 +13198,58 @@ async function _faFetchTeamPage(parsed) {
     }
 }
 
-async function _faFetch(url) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12000);
-    try {
-        const r = await fetch(url, {
+// FIX-601c: prod named the failure — 'FA fetch failed (UND_ERR_CONNECT_TIMEOUT)':
+// the TCP connect NEVER completed, so headers/UA were never even seen. Classic
+// PaaS cause: the FA edge publishes AAAA records and the platform's IPv6 egress
+// blackholes, so undici's connect hangs to timeout. Global fetch can't force an
+// address family without adding the undici package, so the FA fetcher now runs
+// on Node's raw https with family:4 (dependency-free), manual redirect follow
+// (the FA is mid-migration across hosts), the FIX-601b browser headers, and the
+// same error naming ('FA responded HTTP N' / 'FA fetch failed (CODE)').
+// If prod STILL times out after this, the block is IP-reputation at the FA edge
+// (silent SYN drop of datacenter ranges) — escape hatch then: a tiny PHP fetch
+// relay on the Namecheap host (webhost IP, existing tf-secret auth), no new deps.
+function _faHttpGet(url, redirectsLeft) {
+    return new Promise((resolve, reject) => {
+        let u;
+        try { u = new URL(url); } catch (_) { return reject(new Error('FA fetch failed (bad-url)')); }
+        const req = require('https').request({
+            hostname: u.hostname,
+            path: (u.pathname || '/') + (u.search || ''),
+            method: 'GET',
+            family: 4, // FIX-601c: sidestep the AAAA blackhole
             headers: {
-                // FIX-601b: the announced bot UA got connection-reset at the FA's edge
-                // ('fetch failed' — no HTTP status ever arrived), which is WAF bot
-                // filtering. These are the headers a normal browser sends for the same
-                // public page; this is a club admin pulling their OWN team's page on a
-                // button click, not a crawl. Revert to the bot UA only by choice.
+                'Host': u.hostname,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-GB,en;q=0.9',
+                'Accept-Encoding': 'identity',
+                'Connection': 'close',
             },
-            signal: controller.signal,
+            timeout: 12000,
+        }, (res) => {
+            const sc = res.statusCode || 0;
+            if ([301, 302, 303, 307, 308].includes(sc) && res.headers.location && redirectsLeft > 0) {
+                res.resume();
+                let next;
+                try { next = new URL(res.headers.location, u).toString(); }
+                catch (_) { return reject(new Error('FA fetch failed (bad-redirect)')); }
+                return resolve(_faHttpGet(next, redirectsLeft - 1));
+            }
+            if (sc < 200 || sc >= 300) { res.resume(); return reject(new Error('FA responded HTTP ' + sc)); }
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+            res.on('error', (err) => reject(new Error('FA fetch failed (' + (err.code || err.message) + ')')));
         });
-        if (!r.ok) throw new Error('FA responded HTTP ' + r.status);
-        return await r.text();
-    } catch (e) {
-        // FIX-601b: undici hides the real network failure (ECONNRESET / ENOTFOUND /
-        // ETIMEDOUT / TLS) behind TypeError 'fetch failed', with the code on e.cause.
-        // Surface it so the Render log names the culprit instead of shrugging.
-        if (e && e.message === 'fetch failed') {
-            const code = (e.cause && (e.cause.code || e.cause.message)) || 'network';
-            throw new Error('FA fetch failed (' + code + ')');
-        }
-        throw e;
-    } finally { clearTimeout(timer); }
+        req.on('timeout', () => { req.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })); });
+        req.on('error', (err) => reject(
+            err && err.message && (err.message.indexOf('FA responded') === 0 || err.message.indexOf('FA fetch failed') === 0)
+                ? err : new Error('FA fetch failed (' + ((err && err.code) || (err && err.message) || 'network') + ')')));
+        req.end();
+    });
 }
+async function _faFetch(url) { return _faHttpGet(url, 3); }
 
 function _faStrip(html) { // tags -> text, entities we actually meet, squashed whitespace
     return String(html || '')
@@ -72057,7 +72079,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web183-badgepay`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web184-ipv4`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
