@@ -13286,7 +13286,13 @@ function _faRelayFetch(url) {
                 const text = Buffer.concat(chunks).toString('utf8');
                 if ((res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300) return resolve(text);
                 let msg = 'HTTP ' + res.statusCode;
-                try { msg = (JSON.parse(text).error || msg); } catch (_) { /* body wasn't JSON */ }
+                try { msg = (JSON.parse(text).error || msg); } catch (_) {
+                    // FIX-617: a non-JSON body means an INFRASTRUCTURE layer answered,
+                    // not the relay PHP (which always speaks JSON). The snippet names
+                    // the layer — Cloudflare error page vs LiteSpeed vs empty.
+                    const snip = String(text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+                    msg = 'HTTP ' + res.statusCode + (snip ? ' (non-JSON body: ' + snip + '\u2026)' : ' (empty non-JSON body)');
+                }
                 reject(new Error('FA relay: ' + msg));
             });
             res.on('error', (err) => reject(new Error('FA relay: ' + (err.code || err.message))));
@@ -13551,6 +13557,49 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-squad-pull', authenti
         try { _faAlertSuperadmin(faCtx, 'fa-squad-pull', e.message); } catch (_) {} // FIX-522 (FIX-539)
         const friendly = /^FA_PARSE/.test(e.message) ? e.message.replace(/^FA_PARSE:\s*/, '') : 'Could not reach the FA right now \u2014 try again in a minute';
         res.status(424).json({ error: friendly });
+    }
+});
+
+// FIX-617: UPLOAD FA PAGE — the network-independent squad pull. The FA edge
+// drops datacenter IPs (Render proven; Namecheap relay now suspected via
+// non-JSON 502s), but the PARSERS are pre-proven against TF's saved page
+// (37 players, person ids intact). This endpoint accepts the saved HTML
+// directly and runs the exact same parse + classify + response shape as
+// fa-squad-pull, so the CRM list render is shared. Keep the classify block
+// in sync with fa-squad-pull above.
+// Route-scoped 3MB json parser: FA pages are ~700KB and the global limit is 500KB.
+app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-squad-upload',
+    authenticateToken, requireTenantAdmin, express.json({ limit: '3mb' }), async (req, res) => {
+    try {
+        const xl = await pool.query(
+            `SELECT id, name FROM external_leagues
+              WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        const html = typeof req.body.html === 'string' ? req.body.html : '';
+        if (html.length < 10000) return res.status(400).json({ error: 'That file looks too small to be a saved FA team page \u2014 save the FULL page (Ctrl+S \u2192 "Webpage, HTML Only") and upload that.' });
+        if (!/fulltime[.-]/i.test(html) && !/thefa\.com/i.test(html)) {
+            return res.status(400).json({ error: 'That doesn\u2019t look like an FA Full-Time page \u2014 save your team page from fulltime.thefa.com and upload it.' });
+        }
+        const squad = _faParseSquad(html);
+        const ghosts = await pool.query('SELECT fa_person_id FROM tenant_ghost_players WHERE tenant_id = $1', [req.tenant.id]);
+        const ghostIds = new Set(ghosts.rows.map(g => String(g.fa_person_id)));
+        const members = await pool.query(
+            `SELECT LOWER(p.alias) AS a FROM player_tenants pt JOIN players p ON p.id = pt.player_id
+              WHERE pt.tenant_id = $1 AND pt.status = 'active' AND p.alias IS NOT NULL`, [req.tenant.id]);
+        const aliasSet = new Set(members.rows.map(m => m.a));
+        const items = squad.map(s => ({
+            ...s,
+            status: ghostIds.has(String(s.person_id)) ? 'already_ghost'
+                : aliasSet.has(s.name.toLowerCase()) ? 'possible_member'
+                : 'new',
+        }));
+        await auditLog(pool, req.user.playerId, 'fa_squad_uploaded', null,
+            items.length + ' player(s) parsed from an uploaded FA page', req.tenant.id).catch(() => {});
+        res.json({ success: true, count: items.length, items, via: 'upload' });
+    } catch (e) {
+        console.error('fa-squad-upload error:', e.message);
+        const friendly = /^FA_PARSE/.test(e.message) ? e.message.replace(/^FA_PARSE:\s*/, '') : 'Could not read that page \u2014 make sure it\u2019s the saved FA team page';
+        res.status(422).json({ error: friendly });
     }
 });
 
@@ -72388,7 +72437,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web193-tcsmobile`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web194-faupload`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
