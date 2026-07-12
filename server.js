@@ -7143,6 +7143,22 @@ app.post('/api/auth/register', async (req, res) => {
                             if (e && e.code !== '42703') throw e;
                         }
 
+                        // FIX-619: tenant-acquired players default to HIDDEN from
+                        // the cross-tenant directory/discovery (protects the
+                        // tenant's player base from poaching). Pure default —
+                        // the FIX-546/547 visibility wizard lets the player flip
+                        // it any time. hide_from_directory IS NULL guard = never
+                        // stomp an explicit choice (belt/braces on a new row).
+                        try {
+                            await pool.query(
+                                `UPDATE players SET hide_from_directory = TRUE
+                                  WHERE id = $1 AND hide_from_directory IS NULL`,
+                                [playerId]
+                            );
+                        } catch (e) {
+                            if (e && e.code !== '42703') throw e;
+                        }
+
                         // 5. Audit log
                         try {
                             await auditLog(pool, playerId, 'player_signup_with_tenant', _tenant.id,
@@ -13560,6 +13576,114 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-squad-pull', authenti
     }
 });
 
+// FIX-625: EXT OPPOSITION — game.html's opposition panel for vs_external
+// fixtures. Self-sufficient by game_url. Two tiers in one response:
+//   PUBLIC: kind, names, league website; for kind='league' the division table
+//           (same cache + parser as the public table endpoint; legacy-link
+//           constraint applies — table:null with a reason otherwise).
+//   GATED (optionalAuth + _fmBrowseAllowed): `opposition` = the opponent's
+//           FM row matched by name; CUP games resolve through the cup's
+//           parent_league_name to the tenant's league (cup opponents are
+//           league teams). Absent for outsiders — the page renders public-only.
+app.get('/api/public/game/:gameUrl/ext-opposition', optionalAuth, publicEndpointLimiter, async (req, res) => {
+    try {
+        const g = await pool.query(
+            `SELECT g.id, g.tenant_id, g.external_league_id, g.external_opponent
+               FROM games g WHERE g.game_url = $1 AND g.team_selection_type = 'vs_external'`,
+            [req.params.gameUrl]);
+        if (!g.rows.length || !g.rows[0].external_league_id) return res.status(404).json({ error: 'Not an external fixture' });
+        const game = g.rows[0];
+        const xl = await pool.query(
+            `SELECT id, name, kind, parent_league_name, external_website_url, fa_team_url, tenant_id, slug
+               FROM external_leagues WHERE id = $1`, [game.external_league_id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        const L = xl.rows[0];
+        const out = {
+            kind: L.kind === 'cup' ? 'cup' : 'league',
+            competition: L.name,
+            league_id: L.id, league_slug: L.slug || null, /* FIX-626: deep link to the team profile on ext-league.html */
+            league_website: L.external_website_url || null,
+            opponent_name: game.external_opponent || null,
+            table: null, table_note: null, our_team_id: null,
+        };
+        if (out.kind === 'league') {
+            const parsed = _faParseTeamUrl(L.fa_team_url);
+            if (parsed && parsed.divisionseason) {
+                try {
+                    const hit = _faTableCache.get(String(L.id));
+                    if (hit && (Date.now() - hit.at) < FA_TABLE_TTL_MS) {
+                        out.table = hit.data.rows; out.our_team_id = hit.data.our_team_id;
+                    } else {
+                        const html = await _faFetch('https://fulltime.thefa.com/table.html?divisionseason=' + parsed.divisionseason);
+                        const rows = _faParseTable(html);
+                        const data = { league: L.name, our_team_id: parsed.teamID, rows, fetched_at: new Date().toISOString() };
+                        _faTableCache.set(String(L.id), { at: Date.now(), data });
+                        out.table = rows; out.our_team_id = parsed.teamID;
+                    }
+                } catch (te) { out.table_note = 'Table unavailable right now'; }
+            } else { out.table_note = 'Table needs the older FA link format'; }
+        }
+        // Gated tier: opponent's FM detail
+        if (req.user && req.user.playerId && out.opponent_name) {
+            try {
+                if (await _fmBrowseAllowed(req.user.playerId, req.user.role, L.tenant_id)) {
+                    let leagueIds = [L.id];
+                    if (out.kind === 'cup' && L.parent_league_name) {
+                        const pl = await pool.query(
+                            `SELECT id FROM external_leagues WHERE tenant_id = $1 AND kind != 'cup' AND LOWER(name) = LOWER($2)`,
+                            [L.tenant_id, L.parent_league_name]);
+                        if (pl.rows.length) leagueIds = [pl.rows[0].id];
+                        else { // fallback: any of the tenant's synced leagues carrying this opponent
+                            const anyl = await pool.query(`SELECT DISTINCT league_id FROM ext_league_opponents WHERE tenant_id = $1`, [L.tenant_id]);
+                            leagueIds = anyl.rows.map(r2 => r2.league_id);
+                        }
+                    }
+                    if (leagueIds.length) {
+                        const opp = await pool.query(
+                            `SELECT id, league_id, name, is_us, position, played, won, drawn, lost, gf, ga, gd, pts,
+                                    squad_json, fixtures_json, synced_at
+                               FROM ext_league_opponents
+                              WHERE league_id = ANY($1) AND is_us = FALSE AND LOWER(name) LIKE LOWER($2)
+                              ORDER BY synced_at DESC NULLS LAST LIMIT 1`,
+                            [leagueIds, '%' + out.opponent_name.trim() + '%']);
+                        if (opp.rows.length) out.opposition = opp.rows[0];
+                    }
+                }
+            } catch (fe) { /* gated tier is best-effort — public tier already answered */ }
+        }
+        res.set('Cache-Control', 'no-store'); // gated tier varies by viewer
+        res.json(out);
+    } catch (e) {
+        if (e && e.code === '42P01') return res.json({ kind: 'league', table: null, table_note: 'Not synced yet' });
+        console.error('ext-opposition error:', e.message);
+        res.status(500).json({ error: 'Failed to load opposition data' });
+    }
+});
+
+// FIX-623: bug bounty master switch (superadmin). RELOCATED from the boot
+// prelude — the first placement sat BEFORE authenticateToken's const (TDZ
+// ReferenceError, killed boot; the burn-list order class strikes again). system_settings key
+// 'bug_bounty_enabled'; MISSING ROW = ENABLED (scheme is live today — the
+// switch existing must not change anything until TF flips it).
+app.get('/api/public/bounty-status', async (req, res) => {
+    try {
+        const r = await pool.query("SELECT value FROM system_settings WHERE key = 'bug_bounty_enabled'");
+        res.set('Cache-Control', 'public, max-age=60');
+        res.json({ enabled: !r.rows.length || r.rows[0].value !== 'false' });
+    } catch (e) { res.json({ enabled: true }); } // table missing/any error -> scheme visible (safe default)
+});
+app.put('/api/admin/bounty', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const en = req.body.enabled === true || req.body.enabled === 'true';
+        await pool.query(`
+            INSERT INTO system_settings (key, value) VALUES ('bug_bounty_enabled', $1)
+            ON CONFLICT (key) DO UPDATE SET value = $1`, [en ? 'true' : 'false']);
+        setImmediate(() => auditLog(pool, req.user.playerId, 'bounty_master_switch', null,
+            'Bug bounty scheme turned ' + (en ? 'ON' : 'OFF'), null).catch(() => {}));
+        res.json({ success: true, enabled: en });
+    } catch (e) { console.error('bounty switch:', e.message); res.status(500).json({ error: 'Failed to save' }); }
+});
+
 // FIX-617: UPLOAD FA PAGE — the network-independent squad pull. The FA edge
 // drops datacenter IPs (Render proven; Namecheap relay now suspected via
 // non-JSON 502s), but the PARSERS are pre-proven against TF's saved page
@@ -13601,6 +13725,151 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-squad-upload',
         const friendly = /^FA_PARSE/.test(e.message) ? e.message.replace(/^FA_PARSE:\s*/, '') : 'Could not read that page \u2014 make sure it\u2019s the saved FA team page';
         res.status(422).json({ error: friendly });
     }
+});
+
+// FIX-621: FM MODE — sync the WHOLE league. One table fetch resolves every
+// team + their FA teamID; one displayTeam fetch per team yields their squad
+// (with stats) AND their fixtures (with scores) via the pre-proven parsers.
+// Requires the legacy FA link (divisionseason) — same constraint as the
+// table endpoint. Per-team failures are collected, never fatal (a league
+// sync that lands 14/16 teams is a win, not an error).
+app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-league-sync',
+    authenticateToken, requireTenantAdmin, async (req, res) => {
+    let faCtx = null;
+    try {
+        const xl = await pool.query(
+            `SELECT id, name, fa_team_url FROM external_leagues
+              WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, [req.params.id, req.tenant.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        const parsed = _faParseTeamUrl(xl.rows[0].fa_team_url);
+        if (!parsed) return res.status(400).json({ error: 'Save a valid FA team link first' });
+        if (!parsed.divisionseason) return res.status(424).json({ error: 'League sync needs the older FA link format (with divisionseason) \u2014 the same one the league table uses.' });
+        faCtx = { id: xl.rows[0].id, name: xl.rows[0].name, url: xl.rows[0].fa_team_url, tenant: req.tenant && req.tenant.name };
+
+        const tableHtml = await _faFetch('https://fulltime.thefa.com/table.html?divisionseason=' + parsed.divisionseason);
+        const rows = _faParseTable(tableHtml).slice(0, 24); // sanity cap
+        if (!rows.length) return res.status(422).json({ error: 'Could not read the league table' });
+
+        let synced = 0; const failures = [];
+        for (const row of rows) {
+            if (!row.team_id) { failures.push(row.name + ' (no team link)'); continue; }
+            try {
+                const teamHtml = await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + row.team_id);
+                let squad = []; let fixtures = [];
+                try { squad = _faParseSquad(teamHtml); } catch (_) { /* squad optional per team */ }
+                try { fixtures = _faParseFixtures(teamHtml); } catch (_) { /* fixtures optional per team */ }
+                await pool.query(`
+                    INSERT INTO ext_league_opponents (league_id, tenant_id, fa_team_id, name, is_us,
+                        position, played, won, drawn, lost, gf, ga, gd, pts, squad_json, fixtures_json, synced_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
+                    ON CONFLICT (league_id, fa_team_id) DO UPDATE SET
+                        name = EXCLUDED.name, is_us = EXCLUDED.is_us, position = EXCLUDED.position,
+                        played = EXCLUDED.played, won = EXCLUDED.won, drawn = EXCLUDED.drawn, lost = EXCLUDED.lost,
+                        gf = EXCLUDED.gf, ga = EXCLUDED.ga, gd = EXCLUDED.gd, pts = EXCLUDED.pts,
+                        squad_json = EXCLUDED.squad_json, fixtures_json = EXCLUDED.fixtures_json, synced_at = NOW()`,
+                    [xl.rows[0].id, req.tenant.id, String(row.team_id), String(row.name || 'Unknown').slice(0, 80),
+                     String(row.team_id) === String(parsed.teamID || ''),
+                     row.position ?? null, row.played ?? null, row.won ?? null, row.drawn ?? null, row.lost ?? null,
+                     row.gf ?? null, row.ga ?? null, row.gd ?? null, row.pts ?? null,
+                     JSON.stringify(squad), JSON.stringify(fixtures)]);
+                synced++;
+            } catch (e) {
+                failures.push(row.name + ' (' + String(e.message || '').slice(0, 60) + ')');
+            }
+            await new Promise(r2 => setTimeout(r2, 400)); // be gentle with the FA
+        }
+        await auditLog(pool, req.user.playerId, 'ext_league_fm_synced', null,
+            synced + '/' + rows.length + ' teams synced for ' + xl.rows[0].name, req.tenant.id).catch(() => {});
+        res.json({ success: true, teams: rows.length, synced, failures });
+    } catch (e) {
+        console.error('fa-league-sync error:', e.message);
+        try { _faAlertSuperadmin(faCtx, 'fa-league-sync', e.message); } catch (_) {}
+        const friendly = /^FA_PARSE/.test(e.message) ? e.message.replace(/^FA_PARSE:\s*/, '') : 'Could not reach the FA right now \u2014 try again in a minute';
+        res.status(424).json({ error: friendly });
+    }
+});
+
+// FIX-621: FM browse gate — tenant admins, squad members of the league's
+// tenant, and platform admins. NOT public: the tenant's competitive intel
+// stays inside the club (TF: "only for admin and squad members").
+async function _fmBrowseAllowed(playerId, role, tenantId) {
+    if (role === 'admin' || role === 'superadmin') return true;
+    const adm = await pool.query(
+        `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2 AND role = 'tenant_admin' AND status = 'active'`,
+        [playerId, tenantId]);
+    if (adm.rows.length) return true;
+    try { return await _playerInSquad(pool, tenantId, playerId); } catch (_) { return false; }
+}
+app.get('/api/ext-leagues/:id/fm', authenticateToken, async (req, res) => {
+    try {
+        const xl = await pool.query(`SELECT id, name, tenant_id FROM external_leagues WHERE id = $1`, [req.params.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        if (!(await _fmBrowseAllowed(req.user.playerId, req.user.role, xl.rows[0].tenant_id))) {
+            return res.status(403).json({ error: 'Squad members and admins only' });
+        }
+        const r = await pool.query(`
+            SELECT id, fa_team_id, name, is_us, position, played, won, drawn, lost, gf, ga, gd, pts, synced_at
+              FROM ext_league_opponents WHERE league_id = $1
+             ORDER BY position NULLS LAST, pts DESC NULLS LAST, name`, [req.params.id]);
+        res.json({ league: xl.rows[0].name, teams: r.rows, synced_at: r.rows.length ? r.rows[0].synced_at : null });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.status(424).json({ error: 'League not synced yet' });
+        console.error('fm browse error:', e.message); res.status(500).json({ error: 'Failed to load league' });
+    }
+});
+// FIX-626: league-wide PLAYER STATS leaderboard — every synced squad's
+// players unnested from jsonb, TF-matched against the tenant's members by
+// alias (OUR club only — other clubs' players have no TF accounts), with
+// the match exposed ONLY when the member's visibility allows (explicit
+// hide_from_directory=false, or NULL for non-16-18s — the FIX-546 default
+// rule; FIX-619's tenant-acquired defaults therefore hide them here too).
+app.get('/api/ext-leagues/:id/fm-stats', authenticateToken, async (req, res) => {
+    try {
+        const xl = await pool.query(`SELECT id, tenant_id FROM external_leagues WHERE id = $1`, [req.params.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        if (!(await _fmBrowseAllowed(req.user.playerId, req.user.role, xl.rows[0].tenant_id))) {
+            return res.status(403).json({ error: 'Squad members and admins only' });
+        }
+        const r = await pool.query(`
+            SELECT o.id AS team_oid, o.name AS team_name, o.is_us,
+                   p->>'name' AS player_name,
+                   COALESCE((p->>'apps')::int, 0)    AS apps,
+                   COALESCE((p->>'goals')::int, 0)   AS goals,
+                   COALESCE((p->>'assists')::int, 0) AS assists,
+                   CASE WHEN o.is_us THEN tf.id END        AS tf_player_id,
+                   CASE WHEN o.is_us THEN (tf.id IS NOT NULL) ELSE FALSE END AS tf_member
+              FROM ext_league_opponents o
+             CROSS JOIN LATERAL jsonb_array_elements(COALESCE(o.squad_json, '[]'::jsonb)) p
+              LEFT JOIN LATERAL (
+                   SELECT pl.id FROM player_tenants pt
+                     JOIN players pl ON pl.id = pt.player_id
+                    WHERE o.is_us AND pt.tenant_id = o.tenant_id AND pt.status = 'active'
+                      AND LOWER(pl.alias) = LOWER(p->>'name')
+                      AND (pl.hide_from_directory = FALSE
+                           OR (pl.hide_from_directory IS NULL AND COALESCE(pl.age_range, '') != '16_18'))
+                    LIMIT 1
+              ) tf ON TRUE
+             WHERE o.league_id = $1
+             ORDER BY goals DESC, assists DESC, apps DESC
+             LIMIT 600`, [req.params.id]);
+        res.json({ players: r.rows });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.status(424).json({ error: 'League not synced yet' });
+        console.error('fm-stats error:', e.message); res.status(500).json({ error: 'Failed to load stats' });
+    }
+});
+
+app.get('/api/ext-leagues/:id/fm/:oid', authenticateToken, async (req, res) => {
+    try {
+        const xl = await pool.query(`SELECT id, tenant_id FROM external_leagues WHERE id = $1`, [req.params.id]);
+        if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
+        if (!(await _fmBrowseAllowed(req.user.playerId, req.user.role, xl.rows[0].tenant_id))) {
+            return res.status(403).json({ error: 'Squad members and admins only' });
+        }
+        const r = await pool.query(`SELECT * FROM ext_league_opponents WHERE id = $1 AND league_id = $2`, [req.params.oid, req.params.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Team not found' });
+        res.json(r.rows[0]);
+    } catch (e) { console.error('fm detail error:', e.message); res.status(500).json({ error: 'Failed to load team' }); }
 });
 
 // APPLY — upsert the ticked ghosts. Re-import refreshes stats (the point of
@@ -13659,6 +13928,21 @@ app.delete('/api/t/:tenant_short_id/admin/ghost-players/:id', authenticateToken,
 // a separate purpose branch. Multiple fines per player per game by design.
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/t/:tenant_short_id/admin/fines-config', authenticateToken, requireTenantAdmin, async (req, res) => {
+    // FIX-628: Yellow/Red card fines are PRESET — seed them once per tenant
+    // (lazily, here, so no migration sweep) with £0 placeholder amounts; the
+    // tenant just edits the £. Name-guarded: never duplicates, never touches
+    // amounts a tenant already set.
+    try {
+        await pool.query(`
+            INSERT INTO tenant_fines (tenant_id, name, amount, active)
+            SELECT req.id, v.name, 0, TRUE
+              FROM (SELECT $1::uuid AS id) req
+             CROSS JOIN (VALUES ('🟨 Yellow card'), ('🟥 Red card')) AS v(name)
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM tenant_fines tf
+                  WHERE tf.tenant_id = $1 AND LOWER(tf.name) LIKE '%' || LOWER(SPLIT_PART(v.name, ' ', 2)) || ' card%'
+             )`, [req.tenant.id]);
+    } catch (se) { /* seeding is best-effort — the panel must load regardless */ }
     try {
         // FIX-543: ?game_type=<type> serves that type's view — typed settings + SHADOW
         // library + typed award map when customised, else the inherited base preview.
@@ -14384,6 +14668,19 @@ app.post('/api/squad-invite/:token/claim', authenticateToken, async (req, res) =
             INSERT INTO player_tenants (player_id, tenant_id, role, status, show_in_dashboard)
             SELECT $1, $2, 'player', 'active', TRUE
              WHERE NOT EXISTS (SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = $2)`, [req.user.playerId, row.tenant_id]);
+        // FIX-619: a BRAND-NEW account claiming a squad slot is a tenant-acquired
+        // player (their import converting) — default them hidden from cross-tenant
+        // discovery. Guards: only if no explicit choice yet (NULL) and only fresh
+        // accounts (<24h) — an established player claiming a slot keeps whatever
+        // visibility they already live with.
+        try {
+            await pool.query(
+                `UPDATE players SET hide_from_directory = TRUE
+                  WHERE id = $1 AND hide_from_directory IS NULL
+                    AND created_at > NOW() - INTERVAL '24 hours'`,
+                [req.user.playerId]
+            );
+        } catch (e) { if (e && e.code !== '42703') console.warn('FIX-619 claim default:', e.message); }
         const tn = await pool.query(`SELECT name FROM tenants WHERE id = $1`, [row.tenant_id]);
         res.json({ ok: true, tenant_name: (tn.rows[0] || {}).name || 'your club' });
     } catch (e) { console.error('FIX-550 claim:', e.message); res.status(500).json({ error: 'Failed to join squad' }); }
@@ -21368,7 +21665,11 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Register friend error:', error);
-        res.status(500).json({ error: 'Registration failed' });
+        // FIX-632: echo the real cause — the generic label matched the client
+        // fallback string exactly, making crashes indistinguishable from parse
+        // failures and unloggable-from-the-couch. The suffix names the throw
+        // (FIX-617's relay pattern; authed endpoint, 140-char cap).
+        res.status(500).json({ error: 'Registration failed \u2014 ' + String(error.message || error).slice(0, 140) });
     } finally {
         client.release();
     }
@@ -22789,7 +23090,12 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
         const state = await client.query('SELECT teams_generated, teams_confirmed, team_selection_type, is_venue_clash FROM games WHERE id = $1', [gameId]);
         const _row = state.rows[0];
         const _isDraftMemory = _row?.team_selection_type === 'draft_memory';
-        const _locked = !!(_row?.teams_confirmed || (_row?.teams_generated && !_isDraftMemory));
+        // FIX-630: DM games are NEVER prefs-locked pre-completion — a finalised
+        // draft (teams_confirmed=true) previously refused updates, breaking the
+        // late-swap flow ("whether before or after the draft is completed").
+        // Safe because FIX-613 syncs the materialised team_players row on every
+        // fixed_team change, so prefs and teams can't drift.
+        const _locked = _isDraftMemory ? false : !!(_row?.teams_confirmed || _row?.teams_generated);
         if (_locked) {
             return res.status(400).json({ error: 'Cannot update preferences after teams have been generated' });
         }
@@ -61769,9 +62075,15 @@ app.get('/api/players/me/tenants', authenticateToken, async (req, res) => {
             `SELECT pt.tenant_id, pt.role, pt.status, pt.joined_at,
                     pt.show_in_dashboard, pt.allow_tenant_contact,
                     t.short_id, t.name, t.slug, t.logo_url, t.primary_color,
-                    t.status AS tenant_status
+                    t.status AS tenant_status,
+                    xl.slug AS ext_league_slug, xl.name AS ext_league_name /* FIX-624: dashboard league badge */
                FROM player_tenants pt
                JOIN tenants t ON t.id = pt.tenant_id
+               LEFT JOIN LATERAL (
+                   SELECT slug, name FROM external_leagues
+                    WHERE tenant_id = t.id AND status = 'active' AND slug IS NOT NULL
+                    ORDER BY name ASC LIMIT 1
+               ) xl ON TRUE
               WHERE pt.player_id = $1
               ORDER BY t.name ASC`,
             [req.user.playerId]
@@ -71901,6 +72213,30 @@ async function fix401BootstrapLeagues() {
             await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS team2_color TEXT`);
             console.log('✅ tenant team colours ready (FIX-615)');
         } catch (e) { console.error('FIX-615 tenant team colours migration failed:', e.message); }
+        // FIX-621: FM-style league browser — every opponent in an external
+        // league, with their standings row + squad/stats + fixtures/results
+        // stored as jsonb blobs (read-only display data; no relational needs).
+        // Own try/catch per the FIX-615 lesson: a neighbour's failure must
+        // never skip this block.
+        try {
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS ext_league_opponents (
+                    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    league_id     UUID NOT NULL REFERENCES external_leagues(id) ON DELETE CASCADE,
+                    tenant_id     UUID NOT NULL,
+                    fa_team_id    TEXT NOT NULL,
+                    name          TEXT NOT NULL,
+                    is_us         BOOLEAN NOT NULL DEFAULT FALSE,
+                    position      INTEGER,
+                    played        INTEGER, won INTEGER, drawn INTEGER, lost INTEGER,
+                    gf            INTEGER, ga INTEGER, gd INTEGER, pts INTEGER,
+                    squad_json    JSONB,
+                    fixtures_json JSONB,
+                    synced_at     TIMESTAMPTZ,
+                    UNIQUE (league_id, fa_team_id)
+                )`);
+            console.log('✅ FM league browser tables ready (FIX-621)');
+        } catch (e) { console.error('FIX-621 FM tables migration failed:', e.message); }
     } catch (e) {
         console.error('❌ FIX-401 league bootstrap failed:', e.message);
     }
@@ -72437,7 +72773,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web194-faupload`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web210-friendecho`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
