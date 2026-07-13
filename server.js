@@ -2029,6 +2029,26 @@ async function _isOrganiserForTenant(db, playerId, tenantId) {
         return !!(r.rows.length && r.rows[0].ok === true);
     } catch (e) { console.warn('[_isOrganiserForTenant]', e.message); return false; }
 }
+// FIX-650: 'is organiser ANYWHERE' — the identity-level flag for login//me payloads and
+// the manage-games gate. Speaks BOTH vocabularies (FIX-583): the global players.is_organiser
+// flag OR any active player_tenants role='organiser' membership. tenant_admin is deliberately
+// NOT included — it has its own isTenantAdmin signal (FIX-552). Tenant-role organisers were
+// invisible to every discovery surface (nav flag, manage list, NEEDS-ORG counts) while
+// requireGameManager correctly let them manage — this helper is the missing half.
+async function _isOrganiserAnywhere(db, playerId) {
+    try {
+        const r = await db.query(
+            `SELECT (COALESCE((SELECT is_organiser FROM players WHERE id = $1), FALSE)
+                 OR EXISTS (SELECT 1 FROM player_tenants pt
+                             WHERE pt.player_id = $1 AND pt.status = 'active'
+                               AND pt.role = 'organiser')) AS ok`, [playerId]);
+        return !!(r.rows[0] && r.rows[0].ok);
+    } catch (e) {
+        if (e && (e.code === '42P01' || e.code === '42703')) return false;
+        console.warn('[_isOrganiserAnywhere]', e.message);
+        return false;
+    }
+}
 async function autoAddDefaultOrganiser(db, gameId, organiserId, actorId, tenantId = null) {
     if (!organiserId) return false;
     try {
@@ -7782,7 +7802,7 @@ app.post('/api/auth/login', async (req, res) => {
                 playerId: player.id,
                 email: user.email,
                 role: user.role,
-                isOrganiser: player.is_organiser || false,
+                isOrganiser: await _isOrganiserAnywhere(pool, player.id), // FIX-650: BOTH vocabularies — tenant-role organisers had a false flag on every client (web + app)
                 isTenantAdmin: await _isTenantAdminAnywhere(player.id), // FIX-552 (CLM is dead — this is the tenant_admin signal)
                 tokenVersion: player.token_version || 0
             },
@@ -7814,7 +7834,7 @@ app.post('/api/auth/login', async (req, res) => {
                 fullName: player.full_name,
                 alias: player.alias,
                 role: user.role,
-                isOrganiser: player.is_organiser || false,
+                isOrganiser: await _isOrganiserAnywhere(pool, player.id), // FIX-650: BOTH vocabularies — tenant-role organisers had a false flag on every client (web + app)
                 badges: player.badges || []
             }
         });
@@ -7975,7 +7995,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
             squadNumber: player.squad_number,
             referralCode: player.referral_code,
             role: player.role,
-            isOrganiser: player.is_organiser || false,
+            isOrganiser: await _isOrganiserAnywhere(pool, player.id), // FIX-650: BOTH vocabularies — tenant-role organisers had a false flag on every client (web + app)
             isTenantAdmin: await _isTenantAdminAnywhere(player.id), // FIX-552: tenant_admin signal (legacy client alias: isCLMAdmin)
             totpEnabled: player.totp_enabled === true, // FIX-444
             mustChangePassword: player.force_password_change === true
@@ -8128,7 +8148,7 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
                 // Add frontend-friendly role flags
                 player.isAdmin = player.role === 'admin' || player.role === 'superadmin';
                 player.isSuperAdmin = player.role === 'superadmin';
-                player.isOrganiser = player.is_organiser || false;
+                player.isOrganiser = await _isOrganiserAnywhere(pool, player.id); // FIX-650
             }
         } catch (detailsError) {
             console.error('Error fetching details:', detailsError.message);
@@ -13780,8 +13800,12 @@ function _faParseFixtures(html) {
         if (!isHome && !isAway) continue; // e.g. another team's row leaked in — never import it
         const dparts = dm[1].split('/');
         const yy = dparts[2].length === 2 ? '20' + dparts[2] : dparts[2];
+        const when = yy + '-' + dparts[1] + '-' + dparts[0] + 'T' + (dm[2] || '14:00'); // FIX-648
         rows.push({
-            game_date: yy + '-' + dparts[1] + '-' + dparts[0] + 'T' + (dm[2] || '14:00'),
+            game_date: when,
+            date: when,                 // FIX-648: three fxLine renderers (crm/ext-league/game) read f.date — was undefined, every fixture showed TBC
+            home_team: home,            // FIX-648: renderers read f.home_team/f.away_team — parser computed home/away then threw them away
+            away_team: away,
             opponent: isHome ? away : home,
             is_home: isHome,
             away_venue_name: (!isHome && last && !/walkover|postponed|abandoned/i.test(last)) ? last.slice(0, 120) : null,
@@ -13835,6 +13859,12 @@ function _faParseTable(html) {
             gd: parseInt(_faStrip(tds[6]), 10) || 0,
             pts: parseInt(_faStrip(tds[7]), 10) || 0,
         };
+        // FIX-648 ROOT: two key dialects existed for the same rows — the parser's terse set
+        // (tenant.html's public-table contract) and the DB long set (game.html's ext-opposition
+        // render assumed it and got blanks). Emit BOTH so every consumer is satisfied and the
+        // next consumer can't guess wrong. Aliases, not a rename — nothing existing breaks.
+        row.name = row.team; row.position = row.pos;
+        row.played = row.p; row.won = row.w; row.drawn = row.d; row.lost = row.l;
         if (row.team && row.pos && !/^\d+$/.test(row.team) && row.pts <= row.p * 3 + 3) out.push(row); // audit: numeric 'teams' + impossible points = garbage
     }
     if (!out.length) throw new Error('FA_PARSE: no standings rows recognised \u2014 the FA page layout may have changed; save the page and send it over');
@@ -13989,14 +14019,14 @@ app.get('/api/public/game/:gameUrl/ext-opposition', optionalAuth, publicEndpoint
         if (!g.rows.length || !g.rows[0].external_league_id) return res.status(404).json({ error: 'Not an external fixture' });
         const game = g.rows[0];
         const xl = await pool.query(
-            `SELECT id, name, kind, parent_league_name, external_website_url, fa_team_url, tenant_id, slug
-               FROM external_leagues WHERE id = $1`, [game.external_league_id]);
+            `SELECT id, name, kind, parent_league_name, external_website_url, fa_team_url, tenant_id, public_slug
+               FROM external_leagues WHERE id = $1`, [game.external_league_id]);   // FIX-649: public_slug (legacy slug column — dead 'full profile' links)
         if (!xl.rows.length) return res.status(404).json({ error: 'League not found' });
         const L = xl.rows[0];
         const out = {
             kind: L.kind === 'cup' ? 'cup' : 'league',
             competition: L.name,
-            league_id: L.id, league_slug: L.slug || null, /* FIX-626: deep link to the team profile on ext-league.html */
+            league_id: L.id, league_slug: L.public_slug || null, /* FIX-626 deep link (FIX-649: public_slug) */
             league_website: L.external_website_url || null,
             opponent_name: game.external_opponent || null,
             table: null, table_note: null, our_team_id: null,
@@ -14147,12 +14177,12 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-league-sync',
 
         let synced = 0; const failures = [];
         for (const row of rows) {
-            if (!row.team_id) { failures.push(row.name + ' (no team link)'); continue; }
+            if (!row.team_id) { failures.push(row.team + ' (no team link)'); continue; }   // FIX-648: parser key is .team (was .name — printed 'undefined')
             try {
                 const teamHtml = await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + row.team_id);
                 let squad = []; let fixtures = [];
                 try { squad = _faParseSquad(teamHtml); } catch (_) { /* squad optional per team */ }
-                try { fixtures = _faParseFixtures(teamHtml); } catch (_) { /* fixtures optional per team */ }
+                try { fixtures = _faParseFixtures(teamHtml).rows || []; } catch (_) { /* fixtures optional per team */ }   // FIX-648: parser returns {team_name, rows} — storing the object made every frontend fx.filter throw
                 await pool.query(`
                     INSERT INTO ext_league_opponents (league_id, tenant_id, fa_team_id, name, is_us,
                         position, played, won, drawn, lost, gf, ga, gd, pts, squad_json, fixtures_json, synced_at)
@@ -14162,14 +14192,14 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-league-sync',
                         played = EXCLUDED.played, won = EXCLUDED.won, drawn = EXCLUDED.drawn, lost = EXCLUDED.lost,
                         gf = EXCLUDED.gf, ga = EXCLUDED.ga, gd = EXCLUDED.gd, pts = EXCLUDED.pts,
                         squad_json = EXCLUDED.squad_json, fixtures_json = EXCLUDED.fixtures_json, synced_at = NOW()`,
-                    [xl.rows[0].id, req.tenant.id, String(row.team_id), String(row.name || 'Unknown').slice(0, 80),
+                    [xl.rows[0].id, req.tenant.id, String(row.team_id), String(row.team || 'Unknown').slice(0, 80),   // FIX-648: parser key is .team
                      String(row.team_id) === String(parsed.teamID || ''),
-                     row.position ?? null, row.played ?? null, row.won ?? null, row.drawn ?? null, row.lost ?? null,
+                     row.pos ?? null, row.p ?? null, row.w ?? null, row.d ?? null, row.l ?? null,   // FIX-648: parser keys (was .position/.played/… — all undefined, so every team saved as Unknown with NULL stats; only .gd/.pts matched by luck)
                      row.gf ?? null, row.ga ?? null, row.gd ?? null, row.pts ?? null,
                      JSON.stringify(squad), JSON.stringify(fixtures)]);
                 synced++;
             } catch (e) {
-                failures.push(row.name + ' (' + String(e.message || '').slice(0, 60) + ')');
+                failures.push(row.team + ' (' + String(e.message || '').slice(0, 60) + ')');   // FIX-648
             }
             await new Promise(r2 => setTimeout(r2, 400)); // be gentle with the FA
         }
@@ -14337,6 +14367,19 @@ app.get('/api/t/:tenant_short_id/admin/fines-config', authenticateToken, require
                  SELECT 1 FROM tenant_fines tf
                   WHERE tf.tenant_id = $1 AND LOWER(tf.name) LIKE '%' || LOWER(SPLIT_PART(v.name, ' ', 2)) || ' card%'
              )`, [req.tenant.id]);
+        // FIX-653: finish what FIX-628 started — link the seeded presets to the
+        // tenant's card slots when unset, so the panel's direct \u00a3 inputs work
+        // out of the box. Name-guarded, base library only, never overwrites a
+        // slot the tenant already pointed somewhere.
+        await pool.query(`
+            UPDATE tenants t SET
+                card_yellow_fine_id = COALESCE(t.card_yellow_fine_id,
+                    (SELECT id FROM tenant_fines WHERE tenant_id = $1 AND game_type IS NULL AND active = TRUE
+                      AND LOWER(name) LIKE '%yellow card%' ORDER BY id ASC LIMIT 1)),
+                card_red_fine_id = COALESCE(t.card_red_fine_id,
+                    (SELECT id FROM tenant_fines WHERE tenant_id = $1 AND game_type IS NULL AND active = TRUE
+                      AND LOWER(name) LIKE '%red card%' ORDER BY id ASC LIMIT 1))
+             WHERE t.id = $1`, [req.tenant.id]);
     } catch (se) { /* seeding is best-effort — the panel must load regardless */ }
     try {
         // FIX-543: ?game_type=<type> serves that type's view — typed settings + SHADOW
@@ -15936,7 +15979,7 @@ app.get('/api/games', authenticateToken, async (req, res) => {
                        COUNT(*) FILTER (WHERE r.status IN ('confirmed','rsvp'))                  AS conf_rsvp_regs,
                        COUNT(*) FILTER (WHERE r.status = 'confirmed')                            AS confirmed_regs,
                        COUNT(*) FILTER (WHERE r.status = 'backup')                               AS backup_count,
-                       COUNT(*) FILTER (WHERE r.status = 'confirmed' AND p.is_organiser = true)  AS confirmed_organiser_count,
+                       COUNT(*) FILTER (WHERE r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = r.game_id WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id) /* FIX-650 */))  AS confirmed_organiser_count,
                        SUM(CASE WHEN UPPER(TRIM(r.position_preference)) = 'GK'
                                 THEN NULLIF(p.goalkeeper_rating, 0)
                                 ELSE p.overall_rating END) FILTER (WHERE r.status IN ('confirmed','rsvp'))   AS reg_rating_sum,
@@ -16341,7 +16384,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
                        FROM game_guests gg WHERE gg.game_id = g.id
                    ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status IN ('confirmed', 'rsvp') AND UPPER(TRIM(position_preference)) = 'GK') as gk_count /* FIX-315 */,
-                   COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0) as confirmed_organiser_count,
+                   COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = g.tenant_id) /* FIX-650 */))::int, 0) as confirmed_organiser_count,
                    ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') + (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as confirmed_only_count,
                    (SELECT status FROM registrations WHERE game_id = g.id AND player_id = $2 ORDER BY CASE status WHEN 'confirmed' THEN 1 WHEN 'confirmed_backup' THEN 2 WHEN 'rsvp' THEN 3 WHEN 'backup' THEN 4 ELSE 9 END, id DESC LIMIT 1) as registration_status,
                    (SELECT backup_type FROM registrations WHERE game_id = g.id AND player_id = $2 ORDER BY CASE status WHEN 'confirmed' THEN 1 WHEN 'confirmed_backup' THEN 2 WHEN 'rsvp' THEN 3 WHEN 'backup' THEN 4 ELSE 9 END, id DESC LIMIT 1) as my_backup_type,
@@ -16416,7 +16459,7 @@ app.get('/api/games/:id', authenticateToken, async (req, res) => {
             const orgCount = await pool.query(`
                 SELECT COUNT(*) AS cnt FROM registrations r
                 JOIN players p ON p.id = r.player_id
-                WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
+                WHERE r.game_id = $1 AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1 WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id) /* FIX-650 */)
             `, [req.params.id]);
             game.confirmed_organiser_count = parseInt(orgCount.rows[0].cnt) || 0;
         } else {
@@ -18455,13 +18498,18 @@ app.post('/api/games/:id/rsvp', authenticateToken, registrationLimiter, async (r
         // Same organiser-reservation guard as /register.
         let effectiveMax = parseInt(game.max_players);
         if (game.requires_organiser) {
-            const _orgCheck = await client.query('SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]);
-            const _playerIsOrganiser = _orgCheck.rows[0]?.is_organiser || false;
+            const _orgCheck = await client.query( // FIX-650: joiner check speaks BOTH vocabularies — a tenant-role organiser IS the organiser for their tenant's game
+                `SELECT (COALESCE((SELECT is_organiser FROM players WHERE id = $2), FALSE)
+                     OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1
+                                 WHERE _op.player_id = $2 AND _op.status = 'active'
+                                   AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id)) AS ok`,
+                [gameId, req.user.playerId]);
+            const _playerIsOrganiser = !!(_orgCheck.rows[0] && _orgCheck.rows[0].ok);
             if (!_playerIsOrganiser) {
                 const _orgCount = await client.query(`
                     SELECT COUNT(*) AS cnt FROM registrations r
                     JOIN players p ON p.id = r.player_id
-                    WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
+                    WHERE r.game_id = $1 AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1 WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id) /* FIX-650 */)
                 `, [gameId]);
                 if (parseInt(_orgCount.rows[0].cnt) === 0) {
                     effectiveMax = parseInt(game.max_players) - 1;
@@ -19838,17 +19886,19 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         // This reserves the last slot for an organiser.
         let effectiveMax = parseInt(game.max_players);
         if (game.requires_organiser) {
-            // We already fetched is_organiser below — but we need it here. Fetch now.
-            const _orgCheck = await client.query(
-                'SELECT is_organiser FROM players WHERE id = $1', [req.user.playerId]
-            );
-            const _playerIsOrganiser = _orgCheck.rows[0]?.is_organiser || false;
+            const _orgCheck = await client.query( // FIX-650: BOTH vocabularies (see /register)
+                `SELECT (COALESCE((SELECT is_organiser FROM players WHERE id = $2), FALSE)
+                     OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1
+                                 WHERE _op.player_id = $2 AND _op.status = 'active'
+                                   AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id)) AS ok`,
+                [gameId, req.user.playerId]);
+            const _playerIsOrganiser = !!(_orgCheck.rows[0] && _orgCheck.rows[0].ok);
             if (!_playerIsOrganiser) {
                 // Count confirmed organisers currently in this game
                 const _orgCount = await client.query(`
                     SELECT COUNT(*) AS cnt FROM registrations r
                     JOIN players p ON p.id = r.player_id
-                    WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
+                    WHERE r.game_id = $1 AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1 WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id) /* FIX-650 */)
                 `, [gameId]);
                 if (parseInt(_orgCount.rows[0].cnt) === 0) {
                     effectiveMax = parseInt(game.max_players) - 1;
@@ -22271,7 +22321,7 @@ app.put('/api/admin/games/:id/lineup/:teamName', authenticateToken, async (req, 
             const [orgCheck, capCheck, editorCheck] = await Promise.all([
                 pool.query(
                     `SELECT 1 FROM registrations r JOIN players p ON p.id = r.player_id
-                     WHERE r.game_id = $1 AND r.player_id = $2 AND r.status = 'confirmed' AND p.is_organiser = true`,
+                     WHERE r.game_id = $1 AND r.player_id = $2 AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1 WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id) /* FIX-650 */)`,
                     [gameId, req.user.playerId]
                 ),
                 pool.query('SELECT 1 FROM game_captains WHERE game_id = $1 AND player_id = $2', [gameId, req.user.playerId]),
@@ -22993,7 +23043,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
             const remainingOrg = await client.query(`
                 SELECT COUNT(*) AS cnt FROM registrations r
                 JOIN players p ON p.id = r.player_id
-                WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
+                WHERE r.game_id = $1 AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1 WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id) /* FIX-650 */)
             `, [gameId]);
             if (parseInt(remainingOrg.rows[0].cnt) === 0) {
                 // No confirmed organiser left — look for an organiser in the backup list
@@ -23002,7 +23052,7 @@ app.post('/api/games/:id/drop-out', authenticateToken, registrationLimiter, asyn
                            r.amount_paid, r.amount_paid_free, p.full_name, p.alias
                     FROM registrations r
                     JOIN players p ON p.id = r.player_id
-                    WHERE r.game_id = $1 AND r.status = 'backup' AND p.is_organiser = true
+                    WHERE r.game_id = $1 AND r.status = 'backup' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1 WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id) /* FIX-650 */)
                     ORDER BY
                         CASE r.backup_type
                             WHEN 'confirmed_backup' THEN 1
@@ -30414,7 +30464,7 @@ app.get('/api/public/game/:gameUrl/details', optionalAuth, async (req, res) => {
                                    ELSE gg.overall_rating END AS rating
                        FROM game_guests gg WHERE gg.game_id = g.id
                    ) ratings WHERE rating IS NOT NULL)::numeric, 1) as live_avg_ovr,
-                   (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true) as confirmed_organiser_count,
+                   (SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id WHERE r.game_id = g.id AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = g.tenant_id) /* FIX-650 */)) as confirmed_organiser_count,
                    -- FIX-315: RSVP system state, exposed publicly so game.html can render the split.
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'rsvp') as rsvp_count,
                    (SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'backup' AND backup_type = 'confirmed_backup') as confirmed_backup_count,
@@ -35479,6 +35529,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
         );
         const player = playerResult.rows[0];
         if (!player) return res.status(403).json({ error: 'Player not found' });
+        const _orgAnywhere = await _isOrganiserAnywhere(pool, playerId); // FIX-650: tenant-role organisers were 403'd off this list
         // FIX-530: compute standing + parse the 🏢 filter. Pure tenant admins
         // (not organisers, not platform admins) now pass the gate — their own
         // tenant's games are exactly what this list is for.
@@ -35498,7 +35549,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 [playerId]);
             _hasCoachRefGame = !!(_crc.rows[0] && _crc.rows[0].has);
         } catch (e) { if (!e || (e.code !== '42P01' && e.code !== '42703')) throw e; }
-        if (!isFullAdmin && !player.is_organiser && !_mgAllowedIds.length && !_hasCoachRefGame) {
+        if (!isFullAdmin && !_orgAnywhere && !_mgAllowedIds.length && !_hasCoachRefGame) { // FIX-650
             return res.status(403).json({ error: 'No management access' });
         }
         
@@ -35521,7 +35572,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id
-                          WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0)
+                          WHERE r.game_id = g.id AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = g.tenant_id) /* FIX-650 */))::int, 0)
                   as confirmed_organiser_count,
                 motm_p.alias as motm_winner_alias,
                 COALESCE((SELECT SUM(CASE
@@ -35624,7 +35675,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
             // built alongside so tenant conditions can join dynamically).
             const conditions = [];
             params = [];
-            if (player.is_organiser) {
+            if (_orgAnywhere) { // FIX-650: tenant-role organisers list their registered games too
                 params.push(playerId);
                 conditions.push(`EXISTS (
                     SELECT 1 FROM registrations r 
@@ -35656,7 +35707,7 @@ app.get('/api/manage/games', authenticateToken, async (req, res) => {
                 ((SELECT COUNT(*) FROM registrations WHERE game_id = g.id AND status = 'confirmed') +
                  (SELECT COUNT(*) FROM game_guests WHERE game_id = g.id)) as current_players,
                 COALESCE((SELECT COUNT(*) FROM registrations r JOIN players p ON p.id = r.player_id
-                          WHERE r.game_id = g.id AND r.status = 'confirmed' AND p.is_organiser = true)::int, 0)
+                          WHERE r.game_id = g.id AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = g.tenant_id) /* FIX-650 */))::int, 0)
                   as confirmed_organiser_count,
                 motm_p.alias as motm_winner_alias,
                 COALESCE((SELECT SUM(CASE
@@ -56073,7 +56124,13 @@ async function _wonderfulAutoRegister(pmt) {
             [pmt.player_id]
         );
         const playerTier = playerRow.rows[0]?.reliability_tier;
-        const isOrganiser = !!playerRow.rows[0]?.is_organiser;
+        const _payOrg = await pool.query( // FIX-650: payment-path joiner speaks BOTH vocabularies — a PAYING tenant organiser must get identical capacity math to /register
+            `SELECT (COALESCE((SELECT is_organiser FROM players WHERE id = $2), FALSE)
+                     OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1
+                                 WHERE _op.player_id = $2 AND _op.status = 'active'
+                                   AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id)) AS ok`,
+            [pmt.game_id, pmt.player_id]);
+        const isOrganiser = !!(_payOrg.rows[0] && _payOrg.rows[0].ok);
 
         if (playerTier === 'white' || playerTier === 'black') {
             return { status: 'failed_tier', reason: `Account tier ${playerTier} — signup blocked` };
@@ -56143,7 +56200,7 @@ async function _wonderfulAutoRegister(pmt) {
             const orgCountRes = await pool.query(`
                 SELECT COUNT(*) AS cnt FROM registrations r
                 JOIN players p ON p.id = r.player_id
-                WHERE r.game_id = $1 AND r.status = 'confirmed' AND p.is_organiser = true
+                WHERE r.game_id = $1 AND r.status = 'confirmed' AND (p.is_organiser = true OR EXISTS (SELECT 1 FROM player_tenants _op JOIN games _og ON _og.id = $1 WHERE _op.player_id = p.id AND _op.status = 'active' AND _op.role = 'organiser' AND _op.tenant_id = _og.tenant_id) /* FIX-650 */)
             `, [pmt.game_id]);
             if (parseInt(orgCountRes.rows[0].cnt) === 0) {
                 effectiveMax = parseInt(game.max_players) - 1;
@@ -62992,12 +63049,12 @@ app.get('/api/players/me/tenants', authenticateToken, async (req, res) => {
                     pt.show_in_dashboard, pt.allow_tenant_contact,
                     t.short_id, t.name, t.slug, t.logo_url, t.primary_color,
                     t.status AS tenant_status,
-                    xl.slug AS ext_league_slug, xl.name AS ext_league_name /* FIX-624: dashboard league badge */
+                    xl.public_slug AS ext_league_slug, xl.name AS ext_league_name /* FIX-624 badge (FIX-649: public_slug — the column creation writes and /api/public/ext-league resolves; the legacy slug column meant the badge only ever surfaced stale-era leagues, with links the resolver could never match) */
                FROM player_tenants pt
                JOIN tenants t ON t.id = pt.tenant_id
                LEFT JOIN LATERAL (
-                   SELECT slug, name FROM external_leagues
-                    WHERE tenant_id = t.id AND status = 'active' AND slug IS NOT NULL
+                   SELECT public_slug, name FROM external_leagues
+                    WHERE tenant_id = t.id AND status = 'active' AND public_slug IS NOT NULL
                     ORDER BY name ASC LIMIT 1
                ) xl ON TRUE
               WHERE pt.player_id = $1
@@ -63727,7 +63784,7 @@ app.post('/api/public/start-tenant', startTenantLimiter, async (req, res) => {
         const token = jwt.sign(
             {
                 userId: user.id, playerId: player.id, email: user.email, role: user.role,
-                isOrganiser: player.is_organiser || false,
+                isOrganiser: await _isOrganiserAnywhere(pool, player.id), // FIX-650: BOTH vocabularies — tenant-role organisers had a false flag on every client (web + app)
                 tokenVersion: user.token_version || 0
             },
             JWT_SECRET, { expiresIn: '7d' }
@@ -66522,6 +66579,34 @@ app.get('/api/admin/organisers/:player_id/reviews', authenticateToken, requireSu
         if (e && e.code === '42P01') return res.json({ reviews: [], count: 0 });
         console.error('superadmin organiser reviews failed:', e.message);
         res.status(500).json({ error: 'Failed to fetch reviews' });
+    }
+});
+
+// FIX-652: superadmin deletes a single organiser review. Hard delete is safe —
+// every consumer (SA list stats, allowance calcs, panel modal) aggregates live
+// from rows (verified: 6 aggregate readers, zero snapshots), so averages and
+// counts self-heal on the next read. Audit-logged with a content snapshot so
+// the trail survives the row. id is BIGSERIAL — integer validation, not UUID.
+app.delete('/api/admin/organiser-reviews/:review_id', authenticateToken, requireSuperAdmin, async (req, res) => {
+    const rid = parseInt(req.params.review_id, 10);
+    if (!Number.isInteger(rid) || rid <= 0 || String(rid) !== String(req.params.review_id).trim()) {
+        return res.status(400).json({ error: 'Invalid review id' });
+    }
+    try {
+        const del = await pool.query(
+            `DELETE FROM organiser_reviews WHERE id = $1
+             RETURNING organiser_player_id, reviewer_player_id, rating, comment, game_id, tenant_id`,
+            [rid]);
+        if (!del.rows.length) return res.status(404).json({ error: 'Review not found' });
+        const d = del.rows[0];
+        setImmediate(() => auditLog(pool, req.user.playerId, 'organiser_review_deleted', d.organiser_player_id,
+            'Deleted a ' + d.rating + '\u2605 organiser review by reviewer ' + d.reviewer_player_id +
+            (d.comment ? ' \u2014 "' + String(d.comment).slice(0, 120) + '"' : ''), d.tenant_id || null).catch(() => {}));
+        res.json({ ok: true });
+    } catch (e) {
+        if (e && e.code === '42P01') return res.status(404).json({ error: 'Review not found' });
+        console.error('FIX-652 delete organiser review failed:', e.message);
+        res.status(500).json({ error: 'Failed to delete review' });
     }
 });
 
@@ -73696,7 +73781,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web223-faleaguealt`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web228-cardfines`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
