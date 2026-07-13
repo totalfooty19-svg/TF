@@ -13575,20 +13575,27 @@ function _faParseTeamUrl(raw) {
 // FIX-601: canonical team-page fetch — id URL first, one legacy retry if the
 // saved link carried the old pair (belt + braces for migration stragglers).
 async function _faFetchTeamPage(parsed) {
+    // FIX-659: the id-shape endpoints can 200 a "team not found" page instead of
+    // erroring (FIX-601 assumed id == legacy teamID resolves universally — not
+    // always true). A soft-404 sailed through, the downstream parser found no
+    // squad table, and the legacy fallback never fired because nothing threw.
+    // Now every fetched page is sniffed with the FIX-539 genuine-team markers;
+    // a non-team page counts as a miss when a legacy pair exists to try.
+    const _looksLikeTeamPage = (html) =>
+        /Overall\s+Goals/i.test(String(html)) || /statsForPlayer\.html/i.test(String(html));
     try {
-        return await _faFetch('https://fulltime.thefa.com/displayTeam.html?id=' + parsed.id);
-    } catch (e1) {
-        // FIX-601b: the league host serves the same team page from different edge
-        // config — one shot there before falling back to the legacy URL shape.
-        try {
-            return await _faFetch('https://fulltime-league.thefa.com/displayTeam.html?id=' + parsed.id);
-        } catch (e2) {
-            if (parsed.divisionseason) {
-                return await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + parsed.teamID);
-            }
-            throw e2;
-        }
+        const h = await _faFetch('https://fulltime.thefa.com/displayTeam.html?id=' + parsed.id);
+        if (_looksLikeTeamPage(h) || !parsed.divisionseason) return h;
+    } catch (e1) { /* fall through — alt host next */ }
+    // FIX-601b: the league host serves the same team page from different edge config.
+    try {
+        const h = await _faFetch('https://fulltime-league.thefa.com/displayTeam.html?id=' + parsed.id);
+        if (_looksLikeTeamPage(h) || !parsed.divisionseason) return h;
+    } catch (e2) {
+        if (!parsed.divisionseason) throw e2;
     }
+    // Legacy pair — reached on throw OR on soft-404 from both id endpoints.
+    return await _faFetch('https://fulltime.thefa.com/displayTeam.html?divisionseason=' + parsed.divisionseason + '&teamID=' + parsed.teamID);
 }
 
 // FIX-601c: prod named the failure — 'FA fetch failed (UND_ERR_CONNECT_TIMEOUT)':
@@ -73920,7 +73927,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web229-ghostclaim`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web230-falegacy`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
