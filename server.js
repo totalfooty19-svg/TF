@@ -1780,6 +1780,9 @@ const AUDIT_TAG_TABLE = {
     wonderful_hold_writeoff:  { cat: 'payment', sub: 'wonderful', actor: 'admin',  sev: 'high' }, // FIX-538
     fine_attached:            { cat: 'tenant',  sub: 'fines',    actor: 'admin',  sev: 'low'  }, // FIX-533
     card_recorded:            { cat: 'tenant',  sub: 'fines',    actor: 'admin',  sev: 'low'  }, // FIX-533
+    ghost_invite_issued:      { cat: 'tenant',  sub: 'squad',    actor: 'admin',  sev: 'low'  }, // FIX-656
+    ghost_invite_revoked:     { cat: 'tenant',  sub: 'squad',    actor: 'admin',  sev: 'low'  }, // FIX-656
+    ghost_claimed:            { cat: 'tenant',  sub: 'squad',    actor: 'player', sev: 'med'  }, // FIX-656
     balance_adjustment:       { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
     credit_adjustment:        { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
     admin_adjustment:         { cat: 'credits', sub: 'admin_moves',    actor: 'admin',  sev: 'high' },
@@ -14336,10 +14339,133 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-squad-apply', authent
 app.get('/api/t/:tenant_short_id/admin/ghost-players', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
         const r = await pool.query(
-            `SELECT id, name, apps, goals, assists FROM tenant_ghost_players
-              WHERE tenant_id = $1 ORDER BY apps DESC, name ASC`, [req.tenant.id]);
+            `SELECT g.id, g.name, g.apps, g.goals, g.assists,
+                    g.claim_token, g.claim_expires_at, g.claimed_at,
+                    p.alias AS claimed_alias
+               FROM tenant_ghost_players g
+               LEFT JOIN players p ON p.id = g.claimed_by_player_id
+              WHERE g.tenant_id = $1 ORDER BY g.apps DESC, g.name ASC`, [req.tenant.id]);   /* FIX-656: claim lifecycle for the panel */
         res.json({ items: r.rows });
     } catch (e) { console.error('ghost list error:', e.message); res.status(500).json({ error: 'Failed to load ghost players' }); }
+});
+// ═══ FIX-656 — GHOST PROFILE CLAIMING ═══════════════════════════════════════
+// A short typeable code per ghost (URL is just a carrier: claim.html?c=CODE).
+// Single-use, 30-day expiry, tenant-scoped, revocable, audit-logged. The admin
+// issuing the code IS the membership authorisation — a front door into the
+// member-first world, not a bypass. Claim = A.50-style join + ghost attach in
+// one race-safe transaction. RAF stays separate: claim.html may carry ?ref=
+// into the normal signup, so welcome credit mints on NEW accounts only.
+const CLAIM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
+function _generateGhostClaimCode() {
+    let c = '';
+    for (let i = 0; i < 8; i++) c += CLAIM_ALPHABET[_crypto.randomInt(CLAIM_ALPHABET.length)];
+    return c;
+}
+const CLAIM_URL_BASE = 'https://totalfooty.co.uk/vibecoding/claim.html?c='; // hardcoded base, per share-URL convention
+app.post('/api/t/:tenant_short_id/admin/ghost-players/:id/invite', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const gid = parseInt(req.params.id, 10) || 0;
+        const own = await pool.query(
+            'SELECT id, name, claimed_by_player_id FROM tenant_ghost_players WHERE id = $1 AND tenant_id = $2', [gid, req.tenant.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Ghost player not found' });
+        if (own.rows[0].claimed_by_player_id) return res.status(400).json({ error: 'Already claimed — nothing to invite' });
+        let code = null;
+        for (let attempt = 0; attempt < 3 && !code; attempt++) {   // UNIQUE-index collision retry
+            const cand = _generateGhostClaimCode();
+            try {
+                await pool.query(
+                    `UPDATE tenant_ghost_players SET claim_token = $1, claim_expires_at = NOW() + INTERVAL '30 days'
+                      WHERE id = $2 AND tenant_id = $3`, [cand, gid, req.tenant.id]);
+                code = cand;
+            } catch (ce) { if (attempt === 2) throw ce; }
+        }
+        await auditLog(pool, req.user.playerId, 'ghost_invite_issued', null,
+            `claim code for ghost "${own.rows[0].name}"`, req.tenant.id).catch(() => {});
+        res.json({ success: true, code, url: CLAIM_URL_BASE + code, expires_in_days: 30 });
+    } catch (e) { console.error('ghost invite error:', e.message); res.status(500).json({ error: 'Failed to create claim code' }); }
+});
+app.delete('/api/t/:tenant_short_id/admin/ghost-players/:id/invite', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const gid = parseInt(req.params.id, 10) || 0;
+        const r = await pool.query(
+            `UPDATE tenant_ghost_players SET claim_token = NULL, claim_expires_at = NULL
+              WHERE id = $1 AND tenant_id = $2 AND claimed_by_player_id IS NULL RETURNING name`, [gid, req.tenant.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Nothing to revoke' });
+        await auditLog(pool, req.user.playerId, 'ghost_invite_revoked', null,
+            `claim code revoked for ghost "${r.rows[0].name}"`, req.tenant.id).catch(() => {});
+        res.json({ success: true });
+    } catch (e) { console.error('ghost invite revoke error:', e.message); res.status(500).json({ error: 'Failed to revoke' }); }
+});
+// Public resolve — safe fields only, uniform 404 (never reveals WHY a code is dead).
+// Inherits the /api/public/ rate limiter via the existing app.use.
+app.get('/api/public/claim/:code', async (req, res) => {
+    try {
+        const code = String(req.params.code || '').trim().toUpperCase();
+        if (!/^[A-Z2-9]{8}$/.test(code)) return res.status(404).json({ error: 'Code not found or expired' });
+        const r = await pool.query(
+            `SELECT g.name, g.apps, g.goals, g.assists,
+                    t.name AS tenant_name, t.short_id AS tenant_short_id, t.logo_url, t.primary_color
+               FROM tenant_ghost_players g
+               JOIN tenants t ON t.id = g.tenant_id
+              WHERE g.claim_token = $1 AND g.claimed_by_player_id IS NULL
+                AND g.claim_expires_at > NOW() AND t.status = 'active'`, [code]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Code not found or expired' });
+        const g = r.rows[0];
+        res.json({ ghost: { name: g.name, apps: g.apps, goals: g.goals, assists: g.assists },
+                   tenant: { name: g.tenant_name, short_id: g.tenant_short_id, logo_url: g.logo_url, primary_color: g.primary_color } });
+    } catch (e) { console.error('claim resolve error:', e.message); res.status(500).json({ error: 'Failed to check code' }); }
+});
+// Authed claim — the single attach path for BOTH new accounts (claim.html runs
+// register → login → this) and existing accounts (login → this).
+app.post('/api/claim/:code', authenticateToken, async (req, res) => {
+    try {
+        const code = String(req.params.code || '').trim().toUpperCase();
+        if (!/^[A-Z2-9]{8}$/.test(code)) return res.status(404).json({ error: 'Code not found or expired' });
+        const me = req.user.playerId;
+        // Pre-burn checks: banned is refused WITHOUT consuming the code.
+        const pre = await pool.query(
+            `SELECT g.id, g.tenant_id, g.name, t.status AS tenant_status, t.name AS tenant_name, t.short_id,
+                    pt.status AS my_status
+               FROM tenant_ghost_players g
+               JOIN tenants t ON t.id = g.tenant_id
+               LEFT JOIN player_tenants pt ON pt.tenant_id = g.tenant_id AND pt.player_id = $2
+              WHERE g.claim_token = $1 AND g.claimed_by_player_id IS NULL AND g.claim_expires_at > NOW()`, [code, me]);
+        if (!pre.rows.length) return res.status(404).json({ error: 'Code not found or expired' });
+        const row = pre.rows[0];
+        if (row.tenant_status !== 'active') return res.status(404).json({ error: 'Code not found or expired' });
+        if (row.my_status === 'banned') return res.status(403).json({ error: 'You cannot join this team' });
+        // FIX-656b (audit catch): burn + join are ONE transaction — a failure between
+        // them previously consumed the token without delivering membership (the
+        // claimed-but-not-joined class). Rollback keeps the code alive for a retry.
+        // Membership is the register-attach's own upsert (7155 family): one statement
+        // covers none→insert, left/any-legacy-status→reactivate, active→no-op;
+        // banned is pre-refused above and belt-and-braces guarded in the WHERE.
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const burn = await client.query(
+                `UPDATE tenant_ghost_players
+                    SET claimed_by_player_id = $1, claimed_at = NOW(), claim_token = NULL, claim_expires_at = NULL
+                  WHERE claim_token = $2 AND claimed_by_player_id IS NULL RETURNING id`, [me, code]);
+            if (!burn.rows.length) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ error: 'Code not found or expired' });
+            }
+            await client.query(
+                `INSERT INTO player_tenants (player_id, tenant_id, role, status, joined_at, show_in_dashboard)
+                 VALUES ($1, $2, 'player', 'active', NOW(), TRUE)
+                 ON CONFLICT (player_id, tenant_id) DO UPDATE
+                    SET status = 'active', joined_at = NOW()
+                  WHERE player_tenants.status NOT IN ('active', 'banned')`, [me, row.tenant_id]);
+            await client.query('COMMIT');
+        } catch (txe) {
+            try { await client.query('ROLLBACK'); } catch (_) {}
+            throw txe;
+        } finally { client.release(); }
+        await auditLog(pool, me, 'ghost_claimed', null,
+            `claimed ghost "${row.name}"`, row.tenant_id).catch(() => {});
+        res.json({ success: true, tenant: { name: row.tenant_name, short_id: row.short_id }, ghost: { name: row.name } });
+    } catch (e) { console.error('claim error:', e.message); res.status(500).json({ error: 'Failed to claim' }); }
 });
 app.delete('/api/t/:tenant_short_id/admin/ghost-players/:id', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
@@ -72109,6 +72235,19 @@ async function bootstrapTenantFreeCredits() {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE (tenant_id, fa_person_id)
             )`);
+        // FIX-656: ghost profile claiming — token + lifecycle columns. Additive,
+        // idempotent, pre-existing rows unaffected. Partial unique index keeps
+        // NULLs plentiful and codes unique.
+        await pool.query(`
+            ALTER TABLE tenant_ghost_players
+                ADD COLUMN IF NOT EXISTS claim_token TEXT,
+                ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS claimed_by_player_id UUID,
+                ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`);
+        await pool.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_claim_token
+                ON tenant_ghost_players (claim_token) WHERE claim_token IS NOT NULL`);
+        console.log('✅ FIX-656: tenant_ghost_players claim columns ready');
         console.log('✅ ghost roster ready (FIX-524)');
         // FIX-523: TotalFooty -> tenant-admin notices (popup on next CRM sign-in).
         await pool.query(`
@@ -73781,7 +73920,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web228-cardfines`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web229-ghostclaim`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
