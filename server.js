@@ -138,6 +138,16 @@ const registerLimiter = rateLimit({
     legacyHeaders: false,
     skip: (req) => req.method === 'OPTIONS',
 });
+// FIX-634: HYPE ✨ polish — every tap is an Anthropic call; cap it so a stuck
+// button or an enthusiastic thumb can't burn API credit.
+const hypePolishLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 40,
+    message: { error: 'Polish limit reached — try again in a bit.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
+});
 // SEC-002: Stricter limit for password reset to prevent token enumeration
 const resetLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
@@ -486,6 +496,13 @@ function _massGameLabel(venueName, whenStr) {
 
 // Mass-message template definitions. Hardcoded in v1 (admin can edit the body
 // in the UI before sending, but the 6 default texts live here).
+// FIX-636: tenant message templates — {TOKEN} substitution. Unknown tokens
+// are left untouched so a typo'd template stays visibly wrong, never silently blank.
+function _applyMsgTemplate(tpl, vars) {
+    return String(tpl).replace(/\{([A-Z_]+)\}/g, (m, k) =>
+        Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m);
+}
+
 const MASS_MESSAGE_TEMPLATES = {
     game_reminder: {
         label: 'Game Reminder',
@@ -819,6 +836,23 @@ async function _buildMassMessageAudience(client, gameId, buckets, opts = {}) {
 
     const bucketSql = bucketClauses.length > 0 ? '\n   AND ' + bucketClauses.join('\n   AND ') : '';
 
+    // FIX-637: tenant scope — a tenant's audience NEVER exceeds players with a
+    // relationship to that tenant (members ∪ confirmed in its games), whatever
+    // the game's visibility says. members/link-only games tighten to members.
+    // This is the anti-spam boundary: vis='all players' never becomes a
+    // platform-wide megaphone for a tenant.
+    let tenantSql = '';
+    if (opts.tenantId) {
+        params.push(opts.tenantId); p++;
+        const memberClause = `EXISTS (SELECT 1 FROM player_tenants pt
+                 WHERE pt.player_id = p.id AND pt.tenant_id = $${p} AND pt.status = 'active')`;
+        tenantSql = opts.membersOnly
+            ? `\n   AND ${memberClause}`
+            : `\n   AND (${memberClause}
+               OR EXISTS (SELECT 1 FROM registrations rt JOIN games gt ON gt.id = rt.game_id
+                    WHERE rt.player_id = p.id AND rt.status = 'confirmed' AND gt.tenant_id = $${p}))`;
+    }
+
     // Note: messaging_blocked check mirrors _MSG_BLOCKED_SQL pattern from comms.
     // We also exclude players whose status is white/black tier (banned/suspended).
     const sql = `
@@ -842,7 +876,7 @@ async function _buildMassMessageAudience(client, gameId, buckets, opts = {}) {
                SELECT player_id FROM registrations
                 WHERE game_id = $1 AND status IN ('confirmed', 'rsvp', 'backup')
            )
-           ${bucketSql}
+           ${tenantSql}${bucketSql}
          ORDER BY p.full_name NULLS LAST, p.alias NULLS LAST
     `;
     const r = await client.query(sql, params);
@@ -12644,6 +12678,326 @@ function _isValidSocialUrl(kind, raw) {
 }
 
 // ── NEWS ────────────────────────────────────────────────────────────────────
+// ═══ FIX-636: per-tenant message templates (team-ready + completion) ═══
+// Empty/NULL = the stock message. Tokens documented in the CRM panel legend.
+app.get('/api/t/:tenant_short_id/admin/msg-templates', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const t = await pool.query(
+            'SELECT teams_ready_template, completion_template FROM tenants WHERE short_id = $1',
+            [req.params.tenant_short_id]);
+        if (t.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        res.json({
+            teams_ready_template: t.rows[0].teams_ready_template || '',
+            completion_template:  t.rows[0].completion_template  || '',
+        });
+    } catch (e) {
+        console.error('GET msg-templates error:', e);
+        res.status(500).json({ error: 'Failed to load templates' });
+    }
+});
+app.put('/api/t/:tenant_short_id/admin/msg-templates', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const clean = (v) => {
+            const s = (typeof v === 'string' ? v : '').trim();
+            if (s.length > 2000) throw new Error('too_long');
+            return s.length ? s : null;
+        };
+        let tr, ct;
+        try {
+            tr = clean(req.body && req.body.teams_ready_template);
+            ct = clean(req.body && req.body.completion_template);
+        } catch (_) {
+            return res.status(400).json({ error: 'Templates are capped at 2000 characters' });
+        }
+        await pool.query(
+            'UPDATE tenants SET teams_ready_template = $1, completion_template = $2 WHERE short_id = $3',
+            [tr, ct, req.params.tenant_short_id]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('PUT msg-templates error:', e);
+        res.status(500).json({ error: 'Failed to save templates' });
+    }
+});
+
+// ═══ FIX-637: tenant Mass Message v1 — visibility-filtered audience + copy.
+// Dispatch (push/email) stays superadmin-side; v2 reuses the admin send.
+app.post('/api/t/:tenant_short_id/admin/mass-message/audience', authenticateToken, requireTenantAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { game_id } = req.body || {};
+        if (!game_id || !isValidUuid(String(game_id))) return res.status(400).json({ error: 'Valid game_id required' });
+        const tRes = await client.query('SELECT id FROM tenants WHERE short_id = $1', [req.params.tenant_short_id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const tenantId = tRes.rows[0].id;
+        const gRes = await client.query(
+            `SELECT g.id, g.tenant_id, g.game_url, g.game_date, v.name AS venue_name,
+                    COALESCE(g.visibility, t.game_visibility, '{"members":true,"all":true,"region":false,"link":true}'::jsonb) AS vis
+               FROM games g
+               LEFT JOIN tenants t ON t.id = g.tenant_id
+               LEFT JOIN venues v ON v.id = g.venue_id
+              WHERE g.id = $1`,
+            [game_id]);
+        if (gRes.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const g = gRes.rows[0];
+        if (String(g.tenant_id) !== String(tenantId)) return res.status(403).json({ error: 'Not your game' });
+        const vis = g.vis || {};
+        const membersOnly = !vis.all && !vis.region;   // members/link-only → members alone
+        const recipients = await _buildMassMessageAudience(client, game_id, ['not_registered'], { tenantId, membersOnly });
+        res.json({
+            count: recipients.length,
+            members_only: membersOnly,
+            recipients: recipients.slice(0, 200).map(r => ({
+                id: r.id,
+                alias: r.alias || r.first_name || r.full_name || 'Player',
+                has_app: r.has_app,
+                has_phone: !!r.phone_e164,
+            })),
+            game: { url: g.game_url || '', date: g.game_date, venue: g.venue_name || '' },
+        });
+    } catch (e) {
+        console.error('[FIX-637] tenant mm audience error:', e);
+        res.status(500).json({ error: 'Audience preview failed' });
+    } finally { client.release(); }
+});
+
+// ═══ FIX-638: tenant refs — who's officiated your games + their feedback ═══
+// Privacy boundary: a tenant sees ratings/comments generated in THEIR OWN
+// games only (plus the anonymised all-time average for context). Reviewer
+// identity is never exposed. Approving NEW refs stays platform-side (SA).
+app.get('/api/t/:tenant_short_id/admin/refs', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const tRes = await pool.query('SELECT id FROM tenants WHERE short_id = $1', [req.params.tenant_short_id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const tenantId = tRes.rows[0].id;
+
+        const refs = await pool.query(
+            `SELECT p.id, COALESCE(p.alias, p.full_name) AS alias,
+                    COUNT(*)::int AS tenant_apps,
+                    MAX(g.game_date) AS last_officiated,
+                    (SELECT ROUND(AVG(rr.rating), 1) FROM referee_reviews rr
+                      JOIN games gg ON gg.id = rr.game_id
+                     WHERE rr.referee_player_id = p.id AND gg.tenant_id = $1) AS tenant_avg,
+                    (SELECT COUNT(*)::int FROM referee_reviews rr
+                      JOIN games gg ON gg.id = rr.game_id
+                     WHERE rr.referee_player_id = p.id AND gg.tenant_id = $1) AS tenant_reviews,
+                    (SELECT ROUND(AVG(rating), 1) FROM referee_reviews
+                     WHERE referee_player_id = p.id) AS alltime_avg
+               FROM game_referees gr
+               JOIN games g ON g.id = gr.game_id AND g.tenant_id = $1
+               JOIN players p ON p.id = gr.player_id
+              WHERE gr.status = 'confirmed'
+              GROUP BY p.id, p.alias, p.full_name
+              ORDER BY MAX(g.game_date) DESC`,
+            [tenantId]);
+
+        const feedback = await pool.query(
+            `SELECT rr.referee_player_id, rr.rating, rr.comment, rr.created_at,
+                    g.game_date, v.name AS venue_name
+               FROM referee_reviews rr
+               JOIN games g ON g.id = rr.game_id AND g.tenant_id = $1
+               LEFT JOIN venues v ON v.id = g.venue_id
+              ORDER BY rr.created_at DESC
+              LIMIT 400`,
+            [tenantId]);
+        const byRef = {};
+        for (const f of feedback.rows) {
+            (byRef[f.referee_player_id] = byRef[f.referee_player_id] || []).push({
+                rating: f.rating,
+                comment: f.comment || '',
+                game_date: f.game_date,
+                venue: f.venue_name || '',
+            });
+        }
+
+        res.json({
+            refs: refs.rows.map(r => ({
+                id: r.id, alias: r.alias,
+                tenant_apps: r.tenant_apps,
+                last_officiated: r.last_officiated,
+                tenant_avg: r.tenant_avg, tenant_reviews: r.tenant_reviews,
+                alltime_avg: r.alltime_avg,
+                feedback: byRef[r.id] || [],
+            })),
+        });
+    } catch (e) {
+        console.error('[FIX-638] tenant refs error:', e);
+        res.status(500).json({ error: 'Failed to load referees' });
+    }
+});
+
+// ═══ FIX-639: tenant rating changes — which of YOUR players' ratings the
+// system has moved (feedback recalibration + reference pushes). Read-only;
+// the recalibration TOOLS stay superadmin-side on rating-feedback-admin.html.
+app.get('/api/t/:tenant_short_id/admin/rating-changes', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const tRes = await pool.query('SELECT id FROM tenants WHERE short_id = $1', [req.params.tenant_short_id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const rows = await pool.query(
+            `SELECT al.created_at, al.action, al.detail,
+                    COALESCE(p.alias, p.full_name) AS alias
+               FROM audit_logs al
+               JOIN players p ON p.id = al.target_id
+              WHERE al.action IN ('rating_recalibrated_via_feedback', 'rating_reference_pushed')
+                AND EXISTS (SELECT 1 FROM player_tenants pt
+                             WHERE pt.player_id = al.target_id
+                               AND pt.tenant_id = $1 AND pt.status = 'active')
+              ORDER BY al.created_at DESC
+              LIMIT 50`,
+            [tRes.rows[0].id]);
+        res.json({
+            changes: rows.rows.map(r => {
+                let d = r.detail;
+                if (typeof d === 'string') { try { d = JSON.parse(d); } catch (_) { d = {}; } }
+                d = d || {};
+                return {
+                    alias: r.alias,
+                    when: r.created_at,
+                    recalibrated: r.action === 'rating_recalibrated_via_feedback',
+                    old_ovr: d.old_ovr != null ? d.old_ovr : null,
+                    new_ovr: d.new_ovr != null ? d.new_ovr : null,
+                    delta: d.delta != null ? d.delta : 0,
+                    votes_used: d.votes_used != null ? d.votes_used : 0,
+                    suspicion: d.suspicion_flag || null,
+                };
+            }),
+        });
+    } catch (e) {
+        console.error('[FIX-639] rating-changes error:', e);
+        res.status(500).json({ error: 'Failed to load rating changes' });
+    }
+});
+
+// ═══ FIX-640: tenant coaches — everyone who has coached your games ═══
+// Sessions live in the Training panel (FIX-462); approving NEW coaches stays
+// platform-side. v1 source = games.assigned_coach_player_id (tenant-scoped);
+// coaching_sessions joins in once its tenant scoping is confirmed.
+app.get('/api/t/:tenant_short_id/admin/coaches', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const tRes = await pool.query('SELECT id FROM tenants WHERE short_id = $1', [req.params.tenant_short_id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const rows = await pool.query(
+            `SELECT p.id, COALESCE(p.alias, p.full_name) AS alias,
+                    COUNT(*)::int AS games_coached,
+                    MAX(g.game_date) AS last_coached
+               FROM games g
+               JOIN players p ON p.id = g.assigned_coach_player_id
+              WHERE g.tenant_id = $1
+              GROUP BY p.id, p.alias, p.full_name
+              ORDER BY MAX(g.game_date) DESC`,
+            [tRes.rows[0].id]);
+        res.json({ coaches: rows.rows });
+    } catch (e) {
+        console.error('[FIX-640] tenant coaches error:', e);
+        res.status(500).json({ error: 'Failed to load coaches' });
+    }
+});
+
+// ═══ FIX-641: tenant venues — list what your games use + add your own ═══
+app.get('/api/t/:tenant_short_id/admin/venues', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const tRes = await pool.query('SELECT id FROM tenants WHERE short_id = $1', [req.params.tenant_short_id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        // FIX-641b: LEFT JOIN + owner clause so a just-added venue (0 games,
+        // owner_tenant_id stamped) appears immediately; 'own' drives edit rights.
+        const rows = await pool.query(
+            `SELECT v.id, v.name, v.address, v.postcode, v.region,
+                    (v.owner_tenant_id = $1) AS own,
+                    COUNT(g.id)::int AS games_here,
+                    MAX(g.game_date) AS last_used
+               FROM venues v
+               LEFT JOIN games g ON g.venue_id = v.id AND g.tenant_id = $1
+              WHERE g.id IS NOT NULL OR v.owner_tenant_id = $1
+              GROUP BY v.id, v.name, v.address, v.postcode, v.region, v.owner_tenant_id
+              ORDER BY MAX(g.game_date) DESC NULLS LAST, v.name ASC`,
+            [tRes.rows[0].id]);
+        res.json({ venues: rows.rows });
+    } catch (e) {
+        console.error('[FIX-641] tenant venues GET error:', e);
+        res.status(500).json({ error: 'Failed to load venues' });
+    }
+});
+app.post('/api/t/:tenant_short_id/admin/venues', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const tRes = await pool.query('SELECT id FROM tenants WHERE short_id = $1', [req.params.tenant_short_id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const name = String(req.body && req.body.name || '').trim().slice(0, 120);
+        const address = String(req.body && req.body.address || '').trim().slice(0, 200);
+        const postcode = String(req.body && req.body.postcode || '').trim().slice(0, 12);
+        const region = String(req.body && req.body.region || '').trim().slice(0, 60);
+        if (!name || !region) return res.status(400).json({ error: 'Venue name and region are required' });
+        const dup = await pool.query('SELECT id FROM venues WHERE LOWER(name) = LOWER($1) AND LOWER(region) = LOWER($2)', [name, region]);
+        if (dup.rows.length) return res.status(400).json({ error: 'A venue with that name already exists in that region — it will appear in your game wizard already.' });
+        const ins = await pool.query(
+            'INSERT INTO venues (name, address, postcode, region, owner_tenant_id) VALUES ($1, $2, $3, $4, $5) RETURNING id, name',
+            [name, address || null, postcode || null, region, tRes.rows[0].id]);  // FIX-641b: ownership stamp
+        res.json({ success: true, venue: ins.rows[0] });
+    } catch (e) {
+        console.error('[FIX-641] tenant venues POST error:', e);
+        res.status(500).json({ error: 'Failed to add venue' });
+    }
+});
+
+// ═══ FIX-642: tenant RSVP pulse — status of YOUR upcoming games, read-only.
+// Chasing tools: Mass Message (FIX-637) is the nudge; deadline levers stay SA.
+app.get('/api/t/:tenant_short_id/admin/rsvp-pulse', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const tRes = await pool.query('SELECT id FROM tenants WHERE short_id = $1', [req.params.tenant_short_id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const rows = await pool.query(
+            `SELECT g.id, g.game_url, g.game_date, g.max_players, v.name AS venue_name,
+                    COUNT(r.id) FILTER (WHERE r.status = 'confirmed')::int AS confirmed,
+                    COUNT(r.id) FILTER (WHERE r.status = 'rsvp')::int      AS rsvps,
+                    COUNT(r.id) FILTER (WHERE r.status = 'backup')::int    AS backups,
+                    COALESCE(STRING_AGG(DISTINCT COALESCE(p.alias, p.full_name), ', ')
+                             FILTER (WHERE r.status = 'rsvp'), '')          AS rsvp_names
+               FROM games g
+               LEFT JOIN venues v ON v.id = g.venue_id
+               LEFT JOIN registrations r ON r.game_id = g.id
+               LEFT JOIN players p ON p.id = r.player_id
+              WHERE g.tenant_id = $1
+                AND g.game_date >= NOW() - INTERVAL '1 day'
+              GROUP BY g.id, g.game_url, g.game_date, g.max_players, v.name
+              ORDER BY g.game_date ASC
+              LIMIT 30`,
+            [tRes.rows[0].id]);
+        res.json({ games: rows.rows });
+    } catch (e) {
+        console.error('[FIX-642] tenant rsvp-pulse error:', e);
+        res.status(500).json({ error: 'Failed to load RSVP status' });
+    }
+});
+
+// FIX-641b: edit YOUR OWN venues only — the WHERE owner_tenant_id clause is
+// the security boundary (rowCount 0 = not yours/not found → 403). There is
+// deliberately NO tenant delete: venue deletion stays superadmin-side.
+app.put('/api/t/:tenant_short_id/admin/venues/:venueId', authenticateToken, requireTenantAdmin, async (req, res) => {
+    try {
+        const tRes = await pool.query('SELECT id FROM tenants WHERE short_id = $1', [req.params.tenant_short_id]);
+        if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        const tenantId = tRes.rows[0].id;
+        const vid = parseInt(req.params.venueId, 10);
+        if (!Number.isInteger(vid)) return res.status(400).json({ error: 'Invalid venue id' });
+        const name = String(req.body && req.body.name || '').trim().slice(0, 120);
+        const address = String(req.body && req.body.address || '').trim().slice(0, 200);
+        const postcode = String(req.body && req.body.postcode || '').trim().slice(0, 12);
+        const region = String(req.body && req.body.region || '').trim().slice(0, 60);
+        if (!name || !region) return res.status(400).json({ error: 'Venue name and region are required' });
+        const dup = await pool.query(
+            'SELECT id FROM venues WHERE LOWER(name) = LOWER($1) AND LOWER(region) = LOWER($2) AND id <> $3',
+            [name, region, vid]);
+        if (dup.rows.length) return res.status(400).json({ error: 'Another venue already has that name in that region.' });
+        const upd = await pool.query(
+            `UPDATE venues SET name = $1, address = $2, postcode = $3, region = $4
+              WHERE id = $5 AND owner_tenant_id = $6`,
+            [name, address || null, postcode || null, region, vid, tenantId]);
+        if (upd.rowCount === 0) return res.status(403).json({ error: 'You can only edit venues your club added.' });
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[FIX-641b] tenant venue PUT error:', e);
+        res.status(500).json({ error: 'Failed to update venue' });
+    }
+});
+
 app.get('/api/t/:tenant_short_id/admin/news', authenticateToken, requireTenantAdmin, async (req, res) => {
     try {
         const r = await pool.query(
@@ -13294,7 +13648,7 @@ function _faRelayFetch(url) {
                 'Content-Length': Buffer.byteLength(body),
                 'User-Agent': 'TotalFooty-API/1.0 (fa-relay client)',
             },
-            timeout: 25000,
+            timeout: 32000,   // FIX-647: must exceed the worker's 28s FA fetch window
         }, (res) => {
             const chunks = [];
             res.on('data', (c) => chunks.push(c));
@@ -13318,7 +13672,42 @@ function _faRelayFetch(url) {
         req.end(body);
     });
 }
+// FIX-647b: league-table ladder. FA's OWN Cloudflare edge intermittently 522s
+// table.html while displayLeagueTable.html (the modern table URL) serves the
+// identical markup — _faParseTable handles either. Rung 2 retries table.html
+// after 2s because FA-side 522s are often transient. Worst case ~90s wall
+// (3 relay windows) — inside CF's 100s proxy ceiling on api.totalfooty.co.uk.
+async function _faFetchTableLadder(divisionseason) {
+    const urls = [
+        'https://fulltime.thefa.com/table.html?divisionseason=' + divisionseason,
+        'https://fulltime.thefa.com/table.html?divisionseason=' + divisionseason,
+        'https://fulltime.thefa.com/displayLeagueTable.html?divisionseason=' + divisionseason,
+    ];
+    let lastErr = null;
+    for (let i = 0; i < urls.length; i++) {
+        if (i === 1) await new Promise(r => setTimeout(r, 2000));
+        try {
+            const html = await _faFetch(urls[i]);
+            if (i > 0) console.log('[FA] table ladder rung ' + (i + 1) + ' served ' + urls[i].split('/').pop().split('?')[0]);
+            return html;
+        } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('FA fetch failed (table ladder exhausted)');
+}
+
+let _faDirectDeadUntil = 0;   // FIX-647: epoch ms; relay-first while in the window
 async function _faFetch(url) {
+    if (process.env.FA_RELAY_URL && Date.now() < _faDirectDeadUntil) {
+        try {
+            const html = await _faRelayFetch(url);
+            console.log('[FA] relay-first (direct marked dead) served ' + url.slice(0, 90));
+            return html;
+        } catch (re) {
+            // Relay down while direct is marked dead → fall through to the
+            // normal direct+relay path below (direct may have recovered).
+            console.warn('[FA] relay-first failed (' + re.message + ') — retrying full direct+relay path');
+        }
+    }
     try {
         return await _faHttpGet(url, 3);
     } catch (e) {
@@ -13332,9 +13721,15 @@ async function _faFetch(url) {
             console.warn('[FA] direct fetch failed (' + e.message + ') and FA_RELAY_URL is UNSET \u2014 relay skipped. Set the env var to enable the Namecheap fallback (see DEPLOY-ORDER web186).');
         }
         if (!networkClass || !process.env.FA_RELAY_URL) throw e;
+        // FIX-647c: direct just died network-class — that fact doesn't depend on
+        // whether the relay succeeds. Engage relay-first NOW so multi-fetch flows
+        // (the table ladder, per-team loops) stop paying the dead-connect tax on
+        // every subsequent URL. The relay-first fall-through still covers the
+        // relay-down-during-window case.
+        _faDirectDeadUntil = Date.now() + 10 * 60 * 1000;
         try {
             const html = await _faRelayFetch(url);
-            console.log('[FA] direct fetch failed (' + e.message + ') \u2192 relay served ' + url.slice(0, 90));
+            console.log('[FA] direct fetch failed (' + e.message + ') \u2192 relay served ' + url.slice(0, 90) + ' (relay-first engaged for 10 min)');
             return html;
         } catch (re) {
             throw new Error(e.message + '; relay also failed: ' + re.message);
@@ -13746,7 +14141,7 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-league-sync',
         if (!parsed.divisionseason) return res.status(424).json({ error: 'League sync needs the older FA link format (with divisionseason) \u2014 the same one the league table uses.' });
         faCtx = { id: xl.rows[0].id, name: xl.rows[0].name, url: xl.rows[0].fa_team_url, tenant: req.tenant && req.tenant.name };
 
-        const tableHtml = await _faFetch('https://fulltime.thefa.com/table.html?divisionseason=' + parsed.divisionseason);
+        const tableHtml = await _faFetchTableLadder(parsed.divisionseason);   // FIX-647b: retry + modern-URL fallback
         const rows = _faParseTable(tableHtml).slice(0, 24); // sanity cap
         if (!rows.length) return res.status(422).json({ error: 'Could not read the league table' });
 
@@ -16296,6 +16691,19 @@ app.delete('/api/player/favourite-opponents/:opponentId', authenticateToken, asy
 
 const BFF_MAX = 3;
 const RIVAL_MAX = 3;
+// FIX-633: preference caps + 24h arming.
+//   - Manual per-game picks: max 2 pairs AND 2 avoids (PREF_MANUAL_MAX).
+//   - Armed BFF/Rival auto-fills ride on top (max 3 each) → worst case 5+5
+//     rows per type per registration (PREF_TYPE_TOTAL_MAX).
+//   - A BFF/Rival nomination only auto-applies once it is 24h old ("armed").
+//     Unarmed nominations included in a save count as MANUAL picks (they
+//     cost a slot) — the free ride needs 24h. Anti-manipulation: you can't
+//     swap your BFF five minutes before a draft. Removals are immediate.
+//     Legacy rows with NULL created_at count as armed.
+//   - Existing 3+3 manual saves are grandfathered: caps bite only at the
+//     write endpoints, never retroactively, never at team-gen read time.
+const PREF_MANUAL_MAX = 2;
+const PREF_TYPE_TOTAL_MAX = 5;
 
 // ── 11.1 GET /api/player/relationships — calling player's BFFs + Rivals ──
 app.get('/api/player/relationships', authenticateToken, async (req, res) => {
@@ -16305,7 +16713,9 @@ app.get('/api/player/relationships', authenticateToken, async (req, res) => {
         if (!playerId) return res.status(403).json({ error: 'No player profile' });
 
         const bffs = await pool.query(
-            `SELECT pb.bff_player_id AS player_id, p.alias, pb.created_at AS added_at
+            `SELECT pb.bff_player_id AS player_id, p.alias, pb.created_at AS added_at,
+                    (pb.created_at IS NULL OR pb.created_at <= NOW() - INTERVAL '24 hours') AS armed,
+                    pb.created_at + INTERVAL '24 hours' AS arms_at
              FROM player_bffs pb
              JOIN players p ON p.id = pb.bff_player_id
              WHERE pb.player_id = $1 AND p.is_active = TRUE
@@ -16313,7 +16723,9 @@ app.get('/api/player/relationships', authenticateToken, async (req, res) => {
             [playerId]
         );
         const rivals = await pool.query(
-            `SELECT pr.rival_player_id AS player_id, p.alias, pr.created_at AS added_at
+            `SELECT pr.rival_player_id AS player_id, p.alias, pr.created_at AS added_at,
+                    (pr.created_at IS NULL OR pr.created_at <= NOW() - INTERVAL '24 hours') AS armed,
+                    pr.created_at + INTERVAL '24 hours' AS arms_at
              FROM player_rivals pr
              JOIN players p ON p.id = pr.rival_player_id
              WHERE pr.player_id = $1 AND p.is_active = TRUE
@@ -16324,7 +16736,7 @@ app.get('/api/player/relationships', authenticateToken, async (req, res) => {
         res.json({
             bffs:   bffs.rows,
             rivals: rivals.rows,
-            caps:   { bff_max: BFF_MAX, rival_max: RIVAL_MAX },
+            caps:   { bff_max: BFF_MAX, rival_max: RIVAL_MAX, manual_max: PREF_MANUAL_MAX, arm_hours: 24 }, /* FIX-633 */
         });
     } catch (error) {
         console.error('GET /api/player/relationships error:', error);
@@ -16424,42 +16836,22 @@ app.post('/api/player/relationships', authenticateToken, async (req, res) => {
         }
 
         // Insert into target list (idempotent via UNIQUE)
+        // FIX-633: created_at set explicitly (arming clock starts NOW, never
+        // relies on a column default). ON CONFLICT DO NOTHING means re-adding
+        // an existing nomination can NOT reset its clock.
         const ins = await client.query(
-            `INSERT INTO ${targetTable} (player_id, ${targetCol}) VALUES ($1, $2)
+            `INSERT INTO ${targetTable} (player_id, ${targetCol}, created_at) VALUES ($1, $2, NOW())
              ON CONFLICT (player_id, ${targetCol}) DO NOTHING
-             RETURNING id`,
+             RETURNING id, created_at`,
             [playerId, targetId]
         );
 
-        // Materialise auto rows in upcoming eligible games (this player → target).
-        // Cap-aware, override-aware.
-        await client.query(
-            `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type, source)
-             SELECT r1.id, $1, $2, $3
-             FROM registrations r1
-             JOIN games g ON g.id = r1.game_id
-             JOIN registrations r2 ON r2.game_id = g.id
-                                   AND r2.player_id = $1
-                                   AND r2.status = 'confirmed'
-             WHERE r1.player_id = $4
-               AND r1.status = 'confirmed'
-               AND g.game_date > NOW()
-               AND g.team_selection_type NOT IN ('draft_memory', 'vs_external')
-               AND g.is_venue_clash IS NOT TRUE
-               AND g.venue_clash_team1_name IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM registration_preferences rp
-                   WHERE rp.registration_id = r1.id AND rp.target_player_id = $1
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM registration_preference_overrides rpo
-                   WHERE rpo.registration_id = r1.id AND rpo.target_player_id = $1
-               )
-               AND (
-                   SELECT COUNT(*) FROM registration_preferences WHERE registration_id = r1.id
-               ) < 6`,
-            [targetId, autoPrefType, autoSource, playerId]
-        );
+        // FIX-633: a brand-new nomination is UNARMED by definition — no
+        // immediate materialisation into this player's upcoming games any
+        // more. Once it arms (24h), §7 applyBffRivalAutoFill picks it up on
+        // the next registration event for a shared game, and the
+        // generate-teams catch-up sweep guarantees it lands before any draft
+        // that matters.
 
         // Symmetric direction (target's prefs → this player) only fires if mutual
         // (target also has me on their list of the same type).
@@ -16474,6 +16866,7 @@ app.post('/api/player/relationships', authenticateToken, async (req, res) => {
                                    AND r2.status = 'confirmed'
              WHERE pr.player_id = $4
                AND pr.${targetCol} = $1
+               AND (pr.created_at IS NULL OR pr.created_at <= NOW() - INTERVAL '24 hours') /* FIX-633: armed only */
                AND g.game_date > NOW()
                AND g.team_selection_type NOT IN ('draft_memory', 'vs_external')
                AND g.is_venue_clash IS NOT TRUE
@@ -16487,8 +16880,9 @@ app.post('/api/player/relationships', authenticateToken, async (req, res) => {
                    WHERE rpo.registration_id = r1.id AND rpo.target_player_id = $1
                )
                AND (
-                   SELECT COUNT(*) FROM registration_preferences WHERE registration_id = r1.id
-               ) < 6`,
+                   SELECT COUNT(*) FROM registration_preferences
+                   WHERE registration_id = r1.id AND preference_type = $2
+               ) < ${PREF_TYPE_TOTAL_MAX}`, /* FIX-633: per-type cap */
             [playerId, autoPrefType, autoSource, targetId]
         );
 
@@ -16499,7 +16893,11 @@ app.post('/api/player/relationships', authenticateToken, async (req, res) => {
         setImmediate(() => auditLog(pool, playerId, auditAction, targetId,
             `${type} ${isSwap ? '(swapped from opposite list)' : ''}`.trim()));
 
-        res.json({ success: true, swapped: isSwap });
+        // FIX-633: tell the UI when this nomination starts auto-applying.
+        const _armsAt = ins.rows.length
+            ? new Date(new Date(ins.rows[0].created_at).getTime() + 24 * 3600 * 1000).toISOString()
+            : null;
+        res.json({ success: true, swapped: isSwap, arms_at: _armsAt });
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('POST /api/player/relationships error:', error);
@@ -16616,7 +17014,7 @@ app.get('/api/admin/players/:playerId/relationships', authenticateToken, require
         res.json({
             bffs:   bffs.rows,
             rivals: rivals.rows,
-            caps:   { bff_max: BFF_MAX, rival_max: RIVAL_MAX },
+            caps:   { bff_max: BFF_MAX, rival_max: RIVAL_MAX, manual_max: PREF_MANUAL_MAX, arm_hours: 24 }, /* FIX-633 */
         });
     } catch (error) {
         console.error('GET /api/admin/players/:playerId/relationships error:', error);
@@ -17692,7 +18090,9 @@ async function _gameAcceptsPairAvoid(client, gameId) {
  *      player on their own BFF/Rival list, an auto row in their prefs targeting
  *      the newly-confirmed player.
  *
- * Respects the 6-cap (silent skip if full) and registration_preference_overrides
+ * FIX-633: only ARMED nominations (24h+ old; NULL created_at = legacy =
+ * armed) are materialised, and the cap is per-type (manual 2 + auto 3 = 5).
+ * Respects the per-type cap (silent skip if full) and registration_preference_overrides
  * (skip re-insert if previously suppressed for this game).
  *
  * Idempotent — safe to retry. Uses NOT EXISTS guards so re-running is a no-op.
@@ -17720,11 +18120,12 @@ async function applyBffRivalAutoFill(client, playerId, gameId, registrationId) {
         // Returns 'inserted' | 'skipped_cap' | 'skipped_existing' | 'skipped_override'.
         const _tryInsertAuto = async (regId, targetId, prefType, source) => {
             // Re-check cap with FRESH count from this transaction
+            // FIX-633: cap is per preference_type (manual 2 + auto 3 = 5 max).
             const cnt = await client.query(
-                'SELECT COUNT(*)::int AS n FROM registration_preferences WHERE registration_id = $1',
-                [regId]
+                'SELECT COUNT(*)::int AS n FROM registration_preferences WHERE registration_id = $1 AND preference_type = $2',
+                [regId, prefType]
             );
-            if (cnt.rows[0].n >= 6) return 'skipped_cap';
+            if (cnt.rows[0].n >= PREF_TYPE_TOTAL_MAX) return 'skipped_cap';
 
             // Re-check prefs
             const existing = await client.query(
@@ -17763,6 +18164,7 @@ async function applyBffRivalAutoFill(client, playerId, gameId, registrationId) {
                                       AND r2.status = 'confirmed'
                  JOIN players p2 ON p2.id = pr.${relCol} AND p2.is_active = TRUE
                  WHERE pr.player_id = $2
+                   AND (pr.created_at IS NULL OR pr.created_at <= NOW() - INTERVAL '24 hours') /* FIX-633: armed only */
                  ORDER BY pr.${relCol} ASC`,
                 [gameId, playerId]
             );
@@ -17792,6 +18194,7 @@ async function applyBffRivalAutoFill(client, playerId, gameId, registrationId) {
                  JOIN players p2 ON p2.id = pr.player_id AND p2.is_active = TRUE
                  WHERE pr.${relCol} = $2
                    AND r2.id <> $3
+                   AND (pr.created_at IS NULL OR pr.created_at <= NOW() - INTERVAL '24 hours') /* FIX-633: armed only */
                  ORDER BY pr.player_id ASC`,
                 [gameId, playerId, registrationId]
             );
@@ -19259,11 +19662,13 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
         const positionValue           = _pos.positionValue;
         const sanitisedPositionAreas  = _pos.positionAreas;
 
-        // FIX-180: BFFs/Rivals — combined cap of 6 across pairs + avoids.
+        // FIX-180 → FIX-633: early per-type sanity bound. Legit worst case is
+        // 2 manual + 3 armed autos = 5 per type; the precise manual-2 check
+        // (armed-aware) runs further down once the BFF/Rival sets are loaded.
         const _incomingPairCount  = Array.isArray(pairs)  ? pairs.length  : 0;
         const _incomingAvoidCount = Array.isArray(avoids) ? avoids.length : 0;
-        if (_incomingPairCount + _incomingAvoidCount > 6) {
-            return res.status(400).json({ error: 'Max 6 combined pairs and avoids' });
+        if (_incomingPairCount > PREF_TYPE_TOTAL_MAX || _incomingAvoidCount > PREF_TYPE_TOTAL_MAX) {
+            return res.status(400).json({ error: `Max ${PREF_TYPE_TOTAL_MAX} pairs and ${PREF_TYPE_TOTAL_MAX} avoids per registration (including BFFs/Rivals)` });
         }
         
         await client.query('BEGIN');
@@ -19665,31 +20070,45 @@ app.post('/api/games/:id/register', authenticateToken, registrationLimiter, asyn
             || game.is_venue_clash;
 
         // FIX-180: BFFs/Rivals — source detection (auto_bff/auto_rival) for incoming pairs/avoids.
+        // FIX-633: only ARMED nominations grant the free auto slot. Anything
+        // else in the incoming arrays is a MANUAL pick and counts against the
+        // 2-per-type cap. Validate BEFORE inserting.
         if (status === 'confirmed' && !regNoDraftMode) {
-            const _bffRows  = await client.query('SELECT bff_player_id FROM player_bffs WHERE player_id = $1', [req.user.playerId]);
-            const _rivalRows = await client.query('SELECT rival_player_id FROM player_rivals WHERE player_id = $1', [req.user.playerId]);
+            const _bffRows  = await client.query(
+                `SELECT bff_player_id FROM player_bffs
+                  WHERE player_id = $1 AND (created_at IS NULL OR created_at <= NOW() - INTERVAL '24 hours')`,
+                [req.user.playerId]);
+            const _rivalRows = await client.query(
+                `SELECT rival_player_id FROM player_rivals
+                  WHERE player_id = $1 AND (created_at IS NULL OR created_at <= NOW() - INTERVAL '24 hours')`,
+                [req.user.playerId]);
             const _myBffs   = new Set(_bffRows.rows.map(r => r.bff_player_id));
             const _myRivals = new Set(_rivalRows.rows.map(r => r.rival_player_id));
 
-            if (Array.isArray(pairs)) {
-                for (const pairPlayerId of pairs) {
-                    const _src = _myBffs.has(pairPlayerId) ? 'auto_bff' : 'manual';
-                    await client.query(
-                        `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type, source)
-                         VALUES ($1, $2, 'pair', $3)`,
-                        [registrationId, pairPlayerId, _src]
-                    );
-                }
+            const _pairItems  = (Array.isArray(pairs)  ? pairs  : []).map(id => ({ id, src: _myBffs.has(id)   ? 'auto_bff'   : 'manual' }));
+            const _avoidItems = (Array.isArray(avoids) ? avoids : []).map(id => ({ id, src: _myRivals.has(id) ? 'auto_rival' : 'manual' }));
+            const _manualPairs  = _pairItems.filter(i => i.src === 'manual').length;
+            const _manualAvoids = _avoidItems.filter(i => i.src === 'manual').length;
+            if (_manualPairs > PREF_MANUAL_MAX || _manualAvoids > PREF_MANUAL_MAX) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    error: `Max ${PREF_MANUAL_MAX} pair and ${PREF_MANUAL_MAX} avoid picks (you sent ${_manualPairs} pairs / ${_manualAvoids} avoids). BFFs and Rivals added 24h+ ago don't count.`
+                });
             }
-            if (Array.isArray(avoids)) {
-                for (const avoidPlayerId of avoids) {
-                    const _src = _myRivals.has(avoidPlayerId) ? 'auto_rival' : 'manual';
-                    await client.query(
-                        `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type, source)
-                         VALUES ($1, $2, 'avoid', $3)`,
-                        [registrationId, avoidPlayerId, _src]
-                    );
-                }
+
+            for (const item of _pairItems) {
+                await client.query(
+                    `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type, source)
+                     VALUES ($1, $2, 'pair', $3)`,
+                    [registrationId, item.id, item.src]
+                );
+            }
+            for (const item of _avoidItems) {
+                await client.query(
+                    `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type, source)
+                     VALUES ($1, $2, 'avoid', $3)`,
+                    [registrationId, item.id, item.src]
+                );
             }
 
             // FIX-184: §7 step 7 — set-difference override writes.
@@ -22930,15 +23349,29 @@ app.put('/api/admin/games/:gameId/player/:playerId/preferences', authenticateTok
             const safePairs  = adminNoDraftMode ? [] : (Array.isArray(pairs)  ? pairs.filter(id => id !== playerId)  : []);
             const safeAvoids = adminNoDraftMode ? [] : (Array.isArray(avoids) ? avoids.filter(id => id !== playerId) : []);
 
-            // Cap-of-6 check
-            if (safePairs.length + safeAvoids.length > 6) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: 'Max 6 combined pairs and avoids' });
-            }
+            // Look up TARGET's ARMED BFFs / Rivals (not admin's) — FIX-633:
+            // unarmed nominations don't grant the free auto slot, so they
+            // classify as manual below and count against the cap.
+            const _bffRows = await client.query(
+                `SELECT bff_player_id FROM player_bffs
+                  WHERE player_id = $1 AND (created_at IS NULL OR created_at <= NOW() - INTERVAL '24 hours')`,
+                [playerId]);
+            const _rivalRows = await client.query(
+                `SELECT rival_player_id FROM player_rivals
+                  WHERE player_id = $1 AND (created_at IS NULL OR created_at <= NOW() - INTERVAL '24 hours')`,
+                [playerId]);
+            const _preBffs   = new Set(_bffRows.rows.map(r => r.bff_player_id));
+            const _preRivals = new Set(_rivalRows.rows.map(r => r.rival_player_id));
 
-            // Look up TARGET's BFFs / Rivals (not admin's)
-            const _bffRows = await client.query('SELECT bff_player_id FROM player_bffs WHERE player_id = $1', [playerId]);
-            const _rivalRows = await client.query('SELECT rival_player_id FROM player_rivals WHERE player_id = $1', [playerId]);
+            // FIX-633: manual picks capped at 2 per type (armed autos ride free).
+            const _manualPairs  = safePairs.filter(id => !_preBffs.has(id)).length;
+            const _manualAvoids = safeAvoids.filter(id => !_preRivals.has(id)).length;
+            if (_manualPairs > PREF_MANUAL_MAX || _manualAvoids > PREF_MANUAL_MAX) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    error: `Max ${PREF_MANUAL_MAX} pair and ${PREF_MANUAL_MAX} avoid picks (${_manualPairs} pairs / ${_manualAvoids} avoids sent). The player's BFFs and Rivals added 24h+ ago don't count.`
+                });
+            }
             const _targetBffs   = new Set(_bffRows.rows.map(r => r.bff_player_id));
             const _targetRivals = new Set(_rivalRows.rows.map(r => r.rival_player_id));
 
@@ -23107,9 +23540,25 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
         const safePairs  = noDraftMode ? [] : (pairs  || []);
         const safeAvoids = noDraftMode ? [] : (avoids || []);
 
-        // FIX-179: BFFs/Rivals — cap is now 6 COMBINED across pairs + avoids (was 10 each).
-        if (safePairs.length + safeAvoids.length > 6) {
-            return res.status(400).json({ error: 'Max 6 combined pairs and avoids' });
+        // FIX-179 → FIX-633: manual picks capped at 2 per type. Armed BFF/
+        // Rival selections (nominated 24h+ ago) don't count — they take the
+        // free auto slots (max 3 each → 5 rows per type worst case).
+        const _bffRows = await client.query(
+            `SELECT bff_player_id FROM player_bffs
+              WHERE player_id = $1 AND (created_at IS NULL OR created_at <= NOW() - INTERVAL '24 hours')`,
+            [req.user.playerId]);
+        const _rivalRows = await client.query(
+            `SELECT rival_player_id FROM player_rivals
+              WHERE player_id = $1 AND (created_at IS NULL OR created_at <= NOW() - INTERVAL '24 hours')`,
+            [req.user.playerId]);
+        const _myBffs = new Set(_bffRows.rows.map(r => r.bff_player_id));
+        const _myRivals = new Set(_rivalRows.rows.map(r => r.rival_player_id));
+        const _manualPairs  = safePairs.filter(id => !_myBffs.has(id)).length;
+        const _manualAvoids = safeAvoids.filter(id => !_myRivals.has(id)).length;
+        if (_manualPairs > PREF_MANUAL_MAX || _manualAvoids > PREF_MANUAL_MAX) {
+            return res.status(400).json({
+                error: `Max ${PREF_MANUAL_MAX} pair and ${PREF_MANUAL_MAX} avoid picks (you have ${_manualPairs} pairs / ${_manualAvoids} avoids). BFFs and Rivals added 24h+ ago don't count.`
+            });
         }
 
         // Batch 6 — sanitise position_areas with same whitelist used at signup
@@ -23139,11 +23588,8 @@ app.put('/api/games/:id/update-preferences', authenticateToken, async (req, res)
         );
         
         // FIX-179: BFFs/Rivals §7 save-time logic.
-        // Compute expected auto-fills (player's BFFs/Rivals confirmed in this game).
-        const _bffRows = await client.query('SELECT bff_player_id FROM player_bffs WHERE player_id = $1', [req.user.playerId]);
-        const _rivalRows = await client.query('SELECT rival_player_id FROM player_rivals WHERE player_id = $1', [req.user.playerId]);
-        const _myBffs = new Set(_bffRows.rows.map(r => r.bff_player_id));
-        const _myRivals = new Set(_rivalRows.rows.map(r => r.rival_player_id));
+        // FIX-633: _myBffs/_myRivals hoisted above (armed-filtered) — reused
+        // here so expected auto-fills only ever consider ARMED nominations.
 
         // Confirmed players in this game (used to filter expected auto-fills)
         const _confirmedRows = await client.query(
@@ -23305,6 +23751,7 @@ app.get('/api/games/:id/my-preferences', authenticateToken, async (req, res) => 
                                           AND r.game_id = $1
                                           AND r.status = 'confirmed'
                      WHERE pb.player_id = $2
+                       AND (pb.created_at IS NULL OR pb.created_at <= NOW() - INTERVAL '24 hours') /* FIX-633: armed only */
                        AND pb.bff_player_id NOT IN (
                            SELECT target_player_id FROM registration_preferences
                            WHERE registration_id = $3 AND source = 'auto_bff'
@@ -23323,6 +23770,7 @@ app.get('/api/games/:id/my-preferences', authenticateToken, async (req, res) => 
                                           AND r.game_id = $1
                                           AND r.status = 'confirmed'
                      WHERE pr.player_id = $2
+                       AND (pr.created_at IS NULL OR pr.created_at <= NOW() - INTERVAL '24 hours') /* FIX-633: armed only */
                        AND pr.rival_player_id NOT IN (
                            SELECT target_player_id FROM registration_preferences
                            WHERE registration_id = $3 AND source = 'auto_rival'
@@ -23361,7 +23809,7 @@ app.get('/api/games/:id/my-preferences', authenticateToken, async (req, res) => 
                 bffs:   expected_but_skipped_bffs,
                 rivals: expected_but_skipped_rivals,
             },
-            cap: { max: 6, used: pairs.length + avoids.length },
+            cap: { max: PREF_TYPE_TOTAL_MAX, manual_max: PREF_MANUAL_MAX, used: pairs.length + avoids.length }, /* FIX-633 */
         });
     } catch (error) {
         console.error('Get my preferences error:', error);
@@ -23595,6 +24043,25 @@ app.post('/api/admin/games/:gameId/generate-teams', authenticateToken, requireGa
                     error: 'Multi-team voting is currently open for this game. End voting first before generating Standard teams.'
                 });
             }
+        }
+
+        // FIX-633: arming catch-up sweep. A nomination that ARMED after the
+        // last registration event has no materialised auto row yet (§7 only
+        // fires on reg events, and the ADD endpoints no longer materialise
+        // fresh nominations). Re-run the idempotent §7 helper for every
+        // confirmed player so armed BFFs/Rivals land before the draft reads
+        // prefs. NOT-EXISTS guards inside make re-runs no-ops; own try/catch
+        // per player keeps it non-fatal.
+        try {
+            const _sweepRegs = await pool.query(
+                "SELECT id, player_id FROM registrations WHERE game_id = $1 AND status = 'confirmed'",
+                [gameId]
+            );
+            for (const _sr of _sweepRegs.rows) {
+                await applyBffRivalAutoFill(pool, _sr.player_id, gameId, _sr.id);
+            }
+        } catch (_sweepErr) {
+            console.warn('[generate-teams] FIX-633 arming sweep failed (non-fatal):', _sweepErr.message);
         }
 
         // Get all confirmed registrations with player stats
@@ -28067,10 +28534,26 @@ app.put('/api/admin/games/:gameId/player-stats', authenticateToken, requireGameM
 // Resolves the soonest next game in the same series and builds a message with a
 // view link (this game) + a one-tap reserve link (next game, &rsvp=1). If no
 // next game exists yet, the reserve line is omitted (view link only).
+// FIX-636: teams-ready template fetch for the team-gen wizard (client substitutes).
+app.get('/api/admin/games/:gameId/msg-templates', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT t.teams_ready_template
+               FROM games g LEFT JOIN tenants t ON t.id = g.tenant_id
+              WHERE g.id = $1`,
+            [req.params.gameId]);
+        if (r.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        res.json({ teams_ready_template: r.rows[0].teams_ready_template || '' });
+    } catch (e) {
+        console.error('GET game msg-templates error:', e);
+        res.status(500).json({ error: 'Failed to load template' });
+    }
+});
+
 app.get('/api/admin/games/:gameId/complete-message', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const gRes = await pool.query(
-            `SELECT g.game_url, g.game_date, g.series_id, v.name AS venue_name
+            `SELECT g.game_url, g.game_date, g.series_id, g.tenant_id, v.name AS venue_name
                FROM games g LEFT JOIN venues v ON v.id = g.venue_id
               WHERE g.id = $1 LIMIT 1`,
             [req.params.gameId]);
@@ -28090,6 +28573,27 @@ app.get('/api/admin/games/:gameId/complete-message', authenticateToken, requireG
             message += `\n\nReserve your spot for next week in one tap — RSVP here: ${reserveLink}`;
         }
         message += `\n\n— TotalFooty`;
+
+        // FIX-636: tenant completion template override. Stock message above is
+        // the fallback; {RESERVE_LINK} falls back to the results link when no
+        // next game exists so a template line never goes blank.
+        try {
+            if (g.tenant_id) {
+                const tRes = await pool.query('SELECT completion_template FROM tenants WHERE id = $1', [g.tenant_id]);
+                const tpl = tRes.rows.length ? (tRes.rows[0].completion_template || '').trim() : '';
+                if (tpl) {
+                    message = _applyMsgTemplate(tpl, {
+                        VENUE: g.venue_name || 'our venue',
+                        WHEN: when || '',
+                        LABEL: label,
+                        RESULTS_LINK: viewLink,
+                        RESERVE_LINK: nextUrl
+                            ? `https://totalfooty.co.uk/game.html?url=${encodeURIComponent(nextUrl)}&rsvp=1`
+                            : viewLink,
+                    });
+                }
+            }
+        } catch (e) { console.warn('FIX-636 completion template failed (stock used):', e.message); }
 
         res.json({ message, has_next: !!nextUrl, next_game_url: nextUrl || null });
     } catch (e) {
@@ -32989,6 +33493,10 @@ async function closeAwards(gameId) {
 // WS2: AI PLAYER BIOS
 // ============================================================
 
+// FIX-634: 📣 HYPE — system prompt for the ✨ polish endpoint. Same honest-
+// numbers discipline as the bio writer (FIX-610): figures are authoritative.
+const HYPE_SYSTEM_PROMPT = `You write one-line teaser captions for a British grassroots five-a-side WhatsApp group. Voice: cheeky terrace banter between mates — warm, never cruel. British English. Each line under 140 characters with at most 2 emojis. Never invent or alter any number, name or fact you are given. On positive awards never mock the player's ability. Output EXACTLY 3 lines separated by newlines — no numbering, no quotes, no preamble.`;
+
 const BIO_SYSTEM_PROMPT = `You are the TotalFooty bio writer for a grassroots football community across Coventry and Nuneaton.
 Write a player bio that reads like a Football Manager scouting report crossed with WhatsApp group banter. Tone: factual, specific, readable, confident.
 Do not be sycophantic. Do not use filler phrases like 'a true asset to the team'.
@@ -33669,6 +34177,205 @@ app.delete('/api/games/:gameId/awards/vote', authenticateToken, async (req, res)
     } catch (error) {
         console.error('DELETE awards vote error:', error);
         res.status(500).json({ error: 'Failed to retract vote' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX-634: 📣 HYPE — mid-vote teaser cards for the group WhatsApp.
+// Admin-only. Cards show tallies + turnout, NEVER who voted or who they voted
+// for. Nothing here is stored — the panel is a snapshot generator.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/games/:gameId/hype-facts — live leaders + history facts.
+app.get('/api/admin/games/:gameId/hype-facts', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const { gameId } = req.params;
+        const g = await pool.query(
+            'SELECT id, tenant_id, awards_open, awards_close_at, game_date FROM games WHERE id = $1',
+            [gameId]
+        );
+        if (g.rows.length === 0) return res.status(404).json({ error: 'Game not found' });
+        const game = g.rows[0];
+        if (!game.awards_open) return res.status(400).json({ error: 'Award voting is not open for this game' });
+
+        // Live tallies — leader + field per award (voters never exposed).
+        const tallies = await pool.query(
+            `SELECT gav.award_type, gav.nominee_player_id, COUNT(*)::int AS votes,
+                    COALESCE(p.alias, p.full_name) AS alias
+             FROM game_award_votes gav
+             JOIN players p ON p.id = gav.nominee_player_id
+             WHERE gav.game_id = $1
+             GROUP BY gav.award_type, gav.nominee_player_id, p.alias, p.full_name
+             ORDER BY gav.award_type ASC, votes DESC, alias ASC`,
+            [gameId]
+        );
+
+        // Turnout. voted can exceed total (refs + admins may vote) — clamp for
+        // display so a teaser card never reads "7 of 6".
+        const votedQ = await pool.query(
+            'SELECT COUNT(DISTINCT voter_player_id)::int AS n FROM game_award_votes WHERE game_id = $1',
+            [gameId]
+        );
+        const totalQ = await pool.query(
+            `SELECT COUNT(*)::int AS n FROM registrations WHERE game_id = $1 AND status = 'confirmed'`,
+            [gameId]
+        );
+        const _voted = Math.min(votedQ.rows[0].n, totalQ.rows[0].n);
+        const _total = totalQ.rows[0].n;
+
+        // Custom award meta as decoration fallback (client prefers its own map).
+        const customMeta = {};
+        if (game.tenant_id) {
+            try {
+                const cm = await pool.query(
+                    'SELECT award_key, label, emoji, polarity FROM tenant_custom_awards WHERE tenant_id = $1',
+                    [game.tenant_id]
+                );
+                for (const c of cm.rows) customMeta[c.award_key] = c;
+            } catch (e) { /* decoration only — never fatal */ }
+        }
+
+        const byAward = {};
+        for (const r of tallies.rows) (byAward[r.award_type] = byAward[r.award_type] || []).push(r);
+
+        const cards = [];
+        for (const [key, rows] of Object.entries(byAward)) {
+            const leader = rows[0];
+            const runnerVotes = rows.length > 1 ? rows[1].votes : 0;
+            const tied = rows.filter(r => r.votes === leader.votes).length > 1;
+            const margin = leader.votes - runnerVotes;
+
+            // History facts — same-tenant history keeps streaks apples-to-apples.
+            const careerQ = await pool.query(
+                `SELECT COUNT(*)::int AS n
+                 FROM game_awards ga JOIN games gg ON gg.id = ga.game_id
+                 WHERE ga.recipient_player_id = $1 AND ga.award_type = $2
+                   AND NOT ga.removed_due_to_team_drop
+                   AND gg.tenant_id IS NOT DISTINCT FROM $3`,
+                [leader.nominee_player_id, key, game.tenant_id]
+            );
+            const career = careerQ.rows[0].n;
+
+            const recentQ = await pool.query(
+                `SELECT ga.recipient_player_id
+                 FROM game_awards ga JOIN games gg ON gg.id = ga.game_id
+                 WHERE ga.award_type = $1 AND NOT ga.removed_due_to_team_drop
+                   AND gg.tenant_id IS NOT DISTINCT FROM $2 AND gg.id <> $3
+                 ORDER BY gg.game_date DESC, gg.id DESC
+                 LIMIT 5`,
+                [key, game.tenant_id, gameId]
+            );
+            let streak = 0;
+            for (const r of recentQ.rows) {
+                if (String(r.recipient_player_id) === String(leader.nominee_player_id)) streak++;
+                else break;
+            }
+
+            const polarity = customMeta[key]
+                ? (customMeta[key].polarity === 'positive' ? 'positive' : 'banter')
+                : (POSITIVE_AWARDS.includes(key) ? 'positive' : 'banter');
+
+            // Fact lines by priority: tie > streak > first > count > margin.
+            const lines = [];
+            const aliasTxt = leader.alias;
+            if (tied) lines.push('Dead level at the top — one vote decides it 👀');
+            if (streak >= 2) lines.push(polarity === 'positive'
+                ? `Wins today and that's ${streak + 1} on the spin 🔥`
+                : `That would be ${streak + 1} on the spin. Someone stage an intervention 😭`);
+            if (career === 0) lines.push(polarity === 'positive'
+                ? `Would be ${aliasTxt}'s first ever — history in the making`
+                : `A first for ${aliasTxt}. Welcome to the hall of shame 🫡`);
+            if (career >= 2) lines.push(polarity === 'positive'
+                ? `Chasing win number ${career + 1} — proper collection now`
+                : `Going for number ${career + 1}. At this point it's a lifestyle`);
+            if (!tied && margin === 1) lines.push('One vote in it — this could flip 👀');
+            if (!tied && margin >= 2) lines.push(`${margin} clear of the field`);
+            if (lines.length === 0) lines.push('The votes are coming in — have your say');
+
+            cards.push({
+                award_key: key,
+                custom_label: customMeta[key] ? customMeta[key].label : null,
+                custom_emoji: customMeta[key] ? customMeta[key].emoji : null,
+                polarity,
+                leader: { player_id: leader.nominee_player_id, alias: leader.alias },
+                votes: leader.votes,
+                runner_up_votes: runnerVotes,
+                tied,
+                fact_line: lines[0],
+                alt_fact_lines: lines.slice(1),
+            });
+        }
+        cards.sort((a, b) => b.votes - a.votes);
+
+        res.json({
+            awards_open: true,
+            closes_at: game.awards_close_at,
+            turnout: { voted: _voted, total: _total },
+            cards,
+        });
+    } catch (error) {
+        console.error('GET hype-facts error:', error);
+        res.status(500).json({ error: 'Failed to build hype facts' });
+    }
+});
+
+// POST /api/admin/games/:gameId/hype-polish — ✨ Claude rewrite of a card's
+// flavour line. Mirrors generatePlayerBio's call shape exactly. No key or any
+// failure → { lines: [] } and the client hides the button. Nothing stored.
+app.post('/api/admin/games/:gameId/hype-polish', authenticateToken, requireGameManager, hypePolishLimiter, async (req, res) => {
+    try {
+        if (!ANTHROPIC_API_KEY) return res.json({ lines: [] });
+        const { award_label, leader_alias, votes, runner_up_votes, fact_line, polarity, turnout } = req.body || {};
+        if (!award_label || !leader_alias) return res.status(400).json({ error: 'Missing card facts' });
+
+        const userMessage = [
+            'Write 3 alternative one-liners for a mid-vote teaser card posted to the group WhatsApp.',
+            '',
+            'Facts (exact and authoritative — use ONLY these figures, never invent numbers):',
+            `- Award: ${String(award_label).slice(0, 60)}`,
+            `- Current leader: ${String(leader_alias).slice(0, 40)}`,
+            `- Their votes so far: ${parseInt(votes, 10) || 0}`,
+            `- Nearest rival's votes: ${parseInt(runner_up_votes, 10) || 0}`,
+            (turnout && turnout.total)
+                ? `- Turnout so far: ${parseInt(turnout.voted, 10) || 0} of ${parseInt(turnout.total, 10) || 0} players have voted`
+                : null,
+            `- Award type: ${polarity === 'banter' ? 'banter/joke award (cheeky roast fine, never cruel)' : 'positive award (hype them up)'}`,
+            fact_line ? `- Current line on the card: "${String(fact_line).slice(0, 140)}"` : null,
+            '',
+            'Goal of the post: get more people to open the app and vote before the window shuts.',
+        ].filter(l => l !== null).join('\n');
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+                model: 'claude-sonnet-4-6',
+                max_tokens: 220,
+                system: HYPE_SYSTEM_PROMPT,
+                messages: [{ role: 'user', content: userMessage }],
+            }),
+        });
+        if (!response.ok) {
+            let errBody = '';
+            try { errBody = JSON.stringify(await response.json()); } catch (_) {}
+            console.error(`❌ Anthropic hype-polish error: HTTP ${response.status} — ${errBody}`);
+            return res.json({ lines: [] });
+        }
+        const data = await response.json();
+        const raw = data.content?.[0]?.text || '';
+        const lines = raw.split('\n')
+            .map(s => s.replace(/^[\s\-\d\.\)"']+|["']+$/g, '').trim())
+            .filter(s => s.length > 3)
+            .slice(0, 3)
+            .map(s => s.slice(0, 160));
+        res.json({ lines });
+    } catch (e) {
+        console.error('❌ hype-polish error:', e.message);
+        res.json({ lines: [] });
     }
 });
 
@@ -44653,8 +45360,225 @@ app.get('/api/reports/access', authenticateToken, requireReportAccess, async (re
     }
 });
 
-app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/reports/players', authenticateToken, requireReportAccess, async (req, res) => {   // FIX-644
     try {
+        const sc = req.reportScope;
+        if (sc && sc.mode !== 'all') {
+            // FIX-644: tenant-scoped players report. Rows = active members; the
+            // game-derived stats (appearances/wins/draws/motm/awards/guests) are
+            // recomputed over the tenant's games via app_stats + scoped CTEs.
+            // Ratings are platform-global by design. Discipline / referrals /
+            // revenue-spent / badges stay lifetime in v1 (documented).
+            const tc = (col) => sc.includeUntagged ? `(${col} = ANY($1) OR ${col} IS NULL)` : `${col} = ANY($1)`;
+            const result = await pool.query(`
+            WITH win_stats AS (
+                SELECT r.player_id,
+                       COUNT(DISTINCT r.game_id) FILTER (WHERE g.team_selection_type = 'tournament') AS tournament_wins
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id AND ${tc('g.tenant_id')}
+                JOIN team_players tp ON tp.player_id = r.player_id
+                JOIN teams t ON t.id = tp.team_id AND t.game_id = g.id
+                WHERE r.status = 'confirmed' AND g.game_status = 'completed'
+                  AND LOWER(g.winning_team) = LOWER(t.team_name)
+                  AND g.team_selection_type != 'vs_external'
+                GROUP BY r.player_id
+            ),
+            ext_wins AS (
+                SELECT r.player_id, COUNT(DISTINCT r.game_id) AS external_wins
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id AND ${tc('g.tenant_id')}
+                WHERE r.status = 'confirmed' AND g.game_status = 'completed'
+                  AND g.team_selection_type = 'vs_external'
+                  AND LOWER(g.winning_team) = 'red'
+                GROUP BY r.player_id
+            ),
+            award_counts AS (
+                SELECT ga.recipient_player_id AS player_id,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'motm')             AS aw_motm,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'best_engine')      AS aw_best_engine,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'brick_wall')       AS aw_brick_wall,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'goalscorer')       AS aw_goalscorer,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'cold_moment')      AS aw_cold_moment,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'reckless_tackler') AS aw_reckless_tackler,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'the_moaner')       AS aw_the_moaner,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'donkey')           AS aw_donkey,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'walker')           AS aw_walker,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'pig')              AS aw_pig,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'controlled')       AS aw_controlled,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'tf_ledge')         AS aw_tf_ledge,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'assist_king')      AS aw_assist_king,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'howler')           AS aw_howler,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'lucky_bastard')    AS aw_lucky_bastard,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'invisible_man')    AS aw_invisible_man,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'lost')             AS aw_lost,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'turtle')           AS aw_turtle,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'secret_agent')     AS aw_secret_agent,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'butterfingers')    AS aw_butterfingers,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'nutmeg_king')       AS aw_nutmeg_king,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'great_goalkeeping') AS aw_great_goalkeeping,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'carried')           AS aw_carried,
+                    COUNT(*) FILTER (WHERE ga.award_type = 'twinkletoes')       AS aw_twinkletoes,
+                    COUNT(*) AS aw_total,
+                    COUNT(*) FILTER (WHERE ga.award_type IN ('motm','best_engine','brick_wall','goalscorer','cold_moment',
+                                                          'controlled','tf_ledge','assist_king',
+                                                          'nutmeg_king','great_goalkeeping','carried','twinkletoes')) AS aw_positive,
+                    COUNT(*) FILTER (WHERE ga.award_type IN ('reckless_tackler','the_moaner','donkey','walker','pig',
+                                                          'howler','lucky_bastard','invisible_man','lost',
+                                                          'turtle','secret_agent','butterfingers')) AS aw_banter,
+                    COUNT(*) FILTER (WHERE ga.star_class = 'A') AS star_a,
+                    COUNT(*) FILTER (WHERE ga.star_class = 'B') AS star_b,
+                    COUNT(*) FILTER (WHERE ga.star_class = 'C') AS star_c,
+                    COUNT(*) FILTER (WHERE ga.star_class = 'D') AS star_d,
+                    COUNT(*) FILTER (WHERE ga.star_class = 'E') AS star_e
+                FROM game_awards ga
+                JOIN games ag ON ag.id = ga.game_id AND ${tc('ag.tenant_id')}
+                WHERE ga.recipient_player_id IS NOT NULL
+                GROUP BY ga.recipient_player_id
+            ),
+            disc_stats AS (
+                SELECT dr.player_id,
+                    COUNT(*) FILTER (WHERE dr.offense_type = 'Late Drop Out') AS dropouts,
+                    COALESCE(SUM(dr.points), 0) AS disc_points
+                FROM discipline_records dr
+                WHERE ${tc('dr.tenant_id')}
+                GROUP BY dr.player_id
+            ),
+            ref_count AS (
+                SELECT referred_by AS player_id, COUNT(DISTINCT id) AS referrals_count
+                FROM players WHERE referred_by IS NOT NULL
+                GROUP BY referred_by
+            ),
+            ref_revenue AS (
+                SELECT ref.referred_by AS player_id,
+                    COALESCE(SUM(ABS(ct.amount)), 0) AS referral_revenue
+                FROM players ref
+                JOIN credit_transactions ct ON ct.player_id = ref.id
+                WHERE ref.referred_by IS NOT NULL AND ct.type = 'game_fee'
+                GROUP BY ref.referred_by
+            ),
+            revenue_stats AS (
+                SELECT player_id, SUM(ABS(amount)) AS revenue_spent
+                FROM credit_transactions
+                WHERE type = 'game_fee'
+                GROUP BY player_id
+            ),
+            app_stats AS (
+                SELECT r.player_id,
+                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_status = 'completed') AS appearances,
+                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_status = 'completed' AND g.winning_team IS NULL) AS draws,
+                    COUNT(DISTINCT r.game_id) FILTER (WHERE g.game_status = 'completed' AND (
+                        (g.team_selection_type = 'vs_external' AND LOWER(g.winning_team) = 'red')
+                        OR (g.team_selection_type <> 'vs_external' AND t.team_name IS NOT NULL
+                            AND g.winning_team IS NOT NULL AND LOWER(t.team_name) = LOWER(g.winning_team))
+                    )) AS wins
+                FROM registrations r
+                JOIN games g ON g.id = r.game_id AND ${tc('g.tenant_id')}
+                LEFT JOIN LATERAL (
+                    SELECT t2.team_name FROM team_players tp2
+                    JOIN teams t2 ON t2.id = tp2.team_id
+                    WHERE tp2.player_id = r.player_id AND t2.game_id = g.id
+                    LIMIT 1
+                ) t ON true
+                WHERE r.status = 'confirmed'
+                GROUP BY r.player_id
+            ),
+            guest_stats AS (
+                SELECT gg.invited_by AS player_id, COUNT(*) AS guests_added
+                FROM game_guests gg
+                JOIN games gjg ON gjg.id = gg.game_id AND ${tc('gjg.tenant_id')}
+                WHERE gg.invited_by IS NOT NULL
+                GROUP BY gg.invited_by
+            ),
+            badge_stats AS (
+                SELECT pb.player_id,
+                    COUNT(*) AS badge_count,
+                    json_agg(json_build_object('id', b.id, 'name', b.name, 'color', b.color, 'icon', b.icon) ORDER BY b.name) AS badges,
+                    string_agg(b.name, ', ' ORDER BY b.name) AS badge_names_csv
+                FROM player_badges pb
+                JOIN badges b ON b.id = pb.badge_id
+                GROUP BY pb.player_id
+            )
+            SELECT
+                p.id, p.squad_number, p.alias, p.full_name,
+                COALESCE(p.alias, p.full_name) AS name,
+                p.reliability_tier AS tier,
+                COALESCE(aps.appearances, 0) AS appearances,
+                COALESCE(ac.aw_motm, 0) AS motm_wins,
+                COALESCE(aps.wins, 0) AS total_wins,
+                COALESCE(aps.draws, 0) AS total_draws,
+                COALESCE(ws.tournament_wins, 0) AS tournament_wins,
+                COALESCE(ew.external_wins,   0) AS external_wins,
+                p.overall_rating,
+                p.defending_rating, p.strength_rating, p.fitness_rating, p.pace_rating,
+                p.decisions_rating, p.assisting_rating, p.shooting_rating, p.goalkeeper_rating,
+                COALESCE(bs.badge_count, 0) AS badge_count,
+                COALESCE(bs.badges, '[]'::json) AS badges,
+                COALESCE(bs.badge_names_csv, '') AS badge_names_csv,
+                COALESCE(ac.aw_total,    0) AS awards_total,
+                COALESCE(ac.aw_positive, 0) AS awards_positive,
+                COALESCE(ac.aw_banter,   0) AS awards_banter,
+                COALESCE(ac.aw_motm,             0) AS award_motm,
+                COALESCE(ac.aw_best_engine,      0) AS award_best_engine,
+                COALESCE(ac.aw_brick_wall,       0) AS award_brick_wall,
+                COALESCE(ac.aw_goalscorer,       0) AS award_goalscorer,
+                COALESCE(ac.aw_cold_moment,      0) AS award_cold_moment,
+                COALESCE(ac.aw_reckless_tackler, 0) AS award_reckless_tackler,
+                COALESCE(ac.aw_the_moaner,       0) AS award_the_moaner,
+                COALESCE(ac.aw_donkey,           0) AS award_donkey,
+                COALESCE(ac.aw_walker,           0) AS award_walker,
+                COALESCE(ac.aw_pig,              0) AS award_pig,
+                COALESCE(ac.aw_controlled,       0) AS award_controlled,
+                COALESCE(ac.aw_tf_ledge,         0) AS award_tf_ledge,
+                COALESCE(ac.aw_assist_king,      0) AS award_assist_king,
+                COALESCE(ac.aw_howler,           0) AS award_howler,
+                COALESCE(ac.aw_lucky_bastard,    0) AS award_lucky_bastard,
+                COALESCE(ac.aw_invisible_man,    0) AS award_invisible_man,
+                COALESCE(ac.aw_lost,             0) AS award_lost,
+                COALESCE(ac.aw_turtle,           0) AS award_turtle,
+                COALESCE(ac.aw_secret_agent,     0) AS award_secret_agent,
+                COALESCE(ac.aw_butterfingers,    0) AS award_butterfingers,
+                COALESCE(ac.aw_nutmeg_king,       0) AS award_nutmeg_king,
+                COALESCE(ac.aw_great_goalkeeping, 0) AS award_great_goalkeeping,
+                COALESCE(ac.aw_carried,           0) AS award_carried,
+                COALESCE(ac.aw_twinkletoes,       0) AS award_twinkletoes,
+                COALESCE(ac.star_a, 0) AS star_class_a,
+                COALESCE(ac.star_b, 0) AS star_class_b,
+                COALESCE(ac.star_c, 0) AS star_class_c,
+                COALESCE(ac.star_d, 0) AS star_class_d,
+                COALESCE(ac.star_e, 0) AS star_class_e,
+                COALESCE(ds.dropouts,    0) AS dropouts,
+                COALESCE(ds.disc_points, 0) AS disc_points,
+                COALESCE(gs.guests_added,   0) AS guests_added,
+                COALESCE(rc.referrals_count,0) AS referrals_count,
+                COALESCE(rr.referral_revenue, 0) AS referral_revenue,
+                COALESCE(rvs.revenue_spent, 0) AS revenue_spent,
+                COALESCE(c.balance, 0) AS credit_balance,
+                CASE WHEN COALESCE(aps.appearances, 0) > 0
+                     THEN ROUND(COALESCE(aps.wins, 0)::numeric / aps.appearances * 100, 1)
+                     ELSE 0 END AS win_percent,
+                CASE WHEN COALESCE(aps.appearances, 0) > 0
+                     THEN ROUND(COALESCE(ac.aw_motm, 0)::numeric / aps.appearances * 100, 1)
+                     ELSE 0 END AS motm_percent,
+                u.email
+            FROM players p
+            LEFT JOIN credits c       ON c.player_id   = p.id
+            LEFT JOIN users u         ON u.id          = p.user_id
+            LEFT JOIN win_stats ws    ON ws.player_id  = p.id
+            LEFT JOIN ext_wins ew     ON ew.player_id  = p.id
+            LEFT JOIN award_counts ac ON ac.player_id  = p.id
+            LEFT JOIN app_stats aps   ON aps.player_id = p.id
+            LEFT JOIN disc_stats ds   ON ds.player_id  = p.id
+            LEFT JOIN guest_stats gs  ON gs.player_id  = p.id
+            LEFT JOIN ref_count rc    ON rc.player_id  = p.id
+            LEFT JOIN ref_revenue rr  ON rr.player_id  = p.id
+            LEFT JOIN revenue_stats rvs ON rvs.player_id = p.id
+            LEFT JOIN badge_stats bs  ON bs.player_id  = p.id
+            WHERE EXISTS (SELECT 1 FROM player_tenants pt
+                           WHERE pt.player_id = p.id AND pt.tenant_id = ANY($1) AND pt.status = 'active')
+            ORDER BY p.squad_number ASC NULLS LAST
+            `, [sc.ids]);
+            return res.json(result.rows);
+        }
         const result = await pool.query(`
             WITH win_stats AS (
                 SELECT r.player_id,
@@ -44859,17 +45783,33 @@ app.get('/api/reports/players', authenticateToken, requireAdmin, async (req, res
 });
 
 
-app.get('/api/reports/players/list', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/reports/players/list', authenticateToken, requireReportAccess, async (req, res) => {   // FIX-644
     try {
+        const sc = req.reportScope;
+        if (sc && sc.mode !== 'all') {
+            const result = await pool.query(
+                `SELECT p.id, COALESCE(p.alias, p.full_name) as name, p.squad_number FROM players p
+                  WHERE EXISTS (SELECT 1 FROM player_tenants pt
+                                 WHERE pt.player_id = p.id AND pt.tenant_id = ANY($1) AND pt.status = 'active')
+                  ORDER BY p.squad_number ASC NULLS LAST`, [sc.ids]);
+            return res.json(result.rows);
+        }
         const result = await pool.query(`SELECT id, COALESCE(alias, full_name) as name, squad_number FROM players ORDER BY squad_number ASC NULLS LAST`);
         res.json(result.rows);
     } catch (error) { res.status(500).json({ error: 'Failed to load players list' }); }
 });
 
 
-app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/reports/player/:id/games', authenticateToken, requireReportAccess, async (req, res) => {   // FIX-644
     try {
         const { id } = req.params;
+        // FIX-644: a scoped caller may only open players who are members of their tenant(s).
+        if (req.reportScope && req.reportScope.mode !== 'all') {
+            const mem = await pool.query(
+                `SELECT 1 FROM player_tenants WHERE player_id = $1 AND tenant_id = ANY($2) AND status = 'active'`,
+                [id, req.reportScope.ids]);
+            if (!mem.rows.length) return res.status(403).json({ error: 'Player is not a member of your club' });
+        }
 
         // Player summary
         const pRes = await pool.query(`
@@ -44958,9 +45898,9 @@ app.get('/api/reports/player/:id/games', authenticateToken, requireAdmin, async 
                 WHERE tp2.player_id = r.player_id AND t2.game_id = g.id
                 LIMIT 1
             ) t ON true
-            WHERE r.player_id = $1 AND r.status = 'confirmed'
+            WHERE r.player_id = $1 AND r.status = 'confirmed'${_reportScopeSql(req.reportScope, 'g', 2).clause}
             ORDER BY g.game_date DESC
-        `, [id]);
+        `, [id, ..._reportScopeSql(req.reportScope, 'g', 2).params]);
 
         res.json({ player: pRes.rows[0], games: gRes.rows });
     } catch (error) {
@@ -61527,40 +62467,13 @@ app.post('/api/players/me/pair-suggestions/:id/accept', authenticateToken, async
         );
 
         // FIX-281 audit-fix: materialise auto rows in upcoming eligible games.
-        // Mirrors the logic in POST /api/player/relationships — without this
-        // step, accepting a suggestion would leave the BFF/Rival inert until
-        // the player manually edited their next game registration's prefs.
+        // Mirrors the logic in POST /api/player/relationships.
+        // FIX-633: Direction A (this player's brand-new nomination → own regs)
+        // removed — a fresh nomination is unarmed for 24h, whether it came
+        // from the profile card or an accepted suggestion. §7 + the
+        // generate-teams catch-up sweep materialise it once armed.
         const autoSource   = type === 'bff' ? 'auto_bff' : 'auto_rival';
         const autoPrefType = type === 'bff' ? 'pair'     : 'avoid';
-
-        // Direction A: this player's upcoming registrations → target as pref.
-        await client.query(
-            `INSERT INTO registration_preferences (registration_id, target_player_id, preference_type, source)
-             SELECT r1.id, $1, $2, $3
-             FROM registrations r1
-             JOIN games g ON g.id = r1.game_id
-             JOIN registrations r2 ON r2.game_id = g.id
-                                   AND r2.player_id = $1
-                                   AND r2.status = 'confirmed'
-             WHERE r1.player_id = $4
-               AND r1.status = 'confirmed'
-               AND g.game_date > NOW()
-               AND g.team_selection_type NOT IN ('draft_memory', 'vs_external')
-               AND g.is_venue_clash IS NOT TRUE
-               AND g.venue_clash_team1_name IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM registration_preferences rp
-                   WHERE rp.registration_id = r1.id AND rp.target_player_id = $1
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM registration_preference_overrides rpo
-                   WHERE rpo.registration_id = r1.id AND rpo.target_player_id = $1
-               )
-               AND (
-                   SELECT COUNT(*) FROM registration_preferences WHERE registration_id = r1.id
-               ) < 6`,
-            [targetId, autoPrefType, autoSource, playerId]
-        );
 
         // Direction B: target's upcoming registrations → this player as pref.
         // Only fires if MUTUAL (target also has me on their list of same type).
@@ -61575,6 +62488,7 @@ app.post('/api/players/me/pair-suggestions/:id/accept', authenticateToken, async
                                    AND r2.status = 'confirmed'
              WHERE pr.player_id = $4
                AND pr.${targetCol} = $1
+               AND (pr.created_at IS NULL OR pr.created_at <= NOW() - INTERVAL '24 hours') /* FIX-633: armed only */
                AND g.game_date > NOW()
                AND g.team_selection_type NOT IN ('draft_memory', 'vs_external')
                AND g.is_venue_clash IS NOT TRUE
@@ -61588,8 +62502,9 @@ app.post('/api/players/me/pair-suggestions/:id/accept', authenticateToken, async
                    WHERE rpo.registration_id = r1.id AND rpo.target_player_id = $1
                )
                AND (
-                   SELECT COUNT(*) FROM registration_preferences WHERE registration_id = r1.id
-               ) < 6`,
+                   SELECT COUNT(*) FROM registration_preferences
+                   WHERE registration_id = r1.id AND preference_type = $2
+               ) < ${PREF_TYPE_TOTAL_MAX}`, /* FIX-633: per-type cap */
             [playerId, autoPrefType, autoSource, targetId]
         );
 
@@ -61615,7 +62530,8 @@ app.post('/api/players/me/pair-suggestions/:id/accept', authenticateToken, async
             `suggestion_id=${suggestionId} type=${type}`
         ).catch(() => {}));
 
-        res.json({ ok: true, type, target_player_id: targetId, swapped: isSwap });
+        res.json({ ok: true, type, target_player_id: targetId, swapped: isSwap,
+                   arms_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString() /* FIX-633 */ });
     } catch (e) {
         try { await client.query('ROLLBACK'); } catch (_) {}
         console.error('POST /api/players/me/pair-suggestions/:id/accept error:', e);
@@ -72213,6 +73129,13 @@ async function fix401BootstrapLeagues() {
             await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS team2_color TEXT`);
             console.log('✅ tenant team colours ready (FIX-615)');
         } catch (e) { console.error('FIX-615 tenant team colours migration failed:', e.message); }
+        // FIX-636: per-tenant wizard message templates. NULL = stock message,
+        // so existing tenants change nothing. Own try/catch per house rule.
+        try {
+            await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS teams_ready_template TEXT`);
+            await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS completion_template TEXT`);
+            console.log('✅ tenant message-template columns ready (FIX-636)');
+        } catch (e) { console.error('FIX-636 message-template migration failed:', e.message); }
         // FIX-621: FM-style league browser — every opponent in an external
         // league, with their standings row + squad/stats + fixtures/results
         // stored as jsonb blobs (read-only display data; no relational needs).
@@ -72773,7 +73696,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web210-friendecho`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web223-faleaguealt`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
