@@ -34376,6 +34376,26 @@ app.delete('/api/games/:gameId/awards/vote', authenticateToken, async (req, res)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // GET /api/admin/games/:gameId/hype-facts — live leaders + history facts.
+// FIX-667: ill-formed Unicode (lone surrogates — broken emoji in a player alias
+// or a custom award label) survives JSON.stringify as invalid UTF-8 bytes, and
+// the browser's strict json() rejects the whole 200 body. hype-facts is the one
+// endpoint that interpolates aliases + custom emoji into prose, which is why it
+// alone died (TF's screen recording: body starts as valid JSON, breaks mid-line).
+// Deep-sanitise every string to well-formed Unicode before serialising.
+function _toWellFormedDeep(v) {
+    if (typeof v === 'string') {
+        if (typeof v.toWellFormed === 'function') return v.toWellFormed();   // Node 20+
+        return v.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '\uFFFD')
+                .replace(/(^|[^\uD800-\uDBFF])([\uDC00-\uDFFF])/g, '$1\uFFFD');
+    }
+    if (Array.isArray(v)) return v.map(_toWellFormedDeep);
+    if (v && typeof v === 'object') {
+        const o = {};
+        for (const k of Object.keys(v)) o[k] = _toWellFormedDeep(v[k]);
+        return o;
+    }
+    return v;
+}
 app.get('/api/admin/games/:gameId/hype-facts', authenticateToken, requireGameManager, async (req, res) => {
     try {
         const { gameId } = req.params;
@@ -34540,12 +34560,12 @@ app.get('/api/admin/games/:gameId/hype-facts', authenticateToken, requireGameMan
         }
         cards.sort((a, b) => b.votes - a.votes);
 
-        res.json({
+        res.json(_toWellFormedDeep({
             awards_open: true,
             closes_at: game.awards_close_at,
             turnout: { voted: _voted, total: _total },
             cards,
-        });
+        }));   /* FIX-667: never ship ill-formed bytes */
     } catch (error) {
         console.error('GET hype-facts error:', error);
         res.status(500).json({ error: 'Failed to build hype facts' });
@@ -73977,7 +73997,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web232-hypecards`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web233-hypewf`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
