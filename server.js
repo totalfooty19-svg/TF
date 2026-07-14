@@ -51,6 +51,7 @@ function _securityAlertEmail(subject, bodyHtml) {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const TF_BUILD = 'web238-setupwiz';   // FIX-669: single source — boot log AND /api/public/version (module scope: the route handler reads it at request time)
 
 // FIX-054: Required for correct client IP on Render (behind load balancer)
 app.set('trust proxy', 1);
@@ -3315,7 +3316,7 @@ function _alertUnresolvedPaidWebhook(wpId, detailHtml) {
 // matched payment row so the email names exactly who to credit.
 async function _wfIdentityHtml(pmt) {
     if (!pmt) return '<p><strong>Player:</strong> unknown — no DB row matched this webhook.</p>';
-    let pl = null;
+    let pl = null, _plErr = null;
     try {
         if (pmt.player_id) {
             const r = await pool.query(
@@ -3323,14 +3324,15 @@ async function _wfIdentityHtml(pmt) {
                 [pmt.player_id]);
             pl = r.rows[0] || null;
         }
-    } catch (e) { /* identity is best-effort; never break the alert */ }
+    } catch (e) { _plErr = e.message; /* identity is best-effort; never break the alert */ }
     const ref   = pmt.merchant_reference || '(no ref)';
     const amount = pmt.amount_pence != null ? '£' + (pmt.amount_pence / 100).toFixed(2) : '(unknown amount)';
     const when  = pmt.created_at ? new Date(pmt.created_at).toISOString() : '(unknown time)';
     if (!pl) {
         return '<p><strong>Payment:</strong> ref ' + ref + ' · ' + amount + ' · created ' + when +
                '<br><strong>Player:</strong> row has player_id ' + (pmt.player_id || '(none)') +
-               ' but no matching players record.</p>';
+               (_plErr ? ' — player lookup FAILED (' + _plErr + '); the row may well exist, check manually.</p>'
+                        : ' but no matching players record.</p>');   /* FIX-672: an error is not a missing row */
     }
     return '<p><strong>Player to credit:</strong><br>' +
         '• Name: ' + (pl.full_name || pl.first_name || '(no name)') + '<br>' +
@@ -8194,6 +8196,12 @@ app.get('/api/players/me', authenticateToken, async (req, res) => {
 app.get('/api/games/:gameId/my-spendable', authenticateToken, async (req, res) => {
     try {
         const { gameId } = req.params;
+        /* FIX-672: live 500s with gameId '298' — a non-uuid from some caller.
+           Guard cleanly, and log WHO so the client can be hunted. */
+        if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(gameId)) {
+            console.warn('[my-spendable] non-uuid gameId', JSON.stringify(gameId), 'from player', (req.user && req.user.playerId) || '(unknown)');
+            return res.status(400).json({ error: 'Invalid game id' });
+        }
         const r = await pool.query(
             `SELECT COALESCE(c.balance,0) AS cash,
                     COALESCE(c.free_credit_balance,0) AS free_original,
@@ -14192,6 +14200,12 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-league-sync',
         if (!rows.length) return res.status(422).json({ error: 'Could not read the league table' });
 
         let synced = 0; const failures = [];
+        /* FIX-674: mode=fixtures = the weekly refresh — table stats + fixtures
+           updated, squad_json PRESERVED on existing rows, ghost fold skipped.
+           Full mode (SYNC LEAGUE) = everything, now INCLUDING the tenant's own
+           squad as ghost players (TF: 'sync league should be everything'). */
+        const _syncMode = (req.body && req.body.mode === 'fixtures') ? 'fixtures' : 'full';
+        let _ownSquad = null;
         for (const row of rows) {
             if (!row.team_id) { failures.push(row.team + ' (no team link)'); continue; }   // FIX-648: parser key is .team (was .name — printed 'undefined')
             try {
@@ -14199,6 +14213,7 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-league-sync',
                 let squad = []; let fixtures = [];
                 try { squad = _faParseSquad(teamHtml); } catch (_) { /* squad optional per team */ }
                 try { fixtures = _faParseFixtures(teamHtml).rows || []; } catch (_) { /* fixtures optional per team */ }   // FIX-648: parser returns {team_name, rows} — storing the object made every frontend fx.filter throw
+                if (String(row.team_id) === String(parsed.teamID || '') && Array.isArray(squad) && squad.length) _ownSquad = squad;   /* FIX-674 */
                 await pool.query(`
                     INSERT INTO ext_league_opponents (league_id, tenant_id, fa_team_id, name, is_us,
                         position, played, won, drawn, lost, gf, ga, gd, pts, squad_json, fixtures_json, synced_at)
@@ -14207,7 +14222,8 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-league-sync',
                         name = EXCLUDED.name, is_us = EXCLUDED.is_us, position = EXCLUDED.position,
                         played = EXCLUDED.played, won = EXCLUDED.won, drawn = EXCLUDED.drawn, lost = EXCLUDED.lost,
                         gf = EXCLUDED.gf, ga = EXCLUDED.ga, gd = EXCLUDED.gd, pts = EXCLUDED.pts,
-                        squad_json = EXCLUDED.squad_json, fixtures_json = EXCLUDED.fixtures_json, synced_at = NOW()`,
+                        squad_json = ${_syncMode === 'fixtures' ? 'ext_league_opponents.squad_json /* FIX-674: light mode preserves squads */' : 'EXCLUDED.squad_json'},
+                        fixtures_json = EXCLUDED.fixtures_json, synced_at = NOW()`,
                     [xl.rows[0].id, req.tenant.id, String(row.team_id), String(row.team || 'Unknown').slice(0, 80),   // FIX-648: parser key is .team
                      String(row.team_id) === String(parsed.teamID || ''),
                      row.pos ?? null, row.p ?? null, row.w ?? null, row.d ?? null, row.l ?? null,   // FIX-648: parser keys (was .position/.played/… — all undefined, so every team saved as Unknown with NULL stats; only .gd/.pts matched by luck)
@@ -14219,9 +14235,37 @@ app.post('/api/t/:tenant_short_id/admin/ext-leagues/:id/fa-league-sync',
             }
             await new Promise(r2 => setTimeout(r2, 400)); // be gentle with the FA
         }
+        /* FIX-674(i): full sync also populates the tenant's own squad as ghost
+           players — mirrors fa-squad-apply's validated upsert (same pid regex,
+           name cap, ON CONFLICT target). Respects GHOSTS_MAX_PER_TENANT; existing
+           ghosts refresh freely, only NEW rows consume cap room. */
+        let _ghostsUpserted = 0;
+        if (_syncMode === 'full' && _ownSquad) {
+            try {
+                const _gc = await pool.query('SELECT COUNT(*)::int AS c FROM tenant_ghost_players WHERE tenant_id = $1', [req.tenant.id]);
+                let _room = Math.max(0, GHOSTS_MAX_PER_TENANT - _gc.rows[0].c);
+                for (const p of _ownSquad) {
+                    const pid = String(p.person_id || '').trim();
+                    const name = String(p.name || '').trim().slice(0, 60);
+                    if (!/^\d{4,15}$/.test(pid) || !name) continue;
+                    const _ex = await pool.query('SELECT 1 FROM tenant_ghost_players WHERE tenant_id = $1 AND fa_person_id = $2', [req.tenant.id, pid]);
+                    if (!_ex.rows.length && _room <= 0) continue;
+                    if (!_ex.rows.length) _room--;
+                    await pool.query(
+                        `INSERT INTO tenant_ghost_players (tenant_id, league_id, fa_person_id, name, apps, goals, assists)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)
+                         ON CONFLICT (tenant_id, fa_person_id)
+                         DO UPDATE SET name = EXCLUDED.name, apps = EXCLUDED.apps,
+                                       goals = EXCLUDED.goals, assists = EXCLUDED.assists`,
+                        [req.tenant.id, req.params.id, pid, name,
+                         parseInt(p.apps, 10) || 0, parseInt(p.goals, 10) || 0, parseInt(p.assists, 10) || 0]);
+                    _ghostsUpserted++;
+                }
+            } catch (ge) { console.warn('[FIX-674] own-squad ghost fold-in failed (sync unaffected):', ge.message); }
+        }
         await auditLog(pool, req.user.playerId, 'ext_league_fm_synced', null,
-            synced + '/' + rows.length + ' teams synced for ' + xl.rows[0].name, req.tenant.id).catch(() => {});
-        res.json({ success: true, teams: rows.length, synced, failures });
+            synced + '/' + rows.length + ' teams synced for ' + xl.rows[0].name + (_ghostsUpserted ? ' \u00b7 ' + _ghostsUpserted + ' own-squad ghosts' : ''), req.tenant.id).catch(() => {});
+        res.json({ success: true, teams: rows.length, synced, failures, mode: _syncMode, ghosts_upserted: _ghostsUpserted });   /* FIX-674 */
     } catch (e) {
         console.error('fa-league-sync error:', e.message);
         try { _faAlertSuperadmin(faCtx, 'fa-league-sync', e.message); } catch (_) {}
@@ -14408,6 +14452,118 @@ app.delete('/api/t/:tenant_short_id/admin/ghost-players/:id/invite', authenticat
             `claim code revoked for ghost "${r.rows[0].name}"`, req.tenant.id).catch(() => {});
         res.json({ success: true });
     } catch (e) { console.error('ghost invite revoke error:', e.message); res.status(500).json({ error: 'Failed to revoke' }); }
+});
+// FIX-669: fetchable build tag — deploy verification stops being archaeology.
+// The HYPE saga burned days on "is the new code actually live": crm had a console
+// tag, game gained one (g663), the server had only a LOG line nobody could see.
+// Open this in a browser tab; it must match the expected build, or the deploy
+// didn't happen. No auth, no secrets, trivially cacheable-safe.
+// FIX-671: per-game-type message templates. READ = any game manager (the
+// builders run for organisers/tenant admins too); WRITE = superadmin only —
+// this is the Original's global voice. Tokens are substituted client-side
+// (team_gen) or server-side (completion): {VENUE} {WHEN} {KICKOFF} {LINK}
+// {SCORE} {MOTM}. Precedence in the builders: per-type row → type NULL row →
+// FIX-636 tenant template (team_gen only) → stock copy.
+app.get('/api/admin/message-templates', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const r = await pool.query('SELECT kind, game_type, body FROM message_templates ORDER BY kind, game_type NULLS FIRST');
+        res.json({ templates: r.rows });
+    } catch (e) { console.error('msg-tpl list error:', e.message); res.status(500).json({ error: 'Failed to load templates' }); }
+});
+app.put('/api/admin/message-templates', authenticateToken, requireSuperAdmin, async (req, res) => {
+    try {
+        const kind = String(req.body.kind || '');
+        const gameType = req.body.game_type ? String(req.body.game_type) : null;
+        const body = String(req.body.body || '').slice(0, 4000);
+        if (!['team_gen', 'completion'].includes(kind)) return res.status(400).json({ error: 'Unknown template kind' });
+        if (!body.trim()) {
+            await pool.query(`DELETE FROM message_templates WHERE kind = $1 AND COALESCE(game_type,'') = COALESCE($2,'')`, [kind, gameType]);
+            return res.json({ success: true, cleared: true });   // empty body = revert to stock
+        }
+        await pool.query(`
+            INSERT INTO message_templates (kind, game_type, body, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (kind, COALESCE(game_type, ''))
+            DO UPDATE SET body = EXCLUDED.body, updated_at = NOW()`, [kind, gameType, body]);
+        res.json({ success: true });
+    } catch (e) { console.error('msg-tpl save error:', e.message); res.status(500).json({ error: 'Failed to save template' }); }
+});
+// FIX-671: deterministic personalisation — TF's ten questions are data lookups,
+// not prose generation. Every source below is schema-verified; anything shaky
+// was swapped for a safe generator. Returns up to 10 toggleable lines.
+app.get('/api/admin/games/:gameId/tpl-suggestions', authenticateToken, requireGameManager, async (req, res) => {
+    try {
+        const gid = req.params.gameId;
+        const g = await pool.query('SELECT id, game_date FROM games WHERE id = $1', [gid]);
+        if (!g.rows.length) return res.status(404).json({ error: 'Game not found' });
+        const roster = await pool.query(`
+            SELECT p.id, p.alias, p.appearances FROM registrations r
+            JOIN players p ON p.id = r.player_id
+            WHERE r.game_id = $1 AND r.status = 'confirmed'`, [gid]);
+        const ids = roster.rows.map(r => r.id);
+        const out = [];
+        if (ids.length) {
+            // Last completed game's MOTM among this roster → back-to-back
+            const motm = await pool.query(`
+                SELECT p.alias FROM games gm JOIN players p ON p.id = gm.motm_winner_id
+                WHERE gm.game_status = 'completed' AND gm.motm_winner_id = ANY($1)
+                ORDER BY gm.game_date DESC LIMIT 1`, [ids]);
+            if (motm.rows.length) out.push(`⭐ Can ${motm.rows[0].alias} win MOTM back to back?`);
+            // Donkey duel — most donkey votes across recent completed games
+            const donk = await pool.query(`
+                SELECT p.alias, COUNT(*) AS n FROM game_award_votes v
+                JOIN players p ON p.id = v.nominee_player_id
+                JOIN games gm ON gm.id = v.game_id AND gm.game_status = 'completed'
+                WHERE v.award_type = 'donkey' AND v.nominee_player_id = ANY($1)
+                GROUP BY p.alias ORDER BY n DESC LIMIT 2`, [ids]).catch(() => ({ rows: [] }));
+            if (donk.rows.length === 2) out.push(`🫏 Who takes the donkey this week — ${donk.rows[0].alias} or ${donk.rows[1].alias}?`);
+            // Late watch — a late-labelled fine in the last 21 days
+            const late = await pool.query(`
+                SELECT DISTINCT p.alias FROM game_fines f
+                JOIN players p ON p.id = f.player_id
+                JOIN games gm ON gm.id = f.game_id
+                WHERE f.player_id = ANY($1) AND f.label ILIKE '%late%'
+                  AND gm.game_date > NOW() - INTERVAL '21 days' LIMIT 2`, [ids]).catch(() => ({ rows: [] }));
+            for (const r of late.rows) out.push(`⏰ Will ${r.alias} actually show up on time this week? 👀`);
+            // Card watch — carded in the last 21 days
+            const card = await pool.query(`
+                SELECT DISTINCT p.alias FROM game_fines f
+                JOIN players p ON p.id = f.player_id
+                JOIN games gm ON gm.id = f.game_id
+                WHERE f.player_id = ANY($1) AND (f.label ILIKE '%yellow%' OR f.label ILIKE '%red%')
+                  AND gm.game_date > NOW() - INTERVAL '21 days' LIMIT 1`, [ids]).catch(() => ({ rows: [] }));
+            if (card.rows.length) out.push(`🟨 Can ${card.rows[0].alias} keep it clean after last week's card?`);
+            // Win streak — most consecutive wins over the roster's last games
+            const streak = await pool.query(`
+                WITH rg AS (
+                    SELECT r.player_id, gm.game_date, gm.winning_team, r.team,
+                           ROW_NUMBER() OVER (PARTITION BY r.player_id ORDER BY gm.game_date DESC) AS rn
+                    FROM registrations r JOIN games gm ON gm.id = r.game_id
+                    WHERE r.player_id = ANY($1) AND gm.game_status = 'completed'
+                      AND gm.winning_team IS NOT NULL AND r.status = 'confirmed')
+                SELECT p.alias, COUNT(*) AS wins FROM rg JOIN players p ON p.id = rg.player_id
+                WHERE rg.rn <= 3 AND LOWER(rg.winning_team) = LOWER(rg.team)
+                GROUP BY p.alias HAVING COUNT(*) >= 2 ORDER BY wins DESC LIMIT 1`, [ids]).catch(() => ({ rows: [] }));
+            if (streak.rows.length) out.push(`🔥 ${streak.rows[0].alias} has won ${streak.rows[0].wins} of their last 3 — does the streak roll on?`);
+            // Debut + milestone from appearances (schema-verified on players)
+            const debut = roster.rows.find(r => (parseInt(r.appearances) || 0) === 0);
+            if (debut) out.push(`👋 First game for ${debut.alias} — big debut incoming!`);
+            const milestone = roster.rows.find(r => { const a = (parseInt(r.appearances) || 0) + 1; return a > 0 && a % 25 === 0; });
+            if (milestone) out.push(`🎉 ${milestone.alias} hits appearance #${(parseInt(milestone.appearances) || 0) + 1} tonight!`);
+            // Top MOTM career in roster
+            const topMotm = await pool.query(`
+                SELECT p.alias, COUNT(*) AS n FROM games gm JOIN players p ON p.id = gm.motm_winner_id
+                WHERE gm.motm_winner_id = ANY($1) AND gm.game_status = 'completed'
+                GROUP BY p.alias ORDER BY n DESC LIMIT 1`, [ids]);
+            if (topMotm.rows.length && parseInt(topMotm.rows[0].n) >= 2) out.push(`👑 ${topMotm.rows[0].alias} owns ${topMotm.rows[0].n} MOTMs — anyone stopping them tonight?`);
+        }
+        out.push('⏰ Reminder: arrive 10 minutes early — warm up, bibs on, respect the kick-off.');
+        out.push('📸 Score a worldie? Tag the page — best clip makes the socials.');
+        res.json({ suggestions: out.slice(0, 10).map((text, i) => ({ id: 'sg' + i, text })) });
+    } catch (e) { console.error('tpl-suggestions error:', e.message); res.status(500).json({ error: 'Failed to build suggestions' }); }
+});
+app.get('/api/public/version', (req, res) => {
+    res.json({ build: TF_BUILD, node: process.version, uptime_s: Math.floor(process.uptime()) });
 });
 // Public resolve — safe fields only, uniform 404 (never reveals WHY a code is dead).
 // Inherits the /api/public/ rate limiter via the existing app.use.
@@ -22113,29 +22269,38 @@ app.post('/api/games/:id/register-friend', authenticateToken, async (req, res) =
         const chargedPriceForDisplay = (status === 'confirmed' || regBackupType === 'confirmed_backup')
             ? getEffectivePrice(game).price
             : 0;
+        // FIX-673: the previous INSERT's ON CONFLICT (game_id, player_id) WHERE
+        // superseded_at IS NULL was a conflict target copied from the fairness-
+        // votes table — registrations has neither that column NOR ANY unique
+        // index on (game_id, player_id), so Postgres rejected the statement at
+        // PREPARE time: every +1 failed with 'column "superseded_at" does not
+        // exist' (TF's screenshot). The transaction rolled back each time, so
+        // no payer was ever charged. Mirror the sibling /register model:
+        // check-then-branch over possibly-multiple rows (duplicate/stale rows
+        // are real on this table — RULE 2's own example).
+        const _frActiveStatuses = ['confirmed', 'rsvp', 'backup', 'confirmed_backup']; // twin of /register's function-scoped ACTIVE_REG_STATUSES — module hoist queued
+        const _frExisting = await client.query(
+            `SELECT id, status FROM registrations WHERE game_id = $1 AND player_id = $2 ORDER BY id DESC`,
+            [gameId, friendPlayerId]);
+        const _frActive = _frExisting.rows.find(r => _frActiveStatuses.includes(r.status));
+        if (_frActive) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'They already have an active registration for this game.' });
+        }
         // FIX-173: capture friend's reg id so we can apply BFFs/Rivals auto-fill if confirmed.
+        /* FIX-673b (audit №9): the sibling /register NEVER revives stale rows —
+           it always INSERTs fresh and lets status filtering handle the history
+           (duplicates-by-design on this table). The first draft's revive-via-
+           UPDATE deviated and would have carried per-life baggage (the old
+           team assignment, check-in state) into the new registration. Mirror
+           the sibling exactly: active row → rejected above; otherwise INSERT. */
         const friendRegResult = await client.query(
             `INSERT INTO registrations (game_id, player_id, status, position_preference, backup_type, amount_paid, amount_paid_free, registered_by_player_id, tournament_team_preference, amount_paid_tenant)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             ON CONFLICT (game_id, player_id) WHERE superseded_at IS NULL DO UPDATE SET
-                 status = EXCLUDED.status,
-                 position_preference = EXCLUDED.position_preference,
-                 backup_type = EXCLUDED.backup_type,
-                 amount_paid = EXCLUDED.amount_paid,
-                 amount_paid_free = EXCLUDED.amount_paid_free,
-                 registered_by_player_id = EXCLUDED.registered_by_player_id,
-                 tournament_team_preference = EXCLUDED.tournament_team_preference,
-                 amount_paid_tenant = EXCLUDED.amount_paid_tenant
              RETURNING id`,
-            [
-                gameId, friendPlayerId, status, positionValue, regBackupType,
-                chargedPrice,
-                friendFreeCharged,
-                registeringPlayerId,
-                tournamentTeamPreference || null,
-                friendTenantCharged || 0
-            ]
-        );
+            [gameId, friendPlayerId, status, positionValue, regBackupType,
+             chargedPrice, friendFreeCharged, registeringPlayerId,
+             tournamentTeamPreference || null, friendTenantCharged || 0]);
         const friendRegId = friendRegResult.rows[0].id;
 
         // FIX-173: BFFs/Rivals auto-fill — only if friend was confirmed (not backup).
@@ -28784,6 +28949,29 @@ app.get('/api/admin/games/:gameId/complete-message', authenticateToken, requireG
             }
         } catch (e) { console.warn('FIX-636 completion template failed (stock used):', e.message); }
 
+        /* FIX-671: per-type completion template outranks the stock build. Tokens:
+           {VENUE} {WHEN} {KICKOFF} {LINK} {SCORE} {MOTM} — best-effort fills from
+           the vars this handler already computed; unknown tokens strip. */
+        try {
+            const tplR = await pool.query(
+                `SELECT body FROM message_templates WHERE kind = 'completion'
+                  AND COALESCE(game_type,'') IN (COALESCE($1,''), '')
+                  ORDER BY (game_type IS NOT NULL) DESC LIMIT 1`,
+                [ ((game.team_selection_type === 'standard' ? 'normal' : game.team_selection_type) || game.game_type || null) ]);   /* FIX-671b: standard→normal alias */
+            if (tplR.rows.length) {
+                const fills = {
+                    VENUE: (typeof venueName !== 'undefined' && venueName) || game.venue_name || 'our venue',
+                    WHEN: (typeof whenLabel !== 'undefined' && whenLabel) || '',
+                    KICKOFF: (typeof kickoff !== 'undefined' && kickoff) || '',
+                    LINK: (typeof viewLink !== 'undefined' && viewLink) || (typeof gameLink !== 'undefined' && gameLink) || '',
+                    SCORE: (typeof scoreLine !== 'undefined' && scoreLine) || (game.winning_team ? (game.winning_team + ' won') : ''),
+                    MOTM: (typeof motmAlias !== 'undefined' && motmAlias) || game.motm_winner_alias || '',
+                };
+                let bodyOut = tplR.rows[0].body;
+                for (const [k, v] of Object.entries(fills)) bodyOut = bodyOut.split('{' + k + '}').join(String(v || ''));
+                return res.json({ message: bodyOut });
+            }
+        } catch (te) { console.error('completion tpl lookup failed:', te.message); /* stock below */ }
         res.json({ message, has_next: !!nextUrl, next_game_url: nextUrl || null });
     } catch (e) {
         console.error('complete-message build failed:', e.message);
@@ -56094,8 +56282,31 @@ async function _wonderfulPaginatedListSearch(opts) {
         const qs = '?' + params.join('&');
         try {
             const res = await wonderfulRequest('GET', '/v2/payments' + qs);
-            const payments = res.data?.payments || res.data?.data || res.data || [];
-            const arr = Array.isArray(payments) ? payments : [];
+            /* FIX-672: shape-tolerant extraction. The live log's 'no-match · pages: 2'
+               on EVERY call (incl. orders that demonstrably exist) means page 1 yields
+               zero records both passes — the classic Wonderful wrapper drift (FIX-536's
+               own history). Dig for the first array at depth ≤2; if still empty while
+               the response has keys, log the true shape ONCE so the next live log
+               names it instead of hiding it. */
+            const _dig = (o) => {
+                if (Array.isArray(o)) return o;
+                if (o && typeof o === 'object') {
+                    for (const k of ['payments', 'data', 'items', 'records', 'results']) {
+                        if (Array.isArray(o[k])) return o[k];
+                    }
+                    for (const k of Object.keys(o)) if (Array.isArray(o[k])) return o[k];
+                    if (o.data && typeof o.data === 'object') {
+                        for (const k of Object.keys(o.data)) if (Array.isArray(o.data[k])) return o.data[k];
+                    }
+                }
+                return [];
+            };
+            const arr = _dig(res.data);
+            if (arr.length === 0 && res.data && typeof res.data === 'object' && Object.keys(res.data).length && !global._wfShapeLogged) {
+                global._wfShapeLogged = true;
+                const inner = (res.data.data && typeof res.data.data === 'object') ? ' · data keys: ' + Object.keys(res.data.data).join(',') : '';
+                console.warn('[WF paginated] FIX-672 shape probe — page 1 empty; response keys:', Object.keys(res.data).join(','), inner);
+            }
             return { arr, ok: true };
         } catch (e) {
             console.warn('[WF paginated] page ' + page + (withStatusPaid ? ' (status=paid)' : '') + ' failed:', e.message);
@@ -57156,17 +57367,48 @@ app.post('/api/webhooks/wonderful', webhookLimiter, async (req, res) => {
             // Do NOT downgrade the row (that's what stranded it last time);
             // leave it for the reconciler and alert superadmin.
             if (_wfClaimsPaid) {
-                await _alertUnresolvedPaidWebhookWithPlayer(wpId, pmt,
-                    `<p>Webhook says <strong>paid</strong> but verification returned <strong>${verified}</strong> for ref <strong>${pmt.merchant_reference}</strong> (£${(pmt.amount_pence / 100).toFixed(2)}, db status ${pmt.status}). Status NOT downgraded. Check the Wonderful dashboard — likely an abort-then-retry where the link id is blind to the paid retry.</p>`);
-                return console.warn('[WF webhook] paid claim unverified (verify said', verified, ') — status untouched, alerted — ref:', pmt.merchant_reference);
+                /* FIX-672: retry-adoption sweep BEFORE giving up. Abort-then-retry
+                   leaves the stored link id pinned to the dead first attempt while
+                   the ORDER carries a paid sibling. Search the list (paid-preferred,
+                   order-id fallback) and adopt an API-VERIFIED paid record — the
+                   webhook's claim alone still credits nothing. */
+                let _adopted = null;
+                try {
+                    const { match: sib } = await _wonderfulPaginatedListSearch({
+                        merchantRef: pmt.merchant_reference,
+                        wpIdForFallback: pmt.wonderful_order_id || null,
+                        preferStatusPaid: true,
+                        maxPages: 5
+                    });
+                    if (sib && (String(sib.status).toLowerCase() === 'paid' || String(sib.status).toLowerCase() === 'accepted')) _adopted = sib;
+                } catch (ae) { console.warn('[WF webhook] retry-adoption sweep failed:', ae.message); }
+                if (_adopted) {
+                    console.log('[WF webhook] paid RETRY adopted via list match (FIX-672):', pmt.wonderful_payment_id, '→', _adopted.id, '· ref:', pmt.merchant_reference);
+                    await pool.query(
+                        `UPDATE wonderful_payments SET wonderful_payment_id = $1 WHERE id = $2`,
+                        [_adopted.id, pmt.id]
+                    ).catch((ue) => console.error('[FIX-672] adopt-id update failed:', ue.message));
+                    verified = 'paid';   // API-verified sibling — proceed to the normal credit path below
+                } else {
+                    await _alertUnresolvedPaidWebhookWithPlayer(wpId, pmt,
+                        `<p>Webhook says <strong>paid</strong> but verification returned <strong>${verified}</strong> for ref <strong>${pmt.merchant_reference}</strong> (£${(pmt.amount_pence / 100).toFixed(2)}, db status ${pmt.status}). Status NOT downgraded. Retry-adoption sweep found no paid sibling. Check the Wonderful dashboard — likely an abort-then-retry where the link id is blind to the paid retry.</p>`);
+                    return console.warn('[WF webhook] paid claim unverified (verify said', verified, ') — status untouched, alerted — ref:', pmt.merchant_reference);
+                }
             }
-            // Record Wonderful's state without crediting. Guard against overwriting
-            // a 'credited_manually' status with a transient Wonderful state.
-            await pool.query(
-                `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
-                [_safeWonderfulStatus(verified), resolvedWpId, pmt.id]
-            ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L46178):', _ce && _ce.message); });
-            return;
+            if (verified !== 'paid' && verified !== 'accepted') {   /* FIX-672b: RE-CHECK — the adoption sweep above may have upgraded
+                   verified to 'paid'. Without this, an adopted payment fell into the
+                   record-and-return below: status written 'paid' WITHOUT crediting,
+                   then stranded forever (the reconciler scans pending only) — silent
+                   money-taken-nothing-delivered, caught by audit №8's flow trace. */
+                // Record Wonderful's state without crediting. Guard against overwriting
+                // a 'credited_manually' status with a transient Wonderful state.
+                await pool.query(
+                    `UPDATE wonderful_payments SET status = $1, wonderful_payment_id = COALESCE(wonderful_payment_id, $2) WHERE id = $3 AND status NOT IN ('credited', 'credited_manually')`,
+                    [_safeWonderfulStatus(verified), resolvedWpId, pmt.id]
+                ).catch((_ce) => { console.error('[FIX-442] silent fail: UPDATE wonderful_payments (L46178):', _ce && _ce.message); });
+                return;
+            }
+            /* FIX-672b: adopted-paid falls through to the normal credit path. */
         }
 
         // Paid — delegate to shared helper for credit + auto-register
@@ -72325,6 +72567,19 @@ async function bootstrapTenantFreeCredits() {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_claim_token
                 ON tenant_ghost_players (claim_token) WHERE claim_token IS NOT NULL`);
         console.log('✅ FIX-656: tenant_ghost_players claim columns ready');
+        // FIX-671: superadmin per-game-type message templates (team_gen / completion).
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS message_templates (
+                id BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL,
+                game_type TEXT,
+                body TEXT NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )`);
+        await pool.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_tpl_kind_type
+                ON message_templates (kind, COALESCE(game_type, ''))`);
+        console.log('✅ FIX-671: message_templates ready');
         console.log('✅ ghost roster ready (FIX-524)');
         // FIX-523: TotalFooty -> tenant-admin notices (popup on next CRM sign-in).
         await pool.query(`
@@ -73997,8 +74252,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web233-hypewf`);
-
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: ` + TF_BUILD);
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
 
