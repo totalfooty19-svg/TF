@@ -34494,6 +34494,50 @@ app.get('/api/admin/games/:gameId/hype-facts', authenticateToken, requireGameMan
                 alt_fact_lines: lines.slice(1),
             });
         }
+        // FIX-663 (TF's spec): award-VOLUME cards — "must've been raining goals",
+        // "must've been a heated one" — themed lines keyed to vote totals across an
+        // award, not just its leader. Top two awards by volume, min 3 votes across
+        // 2+ players so the joke has fuel. Custom awards get the generic race line.
+        const AWARD_VOLUME_LINES = {
+            goalscorer:       (n, k) => `Must've been raining goals \u2014 ${n} goalscorer votes across ${k} players \u2614\u26bd`,
+            reckless_tackler: (n, k) => `Must've been a heated one \u2014 ${n} reckless-tackle votes and counting \ud83d\udd25`,
+            cold_moment:      (n, k) => `Whose cold moment was colder? ${n} votes say it got chilly out there \ud83e\udd76`,
+            assist_king:      (n, k) => `Assists flying in \u2014 ${n} votes for the playmakers \ud83c\udd70\ufe0f`,
+            howler:           (n, k) => `${n} howler votes\u2026 someone's keeping the blooper reel alive \ud83d\ude2c`,
+            donkey:           (n, k) => `${n} donkey votes in \u2014 braying heard for miles \ud83e\udecf`,
+            best_engine:      (n, k) => `${n} engine votes \u2014 somebody ran their socks off \ud83d\udd0b`,
+            the_moaner:       (n, k) => `${n} moaner votes \u2014 the ref heard about ALL of it \ud83d\udde3\ufe0f`,
+        };
+        const _vol = Object.entries(byAward)
+            .map(([key, rows]) => ({ key, total: rows.reduce((a, r) => a + r.votes, 0), noms: rows.length }))
+            .filter(v => v.total >= 3 && v.noms >= 2)
+            .sort((a, b) => b.total - a.total).slice(0, 2);
+        for (const v of _vol) {
+            const mk = AWARD_VOLUME_LINES[v.key];
+            cards.push({
+                kind: 'volume', award_key: v.key, leader: null, votes: v.total, noms: v.noms,
+                custom_label: customMeta[v.key] ? customMeta[v.key].label : null,
+                custom_emoji: customMeta[v.key] ? customMeta[v.key].emoji : null,
+                fact_line: mk ? mk(v.total, v.noms) : `${v.total} votes across ${v.noms} players \u2014 this race is heating up \ud83d\udd25`,
+            });
+        }
+        // FIX-663: hottest race — the tightest contested award (margin <= 1).
+        const _race = Object.entries(byAward)
+            .map(([key, rows]) => ({ key, rows, total: rows.reduce((a, r) => a + r.votes, 0),
+                                     margin: rows.length > 1 ? rows[0].votes - rows[1].votes : 99 }))
+            .filter(r => r.rows.length >= 2 && r.margin <= 1 && r.total >= 2)
+            .sort((a, b) => a.margin - b.margin || b.total - a.total)[0];
+        if (_race) {
+            cards.push({
+                kind: 'race', award_key: _race.key, leader: null, votes: _race.total,
+                custom_label: customMeta[_race.key] ? customMeta[_race.key].label : null,
+                custom_emoji: customMeta[_race.key] ? customMeta[_race.key].emoji : null,
+                duel: { a: _race.rows[0].alias, b: _race.rows[1].alias },
+                fact_line: _race.margin === 0
+                    ? `${_race.rows[0].alias} vs ${_race.rows[1].alias} \u2014 dead level. Someone break the tie \ud83d\udc40`
+                    : `${_race.rows[0].alias} leads ${_race.rows[1].alias} by ONE. Every vote counts \u2696\ufe0f`,
+            });
+        }
         cards.sort((a, b) => b.votes - a.votes);
 
         res.json({
@@ -73933,7 +73977,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web231-fasavefirst`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web232-hypecards`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
