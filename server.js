@@ -13558,8 +13558,14 @@ function _faAlertSuperadmin(ctx, source, errMsg) {
 // Returns { id, teamID (== id), divisionseason|null }. divisionseason only
 // exists on legacy links — the public league-table pull still needs it.
 function _faParseTeamUrl(raw) {
+    // FIX-660: heal historically mangled saves — HTML-escaped ampersands
+    // (&amp;teamID= hides the teamID param) and whole-string percent-encoding
+    // (https%3A%2F%2F… from an encodeURIComponent round-trip). Normalise before
+    // parsing; well-formed links are untouched.
+    let str = String(raw || '').trim().replace(/&amp;/gi, '&');
+    if (/^https%3A/i.test(str)) { try { str = decodeURIComponent(str); } catch (_) {} }
     let u;
-    try { u = new URL(String(raw || '').trim()); } catch (_) { return null; }
+    try { u = new URL(str); } catch (_) { return null; }
     if (u.protocol !== 'https:') return null;
     const host = u.hostname.replace(/^www\./i, '').toLowerCase();
     if (host !== 'fulltime.thefa.com' && host !== 'fulltime-league.thefa.com') return null; // FIX-601
@@ -73927,7 +73933,7 @@ async function _resolveSignupIntentForPlayer(gameId, playerId) {
 
 
 app.listen(PORT, () => {
-    console.log(`🚀 Total Footy API running on port ${PORT} — build: web230-falegacy`);
+    console.log(`🚀 Total Footy API running on port ${PORT} — build: web231-fasavefirst`);
 
     // FIX-356: bootstrap FAQ schema + seed (non-blocking, runs in parallel with email check)
     fix356BootstrapFaq().catch(e => console.error('FIX-356 bootstrap surfaced:', e.message));
