@@ -1,0 +1,6 @@
+penaltyblog>=1.12
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+requests>=2.31
+psycopg[binary]>=3.1

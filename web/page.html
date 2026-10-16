@@ -1,0 +1,1021 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SB-MS-2026 Live</title>
+<style>
+:root {
+  --ground: #F1F4F7;
+  --surface: #FFFFFF;
+  --sunk: #E8EDF2;
+  --ink: #121A26;
+  --muted: #566173;
+  --faint: #7D8898;
+  --line: #DCE2EA;
+  --line-strong: #C3CCD7;
+  --track: #DFE6ED;
+  --accent: #0B5C8E;
+  --accent-ink: #0B4F7A;
+  --back: #D3E9FA;
+  --back-ink: #0B3E63;
+  --lay: #FBE1E9;
+  --lay-ink: #7A2143;
+  --value: #17774A;
+  --value-bg: #DDF1E5;
+  --good: #0B5C8E;
+  --good-bg: #DCEBF7;
+  --cond: #8A5000;
+  --cond-bg: #FAEBCF;
+  --marg: #4B519C;
+  --marg-bg: #E6E7F7;
+  --noedge: #5F6B7C;
+  --noedge-bg: #E4E9EF;
+  --neg: #9A3B45;
+  --hl-bg: #EAF3FB;
+  --display: "Barlow Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #0D131A; --surface: #141C25; --sunk: #101820; --ink: #E5EAF1; --muted: #9CA8B7; --faint: #7C8898;
+    --line: #26313E; --line-strong: #364353; --track: #2A3643;
+    --accent: #72B8E6; --accent-ink: #9ACDF0; --back: #173A55; --back-ink: #CBE7FB; --lay: #4A2030; --lay-ink: #F7C9D8;
+    --value: #62CF98; --value-bg: #133426; --good: #8CC6EE; --good-bg: #16324A; --cond: #EDB25F; --cond-bg: #3A2B12;
+    --marg: #AEB2F2; --marg-bg: #252848; --noedge: #A3AEBC; --noedge-bg: #1F2833; --neg: #E48C95; --hl-bg: #15283A;
+  }
+}
+:root[data-theme="dark"] {
+  --ground: #0D131A; --surface: #141C25; --sunk: #101820; --ink: #E5EAF1; --muted: #9CA8B7; --faint: #7C8898;
+  --line: #26313E; --line-strong: #364353; --track: #2A3643;
+  --accent: #72B8E6; --accent-ink: #9ACDF0; --back: #173A55; --back-ink: #CBE7FB; --lay: #4A2030; --lay-ink: #F7C9D8;
+  --value: #62CF98; --value-bg: #133426; --good: #8CC6EE; --good-bg: #16324A; --cond: #EDB25F; --cond-bg: #3A2B12;
+  --marg: #AEB2F2; --marg-bg: #252848; --noedge: #A3AEBC; --noedge-bg: #1F2833; --neg: #E48C95; --hl-bg: #15283A;
+}
+
+
+* { box-sizing: border-box; }
+body { background: var(--ground); color: var(--ink); font-family: var(--body); font-size: 15px; line-height: 1.55; margin: 0; }
+.wrap { max-width: 1080px; margin: 0 auto; padding-inline: 18px; padding-block: 22px 72px; }
+h1, h2, h3 { margin: 0; text-wrap: balance; }
+p { margin: 0; }
+a { color: var(--accent-ink); }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.sub { color: var(--muted); font-size: 12.5px; line-height: 1.4; margin-top: 2px; }
+.eyebrow { font-family: var(--mono); font-size: 12.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+.mast h1 { font-family: var(--display); font-weight: 700; font-size: clamp(2rem, 6vw, 3.2rem); line-height: 1; margin-top: 8px; }
+.lede { color: var(--muted); max-width: 78ch; margin-top: 10px; }
+/* tabs */
+.tabs { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 18px; padding: 8px 0; background: var(--ground); border-bottom: 2px solid var(--ink); }
+.tabs a { flex: 1 1 140px; text-align: center; text-decoration: none; color: var(--muted); font-family: var(--display); font-weight: 700; font-size: 1.05rem; letter-spacing: .03em; text-transform: uppercase; padding: 10px 8px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); }
+.tabs a small { display: block; font-family: var(--body); font-weight: 500; font-size: 11.5px; letter-spacing: 0; text-transform: none; }
+.tabs a[aria-selected="true"] { color: var(--surface); background: var(--ink); border-color: var(--ink); }
+.tabs a[aria-selected="true"] small { color: var(--surface); opacity: .8; }
+.js .panel:not(.active) { display: none; }
+.sec { margin-top: 42px; display: grid; gap: 12px; }
+.sec.first { margin-top: 22px; }
+.sec > h2 { font-family: var(--display); font-weight: 700; font-size: 1.5rem; letter-spacing: .02em; text-transform: uppercase; padding-top: 16px; border-top: 2px solid var(--ink); }
+.sec.first > h2 { border-top: 0; padding-top: 0; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+ul { margin: 0; padding-left: 20px; } li { margin: 4px 0; }
+.scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; background: var(--surface); }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-family: var(--mono); font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); background: var(--sunk); white-space: nowrap; }
+table.picks { min-width: 1360px; } table.picks td:nth-child(2) { min-width: 190px; } table.picks td:nth-child(3) { min-width: 250px; } table.picks td.flags { min-width: 230px; } table.mk { min-width: 720px; } table.nopick { min-width: 640px; }
+td.mono .sub { white-space: nowrap; }
+tr.rowlink { cursor: pointer; }
+tr.rowlink:hover, tr.rowlink:focus-visible { background: var(--hl-bg); outline: none; }
+a.fxlink { text-decoration: none; }
+a.fxlink b { text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
+.go { display: inline-block; font-size: 11.5px; font-weight: 600; color: var(--accent-ink); background: var(--back); padding: 1px 7px; border-radius: 999px; margin-left: 4px; white-space: nowrap; }
+.pos { color: var(--value); } .neg { color: var(--neg); }
+.chip { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; white-space: nowrap; margin: 1px 0; }
+.c-sturdy { color: var(--value); background: var(--value-bg); } .c-frag { color: var(--cond); background: var(--cond-bg); }
+.c-cap { color: var(--marg); background: var(--marg-bg); } .c-contra { color: var(--lay-ink); background: var(--lay); }
+.c-plain { color: var(--noedge); background: var(--noedge-bg); } .c-neg { color: var(--neg); background: var(--lay); }
+.c-bias { color: var(--noedge); background: var(--noedge-bg); } .c-top { color: var(--surface); background: var(--ink); white-space: normal; } table.top4 { min-width: 1240px; } .c-picks { color: var(--value); background: var(--value-bg); white-space: normal; }
+.flags { display: flex; flex-wrap: wrap; gap: 4px; min-width: 200px; }
+details.fx { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; margin-top: 8px; }
+details.fx > summary { cursor: pointer; padding: 12px 14px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; list-style: none; }
+details.fx > summary::-webkit-details-marker { display: none; }
+details.fx > summary .chev { display: inline-block; color: var(--accent-ink); transition: transform .15s; }
+details.fx[open] > summary .chev { transform: rotate(90deg); }
+details.fx.flash { box-shadow: 0 0 0 3px var(--accent); }
+.fx-body { padding: 4px 14px 14px; display: grid; gap: 10px; border-top: 1px solid var(--line); }
+details.sub-d { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; background: var(--sunk); }
+details.sub-d > summary { cursor: pointer; font-weight: 600; }
+ul.news li.n-count { color: var(--ink); } ul.news li.n-not { color: var(--muted); } ul.news li.n-what { color: var(--cond); }
+ul.sel li { margin: 8px 0; }
+.cap { color: var(--marg); font-size: 11px; font-weight: 600; } .thin { color: var(--neg); font-size: 11px; font-weight: 600; }
+.kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.kpi div { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.kpi b { display: block; font-family: var(--display); font-size: 1.6rem; line-height: 1.1; }
+.kpi span { color: var(--muted); font-size: 12.5px; }
+.back-top { display: inline-block; margin-top: 18px; font-size: 13px; }
+.c-score { color: var(--ink); background: var(--sunk); border: 1px solid var(--line-strong); }
+.c-won { color: var(--value); background: var(--value-bg); } .c-lost { color: var(--neg); background: var(--lay); }
+td.res { min-width: 220px; }
+p.settled { background: var(--sunk); border-radius: 8px; padding: 8px 10px; }
+.audit { border-left: 3px solid var(--accent); padding: 8px 12px; background: var(--hl-bg); border-radius: 6px; display: grid; gap: 8px; }
+td.aud { min-width: 240px; }
+table.audit-t { min-width: 760px; } table.uni { min-width: 900px; }
+@media (max-width: 640px) { .wrap { padding-inline: 16px; } .tabs a { font-size: .95rem; padding: 8px 6px; } }
+
+nav.vtabs { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 14px; }
+nav.vtabs a { border:1px solid var(--line-strong); border-radius:8px; padding:7px 12px; text-decoration:none; color:inherit; font-weight:600; font-size:.92em; background:var(--surface); }
+nav.vtabs a small { display:block; font-weight:400; opacity:.7; font-size:.82em; }
+nav.vtabs a.on { background:var(--ink); color:var(--surface); border-color:var(--ink); }
+[data-mv].hide { display:none; }
+table.picks { min-width:1080px; } table.work { min-width:860px; } table.var { min-width:760px; } table.book { min-width:980px; }
+tr.pickrow td { background:var(--value-bg); }
+.live { display:inline-flex; align-items:center; gap:6px; }
+.dot { width:8px; height:8px; border-radius:50%; background:var(--value); display:inline-block; }
+.dot.stale { background:var(--cond); } .dot.err { background:var(--neg); }
+.empty { color:var(--muted); font-style:italic; }
+.note { font-size:12.5px; color:var(--muted); }
+.fxsum { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
+.fxsum .t { font-family:var(--mono); font-size:12.5px; color:var(--muted); }
+.warn { border-left:3px solid var(--cond); background:var(--cond-bg); padding:8px 12px; border-radius:6px; }
+.bad { border-left:3px solid var(--neg); background:var(--lay); padding:8px 12px; border-radius:6px; }
+pre.err { white-space:pre-wrap; font-size:12px; margin:6px 0 0; max-height:220px; overflow:auto; }
+@media print { .tabs, .refresh { display:none; } .js .panel:not(.active), section.panel[hidden] { display:block !important; } }
+/* real bets (16 Oct) */
+button.take { font: 600 11.5px var(--body); color: var(--accent-ink); background: var(--good-bg); border: 1px solid var(--line-strong); border-radius: 999px; padding: 2px 9px; margin-top: 4px; cursor: pointer; white-space: nowrap; }
+button.take:hover, button.take:focus-visible { border-color: var(--accent); outline: none; }
+button.undo { font: 600 11.5px var(--body); color: var(--neg); background: transparent; border: 1px solid var(--line-strong); border-radius: 999px; padding: 2px 9px; cursor: pointer; }
+dialog#takeDlg { border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); color: var(--ink); padding: 0; width: min(440px, calc(100vw - 32px)); }
+dialog#takeDlg::backdrop { background: rgba(10, 16, 24, .45); }
+#takeDlg form { padding: 18px 18px 14px; }
+#takeDlg h2 { font: 700 20px var(--display); text-transform: uppercase; letter-spacing: .02em; margin: 0 0 4px; }
+#takeDlg .what { color: var(--muted); font-size: 13.5px; margin: 0 0 12px; }
+#takeDlg label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; }
+#takeDlg input { width: 100%; box-sizing: border-box; font: 500 15px var(--mono); color: var(--ink); background: var(--sunk); border: 1px solid var(--line-strong); border-radius: 6px; padding: 8px 10px; }
+#takeDlg input:focus { outline: 2px solid var(--accent); outline-offset: 0; }
+#takeDlg .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+#takeDlg .calc { margin: 12px 0 0; padding: 10px 12px; background: var(--sunk); border-radius: 6px; font-size: 13px; line-height: 1.55; }
+#takeDlg .acts { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+#takeDlg .acts button { font: 600 14px var(--body); border-radius: 6px; padding: 8px 14px; cursor: pointer; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); }
+#takeDlg .acts button.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+#takeDlg .err { color: var(--neg); font-size: 13px; margin: 8px 0 0; min-height: 1em; }
+</style></head>
+<body>
+<div class="wrap">
+  <header class="mast">
+    <div class="eyebrow" id="eyebrow">SB-MS-2026 · paper · loading…</div>
+    <h1 id="h1">Reading the model…</h1>
+    <p class="lede" id="lede"></p>
+    <p class="note refresh" style="margin-top:8px"><span class="live"><span class="dot" id="dot"></span><span id="status">Connecting</span></span> · refreshes every 5 minutes · <a href="#" id="reload">refresh now</a></p>
+    <nav class="tabs" role="tablist" id="tabs"></nav>
+  </header>
+  <main id="panels"></main>
+</div>
+<dialog id="takeDlg" aria-labelledby="takeTitle">
+  <form method="dialog" id="takeForm">
+    <h2 id="takeTitle">I took this bet</h2>
+    <p class="what" id="takeWhat"></p>
+    <div class="row2">
+      <div><label for="takeOdds">Odds taken (decimal)</label><input id="takeOdds" type="number" step="0.01" min="1.01" max="1000" inputmode="decimal" required></div>
+      <div><label for="takeStake">Stake (£)</label><input id="takeStake" type="number" step="0.01" min="0.01" max="100000" inputmode="decimal" required></div>
+    </div>
+    <div class="calc" id="takeCalc"></div>
+    <label for="takeNote">Note (optional)</label><input id="takeNote" type="text" maxlength="300" style="font-family: var(--body)">
+    <div id="takeKeyWrap"><label for="takeKey">Bets key (asked once, kept in this browser)</label><input id="takeKey" type="password" autocomplete="off" style="font-family: var(--body)"></div>
+    <p class="err" id="takeErr" role="alert"></p>
+    <div class="acts"><button type="button" id="takeCancel">Cancel</button><button type="submit" class="go" id="takeGo">Log this bet</button></div>
+  </form>
+</dialog>
+<script>
+(function () {
+  'use strict';
+  var DATA_URL = location.pathname.replace(/\/+$/, '') + '/page-data' + location.search;
+  var TZ = 'Europe/London';
+  var state = { data: null, tab: (location.hash || '').slice(1), mv: {} };
+
+  // ---------------------------------------------------------------- formatting
+  function e(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
+  function num(x) { return x == null || x === '' || isNaN(Number(x)) ? null : Number(x); }
+  function pc(x, d) { x = num(x); return x == null ? '—' : (x * 100).toFixed(d == null ? 1 : d) + '%'; }
+  function spc(x, d) { x = num(x); return x == null ? '—' : (x >= 0 ? '+' : '−') + Math.abs(x * 100).toFixed(d == null ? 1 : d) + '%'; }
+  function od(x) { x = num(x); return x == null ? '—' : x.toFixed(2); }
+  function f3(x) { x = num(x); return x == null ? '—' : x.toFixed(3); }
+  function f4(x) { x = num(x); return x == null ? '—' : x.toFixed(4); }
+  function money(x) { x = num(x); if (x == null) return '—'; return (x >= 0 ? '+£' : '−£') + Math.abs(x).toFixed(2); }
+  function sign(x) { x = num(x); return x == null ? '' : (x > 0 ? 'pos' : (x < 0 ? 'neg' : '')); }
+  function chip(t, k) { return '<span class="chip c-' + (k || 'plain') + '">' + e(t) + '</span>'; }
+  function dayKey(d) { return new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(d)); }
+  function dayLabel(k) { var d = new Date(k + 'T12:00:00Z'); return new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', weekday: 'long', day: 'numeric', month: 'long' }).format(d); }
+  function dayShort(k) { var d = new Date(k + 'T12:00:00Z'); return new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' }).format(d); }
+  function hm(d) { return d ? new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit' }).format(new Date(d)) : '—'; }
+  function dhm(d) { return d ? new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(d)) : '—'; }
+  function ago(d, now) { if (!d) return '—'; var m = Math.round((new Date(now) - new Date(d)) / 60000); if (m < 1) return 'just now'; if (m < 60) return m + ' min ago'; var h = Math.floor(m / 60); if (h < 48) return h + ' h ' + (m % 60) + ' min ago'; return Math.floor(h / 24) + ' days ago'; }
+  function sum(a, f) { return a.reduce(function (s, x) { var v = num(f(x)); return s + (v == null ? 0 : v); }, 0); }
+  function mean(a, f) { var v = a.map(f).map(num).filter(function (x) { return x != null; }); return v.length ? v.reduce(function (s, x) { return s + x; }, 0) / v.length : null; }
+  function kpi(items) { return '<div class="kpi">' + items.map(function (i) { return '<div><b class="' + (i[2] || '') + '">' + e(i[0]) + '</b><span>' + e(i[1]) + '</span></div>'; }).join('') + '</div>'; }
+  function table(heads, rows, cls) {
+    return '<div class="scroll"><table class="' + (cls || 'nopick') + '"><thead><tr>' + heads.map(function (h) { return '<th>' + h + '</th>'; }).join('') + '</tr></thead><tbody>' +
+      rows.map(function (r) {
+        var attrs = r.cls ? ' class="' + r.cls + '"' : '';
+        if (r.fx) attrs += ' data-fx="' + r.fx + '" tabindex="0"';
+        return '<tr' + attrs + '>' + (r.cells || r).map(function (c) { return Array.isArray(c) ? '<td' + c[1] + '>' + c[0] + '</td>' : '<td>' + c + '</td>'; }).join('') + '</tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+  function section(title, body, opts) { opts = opts || {}; return '<div class="sec' + (opts.first ? ' first' : '') + '"' + (opts.mv ? ' data-mv="' + opts.mv + '"' : '') + '><h2>' + title + '</h2>' + body + '</div>'; }
+  function details(summary, body, id, note) { return '<details class="fx"' + (id ? ' id="' + id + '"' : '') + '><summary><span class="chev">▸</span>' + summary + (note ? ' <span class="muted">' + e(note) + '</span>' : '') + '</summary><div class="fx-body">' + body + '</div></details>'; }
+  function card(b) { return '<div class="card">' + b + '</div>'; }
+
+  var KEY_LABEL = { H: 'Home', D: 'Draw', A: 'Away', DNB_H: 'Home DNB', DNB_A: 'Away DNB', BTTS_Y: 'Both score', BTTS_N: 'Not both score', 'O1.5': 'Over 1.5', 'U1.5': 'Under 1.5', 'O2.5': 'Over 2.5', 'U2.5': 'Under 2.5', 'O3.5': 'Over 3.5', 'U3.5': 'Under 3.5' };
+  var KEY_ORDER = ['H', 'D', 'A', 'DNB_H', 'DNB_A', 'BTTS_Y', 'BTTS_N', 'O1.5', 'U1.5', 'O2.5', 'U2.5', 'O3.5', 'U3.5'];
+  function sel(key, f) { if (!f) return KEY_LABEL[key] || key; if (key === 'H' || key === 'DNB_H') return f.home + (key === 'DNB_H' ? ' (draw no bet)' : ''); if (key === 'A' || key === 'DNB_A') return f.away + (key === 'DNB_A' ? ' (draw no bet)' : ''); return KEY_LABEL[key] || key; }
+  function modelLabel(m) {
+    if (m === 'dixon_coles') return 'Dixon-Coles (champion)';
+    if (m === 'elo_cross') return 'ClubElo (European ties)';
+    if (m === 'market_consensus') return 'Challenger: the markets\' own consensus';
+    if (m === 'sharp_pinnacle') return 'Challenger: Pinnacle\'s prices';
+    if (m === 'committee') return 'Challenger: the committee (every variant votes)';
+    if (m === 'dixon_coles:cs') return 'Correct score (the champion\'s scoreline grid)';
+    if (String(m).indexOf('dixon_coles~') === 0) return 'Challenger: ' + ({ fade_slower: 'old results fade slower', fade_faster: 'old results fade faster', uncalibrated: 'no bias correction', no_weather: 'weather ignored', no_referee: 'referee ignored', shrunk: 'thin-data ratings pulled to average', unshrunk: 'no rating pull', shots: 'goals + shots on target', pyramid: 'whole-pyramid fit', xg: 'goals + xG', prices: 'ratings from closing prices', goals: 'goals only' }[m.slice(12)] || m.slice(12).replace(/_/g, ' '));
+    return String(m).replace('dixon_coles+', 'DC + ').replace(/_/g, ' ');
+  }
+  function isChallenger(m) { return String(m).indexOf('~') > 0 || m === 'market_consensus' || m === 'sharp_pinnacle' || m === 'committee'; }
+  function roleChip(d, m) { return d.isLive(m) ? chip('live', 'sturdy') : isChallenger(m) ? chip('challenger', 'cap') : chip('testing', 'frag'); }
+  function gateText(g, key, s) {
+    if (g === 'threshold') return 'below the ' + (/^(H|D|A|DNB_)/.test(key) ? pc(s && s.thresh_result, 0) : pc(s && s.thresh_goals, 0)) + ' gate';
+    if (g === 'floor') return 'no price clears the floor';
+    if (g === 'untraded') return 'untraded (old S-1a gate)';
+    if (g === 'thin') return 'spread too wide (old line)';
+    return g || '';
+  }
+  function statusChip(s) {
+    if (s.status === 'open') return s.order_type === 'rest' ? (s.filled ? chip('filled', 'sturdy') : chip('resting', 'frag')) : chip('open', 'plain');
+    if (s.status === 'unfilled') return chip('never filled', 'plain') + ' ' + (s.outcome === 'winner' ? chip('would have won', 'plain') : s.outcome === 'loser' ? chip('would have lost', 'plain') : chip(s.outcome || '', 'plain'));
+    return s.outcome === 'winner' ? chip('won', 'won') : s.outcome === 'loser' ? chip('lost', 'lost') : chip(s.outcome || s.status, 'plain');
+  }
+  function typeChip(s) { return s.order_type === 'take' ? chip('bet', 'sturdy') : s.order_type === 'lean' ? chip('forced', 'cap') : chip('resting order', 'plain'); }
+
+  // ---------------------------------------------------------------- data shaping
+  function shape(d) {
+    var byId = {}, s = (d.lastFull && d.lastFull.notes && d.lastFull.notes.settings) || null;
+    d.settings = s;
+    d.liveModels = ['elo_cross', (s && s.live_model) || 'dixon_coles'];
+    d.fixtures.forEach(function (f) { f.preds = {}; f.working = {}; f.sugs = []; f.day = dayKey(f.kickoff); byId[f.id] = f; });
+    d.preds.forEach(function (p) { if (byId[p.fixture_id]) byId[p.fixture_id].preds[p.model] = p; });
+    d.quotes.forEach(function (q) { if (byId[q.fixture_id]) byId[q.fixture_id].quote = q; });
+    d.working.forEach(function (w) { if (byId[w.fixture_id]) byId[w.fixture_id].working[w.model] = w; });
+    d.suggestions.forEach(function (x) { var f = byId[x.fixture_id]; if (f) { x.f = f; f.sugs.push(x); } });
+    (d.stakes || []).forEach(function (x) { if (byId[x.fixture_id]) byId[x.fixture_id].stakes = x; });
+    (d.news || []).forEach(function (x) { var f = byId[x.fixture_id]; if (f) (f.news = f.news || []).push(x); });
+    d.byId = byId;
+    d.isLive = function (m) { return d.liveModels.indexOf(m) >= 0; };
+    d.liveOf = function (f) { var ms = Object.keys(f.preds); for (var i = 0; i < d.liveModels.length; i++) if (ms.indexOf(d.liveModels[i]) >= 0) return d.liveModels[i]; return ms[0]; };
+    d.book.forEach(function (x) { x.f = { home: x.home, away: x.away, league: x.league, kickoff: x.kickoff }; });
+    var todayK = dayKey(d.now), days = {};
+    d.fixtures.forEach(function (f) { days[f.day] = true; });
+    var t = new Date(todayK + 'T12:00:00Z');
+    [-1, 0, 1, 2].forEach(function (k) { var x = new Date(t.getTime() + k * 864e5).toISOString().slice(0, 10); if (k >= 0) days[x] = true; });
+    d.days = Object.keys(days).sort();
+    d.todayK = todayK;
+    return d;
+  }
+
+  // ---------------------------------------------------------------- fixture details
+  function fixtureDetails(d, f) {
+    var s = d.settings, live = d.liveOf(f), q = f.quote && f.quote.rows || {};
+    var parts = [];
+    var meta = [chip(f.league || '?', 'plain'), '<span class="t">' + e(dhm(f.kickoff)) + ' UK</span>'];
+    var lp = f.preds[live]; if (lp && lp.band) meta.push(chip(lp.band === 'full' ? 'full data (15% band)' : 'thin data (10% band)', lp.band === 'full' ? 'sturdy' : 'frag'));
+    if (f.outcome_1x2) meta.push(chip('result: ' + sel(f.outcome_1x2, f), 'score'));
+    parts.push('<div class="fxsum">' + meta.join(' ') + '</div>');
+    if (f.match_note) parts.push('<p class="note">Name matching: ' + e(f.match_note) + '</p>');
+    // variants
+    var ms = Object.keys(f.preds).sort(function (a, b) { return (d.isLive(b) - d.isLive(a)) || a.localeCompare(b); });
+    if (ms.length) {
+      var mk = function (k) { var r = q[k]; return r && r.mid_novig != null ? r.mid_novig : null; };
+      var rows = ms.map(function (m) {
+        var p = f.preds[m], pr = p.probs || {}, notes = p.layer_notes && Object.keys(p.layer_notes).length ? Object.keys(p.layer_notes).map(function (k) { return k.replace(/_/g, ' ') + ': ' + p.layer_notes[k]; }).join('; ') : '';
+        return [e(modelLabel(m)) + ' ' + roleChip(d, m), ['<span class="mono">' + f3(p.lam_h) + ' – ' + f3(p.lam_a) + '</span>', ''], [pc(pr.H), ' class="mono"'], [pc(pr.D), ' class="mono"'], [pc(pr.A), ' class="mono"'], [pc(pr['O2.5']), ' class="mono"'], [pc(pr.BTTS_Y), ' class="mono"'], e(notes) + '<div class="sub">priced ' + e(hm(p.made_at)) + '</div>'];
+      });
+      rows.push({ cls: '', cells: ['<b>Market</b> (exchange, margin removed)', '—', [pc(mk('H')), ' class="mono"'], [pc(mk('D')), ' class="mono"'], [pc(mk('A')), ' class="mono"'], [pc(mk('O2.5')), ' class="mono"'], [pc(mk('BTTS_Y')), ' class="mono"'], f.quote ? 'read ' + e(hm(f.quote.read_at)) + (f.quote.is_close ? ' (kick-off read)' : '') : 'no book read'] });
+      parts.push('<h3 class="eyebrow" style="margin-top:4px">Goal expectations and 1X2 by model</h3>' + table(['Model', 'Goals exp. (home – away)', 'Home', 'Draw', 'Away', 'Over 2.5', 'Both score', 'Layer notes'], rows, 'var'));
+    }
+    // working for the live model
+    var w = f.working[live];
+    var aw = lp && lp.layer_notes && lp.layer_notes.anchor != null ? num(lp.layer_notes.anchor) : (s ? s.anchor_model_weight : null);   // the league's earned weight
+    if (w && w.rows && w.rows.length) {
+      var wr = w.rows.slice().sort(function (a, b) { return KEY_ORDER.indexOf(a.key) - KEY_ORDER.indexOf(b.key); }).map(function (r) {
+        var out = r.order_type === 'take' ? chip('take at ' + od(r.price), 'sturdy') : r.order_type === 'rest' ? chip('rest at ' + od(r.price), 'cap') : chip(gateText(r.gate, r.key, s), 'plain');
+        var isPick = w.pick === r.key;
+        return { cls: isPick ? 'pickrow' : '', cells: [e(sel(r.key, f)) + (isPick ? ' ' + chip('the pick', 'top') : '') + (r.back ? takeBtn(f, r.key, null, r.back, r.p_work, d) : ''), [pc(r.p_model), ' class="mono"'], [pc(r.p_capped), ' class="mono"'], [pc(r.p_market), ' class="mono"'], ['<b>' + pc(r.p_work) + '</b>', ' class="mono"'], [od(r.back) + ' / ' + od(r.lay), ' class="mono"'], [r.spread_pts == null ? '—' : num(r.spread_pts).toFixed(1), ' class="mono"'], ['<span class="' + sign(r.take_ev) + '">' + spc(r.take_ev) + '</span>', ' class="mono"'], out] };
+      });
+      parts.push('<h3 class="eyebrow" style="margin-top:6px">The working — ' + e(modelLabel(live)) + ', every market</h3>' +
+        '<p class="note">Model → capped to within ' + (s ? pc(s.band_cap && s.band_cap[w.band || 'full'], 0) : 'the band') + ' of the market → anchored at ' + (aw != null ? pc(aw, 0) + ' model / ' + pc(1 - aw, 0) + ' market' : 'the anchor') + '. EV is at the back price on offer, after ' + (s ? pc(s.commission, 0) : '') + ' commission; the floor is ' + (s ? spc(s.floor_ev, 0) : '+4%') + '.</p>' +
+        table(['Selection', 'Model', 'Capped', 'Market', 'Anchored', 'Back / lay', 'Spread', 'EV now', 'Outcome'], wr, 'work'));
+    } else if (Object.keys(f.preds).length) {
+      parts.push('<p class="empty">The row-by-row working appears from the first run after this page was installed.</p>');
+    }
+    // suggestions by every variant
+    if (f.sugs.length) {
+      parts.push('<h3 class="eyebrow" style="margin-top:6px">Bets and resting orders on this fixture</h3>' + table(['Model', 'Selection', 'Type', 'Paper price', 'EV', 'Status', 'CLV', 'Paper P&L'], f.sugs.map(function (x) {
+        return [e(modelLabel(x.model)) + (x.featured ? ' ' + chip('featured bet', 'top') : ''), e(sel(x.key, f)), typeChip(x), ['<b>' + od(x.price) + '</b>', ' class="mono"'], [spc(x.ev), ' class="mono"'], statusChip(x), ['<span class="' + sign(x.clv) + '">' + spc(x.clv) + '</span>', ' class="mono"'], ['<span class="' + sign(x.paper_pnl) + '">' + money(x.paper_pnl) + '</span>', ' class="mono"']];
+      }), 'var'));
+    } else if (Object.keys(f.preds).length) {
+      parts.push('<p class="note">No bet and no resting order: no market cleared the gates for any model.</p>');
+    }
+    var pickChip = '';
+    var lbet = f.sugs.filter(function (x) { return d.isLive(x.model) && x.order_type === 'take'; })[0];
+    var lrest = f.sugs.filter(function (x) { return d.isLive(x.model) && x.order_type === 'rest'; })[0];
+    if (lbet) pickChip = (lbet.featured ? chip('featured bet', 'top') + ' ' : '') + chip('bet: ' + sel(lbet.key, f) + ' @ ' + od(lbet.price), 'sturdy');
+    else if (lrest) pickChip = chip('rest ' + sel(lrest.key, f) + ' @ ' + od(lrest.price), 'plain');
+    if (f.stakes && f.stakes.data) {
+      var zl = { title: 'title', top_four: 'top four', promotion: 'automatic promotion', play_offs: 'play-offs', relegation: 'relegation' };
+      var srows = [];
+      [['home', f.home], ['away', f.away]].forEach(function (sd) { var tm = sd[1], zs = f.stakes.data[sd[0]] || {}; Object.keys(zs).forEach(function (z) { var v = zs[z]; srows.push([e(tm), e(zl[z] || z), [pc(v.now, 0), ' class="mono"'], [pc(v.if_win, 0), ' class="mono"'], [pc(v.if_draw, 0), ' class="mono"'], [pc(v.if_lose, 0), ' class="mono"'], ['<b>' + (v.swing == null ? '—' : (v.swing >= 0 ? '+' : '−') + Math.abs(v.swing * 100).toFixed(0) + ' pts') + '</b>', ' class="mono"']]); }); });
+      if (srows.length) parts.push('<h3 class="eyebrow" style="margin-top:6px">What\'s at stake (season simulated 10,000 times)</h3>' + table(['Side', 'Finishing in', 'Now', 'If they win', 'Draw', 'If they lose', 'Win v lose'], srows, 'var') + '<p class="note">Recorded for research; not used in pricing until it is shown to matter beyond the price.</p>');
+    }
+    if (f.news && f.news.length) parts.splice(1, 0, '<div class="warn"><b>Team news (Claude\'s news analyst, priced as the testing layer "news"):</b><ul>' + f.news.map(function (n) { return '<li>' + e(n.side === 'home' ? f.home : f.away) + ': goals scored ×' + num(n.attack).toFixed(2) + ', conceded ×' + num(n.defence).toFixed(2) + ' — ' + e(n.reason) + (n.source ? ' <a href="' + e(n.source) + '" target="_blank" rel="noopener">source</a>' : '') + '</li>'; }).join('') + '</ul></div>');
+    var rf_ = f.flags && f.flags.referee;
+    if (rf_) parts.splice(1, 0, '<p class="note">Referee: ' + e(rf_.name) + ' (API-Football).</p>');
+    var wx_ = f.flags && f.flags.weather;
+    if (wx_) parts.splice(1, 0, '<p class="note">Weather at ' + e(wx_.venue || 'the ground') + ': ' + e(wx_.rain) + ' mm of rain, wind ' + e(wx_.wind) + ' km/h, ' + e(wx_.temp) + ' °C over the match (' + e(wx_.bucket) + '; forecast ' + e(hm(wx_.fetched)) + ').</p>');
+    var sm_ = f.flags && f.flags.sharp_move;
+    if (sm_) parts.splice(1, 0, '<div class="warn"><b>Sharp move:</b> ' + e(sel(sm_.key, f)) + ' ' + pc(sm_.before) + ' → ' + pc(sm_.after) + ' in ' + e(sm_.minutes) + ' minutes, ' + e(sm_.hours_to_kickoff) + ' hours before kick-off. Recorded for the integrity research; bets are not blocked.</div>');
+    var summ = '<span class="t">' + e(hm(f.kickoff)) + '</span> <b>' + e(f.home) + ' v ' + e(f.away) + '</b> ' + chip(f.league || '?', 'plain') + ' ' + (sm_ ? chip('sharp move', 'neg') + ' ' : '') + (wx_ && wx_.bucket !== 'fair' ? chip(wx_.bucket, 'frag') + ' ' : '') + (f.stakes && f.stakes.swing != null && Math.abs(f.stakes.swing) >= 0.15 ? chip('big game: ' + (f.stakes.headline_team === 'away' ? f.away : f.home) + ' ' + String(f.stakes.headline_zone).replace('_', ' '), 'cap') + ' ' : '') + pickChip + (f.outcome_1x2 ? ' ' + chip(sel(f.outcome_1x2, f), 'score') : '');
+    return details(summ, parts.join(''), 'fx-' + f.id);
+  }
+
+  // ---------------------------------------------------------------- day tab
+  // A BET is a take: a price that was on offer when the bot priced it. A rest is an order waiting for a better price; it is
+  // not a bet unless matched, and it is shown apart (Mitch, 29 Sep: "the 4 picks should be the best 4 bets available to
+  // take there and then").
+  function isBet(x) { return x.order_type === 'take'; }
+  // ---------------------------------------------------------------- real bets (16 Oct: "I took this bet")
+  function takeBtn(f, key, sid, price, pw, state_) {
+    if (new Date(f.kickoff) <= new Date(state_ ? state_.now : Date.now())) return '';
+    return '<br><button type="button" class="take" data-fid="' + e(f.id) + '" data-key="' + e(key) + '" data-sid="' + e(sid == null ? '' : sid) + '" data-price="' + e(price == null ? '' : price) + '" data-pw="' + e(pw == null ? '' : pw) + '" data-what="' + e(f.home + ' v ' + f.away + ' · ' + sel(key, f) + ' · ' + dhm(f.kickoff)) + '">I took this</button>';
+  }
+  function pickRows(d, list) {
+    return list.map(function (x) {
+      var f = x.f, q = f.quote && f.quote.rows && f.quote.rows[x.key];
+      return { fx: f.id, cls: 'rowlink', cells: [
+        '<span class="mono">' + e(hm(f.kickoff)) + '</span>',
+        '<a class="fxlink" href="#fx-' + f.id + '"><b>' + e(f.home) + ' v ' + e(f.away) + '</b></a><div class="sub">' + e(f.league) + ' · ' + e(modelLabel(x.model)) + '</div>',
+        '<b>' + e(sel(x.key, f)) + '</b>' + (f.id ? takeBtn(f, x.key, x.id, x.order_type === 'take' || x.order_type === 'lean' ? (q && q.back) || x.price : x.price, x.p_work, d) : ''),
+        typeChip(x),
+        ['<b>' + od(x.price) + '</b><div class="sub">at ' + e(hm(x.made_at)) + '</div>', ' class="mono"'],
+        [od(q && q.back), ' class="mono"'],
+        ['<span class="' + sign(x.ev) + '">' + spc(x.ev) + '</span>', ' class="mono"'],
+        [pc(x.p_model) + ' / ' + pc(x.p_market) + ' / <b>' + pc(x.p_work) + '</b>', ' class="mono"'],
+        statusChip(x),
+        ['<span class="' + sign(x.clv) + '">' + spc(x.clv) + '</span>', ' class="mono"'],
+        x.status === 'unfilled' ? ['<span class="muted">' + money(x.paper_pnl) + ' as if</span>', ' class="mono"'] : ['<span class="' + sign(x.paper_pnl) + '">' + money(x.paper_pnl) + '</span>', ' class="mono"']
+      ] };
+    });
+  }
+  var PICK_HEADS = ['Kick-off', 'Fixture', 'Selection', 'Type', 'Price', 'Back now', 'EV at price', 'Model / market / anchored', 'Status', 'CLV', 'Paper P&L'];
+
+  // The best prices on offer that did NOT clear the floor: what came closest to being a bet. Not bets.
+  function closest(d, fx, n) {
+    var out = [];
+    fx.forEach(function (f) {
+      if (new Date(f.kickoff) <= new Date(d.now)) return;
+      if (f.sugs.some(function (x) { return d.isLive(x.model) && x.order_type === 'take'; })) return;   // already a bet
+      var w = f.working[d.liveOf(f)]; if (!w || !w.rows) return;
+      w.rows.forEach(function (r) { if (r.gate == null && r.order_type !== 'take' && r.take_ev != null) out.push({ f: f, r: r }); });
+    });
+    out.sort(function (a, b) { return b.r.take_ev - a.r.take_ev; });
+    return out.slice(0, n);
+  }
+
+  function dayTab(d, k) {
+    var fx = d.fixtures.filter(function (f) { return f.day === k; });
+    var priced = fx.filter(function (f) { return Object.keys(f.preds).length; });
+    var sugs = [].concat.apply([], fx.map(function (f) { return f.sugs; }));
+    var liveS = sugs.filter(function (x) { return d.isLive(x.model); });
+    var bets = liveS.filter(isBet);
+    var feat = bets.filter(function (x) { return x.featured; });
+    var otherBets = bets.filter(function (x) { return !x.featured; });
+    var rests = liveS.filter(function (x) { return x.order_type === 'rest'; });
+    var cardBets = liveS.filter(function (x) { return x.card === 'bet'; }), cardForced = liveS.filter(function (x) { return x.card === 'forced'; }), cardRests = liveS.filter(function (x) { return x.card === 'rest'; });
+    var test = sugs.filter(function (x) { return !d.isLive(x.model); });
+    var settledFx = fx.filter(function (f) { return f.outcome_1x2; });
+    var nMax = (d.settings && d.settings.max_featured_per_day) || 4, floor = d.settings ? spc(d.settings.floor_ev, 0) : '+4%';
+    var html = '';
+    // results first on a settled day
+    if (settledFx.length) {
+      var rows = [], llm = [], llk = [];
+      settledFx.forEach(function (f) {
+        var live = d.liveOf(f), p = f.preds[live], o = f.outcome_1x2, q = f.quote && f.quote.rows && f.quote.rows[o];
+        var pm = p && p.probs ? num(p.probs[o]) : null, pk = q ? num(q.mid_novig) : null;
+        if (pm && pk) { llm.push(-Math.log(pm)); llk.push(-Math.log(pk)); }
+        var bet = f.sugs.filter(function (x) { return d.isLive(x.model) && isBet(x); })[0];
+        rows.push({ fx: f.id, cls: 'rowlink', cells: ['<b>' + e(f.home) + ' v ' + e(f.away) + '</b><div class="sub">' + e(f.league) + '</div>', chip(sel(o, f), 'score'), [pc(pm), ' class="mono"'], [pc(pk), ' class="mono"'], [pm ? (-Math.log(pm)).toFixed(3) : '—', ' class="mono"'], [pk ? (-Math.log(pk)).toFixed(3) : '—', ' class="mono"'], pm && pk ? (pm > pk ? chip('model closer', 'sturdy') : chip('market closer', 'neg')) : '—', bet ? e(sel(bet.key, f)) + ' @ ' + od(bet.price) + ' ' + statusChip(bet) : '<span class="muted">no bet</span>', bet ? ['<span class="' + sign(bet.paper_pnl) + '">' + money(bet.paper_pnl) + '</span>', ' class="mono"'] : '—'] });
+      });
+      var dayPnl = sum(bets.filter(function (x) { return x.status === 'settled'; }), function (x) { return x.paper_pnl; });
+      var mLL = llm.length ? llm.reduce(function (a, b) { return a + b; }) / llm.length : null, kLL = llk.length ? llk.reduce(function (a, b) { return a + b; }) / llk.length : null;
+      html += section('Results — ' + e(dayLabel(k)), kpi([[settledFx.length, 'fixtures settled'], [f3(mLL), 'model log loss (lower is better)'], [f3(kLL), 'market log loss at kick-off'], [money(dayPnl), 'paper P&L on bets', sign(dayPnl)]]) +
+        (mLL != null ? '<p>' + (mLL < kLL ? 'The model was <b>closer than the market</b> on this day\'s results, by ' + (kLL - mLL).toFixed(3) + ' per fixture.' : 'The market was <b>closer than the model</b> on this day\'s results, by ' + (mLL - kLL).toFixed(3) + ' per fixture.') + ' One day is noise; the Model tab has the running total.</p>' : '') +
+        table(['Fixture', 'Result', 'Model gave it', 'Market gave it', 'Model log loss', 'Market log loss', 'Closer', 'Bet', 'Paper P&L'], rows, 'book'), { first: true });
+    }
+    // the daily card (Mitch, 16 Oct: "rest these 5, 5 real bets, 5 forced bets")
+    var cs_ = (d.settings && d.settings.card_size) || 5;
+    if (cardBets.length || cardForced.length || cardRests.length || k >= d.todayK) {
+      var cardTable = function (list) { return list.length ? table(PICK_HEADS, pickRows(d, list), 'picks') : ''; };
+      html += section('The card — ' + e(dayLabel(k)),
+        kpi([[cardBets.length + ' / ' + nMax, 'bets (cleared ' + floor + ')'], [cardForced.length + ' / ' + cs_, 'forced picks'], [cardRests.length + ' / ' + cs_, 'resting orders to place']]) +
+        '<h3 class="eyebrow" style="margin-top:6px">Bets</h3>' + (cardTable(cardBets) || '<p class="empty">None yet: no price on offer has cleared ' + floor + ' EV after commission. Fewer is correct; the bot keeps looking until kick-off.</p>') +
+        '<h3 class="eyebrow" style="margin-top:10px">Forced picks</h3><p class="note">The ' + cs_ + ' prices on offer the model rates best, chosen once in the morning, whether or not they clear the floor. <b>Not value bets</b>: a fast test of whether the model\'s ranking means anything. Judged by CLV.</p>' + (cardTable(cardForced) || '<p class="empty">Chosen at the first run after 09:00 UK.</p>') +
+        '<h3 class="eyebrow" style="margin-top:10px">Rest these</h3><p class="note">The ' + cs_ + ' resting orders closest to the price on offer now (likeliest to be matched). Counted only if the market reaches the price before kick-off. So far filled resting orders have tended to lose to the closing price (P&amp;L tab).</p>' + (cardTable(cardRests) || '<p class="empty">Chosen at the first run after 09:00 UK.</p>'),
+        settledFx.length ? {} : { first: true });
+    }
+    var near = closest(d, fx, 4);
+    html += section('Bets — ' + e(dayLabel(k)),
+      kpi([[feat.length + ' / ' + nMax, 'bets (the best on offer when found)'], [otherBets.length, 'other bets found'], [rests.length, 'resting orders (not bets)'], [priced.length + ' / ' + fx.length, 'fixtures priced / on the exchange']]) +
+      (feat.length ? table(PICK_HEADS, pickRows(d, feat), 'picks') :
+        '<p class="empty">No bet for this day' + (priced.length ? ': no price on offer cleared ' + floor + ' EV after commission. Fewer is correct.' : (fx.length ? ': fixtures are listed but none is priced yet.' : ': no covered fixtures on the exchange yet (the bot looks 48 hours ahead).')) + '</p>') +
+      (otherBets.length ? details('<b>Other bets found</b>', '<p class="note">Also cleared ' + floor + ' at the price on offer, after the day\'s ' + nMax + ' were already featured.</p>' + table(PICK_HEADS, pickRows(d, otherBets), 'picks'), '', otherBets.length + ' more') : '') +
+      (near.length ? details('<b>Closest to a bet</b>', '<p class="note">The best prices on offer that did <b>not</b> clear ' + floor + '. Not bets: shown so you can see how close the market came.</p>' + table(['Kick-off', 'Fixture', 'Selection', 'Back now', 'EV now', 'Needs', 'Model / market / anchored'], near.map(function (n) {
+        return { fx: n.f.id, cls: 'rowlink', cells: ['<span class="mono">' + e(hm(n.f.kickoff)) + '</span>', '<a class="fxlink" href="#fx-' + n.f.id + '"><b>' + e(n.f.home) + ' v ' + e(n.f.away) + '</b></a><div class="sub">' + e(n.f.league) + '</div>', '<b>' + e(sel(n.r.key, n.f)) + '</b>', [od(n.r.back), ' class="mono"'], ['<span class="' + sign(n.r.take_ev) + '">' + spc(n.r.take_ev) + '</span>', ' class="mono"'], [n.r.price ? od(n.r.price) + ' or better' : '—', ' class="mono"'], [pc(n.r.p_model) + ' / ' + pc(n.r.p_market) + ' / <b>' + pc(n.r.p_work) + '</b>', ' class="mono"']] };
+      }), 'work'), '', 'top ' + near.length + ', not bets') : '') +
+      (rests.length ? details('<b>Resting orders — not bets</b>', '<p class="note">Orders waiting for a better price than the market offered. They are not bets and are not in the P&amp;L. "Filled" means the exchange reached that price before kick-off, judged from reads every 15 minutes.</p>' + table(PICK_HEADS, pickRows(d, rests), 'picks'), '', rests.length + ' orders') : '') +
+      (test.length ? details('<b>Challengers and testing variants</b>', '<p class="note">The model competing with itself: challengers are slight variations of the champion\'s recipe, testing variants add a layer. Each is scored against the champion and the market; a challenger that wins takes over (Model → Self-tuning). Never featured.</p>' + table(PICK_HEADS, pickRows(d, test), 'picks'), '', test.filter(isBet).length + ' bets · ' + test.filter(function (x) { return !isBet(x); }).length + ' rests') : ''),
+      {});
+    html += section('How to use this', card('<ul><li><b>Paper only.</b> Nothing here is placed and nothing is a stake recommendation. A bet here is a priced selection, not advice to bet.</li><li><b>A bet</b> is a price that was on offer when the bot priced the fixture and cleared ' + floor + ' EV after commission. The day\'s first ' + nMax + ' are featured, best EV first. Fewer is correct.</li><li>A bet is fixed when found, at the time shown, like a bet taken at that price. Later runs never move it.</li><li><b>Resting orders</b> are not bets and are kept out of the P&amp;L.</li><li>The real test is <b>CLV</b> (did the price move our way by kick-off) and <b>log loss</b> against the market, not the day\'s P&amp;L.</li></ul>'));
+    html += section('Every fixture', fx.length ? fx.map(function (f) { return fixtureDetails(d, f); }).join('') : '<p class="empty">No fixtures stored for this day yet.</p>');
+    return { html: html, note: fx.length ? (feat.length + ' bet' + (feat.length === 1 ? '' : 's') + ' · ' + priced.length + ' priced') : 'nothing yet' };
+  }
+
+  // ---------------------------------------------------------------- P&L tab
+  function bookRows(list) {
+    return list.map(function (x) {
+      return [
+        '<span class="mono">' + e(dhm(x.kickoff)) + '</span>',
+        '<b>' + e(x.home) + ' v ' + e(x.away) + '</b><div class="sub">' + e(x.league) + ' · ' + e(modelLabel(x.model)) + '</div>',
+        e(sel(x.key, x.f)), typeChip(x), ['<b>' + od(x.price) + '</b>', ' class="mono"'], [spc(x.ev), ' class="mono"'],
+        [pc(x.close_novig), ' class="mono"'], ['<span class="' + sign(x.clv) + '">' + spc(x.clv) + '</span>', ' class="mono"'],
+        statusChip(x), x.status === 'unfilled' ? ['<span class="muted">' + money(x.paper_pnl) + ' as if</span>', ' class="mono"'] : ['<span class="' + sign(x.paper_pnl) + '">' + money(x.paper_pnl) + '</span>', ' class="mono"']];
+    });
+  }
+  function bookSection(title, list, blurb, first) {
+    var tot = sum(list, function (x) { return x.paper_pnl; });
+    var rows = bookRows(list);
+    if (list.length) rows.push({ cls: 'now', cells: ['', '<b>Total</b>', '', '', '', '', '', ['<b>' + spc(mean(list, function (x) { return x.clv; })) + '</b> mean', ' class="mono"'], list.length + (list.length === 1 ? ' row' : ' rows'), ['<b class="' + sign(tot) + '">' + money(tot) + '</b>', ' class="mono"']] });
+    return section(title, '<p class="muted">' + blurb + '</p>' + (list.length ? table(['Kick-off', 'Fixture', 'Selection', 'Type', 'Price', 'EV', 'Close', 'CLV', 'Result', 'Paper P&L'], rows, 'book') : '<p class="empty">Nothing settled here yet.</p>'), { first: first });
+  }
+  // ---------------------------------------------------------------- idea 28: staking plans, on paper
+  function stakingPlans(bets, stake, comm) {
+    var xs = bets.filter(function (x) { return num(x.paper_pnl) != null && num(x.price) > 1; }).slice().sort(function (a, b) { return new Date(a.kickoff) - new Date(b.kickoff); });
+    var plans = [
+      ['Flat', 'the same stake every bet (what the book above uses)', function () { return stake; }],
+      ['By edge', 'stake scaled by the edge: a +4% bet gets 1 stake, +8% gets 2 (between ½ and 3)', function (x) { return stake * Math.min(3, Math.max(0.5, num(x.ev) / 0.04)); }],
+      ['Quarter Kelly', 'a quarter of the Kelly stake from a £' + (stake * 100) + ' bank, at most 5% of the bank, using the anchored probability', function (x, bank) {
+        var p = num(x.p_work), b = (num(x.price) - 1) * (1 - comm); if (p == null || b <= 0) return 0;
+        var f = (p * b - (1 - p)) / b; return Math.max(0, Math.min(0.05, f / 4)) * bank; }]
+    ];
+    return plans.map(function (pl) {
+      var bank = stake * 100, peak = bank, dd = 0, turn = 0, low = bank;
+      xs.forEach(function (x) { var st = pl[2](x, bank); turn += st; bank += num(x.paper_pnl) / stake * st; peak = Math.max(peak, bank); dd = Math.max(dd, peak - bank); low = Math.min(low, bank); });
+      var pnl = bank - stake * 100;
+      return ['<b>' + e(pl[0]) + '</b><div class="sub">' + e(pl[1]) + '</div>', ['<b class="' + sign(pnl) + '">' + money(pnl) + '</b>', ' class="mono" style="white-space:nowrap"'], ['£' + Math.round(turn), ' class="mono"'], [turn ? spc(pnl / turn) : '—', ' class="mono"'], ['£' + Math.round(dd), ' class="mono"'], ['£' + Math.round(low), ' class="mono"']];
+    });
+  }
+
+  // ---------------------------------------------------------------- idea 36: ready for real money?
+  function readiness(d, bets) {
+    var clvs = bets.map(function (x) { return num(x.clv); }).filter(function (x) { return x != null; });
+    var n = clvs.length, m = n ? clvs.reduce(function (a, b) { return a + b; }, 0) / n : null;
+    var sd = n > 1 ? Math.sqrt(clvs.reduce(function (a, b) { return a + (b - m) * (b - m); }, 0) / (n - 1)) : null, t = sd ? m / (sd / Math.sqrt(n)) : null;
+    var beat = n ? clvs.filter(function (x) { return x > 0; }).length / n : null;
+    var lb = d.board.filter(function (b) { return d.isLive(b.model) && b.league == null; })[0];
+    var bt = d.backtest, btn = sum(bt, function (x) { return x.n; }), gap = btn ? (sum(bt, function (x) { return num(x.n) * num(x.ll_model); }) - sum(bt, function (x) { return num(x.n) * num(x.ll_market); })) / btn : null;
+    var stake = (d.settings && d.settings.paper_stake) || 50, xs = bets.slice().sort(function (a, b) { return new Date(a.kickoff) - new Date(b.kickoff); }), run = 0, peak = 0, dd = 0;
+    xs.forEach(function (x) { run += num(x.paper_pnl) || 0; peak = Math.max(peak, run); dd = Math.max(dd, peak - run); });
+    var tripped = {}; (d.tuning || []).slice().reverse().forEach(function (r) { if (r.kind === 'breaker') tripped[r.league] = r.adopted; });
+    var trippedNow = Object.keys(tripped).filter(function (k) { return tripped[k]; });
+    var stale = (d.guardian || []).filter(function (g) { return g.check_name === 'stale results'; });
+    var rows = [
+      ['Enough bets', n >= 200, n + ' settled bets with a closing price', '200 or more'],
+      ['Beats the closing price', n >= 30 && m != null && m > 0 && t != null && t >= 2, m == null ? '—' : 'mean CLV ' + spc(m) + (t != null && n >= 30 ? ', t = ' + t.toFixed(1) : ''), 'mean above 0 and t of 2 or more (unlikely to be luck)'],
+      ['Beats it often', beat != null && beat >= 0.52 && n >= 50, beat == null ? '—' : pc(beat, 0) + ' of bets', '52% or more'],
+      ['Predicts better than the market', !!lb && lb.n >= 300 && num(lb.ll_model) < num(lb.ll_market), lb ? lb.n + ' fixtures, ' + num(lb.ll_model).toFixed(4) + ' v ' + num(lb.ll_market).toFixed(4) : 'not scored yet', '300+ fixtures, lower log loss than the close'],
+      ['Back-test close to Pinnacle', gap != null && gap <= 0.01, gap == null ? 'not run yet' : (gap >= 0 ? '+' : '') + gap.toFixed(4) + ' over ' + btn + ' matches', 'gap of +0.010 or better'],
+      ['Survivable losing run', n >= 50 && dd <= 40 * stake, 'worst fall ' + money(-dd), 'under 40 stakes (' + money(-40 * stake) + ')'],
+      ['No league on the circuit breaker', trippedNow.length === 0 && n >= 50, trippedNow.length ? trippedNow.join(', ') : 'none', 'none tripped'],
+      ['Data clean', stale.length === 0, stale.length ? stale.length + (stale.length === 1 ? ' stale-results warning' : ' stale-results warnings') + ' this week' : 'no warnings this week', 'no stale-results warnings']
+    ];
+    var met = rows.filter(function (r) { return r[1]; }).length;
+    return section('Ready for real money?', '<p class="muted">A checklist, not a switch: nothing here places a bet. Real money only when every line is met and Mitch decides. <b>' + met + ' of ' + rows.length + ' met.</b> CLV is the earliest honest signal; P&amp;L takes far longer to mean anything.</p>' +
+      table(['Test', '', 'Now', 'Needs'], rows.map(function (r) { return ['<b>' + e(r[0]) + '</b>', chip(r[1] ? 'met' : 'not yet', r[1] ? 'pos' : ''), e(r[2]), '<span class="muted">' + e(r[3]) + '</span>']; }), 'var'));
+  }
+
+  function realTab(d) {
+    var all = d.realBets || [], open = all.filter(function (b) { return b.status === 'open'; }), done = all.filter(function (b) { return b.status === 'settled'; });
+    var staked = sum(done, function (b) { return b.stake; }), pnl = sum(done, function (b) { return b.pnl; });
+    var clvB = done.filter(function (b) { return b.clv != null; }), clv = clvB.length ? sum(clvB, function (b) { return num(b.clv) * num(b.stake); }) / sum(clvB, function (b) { return b.stake; }) : null;
+    var evB = all.filter(function (b) { return b.ev != null; }), ev = evB.length ? sum(evB, function (b) { return num(b.ev) * num(b.stake); }) / sum(evB, function (b) { return b.stake; }) : null;
+    var tierLabel = { bet: 'Bets', forced: 'Forced picks', rest: 'Rests', 'own pick': 'Own picks' };
+    var fx = function (b) { return { home: b.home, away: b.away }; };
+    var html = section('Real bets', (d.betsEnabled ? '' : '<div class="warn"><b>Logging is off.</b> Set <span class="mono">BETS_KEY</span> on the sbms-page service in Render to switch on the "I took this" buttons.</div>') +
+      '<p class="muted">Bets you actually placed, logged with the "I took this" button on any pick or on any selection in a fixture\'s working. Settled automatically from the exchange\'s result. <b>EV</b> is the model\'s, at the odds you took, after ' + pc((d.settings && d.settings.commission) || 0.02, 0) + ' commission; <b>CLV</b> compares your odds with the closing price (the early verdict on whether you are getting good prices). Both weighted by stake.</p>' +
+      kpi([[all.length, 'bets logged'], ['£' + Math.round(staked), 'staked (settled)'], [money(pnl), 'real P&L', sign(pnl)], [staked ? spc(pnl / staked) : '—', 'return on stakes', sign(pnl)], [spc(clv), 'CLV', sign(clv)], [spc(ev), 'EV when taken', sign(ev)], [open.length + ' · £' + Math.round(sum(open, function (b) { return b.stake; })), 'open']]), { first: true });
+    var tiers = ['bet', 'forced', 'rest', 'own pick'].map(function (t) {
+      var bs = all.filter(function (b) { return b.tier === t; }), st = bs.filter(function (b) { return b.status === 'settled'; });
+      var stk = sum(st, function (b) { return b.stake; }), pl = sum(st, function (b) { return b.pnl; }), cb = st.filter(function (b) { return b.clv != null; });
+      var c = cb.length ? sum(cb, function (b) { return num(b.clv) * num(b.stake); }) / sum(cb, function (b) { return b.stake; }) : null;
+      return [e(tierLabel[t]), [bs.length, ' class="mono"'], [st.length, ' class="mono"'], ['£' + Math.round(stk), ' class="mono"'], ['<b class="' + sign(pl) + '">' + money(pl) + '</b>', ' class="mono"'], [stk ? spc(pl / stk) : '—', ' class="mono"'], ['<span class="' + sign(c) + '">' + spc(c) + '</span>', ' class="mono"']];
+    });
+    html += section('By tier', table(['Tier', 'Logged', 'Settled', 'Staked', 'P&L', 'Return', 'CLV'], tiers, 'var'));
+    html += section('Open', open.length ? table(['Kick-off', 'Fixture', 'Selection', 'Tier', 'Odds', 'Stake', 'EV', 'Logged', ''], open.map(function (b) {
+      return [e(dhm(b.kickoff)), '<b>' + e(b.home) + ' v ' + e(b.away) + '</b><div class="sub">' + e(b.league) + '</div>', e(sel(b.key, fx(b))), chip(tierLabel[b.tier] || b.tier, 'plain') + (b.late ? ' ' + chip('after kick-off', 'neg') : ''),
+        ['<b>' + od(b.odds) + '</b>' + (b.suggested_price ? '<div class="sub">suggested ' + od(b.suggested_price) + '</div>' : ''), ' class="mono"'], ['£' + num(b.stake).toFixed(2), ' class="mono"'], ['<span class="' + sign(b.ev) + '">' + spc(b.ev) + '</span>', ' class="mono"'], e(dhm(b.created_at)),
+        '<button type="button" class="undo" data-undo="' + e(b.id) + '">Undo</button>'];
+    }), 'book') : '<p class="empty">No open bets.</p>');
+    html += section('Settled', done.length ? table(['Kick-off', 'Fixture', 'Selection', 'Tier', 'Odds', 'Stake', 'EV', 'Close', 'CLV', 'Result', 'P&L'], done.map(function (b) {
+      return [e(dhm(b.kickoff)), '<b>' + e(b.home) + ' v ' + e(b.away) + '</b><div class="sub">' + e(b.league) + (b.note ? ' · ' + e(b.note) : '') + '</div>', e(sel(b.key, fx(b))), chip(tierLabel[b.tier] || b.tier, 'plain'),
+        ['<b>' + od(b.odds) + '</b>', ' class="mono"'], ['£' + num(b.stake).toFixed(2), ' class="mono"'], ['<span class="' + sign(b.ev) + '">' + spc(b.ev) + '</span>', ' class="mono"'], [pc(b.close_novig), ' class="mono"'],
+        ['<span class="' + sign(b.clv) + '">' + spc(b.clv) + '</span>', ' class="mono"'], b.outcome === 'winner' ? chip('won', 'sturdy') : b.outcome === 'void' ? chip('void', 'plain') : chip('lost', 'neg'), ['<b class="' + sign(b.pnl) + '">' + money(b.pnl) + '</b>', ' class="mono"']];
+    }), 'book') : '<p class="empty">Nothing settled yet.</p>');
+    return { html: html, note: all.length ? all.length + (all.length === 1 ? ' bet · ' : ' bets · ') + money(pnl) : 'none logged' };
+  }
+
+  function pnlTab(d) {
+    var live = d.book.filter(function (x) { return d.isLive(x.model); });
+    var bets = live.filter(function (x) { return isBet(x) && x.status === 'settled'; });
+    var feat = bets.filter(function (x) { return x.featured; });
+    var other = bets.filter(function (x) { return !x.featured; });
+    var restsFilled = live.filter(function (x) { return x.order_type === 'rest' && x.status === 'settled'; });
+    var restsUnfilled = live.filter(function (x) { return x.order_type === 'rest' && x.status === 'unfilled'; });
+    var forcedSettled = live.filter(function (x) { return x.order_type === 'lean' && x.status === 'settled'; });
+    var clv = mean(bets, function (x) { return x.clv; }), pos = mean(bets.filter(function (x) { return x.clv != null; }), function (x) { return x.clv > 0 ? 1 : 0; });
+    var pnl = sum(bets, function (x) { return x.paper_pnl; }), fpnl = sum(feat, function (x) { return x.paper_pnl; });
+    var html = section('The paper book — bets only', kpi([[bets.length, 'bets settled'], [money(pnl), 'paper P&L at £' + ((d.settings && d.settings.paper_stake) || 50) + ' a bet', sign(pnl)], [money(fpnl), 'of which the featured ' + feat.length, sign(fpnl)], [spc(clv), 'mean CLV', sign(clv)], [pc(pos, 0), 'beat the closing price']]) +
+      '<p class="muted">Only bets count: prices that were on offer when found. Resting orders are listed below and kept out of every total. P&amp;L at this sample size is mostly luck; CLV is the early signal.</p>', { first: true });
+    var cardRow = function (key, label, blurb) {
+      var r = (d.card || []).filter(function (x) { return x.card === key; })[0] || {};
+      return ['<b>' + e(label) + '</b><div class="sub">' + e(blurb) + '</div>', [r.n || 0, ' class="mono"'], [(r.settled || 0) + (r.unfilled ? ' + ' + r.unfilled + ' unfilled' : ''), ' class="mono"'],
+        ['<b class="' + sign(r.pnl) + '">' + money(r.pnl) + '</b>' + (r.unfilled ? '<div class="sub">unfilled, as if: ' + money(r.pnl_unfilled_as_if) + '</div>' : ''), ' class="mono"'],
+        ['<b class="' + sign(r.clv) + '">' + spc(r.clv) + '</b>', ' class="mono"'], [pc(r.beat_close, 0), ' class="mono"'], [spc(r.ev), ' class="mono"']];
+    };
+    html += section('The card so far', '<p class="muted">Each tier of the daily card judged on its own (from 16 Oct). <b>CLV</b> (did the closing price move our way) is the early verdict: a tier with CLV clearly below zero after a hundred or so picks has no edge, whatever its P&amp;L says.</p>' +
+      table(['Tier', 'Carded', 'Settled', 'Paper P&L at £' + ((d.settings && d.settings.paper_stake) || 50), 'Mean CLV', 'Beat close', 'Average EV when picked'],
+        [cardRow('bet', 'Bets', 'cleared the floor at the price on offer'), cardRow('forced', 'Forced picks', 'the model\'s best-rated prices, floor or not'), cardRow('rest', 'Rest these', 'resting orders; counted when filled')], 'var'));
+    html += bookSection('Forced picks', forcedSettled, 'The card\'s forced picks, settled at the price on offer when they were chosen. Not value bets: a test of the model\'s ranking.');
+    html += readiness(d, bets);
+    var stk = (d.settings && d.settings.paper_stake) || 50;
+    html += section('Staking plans compared', bets.length ? '<p class="muted">The same bets, in kick-off order, staked three ways from a £' + (stk * 100) + ' paper bank (idea 28). Staking cannot create an edge; it decides how hard a real edge is pressed and how deep the losing runs get.</p>' +
+      table(['Plan', 'P&L', 'Staked', 'Return on stakes', 'Worst fall', 'Lowest bank'], stakingPlans(bets, stk, (d.settings && d.settings.commission) || 0.02), 'var') : '<p class="empty">No settled bets yet.</p>');
+    html += bookSection('Featured bets', feat, 'The day\'s best bets on offer when found (up to ' + ((d.settings && d.settings.max_featured_per_day) || 4) + ' a day), settled at that price.');
+    html += bookSection('Other bets', other, 'Bets that cleared the floor after the day\'s featured bets were already chosen.');
+    html += section('Resting orders — not bets', '<p class="muted">Kept for information only, never in the P&amp;L above. Shows how often waiting for a better price is matched, and what those orders would have made.</p>' +
+      kpi([[restsFilled.length, 'filled before kick-off'], [money(sum(restsFilled, function (x) { return x.paper_pnl; })), 'filled, as if bets'], [restsUnfilled.length, 'never filled'], [money(sum(restsUnfilled, function (x) { return x.paper_pnl; })), 'unfilled, as if bets']]) +
+      (restsFilled.length || restsUnfilled.length ? details('<b>Every settled resting order</b>', table(['Kick-off', 'Fixture', 'Selection', 'Type', 'Price', 'EV', 'Close', 'CLV', 'Result', 'As if'], bookRows(restsFilled.concat(restsUnfilled)), 'book')) : ''));
+    html += section('Every model variant', d.paper.length ? table(['Model', 'Bets settled', 'Bets open', 'Bets P&L', 'Mean CLV', 'Beat close', 'Featured P&L', 'Rests', 'Rests filled', 'Filled, as if', 'Unfilled, as if'], d.paper.map(function (p) {
+      return [e(modelLabel(p.model)) + ' ' + roleChip(d, p.model), [p.bets_settled, ' class="mono"'], [p.bets_open, ' class="mono"'], ['<span class="' + sign(p.bets_pnl) + '">' + money(p.bets_pnl) + '</span>', ' class="mono"'], ['<span class="' + sign(p.bets_mean_clv) + '">' + spc(p.bets_mean_clv) + '</span>', ' class="mono"'], [pc(p.bets_beat_close, 0), ' class="mono"'], [money(p.featured_pnl), ' class="mono"'], [p.rests, ' class="mono"'], [p.rests_filled, ' class="mono"'], ['<span class="muted">' + money(p.rests_filled_pnl) + '</span>', ' class="mono"'], ['<span class="muted">' + money(p.rests_unfilled_pnl_as_if) + '</span>', ' class="mono"']];
+    }), 'book') : '<p class="empty">Nothing recorded yet.</p>');
+    return { html: html, note: bets.length + ' bets · ' + money(pnl) };
+  }
+
+  // ---------------------------------------------------------------- Model tab
+  function modelTab(d) {
+    var s = d.settings, models = {};
+    d.board.forEach(function (b) { models[b.model] = true; }); d.paper.forEach(function (p) { models[p.model] = true; });
+    d.fixtures.forEach(function (f) { Object.keys(f.preds).forEach(function (m) { models[m] = true; }); });
+    var ms = Object.keys(models).sort(function (a, b) { return (d.isLive(b) - d.isLive(a)) || a.localeCompare(b); });
+    var subs = [['overview', 'Overview', 'rules in force']].concat(ms.map(function (m) { var o = d.board.filter(function (b) { return b.model === m && b.league == null; })[0]; return ['m-' + m.replace(/[^a-z0-9]/gi, '_'), modelLabel(m), o ? o.n + ' scored' : 'not scored yet']; }), [['selftune', 'Self-tuning', (d.tuning || []).filter(function (x) { return x.adopted; }).length + ' changes'], ['backtest', 'Back-test', d.backtest.length + ' league-seasons'], ['managers', 'Manager changes', d.managers.length + ' recorded'], ['news', 'Team news', (d.news || []).length + ' adjustments']]);
+    var html = '<div class="sec first"><nav class="vtabs" data-vt="model">' + subs.map(function (x) { return '<a href="#" data-mv="' + x[0] + '">' + e(x[1]) + '<small>' + e(x[2]) + '</small></a>'; }).join('') + '</nav></div>';
+    // overview
+    var ov = '';
+    if (s) {
+      var layers = s.layers || {};
+      ov += card('<ul>' +
+        '<li><b>Foundation:</b> penaltyblog Dixon-Coles per league, time decay ξ ' + e(s.dc_xi) + ', ' + e(s.dc_seasons) + ' seasons; a league under ' + e(s.dc_min_matches) + ' matches is "thin". European ties: ClubElo (home advantage ' + e(s.elo_hfa) + ' Elo points, ' + e(s.elo_total_goals) + ' goals a match — stated assumptions).</li>' +
+        '<li><b>Live model:</b> ' + e(modelLabel(s.live_model)) + '.</li>' +
+        '<li><b>Cap and anchor:</b> the model is kept within ' + pc(s.band_cap && s.band_cap.full, 0) + ' of the market (' + pc(s.band_cap && s.band_cap.thin, 0) + ' on thin data), then anchored at ' + pc(s.anchor_model_weight, 0) + ' model / ' + pc(1 - s.anchor_model_weight, 0) + ' market.</li>' +
+        '<li><b>Gates:</b> result rows need ' + pc(s.thresh_result, 0) + ', goals rows ' + pc(s.thresh_goals, 0) + ' model probability.</li>' +
+        '<li><b>Take or rest (L-1):</b> take the back price on offer if it clears ' + spc(s.floor_ev, 0) + ' EV after ' + pc(s.commission, 0) + ' commission; otherwise rest at the lowest price that does. Spread and volume gates ' + (s.liquidity_gates ? '<b>on</b>' : 'off') + '.</li>' +
+        '<li><b>Bets:</b> a price on offer that clears the floor is a bet, fixed when found; at most one per fixture per model. The first ' + e(s.max_featured_per_day) + ' a day are featured, best EV first. Resting orders are recorded apart and are not bets. Paper stake £' + e(s.paper_stake) + '. Prices the next ' + e(s.price_window_hours) + ' hours.</li>' +
+        (s.tuning ? '<li><b>Self-tuning:</b> each league\'s recipe is priced every hour beside challengers (old results fading ' + s.tuning.xi_mults.filter(function (x) { return x !== 1; }).map(function (x) { return x < 1 ? 'slower' : 'faster'; }).join(' / ') + ', and without the bias correction). Weekly, a variation takes over if it beats the champion by ' + e(s.tuning.margin) + ' log loss over ' + e(s.tuning.min_matches) + '+ past matches, or by ' + e(s.tuning.live_margin) + ' over ' + e(s.tuning.live_min) + '+ live ones (at most once every ' + e(s.tuning.cooldown_days) + ' days). Bias correction is used only if it improves matches it was not fitted on, capped at ±' + pc(s.tuning.cal_clip[1] - 1, 0) + '. The model\'s ' + pc(s.tuning.anchor_default, 0) + ' say rises ×' + e(s.tuning.anchor_step) + ' (to ' + pc(s.tuning.anchor_max, 0) + ' at most) when it beats the closing market over a league\'s latest ' + e(s.tuning.anchor_window) + ' results, and falls back when it trails.</li>' : '') +
+        '<li><b>Layers:</b> ' + Object.keys(layers).map(function (n) { return e(n.replace(/_/g, ' ')) + ' ' + chip(layers[n], layers[n] === 'live' ? 'sturdy' : layers[n] === 'retired' ? 'plain' : 'frag'); }).join(' · ') + '. A layer goes live when it beats the stack without it over ' + e(s.promote_min) + ' fixtures.</li>' +
+        '</ul><p class="note" style="margin-top:8px">Read from the last full run (' + e(dhm(d.lastFull.started_at)) + ' UK), so this is what priced the fixtures on this page.</p>');
+    } else ov += '<p class="empty">The rules appear after the first full run of the updated bot.</p>';
+    var overall = d.board.filter(function (b) { return b.league == null; });
+    ov += '<h3 class="eyebrow" style="margin-top:14px">Model v market — every settled fixture</h3>' + (overall.length ? table(['Model', 'Fixtures', 'Model log loss', 'Market log loss', 'Gap', 'Verdict'], overall.map(function (b) {
+      var g = num(b.ll_model) - num(b.ll_market);
+      return [e(modelLabel(b.model)), [b.n, ' class="mono"'], [f4(b.ll_model), ' class="mono"'], [f4(b.ll_market), ' class="mono"'], ['<span class="' + (g < 0 ? 'pos' : 'neg') + '">' + (g >= 0 ? '+' : '') + g.toFixed(4) + '</span>', ' class="mono"'], g < 0 ? chip('model ahead', 'sturdy') : chip('market ahead', 'neg')];
+    }), 'var') + '<p class="note">Log loss: lower is better. A negative gap means the model beat the market\'s kick-off price.</p>' : '<p class="empty">No settled fixtures yet.</p>');
+    html += section('Overview', ov, { mv: 'overview' });
+    ms.forEach(function (m) {
+      var rows = d.board.filter(function (b) { return b.model === m && b.league != null; });
+      var p = d.paper.filter(function (x) { return x.model === m; })[0];
+      var body = roleChip(d, m) + ' ' + (p ? kpi([[p.bets_settled || 0, 'bets settled'], [money(p.bets_pnl), 'paper P&L on bets', sign(p.bets_pnl)], [spc(p.bets_mean_clv), 'mean CLV on bets', sign(p.bets_mean_clv)], [p.rests || 0, 'resting orders (not bets)']]) : '');
+      body += rows.length ? table(['League', 'Fixtures', 'Model log loss', 'Market log loss', 'Gap'], rows.map(function (b) { var g = num(b.ll_model) - num(b.ll_market); return [e(b.league), [b.n, ' class="mono"'], [f4(b.ll_model), ' class="mono"'], [f4(b.ll_market), ' class="mono"'], ['<span class="' + (g < 0 ? 'pos' : 'neg') + '">' + (g >= 0 ? '+' : '') + g.toFixed(4) + '</span>', ' class="mono"']]; }), 'var') : '<p class="empty">No settled fixtures scored for this model yet.</p>';
+      html += section(e(modelLabel(m)), body, { mv: 'm-' + m.replace(/[^a-z0-9]/gi, '_') });
+    });
+    var bt = d.backtest.slice().sort(function (a, b) { return (a.league || '').localeCompare(b.league || '') || String(a.season).localeCompare(String(b.season)); });
+    var btn = sum(bt, function (x) { return x.n; }), btm = btn ? sum(bt, function (x) { return num(x.ll_model) * num(x.n); }) / btn : null, btk = btn ? sum(bt, function (x) { return num(x.ll_market) * num(x.n); }) / btn : null;
+    html += section('Back-test — walk-forward on past seasons', (bt.length ? kpi([[btn, 'matches'], [f4(btm), 'model log loss'], [f4(btk), 'Pinnacle closing log loss'], [(btm - btk >= 0 ? '+' : '') + (btm - btk).toFixed(4), 'gap (negative = model ahead)', btm < btk ? 'pos' : 'neg']]) +
+      table(['League', 'Season', 'Matches', 'Model', 'Market', 'Gap', 'Paper picks', 'ROI', 'Run'], bt.map(function (b) { var g = num(b.ll_model) - num(b.ll_market); return [e(b.league), e(b.season), [b.n, ' class="mono"'], [f4(b.ll_model), ' class="mono"'], [f4(b.ll_market), ' class="mono"'], ['<span class="' + (g < 0 ? 'pos' : 'neg') + '">' + (g >= 0 ? '+' : '') + g.toFixed(4) + '</span>', ' class="mono"'], [b.n_bets, ' class="mono"'], ['<span class="' + sign(b.roi) + '">' + spc(b.roi) + '</span>', ' class="mono"'], e(dhm(b.run_at))]; }), 'var') +
+      '<p class="note">Refits every week on past matches only, then scores against Pinnacle\'s closing prices. Expect the model slightly behind the market in big leagues; anything well ahead is a bug until proven otherwise.</p>' : '<p class="empty">No back-test yet. It runs on Mondays at 05:00 UTC, or trigger sbms-backtest by hand in Render.</p>'), { mv: 'backtest' });
+    html += selfTuning(d);
+    var nw = d.news || [];
+    html += section('Team news', '<p class="muted">Adjustments recorded by the scheduled news analyst (idea 5): a multiplier on one side\'s goals scored and conceded, with the reason and a source. They are priced as the testing layer "news" and count only if it beats the model without them.</p>' +
+      (nw.length ? table(['Recorded', 'Team', 'Side', 'Scored ×', 'Conceded ×', 'Reason', 'Expires'], nw.map(function (n) { return [e(dhm(n.created_at)), '<b>' + e(n.team) + '</b><div class="sub">' + e(n.league) + '</div>', e(n.side), [num(n.attack).toFixed(2), ' class="mono"'], [num(n.defence).toFixed(2), ' class="mono"'], e(n.reason) + (n.source ? ' <a href="' + e(n.source) + '" target="_blank" rel="noopener">source</a>' : ''), e(dhm(n.expires_at))]; }), 'var') : '<p class="empty">None yet. The news analyst is a scheduled task set up once the page is live.</p>'), { mv: 'news' });
+    html += section('Manager changes', (d.managers.length ? table(['League', 'Team', 'Manager', 'Changed', 'Source'], d.managers.map(function (m) { return [e(m.league), e(m.team), e(m.manager), e(String(m.changed_on).slice(0, 10)), e(m.source)]; }), 'var') : '<p class="empty">None recorded. The manager-change layer only uses changes entered from research; the bot never guesses.</p>'), { mv: 'managers' });
+    var o = overall.filter(function (b) { return b.model === (s && s.live_model || 'dixon_coles'); })[0];
+    return { html: html, note: o ? o.n + ' scored' : 'rules · back-test' };
+  }
+
+  // ---------------------------------------------------------------- Self-tuning (Model tab)
+  function selfTuning(d) {
+    var rows = (d.tuning || []).filter(function (r) { return r.kind !== 'breaker'; }), s = d.settings, T = s && s.tuning;   // the breaker is on the Health tab
+    var defXi = s ? s.dc_xi : 0.0018, defFy = s ? s.dc_seasons : 3, defA = T ? T.anchor_default : 0.3;
+    var hl = function (xi) { return Math.round(Math.log(2) / xi) + ' days'; };
+    var leagues = {};
+    d.fixtures.forEach(function (f) { if (f.league && f.league !== 'EUROPE') leagues[f.league] = true; });
+    rows.forEach(function (r) { leagues[r.league] = true; });
+    var force = {};
+    Object.keys(leagues).forEach(function (lg) { force[lg] = { recipe: null, calibration: null, anchor: null, trust: null, weather: null, referee: null, last: null }; });
+    rows.forEach(function (r) {   // newest first: the first adopted row of each kind is in force
+      var f = force[r.league]; if (!f) return;
+      if (!f.last) f.last = r;
+      if (r.adopted && f[r.kind] === null) f[r.kind] = r;
+    });
+    var body = '<p class="muted">The model competing with itself. Every hour each league\'s recipe (the champion) is priced beside slight variations (challengers). Each week the review decides, league by league, from two kinds of evidence: the last year of past matches replayed, and live results. Nothing changes without evidence, and every decision is logged below.</p>';
+    var lg = Object.keys(force).sort();
+    var methodLabel = { goals: 'goals', shots: 'goals + shots on target', pyramid: 'whole-pyramid fit', xg: 'goals + xG', prices: 'ratings from closing prices' };
+    body += lg.length ? table(['League', 'Method', 'Old results fade (half-life)', 'Years of results', 'Bias correction', 'Model\'s say v market', 'Say by part of season', 'Weather / referee', 'Last review'], lg.map(function (k) {
+      var f = force[k], rv = f.recipe ? f.recipe.value : null, cv = f.calibration ? f.calibration.value : null, av = f.anchor ? f.anchor.value : null;
+      var xi = rv ? rv.xi : defXi, fy = rv ? rv.fit_years : defFy, w = av ? av.weight : defA;
+      var meth = rv && rv.method ? rv.method : 'goals';
+      return ['<b>' + e(k) + '</b>', e(methodLabel[meth] || meth) + (meth !== 'goals' ? ' ' + chip('tuned', 'sturdy') : ''),
+        [hl(xi) + (rv ? ' ' + chip('tuned ' + String(f.recipe.decided_at).slice(0, 10), 'sturdy') : ' <span class="muted">default</span>'), ' class="mono"'],
+        [fy + (rv && rv.fit_years !== defFy ? ' ' + chip('tuned', 'sturdy') : ''), ' class="mono"'],
+        [cv && !cv.off ? 'home ×' + num(cv.home).toFixed(3) + ', away ×' + num(cv.away).toFixed(3) + (cv.draw != null ? ', draws ×' + num(cv.draw).toFixed(3) : '') : '<span class="muted">none</span>', ' class="mono"'],
+        [pc(w, 0) + (av && num(av.weight) !== defA ? ' ' + chip(num(av.weight) > defA ? 'earned' : 'reduced', num(av.weight) > defA ? 'sturdy' : 'frag') : ''), ' class="mono"'],
+        [f.trust ? ['early', 'mid', 'late'].map(function (p) { return p + ' ×' + num(f.trust.value[p]).toFixed(2); }).join(', ') : '<span class="muted">full all season</span>', ' class="mono"'],
+        [(f.weather && !f.weather.value.off ? 'weather: ' + Object.keys(f.weather.value.factors || {}).map(function (b) { return b + ' ×' + num(f.weather.value.factors[b]).toFixed(2); }).join(', ') : '<span class="muted">no weather factor</span>') + '<br>' + (f.referee && !f.referee.value.off ? 'referees: ' + Object.keys(f.referee.value.factors || {}).length + ' rated' : '<span class="muted">no referee factor</span>'), ' class="mono"'],
+        f.last ? e(dhm(f.last.decided_at)) + '<div class="sub">' + e(f.last.kind) + ' · ' + (f.last.adopted ? 'changed' : 'kept') + '</div>' : '<span class="muted">not reviewed yet</span>'];
+    }), 'var') : '<p class="empty">No leagues priced yet.</p>';
+    var kindLabel = { recipe: 'Recipe', calibration: 'Bias correction', anchor: 'Say v market', trust: 'Say by part of season', weather: 'Weather', referee: 'Referees' };
+    var log = rows.slice(0, 150).map(function (r) {
+      var v = r.value || {}, ev = r.evidence || {}, what;
+      if (r.kind === 'recipe') what = (v.method && v.method !== 'goals' ? ({ shots: 'goals + shots, ', pyramid: 'whole-pyramid fit, ', xg: 'goals + xG, ', prices: 'ratings from prices, ' }[v.method] || v.method + ', ') : '') + 'half-life ' + hl(v.xi) + ', ' + v.fit_years + ' years';
+      else if (r.kind === 'calibration') what = v.off ? 'none' : 'home ×' + num(v.home).toFixed(3) + ', away ×' + num(v.away).toFixed(3) + (v.draw != null ? ', draws ×' + num(v.draw).toFixed(3) : '');
+      else if (r.kind === 'weather' || r.kind === 'referee') what = v.off ? 'none' : Object.keys(v.factors || {}).slice(0, 6).map(function (b) { return b + ' ×' + num(v.factors[b]).toFixed(2); }).join(', ') + (Object.keys(v.factors || {}).length > 6 ? ' …' : '');
+      else if (r.kind === 'trust') what = ['early', 'mid', 'late'].map(function (p) { return p + ' ×' + num(v[p]).toFixed(2); }).join(', ');
+      else what = pc(v.weight, 0);
+      var evs = [];
+      if (ev.best) evs.push('best ' + e(ev.best) + ' ' + f4(ev.best_ll) + ' v champion ' + f4(ev.champion_ll) + ' over ' + ev.n);
+      if (ev.challenger) evs.push(e(ev.challenger) + ' ' + f4(ev.ll_challenger) + ' v champion ' + f4(ev.ll_champion) + ' over ' + ev.n + ' live');
+      if (ev.ll_without != null) evs.push('unseen matches: ' + f4(ev.ll_without) + ' → ' + f4(ev.ll_with) + ' (' + ev.tested_on + ')');
+      if (ev.ll_model != null) evs.push('model ' + f4(ev.ll_model) + ' v market ' + f4(ev.ll_market) + ' over ' + ev.n);
+      if (ev.gap && r.kind === 'trust') evs.push('gap to market by phase: ' + Object.keys(ev.gap).map(function (p) { return p + ' ' + f4(ev.gap[p]); }).join(', '));
+      if (ev.reason) evs.push(e(ev.reason));
+      return [e(dhm(r.decided_at)), '<b>' + e(r.league) + '</b>', e(kindLabel[r.kind] || r.kind), r.adopted ? chip('changed', 'sturdy') : chip('kept', 'plain'), e(what), chip(r.source === 'live' ? 'live results' : 'past matches', 'plain'), '<span class="note">' + evs.join(' · ') + '</span>'];
+    });
+    body += '<h3 class="eyebrow" style="margin-top:14px">Every decision</h3>' + (log.length ? table(['When', 'League', 'What', 'Outcome', 'Value', 'Evidence', 'Detail'], log, 'book') : '<p class="empty">No reviews yet. The first runs with the weekly job (Mondays 05:00 UTC, or trigger sbms-backtest).</p>');
+    return section('Self-tuning', body, { mv: 'selftune' });
+  }
+
+  // ---------------------------------------------------------------- Research tab (ideas 3, 12, 23)
+  function researchTab(d) {
+    var R = d.research || {}, html = '';
+    // 16 Oct: does the model add anything to the market?
+    var bl = R.blend || [], hrs = [];
+    bl.forEach(function (r) { if (hrs.indexOf(r.hours) < 0) hrs.push(r.hours); });
+    hrs.sort(function (a, b) { return b - a; });
+    html += section('Does the model add anything to the market?', '<p class="muted">The champion\'s probabilities blended into the Smarkets price at each point before kick-off, with weight w on the model, scored on the results (log loss: lower is better). If the best column is always w = 0, the model holds nothing the market did not already know at that time, and every "edge" it reports is noise. A model worth betting has a best w above 0 somewhere.</p>' +
+      (bl.length ? table(['Price at', 'Fixtures', 'Market alone (w = 0)', 'w = 0.1', 'w = 0.2', 'w = 0.3', 'Model alone (w = 1)', 'Best'], hrs.map(function (h) {
+        var rs = bl.filter(function (r) { return r.hours === h; }), get = function (w) { var r = rs.filter(function (x) { return Math.abs(num(x.w) - w) < 1e-6; })[0]; return r ? num(r.ll) : null; };
+        var ws = [0, 0.1, 0.2, 0.3, 1], best = ws.reduce(function (a, w) { return get(w) != null && (get(a) == null || get(w) < get(a)) ? w : a; }, 0);
+        return [h === 0 ? 'the close' : e(h) + ' h before', [rs[0] ? rs[0].n : 0, ' class="mono"']].concat(ws.map(function (w) { return [(w === best ? '<b>' : '') + f4(get(w)) + (w === best ? '</b>' : ''), ' class="mono"']; })).concat([[best === 0 ? chip('market', 'neg') : chip('w = ' + best, 'pos'), '']]);
+      }), 'var') : '<p class="empty">Needs settled fixtures with a price path.</p>'), { first: true });
+    var fills = (R.fills || []).filter(function (r) { return d.isLive(r.model); });
+    var pick = function (t, f) { return fills.filter(function (r) { return r.order_type === t && (r.filled === f); }); };
+    var agg = function (rs) { var n = sum(rs, function (r) { return r.n; }); return { n: n, clv: n ? sum(rs, function (r) { return num(r.mean_clv) * r.n; }) / n : null, beat: n ? sum(rs, function (r) { return num(r.beat_close) * r.n; }) / n : null, pnl: sum(rs, function (r) { return r.pnl; }), win: n ? sum(rs, function (r) { return num(r.win_rate) * r.n; }) / n : null, imp: n ? sum(rs, function (r) { return num(r.implied_at_price) * r.n; }) / n : null }; };
+    var rowsF = [['Bets (taken at the price on offer)', agg(pick('take', true))], ['Resting orders that filled', agg(pick('rest', true))], ['Resting orders that never filled', agg(pick('rest', false))]];
+    var ff = rowsF[1][1], fu = rowsF[2][1], verdict;
+    if (ff.n >= 30 && fu.n >= 30) verdict = ff.clv < fu.clv - 0.01 ? '<div class="warn"><b>Filled orders do worse than unfilled ones</b> (' + spc(ff.clv) + ' v ' + spc(fu.clv) + ' against the close): orders tend to fill when the market moves against them. They are being picked off.</div>' : '<p><b>No sign of being picked off yet:</b> filled orders ' + spc(ff.clv) + ' v unfilled ' + spc(fu.clv) + ' against the close.</p>';
+    else verdict = '<p class="empty">Needs at least 30 settled filled and 30 unfilled resting orders for a verdict (now ' + ff.n + ' and ' + fu.n + ').</p>';
+    html += section('Are resting orders picked off?', '<p class="muted">If resting orders mostly fill when the price moves against them (someone better informed takes them), filled orders will do worse against the closing price than the ones that never filled. If they don\'t, offering prices both ways on thin markets could pay.</p>' + verdict +
+      table(['Live model', 'Settled', 'Mean CLV', 'Beat close', 'Won', 'Price implied', 'Paper P&L (as if)'], rowsF.map(function (x) { var a = x[1]; return [e(x[0]), [a.n, ' class="mono"'], ['<span class="' + sign(a.clv) + '">' + spc(a.clv) + '</span>', ' class="mono"'], [pc(a.beat, 0), ' class="mono"'], [pc(a.win, 0), ' class="mono"'], [pc(a.imp, 0), ' class="mono"'], ['<span class="' + sign(a.pnl) + '">' + money(a.pnl) + '</span>', ' class="mono"']]; }), 'var'));
+    var close = R.close || [], dims = {};
+    close.forEach(function (r) { (dims[r.dimension] = dims[r.dimension] || []).push(r); });
+    if (dims['price band']) dims['price band'].sort(function (a, b) { return parseFloat(a.bucket) - parseFloat(b.bucket); });
+    var nClose = sum((dims['selection'] || []), function (r) { return r.n; }) / 3;
+    html += section('Is Smarkets\' closing price biased?', '<p class="muted">Every settled fixture\'s result market at its last read before kick-off: the probability the price implied against how often it happened. A consistent gap (favourites or long shots, busy or quiet markets, home, draw or away) is a bias the model can use. It takes hundreds of fixtures before a gap means anything: ' + Math.round(nClose) + ' fixtures so far.</p>' +
+      (close.length ? Object.keys(dims).sort().map(function (k) {
+        return '<h3 class="eyebrow" style="margin-top:10px">By ' + e(k) + '</h3>' + table(['Group', 'Selections', 'Price implied', 'Happened', 'Gap'], dims[k].map(function (r) { var g = num(r.actual) - num(r.implied); return [e(r.bucket), [r.n, ' class="mono"'], [pc(r.implied), ' class="mono"'], [pc(r.actual), ' class="mono"'], ['<span class="' + (r.n >= 100 ? sign(g) : 'muted') + '">' + spc(g) + '</span>', ' class="mono"']]; }), 'var');
+      }).join('') + '<p class="note">A positive gap means it happened more often than the price said (the price was too long). Gaps on fewer than 100 selections are greyed out.</p>' : '<p class="empty">No settled fixtures yet.</p>'));
+    var slots = R.slots || [];
+    html += section('Kick-off slots', '<p class="muted">The live model against the closing market by kick-off slot (UK time). Log loss: lower is better; a negative gap means the model did better than the market in that slot.</p>' +
+      (slots.length ? table(['Slot', 'Fixtures', 'Model', 'Market', 'Gap'], slots.map(function (r) { var g = num(r.ll_model) - num(r.ll_market); return [e(r.slot), [r.n, ' class="mono"'], [f4(r.ll_model), ' class="mono"'], [f4(r.ll_market), ' class="mono"'], ['<span class="' + (r.n >= 50 ? (g < 0 ? 'pos' : 'neg') : 'muted') + '">' + (g >= 0 ? '+' : '') + g.toFixed(4) + '</span>', ' class="mono"']]; }), 'var') : '<p class="empty">No settled fixtures yet.</p>'));
+    var mv = R.moves || [];
+    html += section('Sharp moves: informed money or noise?', '<p class="muted">A fixture is flagged when a price moves 8 points or more within three hours (idea 25). If the money behind those moves is informed, the outcome happens about as often as the <b>new</b> price says, or more; if it is noise, closer to the old price. For now flags are only recorded; bets on flagged fixtures can be blocked if this shows the moves are informed.</p>' +
+      (mv.length ? table(['Direction', 'When', 'Fixtures', 'Price before', 'Price after', 'Happened'], mv.map(function (r) { return [e(r.direction), e(r.timing), [r.n, ' class="mono"'], [pc(r.p_before), ' class="mono"'], [pc(r.p_after), ' class="mono"'], ['<b>' + pc(r.happened) + '</b>', ' class="mono"']]; }), 'var') : '<p class="empty">No flagged fixture has settled yet.</p>'));
+    var dr = R.drift || [];
+    html += section('How prices sharpen towards kick-off', '<p class="muted">Each settled fixture\'s result price at 48, 24, 12, 6, 3 and 1 hours before kick-off and at the close (ideas 2 and 20). If the early prices are much worse than the close, the market is still learning, and a model that predicts where the price will go can bet early. The order-book depth kept with these prices is what that model will learn from.</p>' +
+      (dr.length ? table(['Hours before kick-off', 'Fixtures', 'Log loss of the price', 'Average move still to come (home price)'], dr.map(function (r) { return [r.hours === 0 ? 'close' : e(r.hours), [r.n, ' class="mono"'], [f4(r.ll), ' class="mono"'], [r.hours === 0 ? '—' : pc(r.move_to_close, 1), ' class="mono"']]; }), 'var') : '<p class="empty">No settled fixture has a price path yet.</p>'));
+    var rs_ = R.rest || [];
+    html += section('Tired legs: does the market price rest days?', '<p class="muted">Days since each side\'s previous match of any kind (league, cup, Europe, internationals: every football event the bot sees on Smarkets is recorded, from 30 Sep 2026). If the fresher side wins more often than the closing price said, the market underrates fatigue and a fatigue layer can be built (idea 9).</p>' +
+      (rs_.length ? table(['Rest', 'Fixtures', 'Home win priced', 'Home won', 'Model log loss', 'Market log loss'], rs_.map(function (r) { return [e(r.rest), [r.n, ' class="mono"'], [pc(r.home_price), ' class="mono"'], ['<b>' + pc(r.home_won) + '</b>', ' class="mono"'], [f4(r.ll_model), ' class="mono"'], [f4(r.ll_market), ' class="mono"']]; }), 'var') : '<p class="empty">No settled fixtures yet.</p>'));
+    // ideas 29, 31: when to bet, and bets the variants disagree about (the live model's bets)
+    var bucketTable = function (rowsRaw, labelKey, label) {
+      var by = {}, rowsIn = [];      // the live models (Dixon-Coles and ClubElo) together, one row per bucket
+      rowsRaw.slice().sort(function (a, b) { return a.ord - b.ord; }).forEach(function (r) {
+        var g = by[r[labelKey]];
+        if (!g) { g = by[r[labelKey]] = { n: 0, ev: 0, clv: 0, beat_close: 0, settled: 0, pnl: 0 }; g[labelKey] = r[labelKey]; rowsIn.push(g); }
+        var n = num(r.n) || 0; g.ev += n * (num(r.ev) || 0); g.clv += n * (num(r.clv) || 0); g.beat_close += n * (num(r.beat_close) || 0);
+        g.n += n; g.settled += num(r.settled) || 0; g.pnl += num(r.pnl) || 0;
+      });
+      rowsIn.forEach(function (g) { if (g.n) { g.ev /= g.n; g.clv /= g.n; g.beat_close /= g.n; } });
+      return table([label, 'Bets', 'Average EV', 'Mean CLV', 'Beat close', 'Settled', 'P&L'], rowsIn.map(function (r) { return [e(r[labelKey]), [r.n, ' class="mono"'], [spc(r.ev), ' class="mono"'], ['<b class="' + (r.n >= 30 ? sign(r.clv) : 'muted') + '">' + spc(r.clv) + '</b>', ' class="mono"'], [pc(r.beat_close, 0), ' class="mono"'], [r.settled, ' class="mono"'], ['<span class="' + sign(r.pnl) + '">' + money(r.pnl) + '</span>', ' class="mono"']]; }), 'var');
+    };
+    var tm = (R.timing || []).filter(function (r) { return d.isLive(r.model) && r.order_type === 'take'; });
+    html += section('When to bet: early or late?', '<p class="muted">The live model\'s bets by how long before kick-off they were found (idea 29). If early bets beat the close by more, the market is still learning and the bot should move early; if late bets do better, waiting for team news pays. Grey until a bucket has 30 bets.</p>' +
+      (tm.length ? bucketTable(tm, 'before_ko', 'Found') : '<p class="empty">No bet has a closing price yet.</p>'));
+    var dg = (R.disagree || []).filter(function (r) { return d.isLive(r.model) && r.order_type === 'take'; });
+    html += section('When the variants disagree', '<p class="muted">Every variant priced for a fixture (the champion, its layers, the challengers, the market consensus, the committee) gives each selection a probability; the spread between the highest and lowest is recorded with every bet (idea 31). If bets with a wide spread do worse, a wide spread is a warning and the bot can skip them (<span class="mono">DISAGREE_BLOCK</span>, off until this shows it).</p>' +
+      (dg.length ? bucketTable(dg, 'spread', 'Variants\' spread') : '<p class="empty">Recorded from 30 Sep; nothing settled yet.</p>'));
+    var pg = R.pregoal || [];
+    html += section('Does pressure show before a goal?', '<p class="muted">The two minutes of prices before each in-play suspension (idea 30): how far the side the market then moved towards had already shortened. Suspensions that came to nothing (VAR checks) are the baseline. If goals are preceded by a shortening the checks are not, the pressure is visible and the in-play model can use it.</p>' +
+      (pg.length ? table(['Suspension', 'Events', 'Average move before', 'Shortened', 'Drifted', 'Suspended (median)'], pg.map(function (r) { return [e(r.kind), [r.n, ' class="mono"'], [spc(r.drift), ' class="mono"'], [pc(r.shortened, 0), ' class="mono"'], [pc(r.drifted, 0), ' class="mono"'], [Math.round(num(r.suspended_median) || 0) + ' s', ' class="mono"']]; }), 'var') : '<p class="empty">Needs the in-play worker (off until switched on in render.yaml).</p>'));
+    var sk = R.stakes || [];
+    html += section('Nothing to play for', '<p class="muted">From the season simulations (idea 34; English leagues): a side has nothing at stake when no finishing zone\'s chance moves 2 points between winning and losing, a lot when one moves 10. If sides with nothing at stake win less often than their closing price said, especially against a side with a lot at stake, the market misses motivation. Meaningful from the spring, when the stakes separate.</p>' +
+      (sk.length ? table(['This side', 'Against', 'Sides', 'Win priced', 'Won'], sk.map(function (r) { return [e(r.side), e(r.opponent), [r.n, ' class="mono"'], [pc(r.implied), ' class="mono"'], ['<b>' + pc(r.won) + '</b>', ' class="mono"']]; }), 'var') : '<p class="empty">No settled fixture has its stakes recorded yet.</p>'));
+    // ideas 15, 2 / 20: the two models that learn from the bot's own records
+    var L = d.learned || {}, lm = L.meta, lc = L.close, mt_ = lm && lm.test || {}, ct_ = lc && lc.test || {};
+    var mr = R.meta || [], cr = R.closepred || [];
+    html += section('A model of its own mistakes', '<p class="muted">Will a bet beat the closing price? Learned from every settled bet: the edge, the price, the market, thin data, hours before kick-off, spread, volume and how much the variants disagreed (idea 15). Fitted daily once 300 bets have settled, tested on the newest 30% it never saw. Every new bet records its prediction; skipping the ones predicted to lose (<span class="mono">META_SKIP</span>) stays off until the table below shows it works.</p>' +
+      (lm ? kpi([[lm.n, 'bets it learned from'], [f4(mt_.logloss), 'test log loss', num(mt_.logloss) < num(mt_.logloss_base_rate) ? 'pos' : 'neg'], [f4(mt_.logloss_base_rate), 'using the base rate alone'], [spc(mt_.skipped_clv), 'CLV of bets it would skip (' + (mt_.skipped || 0) + ')', sign(mt_.skipped_clv)], [spc(mt_.kept_clv), 'CLV of bets it would keep (' + (mt_.kept || 0) + ')', sign(mt_.kept_clv)]]) : '<p class="empty">Waiting: it is fitted once 300 bets have a closing price.</p>') +
+      (mr.length ? table(['Predicted to beat the close', 'Bets', 'Average prediction', 'Did beat it', 'Mean CLV'], mr.map(function (r) { return [e(r.predicted), [r.n, ' class="mono"'], [pc(r.meta_p, 0), ' class="mono"'], ['<b>' + pc(r.beat_close, 0) + '</b>', ' class="mono"'], ['<span class="' + sign(r.clv) + '">' + spc(r.clv) + '</span>', ' class="mono"']]; }), 'var') : ''));
+    html += section('Predicting the closing price', '<p class="muted">Where will a price be at kick-off? Learned from every settled fixture\'s price path: the price, the money waiting on each side of the book, volume, hours left and the model\'s disagreement with the price (ideas 2 and 20). Fitted daily once 150 fixtures have a path, tested on the newest 30%. If it works, it says when to take a price now and when to wait.</p>' +
+      (lc ? kpi([[lc.fixtures, 'fixtures it learned from'], [ct_.r2 == null ? '—' : num(ct_.r2).toFixed(2), 'test R²'], [pc(ct_.mae, 2), 'average miss', num(ct_.mae) < num(ct_.mae_no_move) ? 'pos' : 'neg'], [pc(ct_.mae_no_move, 2), 'miss if it said "no move"'], [pc(ct_.direction_right, 0), 'direction right when it calls a move']]) : '<p class="empty">Waiting: it is fitted once 150 settled fixtures have a price path.</p>') +
+      (cr.length ? table(['Prediction', 'Order', 'Suggestions', 'Predicted move', 'Actual move', 'Mean CLV'], cr.map(function (r) { return [e(r.predicted), e(r.order_type === 'take' ? 'bet' : 'rest'), [r.n, ' class="mono"'], [spc(r.pred_move), ' class="mono"'], ['<b>' + spc(r.actual_move) + '</b>', ' class="mono"'], ['<span class="' + sign(r.clv) + '">' + spc(r.clv) + '</span>', ' class="mono"']]; }), 'var') : ''));
+    // ideas 4 / 21 and 9
+    var lu = R.lineups || [];
+    html += section('Line-ups: does the market price rotation?', '<p class="muted">Starting line-ups about an hour before kick-off (API-Football; ideas 4 and 21), with how many starters changed from the side\'s previous recorded line-up. The price three hours before (before the line-ups) against the close (after) and how often the side won: if heavily rotated sides win less often than even the closing price says, the market under-reacts to rotation.</p>' +
+      (lu.length ? table(['Changes', 'Sides', 'Price 3 h before', 'Closing price', 'Won'], lu.map(function (r) { return [e(r.changes), [r.n, ' class="mono"'], [pc(r.p_before), ' class="mono"'], [pc(r.p_close), ' class="mono"'], ['<b>' + pc(r.won) + '</b>', ' class="mono"']]; }), 'var') : '<p class="empty">Needs API_FOOTBALL_KEY; line-ups are looked for from 80 to 15 minutes before kick-off.</p>'));
+    var csr = R.cs || [];
+    html += section('Correct score', '<p class="muted">The champion\'s own scoreline grid priced against Smarkets\' correct-score market (idea 16; from 1 Oct): sixteen scores up to 3-3 and the three "any other" results. The grid is the heart of a Dixon-Coles model, so this is its sharpest test. Recorded as its own variant and never featured: the books are thin and every selection is a long shot.</p>' +
+      (csr.length ? table(['League', 'Fixtures', 'Model log loss', 'Market log loss', 'Gap'], csr.map(function (r) { var g = num(r.ll_model) - num(r.ll_market); return [e(r.league), [r.n, ' class="mono"'], [f4(r.ll_model), ' class="mono"'], [f4(r.ll_market), ' class="mono"'], ['<span class="' + (r.n >= 50 ? (g < 0 ? 'pos' : 'neg') : 'muted') + '">' + (g >= 0 ? '+' : '') + g.toFixed(4) + '</span>', ' class="mono"']]; }), 'var') : '<p class="empty">No correct-score result settled yet.</p>'));
+    var tv = R.travel || [];
+    html += section('Travel', '<p class="muted">Straight-line distance between the two grounds (Wikidata, idea 9) against the away side\'s closing price and results. If long trips cost more than the market allows, away sides after long journeys win less often than priced.</p>' +
+      (tv.length ? table(['Trip', 'Fixtures', 'Average', 'Away win priced', 'Away won', 'Model log loss', 'Market log loss'], tv.map(function (r) { return [e(r.trip), [r.n, ' class="mono"'], [Math.round(num(r.km)) + ' km', ' class="mono"'], [pc(r.away_priced), ' class="mono"'], ['<b>' + pc(r.away_won) + '</b>', ' class="mono"'], [f4(r.ll_model), ' class="mono"'], [f4(r.ll_market), ' class="mono"']]; }), 'var') : '<p class="empty">No settled fixture with both grounds known yet.</p>'));
+    return { html: html, note: fills.length ? sum(fills, function (r) { return r.n; }) + ' orders studied' : 'waiting for results' };
+  }
+
+  // ---------------------------------------------------------------- In-play tab (idea 11)
+  function inplayTab(d) {
+    var I = d.inplay || {}, live = I.live || [], bets = I.bets || [], html = '';
+    html += section('In play now', '<p class="muted">The chance of each result from the score and the minute, using the live model\'s pre-match goal expectations (idea 11). Paper only. In-play bets need +6%, a score read in the last two minutes and a calm book; prices on an exchange move during the bet delay, so in-play paper results will flatter what could really be matched.</p>' +
+      (live.length ? table(['Fixture', 'Score', 'Minute', 'Model H / D / A', 'Book H / D / A', 'Model under 2.5', 'Book under 2.5'], live.map(function (x) {
+        var p = x.probs || {}, r = x.rows || {}, mk = function (k) { return r[k] ? pc(r[k].mid_novig, 0) : '—'; };
+        return ['<b>' + e(x.home) + ' v ' + e(x.away) + '</b><div class="sub">' + e(x.league) + '</div>', ['<b>' + x.sh + ' – ' + x.sa + '</b>', ' class="mono"'], [Math.round(x.minute) + '\'', ' class="mono"'], [pc(p.H, 0) + ' / ' + pc(p.D, 0) + ' / ' + pc(p.A, 0), ' class="mono"'], [mk('H') + ' / ' + mk('D') + ' / ' + mk('A'), ' class="mono"'], [pc(p['U2.5'], 0), ' class="mono"'], [mk('U2.5'), ' class="mono"']];
+      }), 'var') : '<p class="empty">Nothing in play' + (bets.length ? '' : ', and the in-play worker has not run yet: it is off until switched on in render.yaml (goal reaction needs no key; the model\'s in-play probabilities need API_FOOTBALL_KEY)') + '.</p>'), { first: true });
+    // goal reaction (Mitch, 30 Sep): back straight after a jump, then lay back (trade out) at 1/2/3/5 minutes, or hold
+    var evs = I.events || [], exits = [60, 120, 180, 300], cells = {};
+    var kindOf = function (ev) { return ev.kind === 'goal or red card' ? 'goal' : ev.kind === 'check, no change' ? 'check' : 'jump'; };
+    var checks = evs.filter(function (ev) { return kindOf(ev) === 'check'; });
+    evs.forEach(function (ev) {
+      var tr = ev.trades || {}, kd = kindOf(ev);
+      if (kd === 'check') return;
+      Object.keys(tr).forEach(function (k) {
+        var t = tr[k], side = kd + t.side;
+        exits.forEach(function (x) { var g = t.green && t.green[x]; if (g != null) { var c = cells[side + x] = cells[side + x] || []; c.push(num(g)); } });
+        if (ev.outcome_1x2) { var won = ev.outcome_1x2 === k, h = won ? 50 * (num(t.entry) - 1) * 0.98 : -50; (cells[side + 'hold'] = cells[side + 'hold'] || []).push(h); }
+      });
+    });
+    var cell = function (arr) {
+      if (!arr || !arr.length) return ['—', ' class="mono"'];
+      var m = arr.reduce(function (a, b) { return a + b; }, 0) / arr.length, up = arr.filter(function (v) { return v > 0; }).length / arr.length;
+      return ['<b class="' + sign(m) + '">' + money(m) + '</b><div class="sub">' + arr.length + ' · ' + pc(up, 0) + ' up</div>', ' class="mono"'];
+    };
+    var grows = [];
+    [['goal', 'After a suspension (goal or red card)'], ['jump', 'Jump with no suspension seen']].forEach(function (g) {
+      ['follow', 'fade'].forEach(function (side) {
+        grows.push([(side === 'follow' ? '<b>Follow the move</b><div class="sub">' : '<b>Fade the overreaction</b><div class="sub">') + e(g[1]) + '</div>']
+          .concat(exits.concat(['hold']).map(function (x) { return cell(cells[g[0] + side + x]); })));
+      });
+    });
+    var suspS = evs.filter(function (ev) { return ev.suspended_s != null; }).map(function (ev) { return num(ev.suspended_s); }).sort(function (a, b) { return a - b; });
+    var medS = suspS.length ? suspS[Math.floor(suspS.length / 2)] : null;
+    html += section('Goal reaction: trade out or hold?', '<p class="muted">Every sharp jump of the result market in play (a goal or a red card, seen in the prices themselves; ' + evs.length + ' recorded). Smarkets suspends the market around a goal, a red card or a VAR check; the entry is the first price after it reopens, the earliest a bet could really be made. For each selection: back at the first price after the jump, then <b>lay it back</b> 1, 2, 3 or 5 minutes later to lock in the same profit or loss whatever happens, or <b>hold</b> to the end. Average per £50, how many, and how often it was positive. Paper: real in-play prices move during the bet delay and after a goal the book can be thin, so read the depth before believing a number.</p>' +
+      table(['Strategy', 'Out after 1 min', '2 min', '3 min', '5 min', 'Hold to the end'], grows, 'var') +
+      '<p class="muted">' + checks.length + (checks.length === 1 ? ' suspension' : ' suspensions') + ' reopened with no real change (a VAR check, a penalty review or a disallowed goal), kept apart from the table' + (medS != null ? '; a suspension typically lasts ' + Math.round(medS) + ' s' : '') + '.</p>' +
+      (evs.length ? details('<b>Latest jumps</b>', table(['When', 'Fixture', 'Minute', 'What', 'Jump', 'Back after (H / D / A)', 'Out at 3 min: follow / fade'], evs.slice(0, 40).map(function (ev) {
+        var f = { home: ev.home, away: ev.away }, tr = ev.trades || {}, fol = tr[ev.up_key] || {}, fades = Object.keys(tr).filter(function (k) { return k !== ev.up_key; });
+        return [e(dhm(ev.at)), '<b>' + e(ev.home) + ' v ' + e(ev.away) + '</b><div class="sub">' + e(ev.league) + '</div>', [Math.round(ev.minute || 0) + '\'', ' class="mono"'], chip(kindOf(ev) === 'goal' ? 'goal / red' : kindOf(ev) === 'check' ? 'check' : 'no suspension', kindOf(ev) === 'goal' ? 'pos' : '') + (ev.suspended_s != null ? '<div class="sub">suspended ' + Math.round(num(ev.suspended_s)) + ' s</div>' : ''), e(sel(ev.key, f)) + ' ' + pc(ev.before, 0) + ' → ' + pc(ev.after, 0), [['H', 'D', 'A'].map(function (k) { return od((tr[k] || {}).entry); }).join(' / '), ' class="mono"'], [money((fol.green || {})[180]) + ' / ' + fades.map(function (k) { return money(((tr[k] || {}).green || {})[180]); }).join(', '), ' class="mono"']];
+      }), 'book'), '', evs.length + ' events') : '<p class="empty">No jumps recorded yet: the in-play worker is off until switched on in render.yaml. It needs no API key for this part.</p>'));
+    // idea 35: the reaction model (which post-goal trades will lock in a profit)
+    var RM = d.reaction, oos = (RM && RM.oos) || {}, usable = evs.filter(function (ev) { return kindOf(ev) !== 'check'; }).length;
+    var planned = evs.filter(function (ev) { return ev.plan; }), pdone = planned.filter(function (ev) { return ev.plan.realised != null; });
+    var ppnl = sum(pdone, function (ev) { return ev.plan.realised; });
+    html += section('Reaction model: which trades to take', '<p class="muted">Learns, from the events above, which selection to back straight after a goal and when to lay it back so the locked profit is positive, using only what is known when the book reopens: the size of the jump, follow or fade, the minute, goal or not, the entry price and depth, and the two minutes of prices before. One paper trade per event at most, only when the predicted locked profit clears £' + (num((RM && RM.edge) || 0.5)).toFixed(2) + ' per £50. Its record is <b>out of sample</b>: every event was predicted by a model fitted only on earlier events.</p>' +
+      (RM ? kpi([[RM.n, 'events it learned from'], [oos.planned == null ? '—' : oos.planned, 'trades it would have made (out of sample)'], [money(oos.mean), 'average locked profit per trade', sign(oos.mean)], [pc(oos.hit, 0), 'positive'], [money(oos.all_mean), 'average of every trade, for comparison', sign(oos.all_mean)]]) +
+        '<p class="muted">Fitted ' + e(ago(RM.fitted_at, d.now)) + '; refitted hourly by the in-play worker.</p>'
+        : '<p class="empty">Learning: ' + usable + ' of 60 events recorded. It starts planning trades at 60.</p>') +
+      (planned.length ? table(['When', 'Fixture', 'Minute', 'Trade', 'Out at', 'Predicted', 'Locked in'], planned.slice(0, 40).map(function (ev) {
+        var pl = ev.plan, f = { home: ev.home, away: ev.away };
+        return [e(dhm(ev.at)), '<b>' + e(ev.home) + ' v ' + e(ev.away) + '</b>', [Math.round(ev.minute || 0) + '\'', ' class="mono"'], e(pl.side) + ': back ' + e(sel(pl.key, f)) + ' at ' + od(pl.entry), [Math.round(pl.exit / 60) + ' min', ' class="mono"'], [money(pl.pred), ' class="mono"'], ['<b class="' + sign(pl.realised) + '">' + money(pl.realised) + '</b>', ' class="mono"']];
+      }), 'book') + '<p class="muted">' + pdone.length + (pdone.length === 1 ? ' planned trade' : ' planned trades') + ' completed: ' + money(ppnl) + ' locked in on paper.</p>' : ''));
+    var settled = bets.filter(function (b) { return b.status === 'settled'; }), pnl = sum(settled, function (b) { return b.paper_pnl; });
+    html += section('In-play paper bets', kpi([[bets.length, 'in-play bets'], [settled.length, 'settled'], [money(pnl), 'paper P&L', sign(pnl)]]) +
+      (bets.length ? table(['When', 'Fixture', 'Score', 'Selection', 'Price', 'EV', 'Model / market', 'Result', 'Paper P&L'], bets.map(function (b) {
+        var f = { home: b.home, away: b.away };
+        return [e(dhm(b.at)) + '<div class="sub">' + Math.round(b.minute) + '\'</div>', '<b>' + e(b.home) + ' v ' + e(b.away) + '</b>', [b.sh + ' – ' + b.sa, ' class="mono"'], e(sel(b.key, f)), ['<b>' + od(b.price) + '</b>', ' class="mono"'], [spc(b.ev), ' class="mono"'], [pc(b.p_model) + ' / ' + pc(b.p_market), ' class="mono"'], b.status === 'settled' ? (b.outcome === 'winner' ? chip('won', 'won') : b.outcome === 'loser' ? chip('lost', 'lost') : chip(b.outcome, 'plain')) : chip('open', 'plain'), ['<span class="' + sign(b.paper_pnl) + '">' + money(b.paper_pnl) + '</span>', ' class="mono"']];
+      }), 'book') : '<p class="empty">No in-play bets yet.</p>'));
+    return { html: html, note: live.length ? live.length + ' live' : (bets.length ? bets.length + ' bets' : 'off') };
+  }
+
+  // ---------------------------------------------------------------- Health tab
+  function healthTab(d) {
+    var runs = d.runs, lf = d.lastFull, errs = runs.filter(function (r) { return r.error; });
+    var notes = (lf && lf.notes) || {};
+    var html = section('Is it running?', kpi([[lf ? ago(lf.finished_at, d.now) : 'never', 'last full pricing run'], [runs[0] ? ago(runs[0].started_at, d.now) : 'never', 'last run of any kind'], [runs.length ? (runs[0].n_events == null ? '—' : runs[0].n_events) : '—', 'events read (last run)'], [errs.length, 'runs with an error (last 24)', errs.length ? 'neg' : '']]) +
+      (errs.length ? '<div class="bad"><b>Latest error</b> (run ' + errs[0].id + ', ' + e(dhm(errs[0].started_at)) + ')<pre class="err">' + e(errs[0].error) + '</pre></div>' : '') +
+      table(['Run', 'Kind', 'Started (UK)', 'Took', 'Events', 'Priced', 'New picks', 'Settled', 'Closes', 'Error'], runs.map(function (r) {
+        var took = r.finished_at ? Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000) + ' s' : (r.error ? '—' : 'running / died');
+        return [[r.id, ' class="mono"'], e(r.kind), e(dhm(r.started_at)), [took, ' class="mono"'], [r.n_events == null ? '—' : r.n_events, ' class="mono"'], [r.n_priced == null ? '—' : r.n_priced, ' class="mono"'], [r.n_suggestions == null ? '—' : r.n_suggestions, ' class="mono"'], [r.n_settled == null ? '—' : r.n_settled, ' class="mono"'], [r.notes && r.notes.closes != null ? r.notes.closes : '—', ' class="mono"'], r.error ? chip('error', 'neg') : ''];
+      }), 'book'), { first: true });
+    var probs = [];
+    if (notes.data_errors) probs.push('<b>Results data failed</b> for ' + Object.keys(notes.data_errors).map(function (k) { return e(k) + ' <span class="note">(' + e(notes.data_errors[k]) + ')</span>'; }).join(', '));
+    if (notes.thin_data) probs.push('<b>Too few matches to fit</b>: ' + Object.keys(notes.thin_data).map(function (k) { return e(k) + ' (' + e(notes.thin_data[k]) + ')'; }).join(', '));
+    if (notes.clubelo_error) probs.push('<b>ClubElo failed</b>: ' + e(notes.clubelo_error));
+    if (notes.xg_errors) probs.push('<b>xG (Understat) failed</b> for ' + Object.keys(notes.xg_errors).map(function (k) { return e(k) + ' <span class="note">(' + e(notes.xg_errors[k]) + ')</span>'; }).join(', '));
+    if (notes.xg_name_misses) probs.push('<b>xG team names not matched</b>: ' + Object.keys(notes.xg_name_misses).map(function (k) { return e(k) + ': ' + e(notes.xg_name_misses[k].join(', ')); }).join('; '));
+    if (notes.fit_errors) probs.push('<b>Fits failed</b>: ' + Object.keys(notes.fit_errors).map(function (k) { return e(k) + ' <span class="note">(' + e(notes.fit_errors[k]) + ')</span>'; }).join(', '));
+    if (notes.event_errors && notes.event_errors.length) probs.push('<b>' + notes.event_errors.length + ' fixtures failed to price</b>' + details('show', '<ul>' + notes.event_errors.map(function (x) { return '<li class="mono">' + e(x) + '</li>'; }).join('') + '</ul>'));
+    var stuck = d.suggestions.filter(function (x) { return x.status === 'open' && x.f && (new Date(d.now) - new Date(x.f.kickoff)) > 24 * 3600e3; });
+    if (stuck.length) probs.push('<b>' + stuck.length + ' selection' + (stuck.length === 1 ? '' : 's') + ' still open more than 24 hours after kick-off</b> (a market Smarkets has not settled yet, or a settlement state the bot does not recognise): ' + stuck.slice(0, 8).map(function (x) { return e(x.f.home + ' v ' + x.f.away + ' ' + sel(x.key, x.f)); }).join(', '));
+    html += section('Problems in the last full run', probs.length ? probs.map(function (p) { return '<div class="warn">' + p + '</div>'; }).join('') : '<p class="muted">None reported.</p>');
+    html += section('Competitions seen but not priced', (d.unmapped.length ? '<p class="muted">Smarkets competitions the bot saw but could not map to a league. The ones that should be priced get added to <span class="mono">sbms/config.py</span>.</p>' + table(['Smarkets slug', 'Events seen', 'Last seen', 'How'], d.unmapped.map(function (u) { return ['<span class="mono">' + e(u.slug) + '</span>', [u.n_events, ' class="mono"'], e(dhm(u.last_seen)), e(u.how)]; }), 'var') : '<p class="muted">None.</p>') +
+      (d.inferred.length ? details('<b>Matched by country only — not priced until confirmed as the top flight</b>', table(['Slug', 'Mapped to', 'Events'], d.inferred.map(function (u) { return ['<span class="mono">' + e(u.slug) + '</span>', e(u.mapped_to), [u.n_events, ' class="mono"']]; }), 'var'), '', d.inferred.length + ' competitions') : ''));
+    // idea 33: the data guardian; idea 32: the circuit breaker
+    var gd = d.guardian || [], blocks = gd.filter(function (g) { return g.level === 'block'; });
+    html += section('Data guardian', '<p class="muted">Checks on every run that stop bad data becoming a bet (idea 33): a broken or crossed book, a goal expectation out of range or probabilities that do not add up, the model and market 25+ points apart on a result (far more often a wrong team match than an edge), and results data 28+ days old. A blocked fixture is still predicted and scored; it just gets no bet from that variant. Last 7 days, each finding once per 12 hours.</p>' +
+      kpi([[blocks.length, 'bets blocked', blocks.length ? 'neg' : ''], [gd.length - blocks.length, 'warnings']]) +
+      (gd.length ? details('<b>Findings</b>', table(['When', 'Check', 'League', 'Fixture', 'Variant', 'Detail'], gd.slice(0, 120).map(function (g) { return [e(dhm(g.at)), chip(g.check_name, g.level === 'block' ? 'neg' : ''), e(g.league), g.fixture_id ? '<span class="mono">' + e(g.fixture_id) + '</span>' : '', e(g.model ? modelLabel(g.model) : ''), e(g.detail)]; }), 'var'), '', gd.length + ' findings') : '<p class="muted">Nothing found.</p>'));
+    var br = (d.tuning || []).filter(function (r) { return r.kind === 'breaker'; }), brNow = {};
+    br.slice().reverse().forEach(function (r) { brNow[r.league] = r; });
+    var brOn = Object.keys(brNow).filter(function (k) { return brNow[k].adopted; });
+    html += section('Circuit breaker', '<p class="muted">A league whose last ' + 30 + ' live bets have averaged a closing-line value below −3% stops being featured (idea 32). Its bets are still recorded, so it can earn its way back: featured again once the same average is above 0. Every trip and reset is logged.</p>' +
+      (brOn.length ? '<div class="warn"><b>Not featured now:</b> ' + e(brOn.join(', ')) + '</div>' : '<p class="muted">No league tripped.</p>') +
+      (br.length ? table(['When', 'League', 'Change', 'Mean CLV', 'Bets'], br.slice(0, 40).map(function (r) { var ev = r.evidence || {}; return [e(dhm(r.decided_at)), e(r.league), chip(r.adopted ? 'tripped' : 'reset', r.adopted ? 'neg' : 'pos'), [spc(ev.mean_clv), ' class="mono"'], [ev.bets, ' class="mono"']]; }), 'var') : ''));
+    var mt = d.marketTypes || [];
+    html += section('Market types on Smarkets', mt.length ? '<p class="muted">Every market type the bot has seen on football events, so extra markets (correct score, Asian handicaps, half-time) can be wired to their real names (idea 16). Priced today: result, draw no bet, both teams to score, over/under 1.5 / 2.5 / 3.5.</p>' + table(['Type', 'Parameter', 'Seen', 'Last seen', 'Selections (sample)'], mt.map(function (r) { var sm_ = r.sample || []; return ['<span class="mono">' + e(r.name) + '</span>', '<span class="mono">' + e(r.param) + '</span>', [r.n, ' class="mono"'], e(dhm(r.last_seen)), sm_.length ? '<span class="sub">' + e(sm_.slice(0, 8).map(function (c) { return (c.name || c.slug || '?') + (c.type ? ' [' + c.type + (c.param != null ? ' ' + c.param : '') + ']' : ''); }).join(' · ')) + (sm_.length > 8 ? ' …' : '') + '</span>' : '<span class="muted">—</span>']; }), 'var') : '<p class="muted">None recorded yet (from the next full run).</p>');
+    html += section('Team names not matched', d.names.length ? '<p class="muted">Exchange names the bot could not match to its results data. These fixtures are skipped until an alias is added to <span class="mono">sbms/names.py</span>.</p>' + table(['League', 'Exchange name', 'Detail', 'Last seen'], d.names.map(function (n) { return [e(n.league), '<b>' + e(n.name) + '</b>', '<span class="note">' + e(n.detail) + '</span>', e(dhm(n.seen_at))]; }), 'var') : '<p class="muted">None.</p>');
+    var note = !lf ? 'no full run yet' : (errs.length ? errs.length + (errs.length === 1 ? ' error' : ' errors') : 'OK · ' + ago(lf.finished_at, d.now));
+    return { html: html, note: note };
+  }
+
+  // ---------------------------------------------------------------- page
+  function render(d) {
+    d = shape(d);
+    var todayTab = null, tabs = [];
+    d.days.forEach(function (k) {
+      if (k < d.todayK && !d.fixtures.some(function (f) { return f.day === k; })) return;
+      var t = dayTab(d, k), label = k === d.todayK ? 'Today' : (k < d.todayK ? 'Yesterday' : dayShort(k));
+      tabs.push({ id: 'd' + k, label: label, note: t.note, html: t.html }); if (k === d.todayK) todayTab = 'd' + k;
+    });
+    var p = pnlTab(d), rb = realTab(d), ip = inplayTab(d), m = modelTab(d), rsch = researchTab(d), h = healthTab(d);
+    tabs.push({ id: 'real', label: 'Real P&L', note: rb.note, html: rb.html }, { id: 'pnl', label: 'Paper P&L', note: p.note, html: p.html }, { id: 'inplay', label: 'In-play', note: ip.note, html: ip.html }, { id: 'model', label: 'Model', note: m.note, html: m.html }, { id: 'research', label: 'Research', note: rsch.note, html: rsch.html }, { id: 'health', label: 'Health', note: h.note, html: h.html });
+
+    // masthead, all computed
+    var s = d.settings, lf = d.lastFull, liveM = (s && s.live_model) || 'dixon_coles';
+    var todayFx = d.fixtures.filter(function (f) { return f.day === d.todayK; });
+    var todayFeat = [].concat.apply([], todayFx.map(function (f) { return f.sugs; })).filter(function (x) { return d.isLive(x.model) && x.featured && x.order_type === 'take'; });
+    var nPriced = d.fixtures.filter(function (f) { return f.day >= d.todayK && Object.keys(f.preds).length; }).length;
+    document.getElementById('eyebrow').textContent = 'SB-MS-2026 · paper · live model ' + modelLabel(liveM) + ' · ' + nPriced + ' fixtures priced ahead · last full run ' + (lf ? dhm(lf.finished_at) + ' UK' : 'never') + ' · page read ' + hm(d.now) + ' UK';
+    var h1;
+    if (!d.runs.length) h1 = 'Waiting for the first run';
+    else {
+      var todayS = [].concat.apply([], todayFx.map(function (f) { return f.sugs; })).filter(function (x) { return d.isLive(x.model); });
+      var nF = todayS.filter(function (x) { return x.card === 'forced'; }).length, nR = todayS.filter(function (x) { return x.card === 'rest'; }).length;
+      if (nF || nR) h1 = 'Today: ' + todayFeat.length + ' bet' + (todayFeat.length === 1 ? '' : 's') + ' · ' + nF + ' forced · ' + nR + ' to rest';
+      else if (!todayFeat.length) h1 = todayFx.length ? 'No bets today — no price on offer cleared the floor' : 'No covered fixtures today';
+      else h1 = todayFeat.length + ' paper bet' + (todayFeat.length === 1 ? '' : 's') + ' today';
+    }
+    document.getElementById('h1').textContent = h1;
+    var o = d.board.filter(function (b) { return b.league == null && b.model === liveM; })[0];
+    var liveBook = d.book.filter(function (x) { return d.isLive(x.model) && x.order_type === 'take' && x.status === 'settled'; });
+    var bt = d.backtest, btn = sum(bt, function (x) { return x.n; });
+    var lede = [];
+    if (o && num(o.n)) { var g = num(o.ll_model) - num(o.ll_market); lede.push('Over <b>' + o.n + '</b> settled fixtures the ' + (g < 0 ? '<b>model is ahead of the market</b>' : '<b>market is ahead of the model</b>') + ' (log loss ' + f4(o.ll_model) + ' v ' + f4(o.ll_market) + ').'); }
+    else lede.push('No settled fixtures scored yet, so there is no verdict on model v market.');
+    if (btn) { var bm = sum(bt, function (x) { return num(x.ll_model) * num(x.n); }) / btn, bk = sum(bt, function (x) { return num(x.ll_market) * num(x.n); }) / btn; lede.push('The back-test over <b>' + btn + '</b> past matches has the model ' + (bm < bk ? '<b>ahead</b>' : '<b>behind</b>') + ' Pinnacle\'s close by ' + Math.abs(bm - bk).toFixed(4) + '.'); }
+    else lede.push('No back-test yet.');
+    if (liveBook.length) lede.push('Paper book: <b>' + liveBook.length + '</b> bets settled, <b>' + money(sum(liveBook, function (x) { return x.paper_pnl; })) + '</b>, mean CLV <b>' + spc(mean(liveBook, function (x) { return x.clv; })) + '</b>.');
+    lede.push('Everything here is paper.');
+    document.getElementById('lede').innerHTML = lede.join(' ');
+
+    // keep what the reader had open
+    var open = [].slice.call(document.querySelectorAll('details[open]')).map(function (x) { return x.id; }).filter(Boolean);
+    var want = state.tab && tabs.some(function (t) { return t.id === state.tab; }) ? state.tab : (todayTab || tabs[0].id);
+    document.getElementById('tabs').innerHTML = tabs.map(function (t) { return '<a role="tab" href="#' + t.id + '" data-tab="' + t.id + '" aria-selected="' + (t.id === want) + '">' + e(t.label) + '<small>' + e(t.note) + '</small></a>'; }).join('');
+    document.getElementById('panels').innerHTML = tabs.map(function (t) { return '<section class="panel" role="tabpanel" id="' + t.id + '"' + (t.id === want ? '' : ' hidden') + '>' + t.html + '</section>'; }).join('');
+    open.forEach(function (id) { var x = document.getElementById(id); if (x) x.open = true; });
+    wire();
+    show(want, true);
+  }
+
+  function show(id, quiet) {
+    state.tab = id;
+    [].forEach.call(document.querySelectorAll('#tabs a'), function (a) { a.setAttribute('aria-selected', a.dataset.tab === id ? 'true' : 'false'); });
+    [].forEach.call(document.querySelectorAll('section.panel'), function (p) { p.hidden = p.id !== id; p.classList.toggle('active', p.id === id); });
+    if (location.hash.slice(1) !== id) history.replaceState(null, '', location.pathname + location.search + '#' + id);
+    if (!quiet) window.scrollTo({ top: document.getElementById('tabs').offsetTop - 4 });
+  }
+  function wire() {
+    [].forEach.call(document.querySelectorAll('#tabs a'), function (a) { a.addEventListener('click', function (ev) { ev.preventDefault(); show(a.dataset.tab); }); });
+    [].forEach.call(document.querySelectorAll('nav.vtabs'), function (nav) {
+      var key = nav.dataset.vt, links = [].slice.call(nav.querySelectorAll('a[data-mv]')), scope = nav.closest('section.panel');
+      var secs = [].slice.call(scope.querySelectorAll('.sec[data-mv]'));
+      function pick(v) { state.mv[key] = v; links.forEach(function (a) { a.classList.toggle('on', a.dataset.mv === v); }); secs.forEach(function (s) { s.classList.toggle('hide', s.dataset.mv !== v); }); }
+      links.forEach(function (a) { a.addEventListener('click', function (ev) { ev.preventDefault(); pick(a.dataset.mv); }); });
+      var v = state.mv[key]; pick(links.some(function (a) { return a.dataset.mv === v; }) ? v : links[0].dataset.mv);
+    });
+    [].forEach.call(document.querySelectorAll('tr.rowlink'), function (tr) {
+      function go(ev) { if (ev.target.closest('button')) return; if (ev.target.closest('a') && !ev.target.closest('a.fxlink')) return; ev.preventDefault(); var x = document.getElementById('fx-' + tr.dataset.fx); if (!x) return; var pnl = x.closest('section.panel'); if (pnl && pnl.hidden) show(pnl.id, true); x.open = true; x.classList.add('flash'); setTimeout(function () { x.classList.remove('flash'); }, 1600); x.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      tr.addEventListener('click', go); tr.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') go(ev); });
+    });
+  }
+
+  // ---------------------------------------------------------------- "I took this bet" (16 Oct)
+  var BET_BASE = location.pathname.replace(/\/+$/, ''), dlg = document.getElementById('takeDlg'), cur = null;
+  function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (err) { return null; } }
+  function betsKey() { return store('sbms.betsKey') || ''; }
+  function calc() {
+    var o = num(document.getElementById('takeOdds').value), st = num(document.getElementById('takeStake').value), c = (state.data && state.data.lastFull && state.data.lastFull.notes && state.data.lastFull.notes.settings && state.data.lastFull.notes.settings.commission) || 0.02;
+    var p = cur && cur.pw !== '' ? num(cur.pw) : null, out = [];
+    if (o && o > 1) out.push('Implied chance at ' + o.toFixed(2) + ': <b>' + (100 / o).toFixed(1) + '%</b>');
+    if (p != null && o && o > 1) {
+      var ev = p * (o - 1) * (1 - c) - (1 - p), be = 1 + (1 - p) / (p * (1 - c));
+      out.push('Model (anchored): <b>' + (p * 100).toFixed(1) + '%</b> → EV <b class="' + (ev >= 0 ? 'pos' : 'neg') + '">' + (ev >= 0 ? '+' : '−') + Math.abs(ev * 100).toFixed(1) + '%</b> after commission' + (st ? ' (' + (ev >= 0 ? '+' : '−') + '£' + Math.abs(ev * st).toFixed(2) + ' expected)' : ''));
+      out.push('Break-even odds for the model: ' + be.toFixed(2));
+    } else if (p == null) out.push('No model view stored for this selection: EV will be blank.');
+    if (o && st) out.push('Returns if it wins: £' + (st * o).toFixed(2) + ' (profit £' + (st * (o - 1) * (1 - c)).toFixed(2) + ' after commission)');
+    document.getElementById('takeCalc').innerHTML = out.join('<br>');
+  }
+  function openTake(btn) {
+    cur = { fid: btn.dataset.fid, key: btn.dataset.key, sid: btn.dataset.sid, pw: btn.dataset.pw };
+    document.getElementById('takeWhat').textContent = btn.dataset.what;
+    document.getElementById('takeOdds').value = btn.dataset.price ? num(btn.dataset.price).toFixed(2) : '';
+    document.getElementById('takeStake').value = store('sbms.lastStake') || '';
+    document.getElementById('takeNote').value = '';
+    document.getElementById('takeKeyWrap').hidden = !!betsKey();
+    document.getElementById('takeErr').textContent = state.data && !state.data.betsEnabled ? 'Logging is off until BETS_KEY is set on sbms-page in Render.' : '';
+    calc();
+    if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', '');
+    document.getElementById('takeOdds').focus();
+  }
+  function post(path, body) {
+    var k = betsKey() || document.getElementById('takeKey').value.trim();
+    return fetch(BET_BASE + path + location.search, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Bets-Key': k }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.status); return { j: j, k: k }; }); });
+  }
+  ['takeOdds', 'takeStake'].forEach(function (id) { document.getElementById(id).addEventListener('input', calc); });
+  document.getElementById('takeCancel').addEventListener('click', function () { dlg.close ? dlg.close() : dlg.removeAttribute('open'); });
+  document.getElementById('takeForm').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var o = num(document.getElementById('takeOdds').value), st = num(document.getElementById('takeStake').value), errEl = document.getElementById('takeErr');
+    if (!o || o < 1.01) { errEl.textContent = 'Enter the decimal odds you got (1.01 or more).'; return; }
+    if (!st || st <= 0) { errEl.textContent = 'Enter the stake.'; return; }
+    document.getElementById('takeGo').disabled = true; errEl.textContent = '';
+    post('/bets/take', { fixture_id: num(cur.fid), key: cur.key, suggestion_id: cur.sid ? num(cur.sid) : null, odds: o, stake: st, note: document.getElementById('takeNote').value })
+      .then(function (res) { store('sbms.betsKey', res.k); store('sbms.lastStake', String(st)); dlg.close ? dlg.close() : dlg.removeAttribute('open'); status.textContent = 'Bet logged (' + res.j.tier + ')'; load(); })
+      .catch(function (err) { errEl.textContent = 'Not logged: ' + err.message + (/key/.test(err.message) ? '. Check the bets key.' : ''); if (/wrong bets key/.test(err.message)) { store('sbms.betsKey', ''); document.getElementById('takeKeyWrap').hidden = false; } })
+      .then(function () { document.getElementById('takeGo').disabled = false; });
+  });
+  document.addEventListener('click', function (ev) {
+    var t = ev.target.closest('button.take'); if (t) { ev.preventDefault(); ev.stopPropagation(); openTake(t); return; }
+    var u = ev.target.closest('button.undo');
+    if (u && confirm('Remove this bet from the real P&L? (Only open bets can be removed.)')) {
+      post('/bets/undo', { id: num(u.dataset.undo) }).then(function () { load(); }).catch(function (err) { alert('Not removed: ' + err.message); });
+    }
+  });
+
+  var dot = document.getElementById('dot'), status = document.getElementById('status');
+  function load() {
+    status.textContent = 'Reading…';
+    fetch(DATA_URL, { cache: 'no-store' }).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.status); return j; }); })
+      .then(function (d) {
+        state.data = d; render(d);
+        var lf = d.lastFull, stale = !lf || (new Date(d.now) - new Date(lf.finished_at)) > 2.5 * 3600e3;
+        dot.className = 'dot' + (stale ? ' stale' : '');
+        status.textContent = 'Live · read ' + hm(d.now) + (stale ? ' · no full run for over 2 hours' : '');
+      })
+      .catch(function (err) {
+        dot.className = 'dot err';
+        status.textContent = 'Could not read the model: ' + err.message;
+        if (!state.data) { document.getElementById('h1').textContent = 'The model data could not be read'; document.getElementById('lede').textContent = 'Usually this means the bot has not run yet (its tables are created on the first run), or the database is unreachable. Details: ' + err.message; }
+      });
+  }
+  document.getElementById('reload').addEventListener('click', function (ev) { ev.preventDefault(); load(); });
+  window.addEventListener('hashchange', function () { var id = location.hash.slice(1); if (document.getElementById(id) && document.getElementById(id).matches('section.panel')) show(id, true); });
+  document.documentElement.classList.add('js');
+  load();
+  setInterval(function () { if (!document.hidden) load(); }, 5 * 60 * 1000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden && state.data && (Date.now() - new Date(state.data.now)) > 5 * 60 * 1000) load(); });
+})();
+</script>
+</body></html>

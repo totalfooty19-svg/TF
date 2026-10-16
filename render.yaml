@@ -1,0 +1,72 @@
+# Render blueprint. Two cron jobs next to your existing services; both read DATABASE_URL from totalfooty-db.
+# (If you add the jobs by hand in the dashboard instead: New -> Cron Job -> this repo, same commands and schedules.)
+services:
+  - type: cron
+    name: sbms-model
+    runtime: python
+    region: frankfurt
+    schedule: "*/15 * * * *"          # full pricing run on the hour, closing-price captures every quarter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m sbms.jobs.run auto
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: totalfooty-db
+          property: connectionString
+      - key: API_FOOTBALL_KEY          # optional: switches on the leagues football-data.co.uk lacks (Bulgaria, Croatia, ...)
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+  - type: cron
+    name: sbms-backtest
+    runtime: python
+    region: frankfurt
+    schedule: "0 5 * * 1"             # Mondays 05:00 UTC: walk-forward test over the last two seasons
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m sbms.jobs.backtest --seasons 2 --step 7
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: totalfooty-db
+          property: connectionString
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+  # The live page (Ultimate HTML layout): read-only, serves / and /page-data from the sbms schema. Starter plan (~$7/month)
+  # stays awake; change plan to free to pay nothing and accept a ~30 s wake-up after 15 idle minutes.
+  - type: web
+    name: sbms-page
+    runtime: python
+    region: frankfurt
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m sbms.web
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: totalfooty-db
+          property: connectionString
+      - key: MODEL_PAGE_KEY            # optional: a password; the page then opens as https://<address>/?key=<password>
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+  # Idea 11, in-play (paper): an always-on background worker (Starter plan, about $7 a month). It reads each live book
+  # every 15 seconds: goal reaction (trade out v hold after a jump) needs no key; the model's in-play probabilities need
+  # API_FOOTBALL_KEY for live scores (free plan: every 10 minutes; paid: set INPLAY_SCORE_EVERY_S=60). To switch it on,
+  # remove the '#' from the lines below, commit, and sync the Blueprint.
+  # - type: worker
+  #   name: sbms-inplay
+  #   runtime: python
+  #   region: frankfurt
+  #   plan: starter
+  #   buildCommand: pip install -r requirements.txt
+  #   startCommand: python -m sbms.jobs.inplay
+  #   envVars:
+  #     - key: DATABASE_URL
+  #       fromDatabase:
+  #         name: totalfooty-db
+  #         property: connectionString
+  #     - key: API_FOOTBALL_KEY
+  #       sync: false
+  #     - key: PYTHON_VERSION
+  #       value: "3.12.7"
